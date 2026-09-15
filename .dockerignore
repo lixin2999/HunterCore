@@ -1,0 +1,20 @@
+# 构建上下文裁剪（各服务 Dockerfile 的构建上下文必须为仓库根目录：
+# docker build -f services/<service>/Dockerfile -t hunter/<service>:<tag> .）
+.git
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+node_modules
+**/node_modules
+frontend
+docs
+.pytest_cache
+**/.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+.env.*
+*.log
+release.md

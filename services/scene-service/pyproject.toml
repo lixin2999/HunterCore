@@ -1,0 +1,29 @@
+[project]
+name = "scene-service"
+version = "0.1.0"
+description = "场景生成：场景库管理、场景编辑、场景参数化、OpenSCENARIO 导出、实车场景自动提取"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.100,<1.0",
+    "uvicorn[standard]>=0.23",
+]
+
+# 注意：hunter_common 由仓库统一安装（先执行 pip install -e "common/python"），
+# 服务内通过 import hunter_common 使用；不声明为 PyPI 依赖以免误装同名包。
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["app/tests"]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

@@ -1,0 +1,104 @@
+"""HunterEdge 服务基础配置（pydantic-settings）。
+
+约束（设计文档：配置管理）：
+- 所有可调参数从环境变量/.env 读取，禁止在业务代码中硬编码 URL/密钥/端口/阈值
+- 各服务继承 HunterBaseConfig 并补充服务私有字段
+- 生产部署：非敏感配置走 ConfigMap，敏感配置（密码/密钥/证书）走 K8s Secret 注入环境变量
+"""
+from __future__ import annotations
+
+import os
+from typing import Literal
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class HunterBaseConfig(BaseSettings):
+    """所有微服务配置的基类（pydantic-settings，环境变量优先于 .env 文件）。"""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # ---------- 服务基础 ----------
+    service_name: str = "hunter-service"
+    environment: Literal["dev", "test", "staging", "prod"] = "dev"
+    debug: bool = True
+    log_level: str = "INFO"
+    api_host: str = "0.0.0.0"
+    api_port: int = 8080
+    # CORS 允许来源（逗号分隔；前端 Vite 默认 5173）
+    cors_origins: str = "http://localhost:5173"
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    # ---------- PostgreSQL 15 + TimescaleDB 2.13 ----------
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    postgres_user: str = "hunter"
+    postgres_password: str = "hunter_dev_123"
+    postgres_db: str = "hunter_edge"
+    db_echo: bool = False
+    # 连接池大小 = CPU 核数 × 2 + 1（开发规则：数据库连接池）
+    db_pool_size: int = Field(default_factory=lambda: (os.cpu_count() or 2) * 2 + 1)
+    db_max_overflow: int = 10
+    db_pool_timeout: int = 30
+
+    @property
+    def database_url(self) -> str:
+        """SQLAlchemy 异步连接串（asyncpg 驱动）。"""
+        return (
+            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    # ---------- Redis 7 ----------
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_password: str | None = None
+    redis_db: int = 0
+    redis_max_connections: int = 100
+
+    @property
+    def redis_url(self) -> str:
+        """redis-py 异步连接串。"""
+        auth = f":{self.redis_password}@" if self.redis_password else ""
+        return f"redis://{auth}{self.redis_host}:{self.redis_port}/{self.redis_db}"
+
+    # ---------- Apache Kafka 3.6 ----------
+    kafka_bootstrap_servers: str = "localhost:9092"
+    # 生产环境及车端接入必须 SASL_SSL + SCRAM-SHA-512（设计文档：Kafka 安全），本地开发可用 PLAINTEXT
+    kafka_security_protocol: Literal["PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"] = "PLAINTEXT"
+    kafka_sasl_mechanism: Literal["SCRAM-SHA-512", "PLAIN"] = "SCRAM-SHA-512"
+    kafka_sasl_username: str | None = None
+    kafka_sasl_password: str | None = None
+    kafka_ssl_cafile: str | None = None
+    # 生产者基准参数（对齐车端生产者配置：lz4 / linger.ms=5 / batch.size=16384 / retries=3）
+    kafka_producer_acks: Literal["0", "1", "all"] = "all"
+    kafka_compression_type: Literal["none", "gzip", "snappy", "lz4", "zstd"] = "lz4"
+    kafka_linger_ms: int = 5
+    kafka_batch_size: int = 16384
+    kafka_retries: int = 3
+
+    @property
+    def kafka_bootstrap_servers_list(self) -> list[str]:
+        return [s.strip() for s in self.kafka_bootstrap_servers.split(",") if s.strip()]
+
+    # ---------- MinIO（S3 兼容对象存储） ----------
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "minioadmin"
+    minio_secret_key: str = "minioadmin"
+    minio_secure: bool = False
+
+    # ---------- 认证与安全 ----------
+    # 生产环境必须通过 K8s Secret 覆盖，禁止使用默认值上线
+    jwt_secret_key: str = "change-me-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 120   # Access Token 2h（设计文档：安全机制）
+    jwt_refresh_token_expire_days: int = 7       # Refresh Token 7d
