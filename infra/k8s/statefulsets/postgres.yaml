@@ -1,0 +1,185 @@
+# =====================================================================
+# PostgreSQL 15 + TimescaleDB 2.13（业务关系库 + 时序库，设计文档第 9 章）
+# - StatefulSet + PVC（有状态服务）
+# - 初始化 SQL 通过 ConfigMap 挂载 docker-entrypoint-initdb.d（仅首次初始化执行；
+#   hypertable 建表由 contracts/database 契约确认后经 Alembic migration 执行）
+# - 连接池核算：无状态服务副本总连接上限约 150，max_connections=300 留余量
+# ⚠ 资源数值需与设计文档 15.2 节核对；生产高可用建议主从 + Patroni（后续层级）
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-sql
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: postgres
+data:
+  # 内容与 infra/docker/postgres/init/01-extensions.sql 一致（修改需同步两处）
+  01-extensions.sql: |
+    CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+    CREATE SCHEMA IF NOT EXISTS scene_svc;
+    CREATE SCHEMA IF NOT EXISTS data_collector;
+    CREATE SCHEMA IF NOT EXISTS data_analytics;
+    CREATE SCHEMA IF NOT EXISTS ota_svc;
+    CREATE SCHEMA IF NOT EXISTS remote_control;
+    CREATE SCHEMA IF NOT EXISTS gateway;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: hunter-edge
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/component: database
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120        # 优雅关闭（检查点刷盘）
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999                          # postgres 镜像内置用户
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: timescale/timescaledb:2.13.1-pg15
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          args:
+            - "-c"
+            - "max_connections=300"
+            - "-c"
+            - "shared_buffers=2GB"
+            - "-c"
+            - "effective_cache_size=4GB"
+            - "-c"
+            - "work_mem=16MB"
+            - "-c"
+            - "maintenance_work_mem=512MB"
+            - "-c"
+            - "max_wal_size=4GB"
+            - "-c"
+            - "wal_level=replica"
+            - "-c"
+            - "log_min_duration_statement=1000"   # 慢查询（>1s）日志，便于 P95 排查
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-common-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: hunter-common-config
+                  key: POSTGRES_DB
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-app-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init-sql
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            - name: run
+              mountPath: /var/run/postgresql
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -h 127.0.0.1"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: init-sql
+          configMap:
+            name: postgres-init-sql
+        - name: run
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard          # 生产按集群实际 StorageClass 覆盖
+        resources:
+          requests:
+            storage: 200Gi                   # ⚠ 容量需与设计文档 15.2 节核对

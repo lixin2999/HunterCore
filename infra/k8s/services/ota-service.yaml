@@ -1,0 +1,154 @@
+# =====================================================================
+# ota-service（版本仓库管理、升级任务调度、灰度发布、升级监控、A/B 分区回滚）
+# 无状态服务：2 副本
+# 资源：⚠ 数值按服务负载特征推导，需与设计文档 15.2 节核对后调整
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ota-service-config
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: ota-service
+data:
+  SERVICE_NAME: "ota-service"
+  API_PORT: "8084"
+  DB_POOL_SIZE: "3"          # 单副本可用 CPU(1 核) × 2 + 1
+  DB_MAX_OVERFLOW: "5"
+  # OTA 包仓库（hunter-ota-packages，生命周期永久）
+  MINIO_BUCKET_OTA_PACKAGES: "hunter-ota-packages"
+  # 灰度发布批次与门禁（设计文档 OTA 灰度流程，不可更改）
+  OTA_CANARY_STAGES: "5,20,50,100"
+  OTA_CANARY_OBSERVE_HOURS: "24"
+  OTA_CANARY_MIN_SUCCESS_RATE: "0.95"
+  # 升级前置条件（升级门禁：电量 ≥50%、车辆静止(P档)、网络稳定、存储 ≥2GB）
+  OTA_PRECONDITION_MIN_SOC: "50"
+  OTA_PRECONDITION_MIN_STORAGE_GB: "2"
+  OTA_PRECONDITION_REQUIRE_PARKED: "true"
+  # 包校验（OTA 安全：SHA-256 完整性校验 + RSA-2048 签名验签 + 版本号单调递增）
+  OTA_PACKAGE_VERIFY_SHA256: "true"
+  OTA_PACKAGE_VERIFY_SIGNATURE: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ota-service
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: ota-service
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ota-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ota-service
+        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/component: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8084"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60   # 升级调度任务平滑交接
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ota-service
+      containers:
+        - name: ota-service
+          image: hunter/ota-service:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8084
+          envFrom:
+            - configMapRef:
+                name: hunter-common-config
+            - configMapRef:
+                name: ota-service-config
+            - secretRef:
+                name: hunter-app-secrets
+          volumeMounts:
+            - name: kafka-tls
+              mountPath: /etc/hunter/kafka-tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: hunter-kafka-tls
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ota-service
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: ota-service
+    app.kubernetes.io/part-of: hunter-edge
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ota-service
+  ports:
+    - name: http
+      port: 8084
+      targetPort: http

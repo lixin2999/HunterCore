@@ -1,0 +1,175 @@
+# =====================================================================
+# MinIO Bucket 初始化 Job（7 个 Bucket + 生命周期 + SSE-S3 默认加密）
+# - Bucket 名称与生命周期严格对齐设计文档（不可更改）
+# - 与 infra/docker/minio/init-buckets.sh 保持同步（差异：HTTPS 端点、SSE-S3 加密）
+# - 应用顺序：statefulsets/minio.yaml 就绪（≥3/4 节点）后执行
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minio-init-script
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: minio-init
+data:
+  MINIO_ENDPOINT_INTERNAL: "https://minio.hunter-edge.svc.cluster.local:9000"
+  # 自签证书场景使用 --insecure；生产接入内部 CA 后可改为空字符串
+  MC_OPTS: "--insecure"
+  init-buckets.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    ALIAS="hunter"
+    ENDPOINT="${MINIO_ENDPOINT_INTERNAL:?endpoint required}"
+    MC_OPTS="${MC_OPTS:-}"
+
+    # 等待 MinIO 集群就绪（最多 5 分钟）
+    for i in $(seq 1 60); do
+      # shellcheck disable=SC2086
+      if mc ${MC_OPTS} alias set "$ALIAS" "$ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; then
+        break
+      fi
+      echo "[minio-init] waiting for minio... ($i/60)"
+      sleep 5
+    done
+
+    create_bucket() {
+      # shellcheck disable=SC2086
+      mc ${MC_OPTS} mb --ignore-existing "$ALIAS/$1" >/dev/null
+      echo "[minio-init] bucket ready: $1"
+    }
+
+    # add_expiry <bucket> <days> [prefix]
+    add_expiry() {
+      local bucket="$1" days="$2" prefix="${3:-}"
+      if [ -n "$prefix" ]; then
+        # shellcheck disable=SC2086
+        mc ${MC_OPTS} ilm rule add --expire-days "$days" --prefix "$prefix" "$ALIAS/$bucket" >/dev/null
+      else
+        # shellcheck disable=SC2086
+        mc ${MC_OPTS} ilm rule add --expire-days "$days" "$ALIAS/$bucket" >/dev/null
+      fi
+      echo "[minio-init] lifecycle: $bucket expire ${days}d${prefix:+ (prefix=$prefix)}"
+    }
+
+    # 启用 SSE-S3 默认加密（数据安全：MinIO 服务端加密）
+    encrypt_bucket() {
+      # shellcheck disable=SC2086
+      if mc ${MC_OPTS} encrypt set sse-s3 "$ALIAS/$1" >/dev/null 2>&1; then
+        echo "[minio-init] sse-s3 enabled: $1"
+      else
+        echo "[minio-init][warn] sse-s3 enable failed (check MINIO_KMS_SECRET_KEY): $1"
+      fi
+    }
+
+    # ---- 7 个 Bucket（名称与生命周期不可更改） ----
+    create_bucket "hunter-raw-data"
+    create_bucket "hunter-rosbag"
+    create_bucket "hunter-video"
+    create_bucket "hunter-ota-packages"
+    create_bucket "hunter-reports"
+    create_bucket "hunter-logs"
+    create_bucket "hunter-scene-assets"
+
+    # ---- 生命周期规则 ----
+    add_expiry "hunter-raw-data" 30
+    # rosbag 约定：常规数据在 regular/ 前缀（30 天）；事件数据在 events/ 前缀（永久）
+    add_expiry "hunter-rosbag" 30 "regular/"
+    add_expiry "hunter-video" 90
+    add_expiry "hunter-logs" 30
+    # hunter-ota-packages / hunter-reports / hunter-scene-assets：永久，不设过期规则
+
+    # ---- 服务端加密 ----
+    encrypt_bucket "hunter-raw-data"
+    encrypt_bucket "hunter-rosbag"
+    encrypt_bucket "hunter-video"
+    encrypt_bucket "hunter-ota-packages"
+    encrypt_bucket "hunter-reports"
+    encrypt_bucket "hunter-logs"
+    encrypt_bucket "hunter-scene-assets"
+
+    echo "[minio-init] buckets:"
+    # shellcheck disable=SC2086
+    mc ${MC_OPTS} ls "$ALIAS"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: minio-init
+    app.kubernetes.io/part-of: hunter-edge
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio-init
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: minio-init
+          image: minio/mc:RELEASE.2024-06-13T16-39-23Z
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/etc/hunter-minio-init/init-buckets.sh"]
+          env:
+            - name: MINIO_ENDPOINT_INTERNAL
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-init-script
+                  key: MINIO_ENDPOINT_INTERNAL
+            - name: MC_OPTS
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-init-script
+                  key: MC_OPTS
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-minio-root
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-minio-root
+                  key: MINIO_ROOT_PASSWORD
+            - name: MC_CONFIG_DIR
+              value: /tmp/hunter/.mc
+          volumeMounts:
+            - name: init-script
+              mountPath: /etc/hunter-minio-init
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: init-script
+          configMap:
+            name: minio-init-script
+            defaultMode: 0755
+            items:
+              - key: init-buckets.sh
+                path: init-buckets.sh
+        - name: tmp
+          emptyDir: {}

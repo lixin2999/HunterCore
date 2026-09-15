@@ -1,0 +1,158 @@
+# =====================================================================
+# remote-control（WebRTC 视频流转发、控制指令转发 20Hz、操作员权限、会话与录像记录）
+# 无状态服务：3 副本（长连接，按会话粘性路由）
+# 资源：⚠ 数值按服务负载特征推导（媒体转发 IO 密集），需与设计文档 15.2 节核对
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: remote-control-config
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: remote-control
+data:
+  SERVICE_NAME: "remote-control"
+  API_PORT: "8085"
+  DB_POOL_SIZE: "5"          # 单副本可用 CPU(2 核) × 2 + 1
+  DB_MAX_OVERFLOW: "5"
+  # 远程操控安全约束（设计文档，不可更改）
+  RC_COMMAND_HZ: "20"                       # 控制指令 20Hz（50ms 间隔）
+  RC_COMMAND_TIMEOUT_MS: "500"              # >500ms 未收到指令自动减速停车
+  RC_MAX_SPEED_MPS: "2.0"                   # 最高速度 2.0 m/s（可配置）
+  RC_SESSION_EXCLUSIVE: "true"              # 同车同时仅一名操作员（Redis 分布式锁）
+  # 视频编码（AGX Orin NVENC 车端编码，云端仅转发）
+  RC_VIDEO_WIDTH: "1280"
+  RC_VIDEO_HEIGHT: "720"
+  RC_VIDEO_FPS: "30"
+  RC_VIDEO_MAX_BITRATE_KBPS: "4096"
+  RC_VIDEO_MIN_BITRATE_KBPS: "2048"
+  RC_VIDEO_KEYFRAME_INTERVAL_S: "1"
+  # 操控录像 Bucket（hunter-video，生命周期 90 天）
+  MINIO_BUCKET_VIDEO: "hunter-video"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: remote-control
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: remote-control
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: remote-control
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: remote-control
+        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/component: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8085"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60   # 等待会话安全收敛（车辆减速停车）
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: remote-control
+      containers:
+        - name: remote-control
+          image: hunter/remote-control:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8085
+          envFrom:
+            - configMapRef:
+                name: hunter-common-config
+            - configMapRef:
+                name: remote-control-config
+            - secretRef:
+                name: hunter-app-secrets
+          volumeMounts:
+            - name: kafka-tls
+              mountPath: /etc/hunter/kafka-tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: hunter-kafka-tls
+        - name: tmp
+          emptyDir: {}
+---
+# 服务入口：/api/v1/remote/** 与 /ws/remote/**（Ingress 经 api-gateway 转发）
+# WebRTC 媒体流（SRTP/UDP）不经过本 Service：ICE 需额外 NodePort/LoadBalancer 暴露
+# UDP 端口范围，端口取值在 remote-control 业务层按契约实现后补充（禁止预设未定义端口）
+apiVersion: v1
+kind: Service
+metadata:
+  name: remote-control
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: remote-control
+    app.kubernetes.io/part-of: hunter-edge
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: remote-control
+  ports:
+    - name: http
+      port: 8085
+      targetPort: http

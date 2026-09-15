@@ -1,0 +1,337 @@
+# =====================================================================
+# Prometheus 告警规则（HunterEdge L1）
+# 阈值来源：
+#   - 《数据采集与分析系统详细设计文档 V4.0》15.4.2 告警阈值（⚠ 需人工核对：本文档未随仓库提供，
+#     当前阈值按系统上下文基座中的性能指标 + 通用运维经验取值）
+#   - 性能指标：API P95 ≤ 200ms / 遥测入库 ≤ 1s / 告警触发 ≤ 2s /
+#               远程操控视频 ≤ 200ms、指令 ≤ 100ms / 可用性 ≥ 99.9%
+#   - 业务约束：遥测中断 > 10s 判定 communication_loss；OTA 灰度成功率 < 95% 暂停并告警
+# 说明：hunter_* 业务指标（遥测延迟、OTA 成功率、远程操控延迟）需业务层暴露后方可生效，
+#       未实现前对应规则不会触发（表达式结果为空），已在条目上标注。
+# =====================================================================
+groups:
+  # ---------------------------------------------------------------
+  # 1) 服务可用性（可用性 ≥ 99.9%）
+  # ---------------------------------------------------------------
+  - name: hunter-service-health
+    rules:
+      - alert: HunterServiceDown
+        expr: up{job="hunter-services"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: service
+        annotations:
+          summary: "服务实例不可用：{{ $labels.service }}"
+          description: "Pod {{ $labels.pod }} 已连续 1 分钟无法抓取 /metrics（up==0）。"
+          action: "检查 Pod 状态与事件：kubectl -n hunter-edge describe pod {{ $labels.pod }}"
+
+      - alert: HunterServiceHighErrorRate
+        expr: |
+          sum by (service) (rate(hunter_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum by (service) (rate(hunter_http_requests_total[5m])), 0.001) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          component: service
+        annotations:
+          summary: "服务 5xx 错误率 > 1%：{{ $labels.service }}"
+          description: "近 5 分钟 5xx 占比 {{ $value | humanizePercentage }}。"
+          action: "查询统一响应体中的 code 与 request_id 定位异常（结构化日志检索 trace_id）。"
+
+      - alert: HunterContainerRestarting
+        expr: increase(kube_pod_container_status_restarts_total{namespace="hunter-edge"}[15m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+          component: runtime
+        annotations:
+          summary: "Pod 频繁重启：{{ $labels.pod }}"
+          description: "15 分钟内重启 {{ $value }} 次，可能与 OOM 或探针失败相关。"
+
+      - alert: HunterContainerOOMKilled
+        expr: kube_pod_container_status_last_terminated_reason{namespace="hunter-edge",reason="OOMKilled"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          component: runtime
+        annotations:
+          summary: "容器因 OOM 被终止：{{ $labels.pod }}"
+          description: "需核对服务资源 limits（设计文档 15.2 节资源配额）。"
+
+  # ---------------------------------------------------------------
+  # 2) API 性能（P95 ≤ 200ms）
+  # ---------------------------------------------------------------
+  - name: hunter-api-performance
+    rules:
+      - alert: HunterApiLatencyP95Warning
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, service) (rate(hunter_http_request_duration_seconds_bucket[5m]))
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "API P95 时延超阈（>200ms）：{{ $labels.service }}"
+          description: "当前 P95 = {{ $value | humanizeDuration }}（性能指标要求 ≤ 200ms）。"
+
+      - alert: HunterApiLatencyP95Critical
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, service) (rate(hunter_http_request_duration_seconds_bucket[5m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "API P95 时延严重劣化（>500ms）：{{ $labels.service }}"
+          description: "排查下游依赖（数据库/Kafka/Redis）与 Pod 资源是否达到 limits。"
+
+      - alert: HunterApiConcurrencySaturated
+        expr: sum by (service) (hunter_http_requests_in_progress) > 200
+        for: 10m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "并发请求数持续偏高：{{ $labels.service }}"
+          description: "可能存在慢请求堆积（结合 P95 与连接池等待指标排查）。"
+
+  # ---------------------------------------------------------------
+  # 3) 数据管道（Kafka 消费积压 / 遥测入库延迟 ≤ 1s）
+  # ---------------------------------------------------------------
+  - name: hunter-data-pipeline
+    rules:
+      - alert: HunterKafkaConsumerLagHigh
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 10000
+        for: 10m
+        labels:
+          severity: warning
+          component: kafka
+        annotations:
+          summary: "消费者积压：{{ $labels.consumergroup }} / {{ $labels.topic }}"
+          description: "积压 {{ $value }} 条，持续 10 分钟。排查 data-collector 处理能力与分区均衡。"
+
+      - alert: HunterKafkaConsumerLagCritical
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 100000
+        for: 5m
+        labels:
+          severity: critical
+          component: kafka
+        annotations:
+          summary: "消费者严重积压：{{ $labels.consumergroup }} / {{ $labels.topic }}"
+          description: "积压 {{ $value }} 条；遥测入库延迟将超过 1s 目标。"
+
+      - alert: HunterKafkaBrokerDown
+        expr: up{job="kafka"} == 0 or kafka_brokers < 3
+        for: 2m
+        labels:
+          severity: critical
+          component: kafka
+        annotations:
+          summary: "Kafka Broker 不可用（在线数 {{ $value }}）"
+          description: "三节点集群要求 min.insync.replicas=2，继续宕机会丧失写可用性。"
+
+      # ⚠ 待 data-collector 暴露指标后生效（遥测入库延迟 ≤ 1s）
+      - alert: HunterTelemetryIngestLagHigh
+        expr: hunter_telemetry_ingest_lag_seconds > 1
+        for: 2m
+        labels:
+          severity: critical
+          component: data-collector
+        annotations:
+          summary: "遥测入库延迟 > 1s"
+          description: "当前 {{ $value }}s（性能指标要求 ≤ 1s）。"
+
+      # ⚠ 待 data-collector 暴露指标后生效（时序写入 ≥ 10000 点/秒）
+      - alert: HunterTelemetryWriteRateLow
+        expr: rate(hunter_telemetry_points_written_total[5m]) < 5000
+        for: 10m
+        labels:
+          severity: warning
+          component: data-collector
+        annotations:
+          summary: "时序数据写入速率低于目标（<5000 点/秒）"
+          description: "目标 ≥ 10000 点/秒；低于 50% 需检查批量写入与数据库负载。"
+
+  # ---------------------------------------------------------------
+  # 4) 中间件与基础设施（PG / Redis / MinIO / 磁盘 / 证书）
+  # ---------------------------------------------------------------
+  - name: hunter-middleware
+    rules:
+      - alert: HunterPostgresDown
+        expr: up{job="postgres"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: postgres
+        annotations:
+          summary: "PostgreSQL 不可达"
+          description: "所有依赖数据库的服务将进入 500/5001 降级状态。"
+
+      - alert: HunterPostgresConnectionSaturated
+        expr: |
+          sum(pg_stat_activity_count) / clamp_min(max(pg_settings_max_connections), 1) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          component: postgres
+        annotations:
+          summary: "PostgreSQL 连接数使用率 > 80%"
+          description: "当前使用率 {{ $value | humanizePercentage }}；核对各服务 DB_POOL_SIZE 与副本数乘积。"
+
+      - alert: HunterRedisUnavailable
+        expr: up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: redis
+        annotations:
+          summary: "Redis 不可达"
+          description: "会话/限流/分布式锁失效，远程操控互斥约束将受影响。"
+
+      - alert: HunterRedisMemoryHigh
+        expr: redis_memory_used_bytes / clamp_min(redis_memory_max_bytes, 1) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          component: redis
+        annotations:
+          summary: "Redis 内存使用率 > 85%"
+          description: "内存策略为 noeviction，达到上限后写操作将失败（会话/锁不可用）。"
+
+      - alert: HunterMinioClusterDegraded
+        expr: minio_cluster_nodes_offline_total >= 1
+        for: 5m
+        labels:
+          severity: warning
+          component: minio
+        annotations:
+          summary: "MinIO 集群存在离线节点（{{ $value }} 个）"
+          description: "4 节点纠删码 EC:2，可容忍 2 节点故障，需尽快恢复。"
+
+      - alert: HunterMinioClusterUnavailable
+        expr: minio_cluster_nodes_online_total < 3
+        for: 2m
+        labels:
+          severity: critical
+          component: minio
+        annotations:
+          summary: "MinIO 在线节点不足（{{ $value }}/4）"
+          description: "低于纠删码可读阈值，数据采集与 OTA 包下载将失败。"
+
+      - alert: HunterDiskSpaceWarning
+        expr: |
+          (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+             / clamp_min(node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}, 1)) > 0.85
+        for: 15m
+        labels:
+          severity: warning
+          component: storage
+        annotations:
+          summary: "磁盘使用率 > 85%：{{ $labels.mountpoint }}"
+          description: "时序数据保留 90 天、MinIO 生命周期依赖可用磁盘空间。"
+
+      - alert: HunterDiskSpaceCritical
+        expr: |
+          (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+             / clamp_min(node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}, 1)) > 0.92
+        for: 5m
+        labels:
+          severity: critical
+          component: storage
+        annotations:
+          summary: "磁盘使用率 > 92%：{{ $labels.mountpoint }}"
+          description: "存在写入失败风险，需立即扩容或调整保留策略。"
+
+      - alert: HunterCertificateExpiringSoon
+        expr: probe_ssl_earliest_cert_expiry - time() < 86400 * 30
+        for: 1h
+        labels:
+          severity: warning
+          component: security
+        annotations:
+          summary: "TLS 证书 30 天内过期"
+          description: "全链路 TLS 依赖，证书过期将导致网关/服务间通信失败。"
+
+  # ---------------------------------------------------------------
+  # 5) 业务约束（远程操控 / OTA 灰度 / 告警时效）
+  #    ⚠ 以下规则依赖各业务服务暴露的 hunter_* 指标（L2+ 实现），未实现前不会触发
+  # ---------------------------------------------------------------
+  - name: hunter-business-constraints
+    rules:
+      - alert: HunterAlertTriggerLatencyHigh
+        expr: hunter_alert_trigger_latency_seconds > 2
+        for: 2m
+        labels:
+          severity: critical
+          component: data-analytics
+        annotations:
+          summary: "实时告警触发延迟 > 2s"
+          description: "当前 {{ $value }}s（性能指标要求 ≤ 2s）；检查 Flink 作业背压与 Kafka 延迟。"
+
+      - alert: HunterVehicleTelemetrySilence
+        expr: hunter_vehicle_telemetry_silence_seconds > 10
+        for: 1m
+        labels:
+          severity: critical
+          component: data-collector
+        annotations:
+          summary: "车辆遥测中断 > 10s：{{ $labels.vehicle_id }}"
+          description: "满足 communication_loss 事件判定条件（遥测中断 > 10s），应同步产生事件记录。"
+
+      - alert: HunterRemoteControlCommandLatencyHigh
+        expr: hunter_remote_control_command_latency_seconds > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          component: remote-control
+        annotations:
+          summary: "远程操控指令延迟 > 100ms"
+          description: "当前 {{ $value }}s；检查 WebSocket 链路与车辆在线状态。"
+
+      - alert: HunterRemoteControlVideoLatencyHigh
+        expr: hunter_remote_control_video_latency_seconds > 0.2
+        for: 2m
+        labels:
+          severity: warning
+          component: remote-control
+        annotations:
+          summary: "远程操控视频端到端延迟 > 200ms"
+          description: "当前 {{ $value }}s；检查网络 RTT 与视频码率设置（2-4Mbps）。"
+
+      - alert: HunterRemoteControlSessionConflict
+        expr: increase(hunter_remote_control_session_conflicts_total[10m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: remote-control
+        annotations:
+          summary: "远程操控会话冲突频发（错误码 7001）"
+          description: "10 分钟内冲突 {{ $value }} 次；核对车辆互斥锁（rc:session:{vehicle_id}）释放逻辑。"
+
+      - alert: HunterOtaCanarySuccessRateLow
+        expr: hunter_ota_canary_success_rate < 0.95
+        for: 5m
+        labels:
+          severity: critical
+          component: ota-service
+        annotations:
+          summary: "OTA 灰度批次成功率 < 95%"
+          description: "必须立即暂停灰度并人工介入（设计文档灰度发布流程）。"
+
+      - alert: HunterOtaPackageVerifyFailed
+        expr: increase(hunter_ota_package_verify_failures_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: ota-service
+        annotations:
+          summary: "OTA 包校验失败（错误码 6001/6002）"
+          description: "SHA-256 完整性或 RSA-2048 签名验签失败，需核查发布流水线。"
+

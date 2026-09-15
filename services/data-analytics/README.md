@@ -5,6 +5,7 @@
 - 端口：**8083**（环境变量 `API_PORT` 可覆盖）
 - 技术栈：Python 3.11+ / FastAPI / pydantic-settings / SQLAlchemy 2.0 (asyncpg)
 - 健康探针：`GET /healthz`（存活）、`GET /readyz`（就绪，含 DB/Redis 检查）
+- 指标端点：`GET /metrics`（Prometheus 文本格式，由 `infra/monitoring` 抓取）
 
 ## 本地运行
 

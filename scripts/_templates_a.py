@@ -70,24 +70,47 @@ async def test_unknown_error_unified_body() -> None:
     body = resp.json()
     assert body["code"] == 5000
     assert body["message"] == "服务器内部错误"
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_prometheus_format() -> None:
+    """/metrics 输出 Prometheus 文本格式，且指标带 service 标签（供 infra/monitoring 抓取）。"""
+    async with _client() as client:
+        await client.get("/healthz")  # 先产生一次请求指标
+        resp = await client.get("/metrics")
+    assert resp.status_code == 200
+    assert "hunter_http_requests_total" in resp.text
+    assert 'service="$service"' in resp.text
 ''')
 
 DOCKERFILE_TMPL = Template('''# $service（多阶段构建；构建上下文为仓库根目录）
-# 构建示例：docker build -f services/$service/Dockerfile -t hunter/$service:dev .
-FROM python:3.12-slim AS builder
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+# 构建：docker build -f services/$service/Dockerfile -t hunter/$service:0.1.0 .
+# 运行用户：distroless :nonroot（UID 65532），禁止 root 运行（安全机制约束）
+#
+# 阶段 1：builder —— python:3.11-slim（Python 小版本必须与运行时 distroless 一致，
+#         否则 site-packages 路径不匹配）。安装到独立前缀 /install 便于整体搬运。
+FROM python:3.11-slim AS builder
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
 COPY common/python ./common/python
 COPY services/$service ./service
 RUN pip install --prefix=/install ./common/python ./service
 
-FROM python:3.12-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-COPY --from=builder /install /usr/local
+# 阶段 2：runner —— distroless（无 shell / 无包管理器，最小化攻击面）
+# 回退方案（若镜像仓库不可达）：python:3.11-slim + 非 root 用户（useradd -u 10001）。
+FROM gcr.io/distroless/python3-debian12:nonroot
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \\
+    PYTHONPATH=/usr/lib/python3/dist-packages:/app \\
+    API_PORT=$port
 WORKDIR /app
+# Debian 12 系统解释器 site-packages 路径（与 builder 的 lib/python3.11/site-packages 对应）
+COPY --from=builder /install/lib/python3.11/site-packages /usr/lib/python3/dist-packages
 COPY --from=builder /build/service/app ./app
 EXPOSE $port
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "$port"]
+# 健康检查由 K8s livenessProbe/readinessProbe 以 HTTP GET 承担
+# （distroless 无 shell，无法使用 Dockerfile HEALTHCHECK）
+ENTRYPOINT ["python3"]
+CMD ["-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "$port"]
 ''')
 
 PYPROJECT_TMPL = Template('''[project]
@@ -98,6 +121,7 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.100,<1.0",
     "uvicorn[standard]>=0.23",
+    "prometheus-client>=0.20,<1",
 ]
 
 # 注意：hunter_common 由仓库统一安装（先执行 pip install -e "common/python"），

@@ -43,3 +43,14 @@ async def test_unknown_error_unified_body() -> None:
     body = resp.json()
     assert body["code"] == 5000
     assert body["message"] == "服务器内部错误"
+
+
+@pytest.mark.asyncio
+async def test_metrics_endpoint_prometheus_format() -> None:
+    """/metrics 输出 Prometheus 文本格式，且指标带 service 标签（供 infra/monitoring 抓取）。"""
+    async with _client() as client:
+        await client.get("/healthz")  # 先产生一次请求指标
+        resp = await client.get("/metrics")
+    assert resp.status_code == 200
+    assert "hunter_http_requests_total" in resp.text
+    assert 'service="remote-control"' in resp.text

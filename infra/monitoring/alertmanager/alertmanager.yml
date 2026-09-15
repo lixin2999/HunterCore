@@ -1,0 +1,49 @@
+# =====================================================================
+# Alertmanager 路由与接收器配置
+# 挂载位置：/etc/alertmanager/alertmanager.yml
+# 说明：接收器地址为占位值，生产环境改用企业微信/钉钉/邮件/短信网关，
+#       敏感凭据（webhook token、SMTP 密码）通过 Secret 注入环境变量后在
+#       启动命令中做 envsubst 替换，禁止明文写入本文件。
+# =====================================================================
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: hunter-default
+  group_by: ["alertname", "component"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # critical 立即通知（可用性/安全类）
+    - matchers:
+        - severity = "critical"
+      receiver: hunter-critical
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: false
+
+inhibit_rules:
+  # 同一组件已 critical 时抑制其 warning，避免告警风暴
+  - source_matchers: [severity = "critical"]
+    target_matchers: [severity = "warning"]
+    equal: ["component", "service"]
+
+receivers:
+  - name: hunter-default
+    webhook_configs:
+      - url: "http://alert-webhook.hunter-edge.svc.cluster.local:8080/alerts"
+        send_resolved: true
+
+  - name: hunter-critical
+    webhook_configs:
+      - url: "http://alert-webhook.hunter-edge.svc.cluster.local:8080/alerts/critical"
+        send_resolved: true
+    # 邮件通道示例（SMTP 凭据走环境变量替换，禁止明文）
+    # email_configs:
+    #   - to: "oncall@hunter-edge.example.com"
+    #     from: "alertmanager@hunter-edge.example.com"
+    #     smarthost: "smtp.example.com:587"
+    #     auth_username: "$SMTP_USER"
+    #     auth_password: "$SMTP_PASSWORD"
+    #     send_resolved: true

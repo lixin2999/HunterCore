@@ -61,9 +61,9 @@ HunterCore/
 │   └── typescript/            # TypeScript 共享类型（后续层级初始化）
 ├── frontend/                  # Vue 3 管理后台（后续层级初始化）
 ├── infra/
-│   ├── k8s/                   # K8s 部署清单（后续层级）
+│   ├── k8s/                   # K8s 清单：6 微服务 Deployment/Service/ConfigMap、中间件 StatefulSet/PVC、初始化 Job、Ingress
 │   ├── docker/                # 本地开发：postgres/kafka/minio 初始化脚本
-│   └── monitoring/            # Prometheus/Grafana 配置（后续层级）
+│   └── monitoring/            # Prometheus 采集与告警 + Alertmanager + Grafana 看板 + exporters + 监控组件清单
 ├── flink-jobs/                # Flink 1.18 实时分析作业（后续层级）
 ├── spark-jobs/                # Spark 3.5 离线分析作业（后续层级）
 ├── docs/                      # 设计与开发文档
@@ -87,7 +87,7 @@ services/{service-name}/
 │   ├── producers/         # Kafka 生产者（单例，key=vehicle_id 保证单车辆有序）
 │   ├── core/              # 核心组件（安全/依赖注入，后续层级实现）
 │   └── tests/             # 单元测试（pytest + pytest-asyncio + httpx）
-├── Dockerfile             # 多阶段构建（构建上下文 = 仓库根目录）
+├── Dockerfile             # 多阶段构建：python:3.11-slim(builder) → distroless nonroot(runner)，上下文 = 仓库根目录
 ├── pyproject.toml
 └── README.md
 ```
@@ -158,6 +158,36 @@ ruff check common services                        # Lint
 4. 启动 api-gateway（依赖上述服务就绪后统一对外路由，8080）
 5. 前端 dev server（Vite，5173，后续层级初始化）
 
+## Kubernetes 部署与监控（L1）
+
+基础设施层清单位于 `infra/k8s/`（应用与中间件）与 `infra/monitoring/`（监控栈），
+静态校验与部署命令：
+
+```bash
+# 静态校验（无需集群）：API 版本/命名空间/探针/资源配额/敏感字段/端口/契约一致性
+python scripts/verify_infra.py
+
+# 部署顺序（完整版见 infra/k8s/README.md）
+kubectl apply -f infra/k8s/base/            # 命名空间 + 共享 ConfigMap + Secret（先复制 02-secret.example.yaml）
+# 前置：创建 TLS Secret hunter-kafka-tls / hunter-minio-tls / hunter-edge-tls
+kubectl apply -f infra/k8s/statefulsets/    # postgres / kafka / redis / minio
+kubectl apply -f infra/k8s/jobs/            # Topic 与 Bucket 初始化（契约一致）
+kubectl apply -f infra/k8s/services/        # 6 个微服务
+kubectl apply -f infra/k8s/ingress.yaml     # 网关路由表 + WebSocket + TLS
+
+# 监控栈
+kubectl apply -k infra/monitoring
+kubectl apply -f infra/monitoring/exporters/exporters.yaml
+```
+
+要点：
+
+- **探针**：`startupProbe`/`livenessProbe` → `/healthz`，`readinessProbe` → `/readyz`（内部 2s 超时，依赖异常时快速 503 + `code=5001`）
+- **指标**：各服务暴露 `GET /metrics`（`common/python/hunter_common/metrics.py`，统一前缀 `hunter_`），Prometheus 通过 Pod 注解自动发现
+- **安全**：`hunter-edge` 命名空间 `pod-security=restricted`；密钥/证书仅经 Secret 注入；Kafka `SASL_SSL + SCRAM-SHA-512`；MinIO HTTPS + SSE-S3
+- **告警**：5 组规则（服务健康 / API 性能 / 数据管道 / 中间件 / 业务约束），阈值需与设计文档 15.4.2 节核对
+- **看板**：`hunter-fleet-overview`、`hunter-kafka`、`hunter-api-performance`（Git 供给，UI 只读）
+
 ## 验证命令清单
 
 | 验证点 | 命令 |
@@ -170,6 +200,10 @@ ruff check common services                        # Lint
 | 共享库测试 | `pytest common/python/tests -q` |
 | 服务健康探针 | `curl http://localhost:<port>/healthz` |
 | 服务单元测试 | `cd services/<service> && pytest -q` |
+| 指标端点 | `curl http://localhost:<port>/metrics`（Prometheus 文本格式，含 `hunter_` 前缀指标） |
+| K8s/监控清单静态校验 | `python scripts/verify_infra.py`（68 个文档：API 版本/命名空间/探针/资源/敏感字段/端口/契约） |
+| 容器镜像构建 | `docker build -f services/<service>/Dockerfile -t hunter/<service>:0.1.0 .` |
+| 监控栈部署 | `kubectl apply -k infra/monitoring` + `kubectl apply -f infra/monitoring/exporters/exporters.yaml` |
 
 ## 开发约束（摘要）
 

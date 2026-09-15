@@ -10,6 +10,7 @@ $desc
 - 端口：**$port**（环境变量 `API_PORT` 可覆盖）
 - 技术栈：Python 3.11+ / FastAPI / pydantic-settings / SQLAlchemy 2.0 (asyncpg)
 - 健康探针：`GET /healthz`（存活）、`GET /readyz`（就绪，含 DB/Redis 检查）
+- 指标端点：`GET /metrics`（Prometheus 文本格式，由 `infra/monitoring` 抓取）
 
 ## 本地运行
 
@@ -36,6 +37,7 @@ $desc
 - 统一响应格式 + 预定义错误码（hunter_common）
 - 全链路 trace_id（X-Request-ID）中间件
 - /healthz 存活探针、/readyz 就绪探针（DB/Redis 连通性）
+- /metrics Prometheus 指标端点（供 infra/monitoring 抓取）
 """
 from __future__ import annotations
 
@@ -57,6 +59,7 @@ from hunter_common.logging import (
     reset_trace_id,
     set_trace_id,
 )
+from hunter_common.metrics import register_metrics
 from hunter_common.redis import RedisManager
 
 logger = get_logger("app.main")
@@ -120,6 +123,7 @@ async def trace_id_middleware(request: Request, call_next) -> Response:
 
 
 app.include_router(health_router)
+register_metrics(app, settings.service_name, version="0.1.0")
 register_exception_handlers(app)
 
 

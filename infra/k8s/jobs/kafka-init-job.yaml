@@ -1,0 +1,147 @@
+# =====================================================================
+# Kafka 平台内部 Topic 初始化 Job
+# - Topic 名称 / 分区数 / 保留时间严格对齐 contracts/kafka 契约（禁止新增未定义 Topic）
+# - 与 infra/docker/kafka/create-topics.sh 保持同步（差异：RF=3 集群、SASL_SSL 客户端配置）
+# - 应用顺序：statefulsets/kafka.yaml 就绪后执行（脚本内置等待循环）
+# ⚠ 车端 Topic（hunter.{vehicle_id}.*）在车辆注册时按契约创建，不在此处创建
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-init-script
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: kafka-init
+data:
+  KAFKA_TOPIC_REPLICATION_FACTOR: "3"
+  create-topics.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    KAFKA_HOME=/opt/bitnami/kafka
+    BOOTSTRAP="kafka-0.kafka-headless.hunter-edge.svc.cluster.local:9093"
+    RF="${KAFKA_TOPIC_REPLICATION_FACTOR:-3}"
+    CONF=/tmp/hunter/client.properties
+    mkdir -p /tmp/hunter
+
+    cat > "$CONF" <<EOF
+    security.protocol=SASL_SSL
+    sasl.mechanism=SCRAM-SHA-512
+    sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${KAFKA_SASL_USERNAME}" password="${KAFKA_SASL_PASSWORD}";
+    ssl.truststore.type=PEM
+    ssl.truststore.location=/etc/hunter/kafka-tls/ca.crt
+    EOF
+
+    kafka_topics() { "$KAFKA_HOME/bin/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --command-config "$CONF" "$@"; }
+
+    # 等待 broker 就绪（最多 5 分钟）
+    for i in $(seq 1 60); do
+      if kafka_topics --list >/dev/null 2>&1; then break; fi
+      echo "[kafka-init] waiting for broker... ($i/60)"
+      sleep 5
+    done
+
+    # create_topic <name> <partitions> <retention_ms>
+    create_topic() {
+      local name="$1" partitions="$2" retention="$3"
+      if kafka_topics --list | grep -Fxq "$name"; then
+        echo "[kafka-init] topic exists, skip: $name"
+        return 0
+      fi
+      kafka_topics --create --if-not-exists \
+        --topic "$name" --partitions "$partitions" --replication-factor "$RF" \
+        --config "retention.ms=${retention}"
+      echo "[kafka-init] topic created: $name (partitions=$partitions, retention=${retention}ms, rf=$RF)"
+    }
+
+    # ---- 平台内部 Topic（分区数/保留时间见设计文档与 contracts/kafka/README.md） ----
+    create_topic "telemetry_raw"     12 604800000
+    create_topic "telemetry_clean"   12 604800000
+    create_topic "event_raw"          6 2592000000
+    create_topic "sensor_file"        3 604800000
+    create_topic "analytics_result"   6 2592000000
+    create_topic "alert_event"        3 2592000000
+
+    echo "[kafka-init] platform topics ready:"
+    kafka_topics --list
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-init
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: kafka-init
+    app.kubernetes.io/part-of: hunter-edge
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400        # 完成后保留 1 天便于日志排查
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka-init
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kafka-init
+          image: bitnami/kafka:3.6.2
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/etc/hunter-kafka-init/create-topics.sh"]
+          env:
+            - name: KAFKA_TOPIC_REPLICATION_FACTOR
+              valueFrom:
+                configMapKeyRef:
+                  name: kafka-init-script
+                  key: KAFKA_TOPIC_REPLICATION_FACTOR
+            - name: KAFKA_SASL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-app-secrets
+                  key: KAFKA_SASL_USERNAME
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-app-secrets
+                  key: KAFKA_SASL_PASSWORD
+          volumeMounts:
+            - name: init-script
+              mountPath: /etc/hunter-kafka-init
+              readOnly: true
+            - name: kafka-tls
+              mountPath: /etc/hunter/kafka-tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: init-script
+          configMap:
+            name: kafka-init-script
+            defaultMode: 0755
+            items:
+              - key: create-topics.sh
+                path: create-topics.sh
+        - name: kafka-tls
+          secret:
+            secretName: hunter-kafka-tls
+        - name: tmp
+          emptyDir: {}

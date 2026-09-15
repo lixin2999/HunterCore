@@ -125,3 +125,15 @@ Icon?
 # ===== 本地文档（按开发规则：每次只更新不提交） =====
 docs/
 release.md
+
+# ===== K8s 敏感配置（仅提交 *.example.yaml 模板，禁止提交真实密钥/证书） =====
+infra/k8s/**/02-secret.yaml
+**/secret.yaml
+**/secret-*.yaml
+**/*-secrets.yaml
+!infra/k8s/base/02-secret.example.yaml
+*.key
+*.csr
+*.jks
+ca.crt
+

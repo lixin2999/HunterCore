@@ -1,0 +1,54 @@
+# =====================================================================
+# 共享非敏感配置（所有服务通过 envFrom 注入）
+# 约束：仅存放非敏感项；密码/密钥/证书一律走 Secret（02-secret.example.yaml）
+# 说明：DB_POOL_SIZE 等按“单副本可用 CPU 核数 × 2 + 1”逐服务在服务级 ConfigMap 覆盖
+#       （开发规则：数据库连接池；容器内 os.cpu_count() 返回宿主核数，必须显式覆盖）
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hunter-common-config
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: hunter-edge
+    app.kubernetes.io/component: config
+data:
+  # ---------- 服务基础 ----------
+  ENVIRONMENT: "prod"
+  LOG_LEVEL: "INFO"
+  DEBUG: "false"                                # 生产关闭 Swagger / 调试端点
+  CORS_ORIGINS: "https://console.hunter-edge.example.com"
+
+  # ---------- PostgreSQL 15 + TimescaleDB 2.13 ----------
+  POSTGRES_HOST: "postgres.hunter-edge.svc.cluster.local"
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: "hunter"
+  POSTGRES_DB: "hunter_edge"
+  DB_POOL_TIMEOUT: "30"
+  DB_ECHO: "false"
+
+  # ---------- Apache Kafka 3.6 ----------
+  # 生产/车端接入强制 SASL_SSL + SCRAM-SHA-512（安全机制：禁止 PLAINTEXT）
+  KAFKA_BOOTSTRAP_SERVERS: "kafka-0.kafka-headless.hunter-edge.svc.cluster.local:9093,kafka-1.kafka-headless.hunter-edge.svc.cluster.local:9093,kafka-2.kafka-headless.hunter-edge.svc.cluster.local:9093"
+  KAFKA_SECURITY_PROTOCOL: "SASL_SSL"
+  KAFKA_SASL_MECHANISM: "SCRAM-SHA-512"
+  KAFKA_SSL_CAFILE: "/etc/hunter/kafka-tls/ca.crt"
+  KAFKA_PRODUCER_ACKS: "all"
+  KAFKA_COMPRESSION_TYPE: "lz4"                 # 对齐车端生产者配置
+  KAFKA_LINGER_MS: "5"
+  KAFKA_BATCH_SIZE: "16384"
+  KAFKA_RETRIES: "3"
+
+  # ---------- Redis 7 ----------
+  REDIS_HOST: "redis.hunter-edge.svc.cluster.local"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+
+  # ---------- MinIO（S3 兼容对象存储） ----------
+  MINIO_ENDPOINT: "minio.hunter-edge.svc.cluster.local:9000"
+  MINIO_SECURE: "true"                          # 数据安全：全链路 TLS
+
+  # ---------- 认证与安全（JWT 密钥本体在 Secret） ----------
+  JWT_ALGORITHM: "HS256"
+  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: "120"        # Access Token 2h
+  JWT_REFRESH_TOKEN_EXPIRE_DAYS: "7"            # Refresh Token 7d

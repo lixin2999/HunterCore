@@ -17,6 +17,7 @@ dependencies = [
     "asyncpg>=0.29,<0.31",
     "redis>=5.0.1,<6",
     "confluent-kafka>=2.3,<3",
+    "prometheus-client>=0.20,<1",
 ]
 
 [project.optional-dependencies]

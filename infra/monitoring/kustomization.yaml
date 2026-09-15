@@ -1,0 +1,47 @@
+# =====================================================================
+# Kustomize 入口（监控栈）
+# 用法：
+#   kubectl apply -k infra/monitoring                                    # 监控组件（hunter-edge 命名空间）
+#   kubectl apply -f infra/monitoring/exporters/exporters.yaml           # 采集器（monitoring 命名空间）
+# 说明：配置类 ConfigMap 由 configMapGenerator 从仓库源文件生成（单一事实来源，禁止手工 kubectl create）
+# =====================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: hunter-edge
+
+resources:
+  - k8s/rbac.yaml
+  - k8s/prometheus.yaml
+  - k8s/alertmanager.yaml
+  - k8s/grafana.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true      # 固定 ConfigMap 名（Deployment 按名引用）
+  labels:
+    app.kubernetes.io/part-of: hunter-edge
+
+configMapGenerator:
+  # Prometheus 主配置 -> /etc/prometheus/prometheus.yml
+  - name: hunter-prometheus-config
+    files:
+      - prometheus.yml=prometheus/prometheus.yml
+  # 告警规则 -> /etc/prometheus/rules/alert-rules.yaml（rule_files 通配匹配）
+  - name: hunter-prometheus-rules
+    files:
+      - rules/alert-rules.yaml=prometheus/alert-rules.yaml
+  # Alertmanager 配置 -> /etc/alertmanager/alertmanager.yml
+  - name: hunter-alertmanager-config
+    files:
+      - alertmanager.yml=alertmanager/alertmanager.yml
+  # Grafana 供给 -> /etc/grafana/provisioning/{datasources,dashboards}/
+  - name: hunter-grafana-provisioning
+    files:
+      - datasources/prometheus.yml=grafana/provisioning/datasources/prometheus.yml
+      - dashboards/dashboards.yml=grafana/provisioning/dashboards/dashboards.yml
+  # Grafana 看板 -> /var/lib/grafana/dashboards/
+  - name: hunter-grafana-dashboards
+    files:
+      - hunter-fleet-overview.json=grafana/dashboards/hunter-fleet-overview.json
+      - hunter-kafka.json=grafana/dashboards/hunter-kafka.json
+      - hunter-api-performance.json=grafana/dashboards/hunter-api-performance.json

@@ -1,0 +1,17 @@
+# =====================================================================
+# Grafana 数据源供给（启动时自动注册 Prometheus）
+# 挂载位置：/etc/grafana/provisioning/datasources/
+# =====================================================================
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus.hunter-edge.svc.cluster.local:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s          # 与 prometheus.yml scrape_interval 一致

@@ -1,0 +1,144 @@
+# =====================================================================
+# Redis 7（会话 / 缓存 / 分布式锁 / 限流）
+# - StatefulSet + PVC + AOF 持久化
+# - 内存策略：noeviction —— Redis 承载会话与分布式锁，禁止被 LRU 淘汰
+#   （会话丢失将导致用户掉线、锁丢失将破坏“同车仅一名操作员”互斥约束）
+# ⚠ 资源数值需与设计文档 15.2 节核对；生产高可用建议 Sentinel(3) 或 Cluster（后续层级）
+# =====================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: hunter-edge
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: cache
+spec:
+  serviceName: redis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/component: cache
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999                     # redis 官方镜像内置用户
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7.2
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - >-
+              exec redis-server
+              --requirepass "$REDIS_PASSWORD"
+              --appendonly yes
+              --appendfsync everysec
+              --maxmemory 1536mb
+              --maxmemory-policy noeviction
+              --save 900 1
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hunter-app-secrets
+                  key: REDIS_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 20Gi                  # ⚠ 容量需与设计文档 15.2 节核对

@@ -1,0 +1,16 @@
+# =====================================================================
+# HunterEdge 命名空间（L1 基础设施层）
+# 应用顺序：00-namespace → 01-configmap-common → 02-secret → statefulsets → services → ingress
+# 校验：kubectl apply --dry-run=client -f infra/k8s/
+# =====================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hunter-edge
+  labels:
+    app.kubernetes.io/name: hunter-edge
+    app.kubernetes.io/part-of: hunter-edge
+    # 强制 Pod 安全标准（非 root、禁止特权容器 —— 安全机制约束）
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

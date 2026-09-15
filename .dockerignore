@@ -18,3 +18,12 @@ docs
 .env.*
 *.log
 release.md
+
+# ---------- 构建上下文裁剪（L1：镜像仅需 common/python + services/<service>） ----------
+# 注意：禁止忽略 *.md —— common/python/pyproject.toml 的 readme 字段依赖 README.md
+contracts
+flink-jobs
+spark-jobs
+infra
+scripts
+services/*/app/tests

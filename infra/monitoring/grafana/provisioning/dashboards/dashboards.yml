@@ -1,0 +1,18 @@
+# =====================================================================
+# Grafana 看板供给（自动加载 infra/monitoring/grafana/dashboards/*.json）
+# 挂载位置：/etc/grafana/provisioning/dashboards/
+# 看板文件挂载位置：/var/lib/grafana/dashboards
+# =====================================================================
+apiVersion: 1
+
+providers:
+  - name: hunter-edge
+    orgId: 1
+    folder: HunterEdge          # 看板统一归入 HunterEdge 目录
+    type: file
+    disableDeletion: true       # 看板以 Git 为准，禁止 UI 删除
+    allowUiUpdates: false       # 变更必须提交仓库（避免配置漂移）
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

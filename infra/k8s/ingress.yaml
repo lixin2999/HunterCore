@@ -1,0 +1,126 @@
+# =====================================================================
+# Ingress（网关路由表，路径前缀不可更改）
+#
+# 路由决策：所有 /api/v1/** 与 /ws/remote/** 统一指向 api-gateway:8080，
+# 由网关按设计文档路由表转发到对应服务。原因：
+#   1) 网关承担 JWT 认证鉴权、五级限流熔断、日志审计（安全约束不可绕过）
+#   2) 与设计文档“网关路由表”语义一致：前缀 → 目标服务的关系由网关维护
+# 若设计文档明确要求 Ingress 直连各服务，可将 backend 改为对应 Service 名与端口。
+#
+# 前置：TLS 证书 Secret hunter-edge-tls（kubernetes.io/tls，创建方式见 README）
+# =====================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hunter-edge-api
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: hunter-edge
+    app.kubernetes.io/component: ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"        # 全链路 TLS（强制 HTTPS）
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"    # 网关内网明文，集群内 mTLS 由服务网格承担
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"     # ROS Bag / 报告上传
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/enable-access-log: "true"   # 日志审计
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - hunter-edge.example.com
+      secretName: hunter-edge-tls
+  rules:
+    - host: hunter-edge.example.com
+      http:
+        paths:
+          # ---------- 网关路由表（前缀不可更改） ----------
+          - path: /api/v1/scene            # → scene-service
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
+          - path: /api/v1/data             # → data-collector
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
+          - path: /api/v1/analytics        # → data-analytics
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
+          - path: /api/v1/ota              # → ota-service
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
+          - path: /api/v1/remote           # → remote-control
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
+          # 路由表定义的前缀（vehicle-service / user-service 模块落地后由网关生效，此处仅保留入口）
+          - path: /api/v1/vehicle
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
+          - path: /api/v1/user
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
+---
+# =====================================================================
+# WebSocket 入口（/ws/remote/** → remote-control，经 api-gateway）
+# 低延迟要求：关闭代理缓冲；长连接要求：读写超时 3600s（远程操控视频/指令链路）
+# =====================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hunter-edge-ws
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: hunter-edge
+    app.kubernetes.io/component: ingress-ws
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"   # WebSocket 需要 HTTP/1.1 Upgrade
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"      # 低延迟（远程操控指令 ≤100ms）
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/enable-access-log: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - hunter-edge.example.com
+      secretName: hunter-edge-tls
+  rules:
+    - host: hunter-edge.example.com
+      http:
+        paths:
+          - path: /ws/remote               # → remote-control（WebSocket）
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080

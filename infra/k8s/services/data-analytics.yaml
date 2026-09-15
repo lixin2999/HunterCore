@@ -1,0 +1,150 @@
+# =====================================================================
+# data-analytics（Flink 实时流处理、Spark 离线批处理、指标计算、Corner Case 挖掘、报告生成）
+# 无状态服务：2 副本（重计算任务由 Flink/Spark 集群承担，本服务负责编排与查询）
+# 资源：⚠ 内存/CPU 密集（分析编排、大数据集聚合），需与设计文档 15.2 节核对
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: data-analytics-config
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: data-analytics
+data:
+  SERVICE_NAME: "data-analytics"
+  API_PORT: "8083"
+  DB_POOL_SIZE: "9"          # 单副本可用 CPU(4 核) × 2 + 1
+  DB_MAX_OVERFLOW: "5"
+  # Flink 1.18 实时作业（flink-jobs/ 目录作业提交目标）
+  FLINK_JOBMANAGER_URL: "http://flink-jobmanager.hunter-edge.svc.cluster.local:8081"
+  # 分析结果与告警输出 Topic（contracts/kafka 契约）
+  KAFKA_TOPIC_ANALYTICS_RESULT: "analytics_result"
+  KAFKA_TOPIC_ALERT_EVENT: "alert_event"
+  # 报告输出 Bucket（hunter-reports，生命周期永久）
+  MINIO_BUCKET_REPORTS: "hunter-reports"
+  # 实时告警触发延迟约束 ≤ 2s（性能指标）
+  ALERT_WINDOW_SECONDS: "2"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-analytics
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: data-analytics
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: data-analytics
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: data-analytics
+        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/component: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8083"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: data-analytics
+      containers:
+        - name: data-analytics
+          image: hunter/data-analytics:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8083
+          envFrom:
+            - configMapRef:
+                name: hunter-common-config
+            - configMapRef:
+                name: data-analytics-config
+            - secretRef:
+                name: hunter-app-secrets
+          volumeMounts:
+            - name: kafka-tls
+              mountPath: /etc/hunter/kafka-tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: hunter-kafka-tls
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-analytics
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: data-analytics
+    app.kubernetes.io/part-of: hunter-edge
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: data-analytics
+  ports:
+    - name: http
+      port: 8083
+      targetPort: http

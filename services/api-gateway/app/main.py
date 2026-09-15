@@ -5,6 +5,7 @@ API 网关：统一接入、JWT 认证鉴权、五级限流熔断、路由转发
 - 统一响应格式 + 预定义错误码（hunter_common）
 - 全链路 trace_id（X-Request-ID）中间件
 - /healthz 存活探针、/readyz 就绪探针（DB/Redis 连通性）
+- /metrics Prometheus 指标端点（供 infra/monitoring 抓取）
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from hunter_common.logging import (
     reset_trace_id,
     set_trace_id,
 )
+from hunter_common.metrics import register_metrics
 from hunter_common.redis import RedisManager
 
 from app.config import settings
@@ -89,6 +91,7 @@ async def trace_id_middleware(request: Request, call_next) -> Response:
 
 
 app.include_router(health_router)
+register_metrics(app, settings.service_name, version="0.1.0")
 register_exception_handlers(app)
 
 

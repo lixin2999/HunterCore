@@ -1,0 +1,130 @@
+# =====================================================================
+# Prometheus 部署（配置由 kustomization configMapGenerator 生成：
+#   hunter-prometheus-config -> prometheus.yml
+#   hunter-prometheus-rules  -> rules/alert-rules.yaml
+# 数据保留 30 天，匹配 7 天/30 天 Kafka 保留与 90 天时序保留的观测窗口
+# ⚠ 资源数值需与设计文档 15.2 节核对
+# =====================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hunter-prometheus-data
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: monitoring
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate            # RWO PVC：重建前必须释放卷
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/component: monitoring
+    spec:
+      serviceAccountName: prometheus
+      automountServiceAccountToken: true    # 需要访问 K8s API 完成服务发现
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534                    # nobody（prometheus 镜像默认）
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.53.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--storage.tsdb.retention.time=30d"
+            - "--web.enable-lifecycle"        # 支持 POST /-/reload 热加载配置
+            - "--web.listen-address=:9090"
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: rules
+              mountPath: /etc/prometheus/rules
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: config
+          configMap:
+            name: hunter-prometheus-config
+        - name: rules
+          configMap:
+            name: hunter-prometheus-rules
+        - name: data
+          persistentVolumeClaim:
+            claimName: hunter-prometheus-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: hunter-edge
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
