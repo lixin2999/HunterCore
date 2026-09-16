@@ -1,0 +1,1521 @@
+# =====================================================================
+# HunterEdge 数据采集服务契约（OpenAPI 3.0.3）—— 单一事实来源
+# 来源：设计文档 5 章（5.3.1 Kafka Topic / 5.3.3 遥测消息格式 / 5.4 数据预处理流程 /
+#       5.5 文件上传管理）、附录 A（错误码）、附录 D（API 限流）、MinIO Bucket 规划、
+#       Redis Key 设计、性能指标（遥测入库 ≤1s、写入 ≥10000 点/秒、单车 ≤100 msg/s）
+# 实现：services/data-collector（FastAPI 0.100+，端口 8082）；变更必须先改本文件再改代码
+#
+# 范围说明：
+#   - 网关前缀 /api/v1/data（不可更改，见 contracts/openapi/api-gateway.yaml 的
+#     x-hunter-gateway-routes）；网关不剥离前缀，本服务按全路径注册路由
+#   - 车端数据接入主链路走 Kafka（hunter.{vehicle_id}.{telemetry,event,health,command_result}），
+#     非 REST；REST 仅承担「查询 + 文件上传管理（MinIO 预签名直传）」两类职责
+#   - Kafka 生产/消费清单见 x-hunter-kafka（与 contracts/kafka/{topics,consumer-groups}.yaml 双向一致）
+#
+# ⚠ 待核对（设计文档相关章节未随仓库提供 / 未明确，需人工确认后回填；
+#    禁止擅自新增端点 / 字段 / Topic / 错误码 / 阈值）：
+#   1) REST 端点清单：本契约按「附录 D 限流端点 + 5.5 上传流程 + events 表列能力」推导，
+#      需与设计文档 12.2 节逐条核对（不得增删）
+#   2) 5.5 步骤 6「元信息入库」在 contracts/database 无对应表（data_collector schema 仅
+#      events / vehicle_telemetry）→ 本契约不新增表，按 MinIO 列举 + Kafka sensor_file 通知实现
+#   3) 文件完整性校验失败复用 6001（附录 A 无通用文件校验错误码，6001 原语义为 OTA 包校验失败）
+#   4) Carla Topic（carla.{sim_id}.vil_state / carla.{sim_id}.sensor_data）在 5.3.1 清单出现，
+#      但 contracts/kafka/topics.yaml 未登记 → 本契约只登记缺口，不新增 Topic
+#   全量清单见文末 x-hunter-pending-confirmation（12 项）
+# =====================================================================
+openapi: 3.0.3
+
+info:
+  title: HunterEdge - data-collector
+  version: 0.1.0
+  description: |
+    数据采集服务统一契约（端口 8082，网关前缀 `/api/v1/data`）。
+
+    **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功，非 0 为预定义错误码（附录 A）。
+
+    **数据接入链路**（5.3.1 / 5.4 节）：车端经 Kafka `SASL_SSL + SCRAM-SHA-512` 上报
+    `hunter.{vehicle_id}.telemetry|event|health|command_result`（消息 key = vehicle_id）→
+    data-collector 消费 → 校验/清洗/时间对齐/enrichment → 落 `data_collector.vehicle_telemetry`
+    （批量插入，hypertable 按天分块 / 保留 90 天）与 `data_collector.events`，并投递
+    `telemetry_raw` / `telemetry_clean` / `event_raw`；健康数据仅更新 Redis 车辆状态，不落明细。
+
+    **文件上传**（5.5 节）：请求预签名 → MinIO 直传（1 小时有效，支持分片）→ 完成通知 →
+    MD5/SHA-256 校验 → 投递 `sensor_file` 通知 data-analytics。文件命名规范
+    `{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}`（服务端生成，不可由客户端指定）。
+
+    **鉴权**：控制台请求经网关校验 JWT 后转发（RBAC 资源域 `data`）；车端文件上传走
+    X.509 双向 TLS（证书 CommonName = vehicle_id，见 securitySchemes.deviceCertificate），
+    `vehicle_id` 一律以证书 CN 为准，禁止由请求体指定他车身份。
+
+    **限流**：继承网关五级限流（全局 10000 QPS / 单用户 100 QPS / 单 IP 200 QPS）；
+    接口级 `GET /api/v1/data/telemetry` 单用户 20 QPS（附录 D）；车辆侧 Kafka 遥测
+    ≤100 msg/s、文件上传带宽 ≤10 Mbps（车辆维度，非网关 HTTP 限流）。
+
+    **性能**：API 响应 P95 ≤ 200ms；遥测入库延迟 ≤ 1s；时序写入 ≥ 10000 点/秒；
+    实时告警 ≤ 2s（由 data-analytics 触发）；列表默认分页 20 条、上限 200 条。
+  license:
+    name: Proprietary - HunterEdge
+
+servers:
+  - url: https://hunter-edge.example.com
+    description: 生产环境（控制台经网关 /api/v1/data 转发；车端数据面走 Kafka / MinIO 直传）
+  - url: http://localhost:8082
+    description: 本地开发（直连服务）
+
+tags:
+  - name: telemetry
+    description: 遥测数据查询（时序表 vehicle_telemetry，保留 90 天）
+  - name: events
+    description: 车辆事件查询与告警确认（events 表，18 种类型 / 3 级等级）
+  - name: files
+    description: 文件上传管理（MinIO 预签名直传 + 完整性校验 + 下载预签名）
+  - name: ops
+    description: 运维探针与指标（K8s probe / Prometheus 抓取）
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/data/telemetry:
+    get:
+      tags: [telemetry]
+      summary: 查询车辆遥测时序数据（单车辆 + 时间区间）
+      description: |
+        查询 `data_collector.vehicle_telemetry`（hypertable，按天分块、保留 90 天）。
+        查询必须同时给出 `vehicle_id` 与 `start_time`/`end_time`（命中
+        `idx_vehicle_telemetry_vehicle_time (vehicle_id, time DESC)`，避免全表扫描；
+        `start_time` 早于保留期 90 天时按保留期内最早数据返回）。
+        嵌套结构与 5.3.3 节遥测消息完全一致（chassis / localization / perception / planning /
+        control / system），由扁平列重组，映射见 `x-hunter-telemetry-query-contract`。
+
+        限流：附录 D `GET /data/telemetry` 单用户 20 QPS（超限 HTTP 429 + `code=5001` + `Retry-After`）。
+      operationId: queryTelemetry
+      parameters:
+        - $ref: "#/components/parameters/VehicleIdQuery"
+        - $ref: "#/components/parameters/StartTimeQuery"
+        - $ref: "#/components/parameters/EndTimeQuery"
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - name: order
+          in: query
+          required: false
+          description: 时间排序（默认按 `time DESC` 返回最新数据）
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 遥测数据（分页）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TelemetryQueryResponse" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/data/events:
+    get:
+      tags: [events]
+      summary: 查询车辆事件列表（分页 + 类型/等级/确认状态/时间筛选）
+      description: |
+        查询 `data_collector.events`。默认按 `event_time DESC`（命中
+        `idx_events_vehicle_time` / `idx_events_type_time`）；`acknowledged=false` 时命中
+        未确认部分索引 `idx_events_unacknowledged`（告警中心默认视图）。
+        事件类型（18 种）与等级（3 级）为受控词表，阈值见 contracts/database/enums.md，
+        代码不得放宽或新增。
+      operationId: listEvents
+      parameters:
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 车辆标识（单车事件时间线）；不传则跨车辆查询（需 `data:read` 全量数据权限）
+          schema: { type: string, minLength: 1, maxLength: 64 }
+        - name: event_type
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/EventType" }
+        - name: event_level
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/EventLevel" }
+        - name: acknowledged
+          in: query
+          required: false
+          description: 确认状态筛选（告警中心用 false 查询未确认事件）
+          schema: { type: boolean }
+        - $ref: "#/components/parameters/StartTimeQuery"
+        - $ref: "#/components/parameters/EndTimeQuery"
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - name: sort
+          in: query
+          required: false
+          description: 排序字段（白名单，禁止任意字段排序以防注入）
+          schema:
+            type: string
+            enum: [event_time, event_level, event_type]
+            default: event_time
+        - name: order
+          in: query
+          required: false
+          schema: { type: string, enum: [asc, desc], default: desc }
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 事件列表
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/data/events/{event_id}:
+    get:
+      tags: [events]
+      summary: 查询事件详情
+      description: |
+        返回事件完整记录（含 `data_json` 上下文与关联文件对象地址）。
+        `data_file_url` 为 MinIO 对象地址，需下载时由服务端另签 15 分钟预签名 URL
+        （返回 `data_file_download_url`，不落长期签名；见 contracts/database/ddl/04_events.sql 注释）。
+      operationId: getEvent
+      parameters:
+        - $ref: "#/components/parameters/EventIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 事件详情
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventResponse" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/data/events/{event_id}/acknowledge:
+    post:
+      tags: [events]
+      summary: 确认事件（告警确认）
+      description: |
+        标记事件已确认：写 `acknowledged=true`、`acknowledged_by`（取自网关注入的
+        `X-User-Id`，禁止由请求体指定）、`acknowledge_time`（服务端 UTC 时间）。
+        幂等：已确认事件重复调用返回 200 与当前记录（不覆盖原确认人与时间）。
+        事件不存在返回 3001；`event_id` 非法返回 2001。
+      operationId: acknowledgeEvent
+      parameters:
+        - $ref: "#/components/parameters/EventIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 确认成功（返回确认后的事件记录）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventResponse" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/data/files:
+    get:
+      tags: [files]
+      summary: 查询已上传文件清单（MinIO 对象列举 + 下载预签名）
+      description: |
+        按 `bucket` + `vehicle_id` + `date` 前缀列举 MinIO 对象（5.5 节命名规范：
+        `{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}`），
+        每个对象返回 15 分钟预签名下载地址（支持 Range 分片下载）。
+
+        分页采用游标语义（`marker` → `next_marker`）：MinIO 列举接口不提供对象总数，
+        故本端点不返回 `total`；⚠ 待确认改为「新增 DB 元信息表 + `total` 分页」的可能性
+        （见 `x-hunter-pending-confirmation`）。
+      operationId: listFiles
+      parameters:
+        - name: bucket
+          in: query
+          required: true
+          description: 目标 Bucket（仅允许车端上传类 Bucket，见 x-hunter-file-upload-flow）
+          schema: { $ref: "#/components/schemas/UploadBucket" }
+        - $ref: "#/components/parameters/VehicleIdQuery"
+        - name: date
+          in: query
+          required: false
+          description: 上传日期（`YYYY-MM-DD`，UTC；不传则列举该车辆全部日期）
+          schema: { type: string, format: date }
+        - name: data_type
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/FileDataType" }
+        - name: marker
+          in: query
+          required: false
+          description: 游标（上一页返回的 next_marker；首页不传）
+          schema: { type: string, maxLength: 1024 }
+        - name: limit
+          in: query
+          required: false
+          description: 单页对象数（上限与列表分页上限一致：200）
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 文件清单（含 15 分钟预签名下载地址）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/data/files/presign:
+    post:
+      tags: [files]
+      summary: 申请文件上传预签名地址（上传有效期 1 小时，支持分片）
+      description: |
+        5.5 节上传流程第 1-2 步：校验身份与配额 → 服务端按命名规范生成 `object_key`
+        （`{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}`，禁止客户端指定）→
+        返回预签名上传地址（有效期 1 小时 = 3600s，MinIO 契约）。
+
+        - `vehicle_id` 必须等于车端证书 CommonName（`deviceCertificate`）；控制台用户仅可为其有权限的车辆申请，
+          不匹配返回 1002（防越权写入他车目录）
+        - `part_count > 1` 时返回分片上传：`upload_id` + `parts[].upload_url`（大文件 ROS Bag 分片上传）
+        - 车辆维度带宽 ≤ 10 Mbps、单车辆限流见 `x-hunter-rate-limits`；超限返回 429/5001
+      operationId: presignFileUpload
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FilePresignRequest" }
+      responses:
+        "200":
+          description: 预签名上传信息（有效期 1 小时）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FilePresignResponse" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/data/files/complete:
+    post:
+      tags: [files]
+      summary: 上报文件上传完成（MD5/SHA-256 校验 + 投递 sensor_file 通知）
+      description: |
+        5.5 节上传流程第 4-6 步：车辆直传完成后通知平台 → 服务端对 MinIO 对象做
+        完整性校验（`size_bytes` / `md5` / `sha256` 三者必须全部一致，任一不符返回 6001，
+        ⚠ 附录 A 无通用文件校验错误码，复用 6001）→ 对象不存在返回 3001 →
+        校验通过后投递 Kafka `sensor_file` 通知（Schema：
+        contracts/kafka/schemas/sensor_file.schema.json，key = vehicle_id）。
+
+        幂等：同一 `object_key` 重复上报返回 200（重复投递由 data-analytics 侧以
+        `object_key` 幂等键去重）。
+      operationId: completeFileUpload
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FileCompleteRequest" }
+      responses:
+        "200":
+          description: 校验通过并已投递 sensor_file 通知
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileCompleteResponse" }
+        "422":
+          description: |-
+            2001 参数错误 / 6001 完整性校验失败（MD5 或 SHA-256 不匹配）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseError" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: 存活探针（K8s startupProbe / livenessProbe）
+      operationId: healthz
+      x-internal: true
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 进程存活（统一响应格式）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseHealthy" }
+
+  /readyz:
+    get:
+      tags: [ops]
+      summary: 就绪探针（K8s readinessProbe，含 DB / Redis 连通性）
+      description: |
+        每项探测内置 2s 超时（依赖挂起时快速失败，避免 probe 超时误判）。
+        依赖不可用时返回 HTTP 503 + `code=5001`，`data` 给出各依赖探测明细。
+        Kafka 连通性在消费者启动阶段检查，不纳入探针（避免探针阻塞滚动更新）。
+      operationId: readyz
+      x-internal: true
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 全部依赖就绪
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseReady" }
+        "503":
+          description: 存在未就绪依赖（code=5001，data 为探测明细）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseReady" }
+              example:
+                code: 5001
+                message: 服务不可用
+                data: { database: true, redis: false }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus 指标端点
+      description: |
+        返回 Prometheus 文本格式（`hunter_` 前缀指标：请求总数 / 时延直方图 / 进行中请求 / 服务信息）。
+        契约明确例外：**不返回**统一 JSON 响应体（由 Prometheus 抓取器消费）。
+      operationId: metrics
+      x-internal: true
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema: { type: string }
+
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        控制台用户 JWT Access Token（2 小时），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
+        载荷结构（3.2.2 节）：`sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` /
+        `iss="hunter-platform"` / `jti`。服务侧按 RBAC 资源域 `data`（action ∈ create/read/execute）复核。
+        校验失败映射：Token 缺失/无效 → 1001；Token 过期 → 1003；权限不足 → 1002。
+    deviceCertificate:
+      type: mutualTLS
+      description: |
+        车辆设备认证：X.509 双向 TLS（CN = vehicle_id，出厂烧录，CRL / OCSP 吊销），
+        车端另有 Kafka `SASL_SSL + SCRAM-SHA-512` 通道。
+        车端 REST 主要用于文件上传管理：`vehicle_id` 以证书 CN 为准，禁止由请求体指定他车身份。
+        ⚠ 车端 REST 入口（经网关 / 独立 Ingress mTLS 端口）待确认，见 `x-hunter-pending-confirmation`。
+
+  headers:
+    RequestId:
+      description: 链路追踪 ID（网关透传上游 X-Request-ID，未提供则生成 UUID）
+      schema: { type: string, format: uuid }
+    RetryAfter:
+      description: 限流重试等待秒数（HTTP 429 必需，附录 D 限流约束）
+      schema: { type: integer, minimum: 1 }
+
+  parameters:
+    TraceRequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: 客户端可选传入链路追踪 ID；未提供时由网关/服务生成 UUID
+      schema: { type: string, format: uuid }
+    VehicleIdQuery:
+      name: vehicle_id
+      in: query
+      required: true
+      description: 车辆标识（= 设备证书 CommonName = Kafka 消息 key，如 HUNTER-001）
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" }
+    StartTimeQuery:
+      name: start_time
+      in: query
+      required: true
+      description: 起始时间（Unix epoch 秒，含毫秒小数；UTC 对齐，5.4 节时间对齐规则）
+      schema: { type: number, minimum: 0 }
+    EndTimeQuery:
+      name: end_time
+      in: query
+      required: true
+      description: 结束时间（Unix epoch 秒，含毫秒小数；必须 ≥ start_time）
+      schema: { type: number, minimum: 0 }
+    PageQuery:
+      name: page
+      in: query
+      required: false
+      description: 页码（≥1，与 BaseRepository.paginate 一致）
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSizeQuery:
+      name: page_size
+      in: query
+      required: false
+      description: 每页条数（上限 200，与 BaseRepository.MAX_PAGE_SIZE 一致）
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    EventIdPath:
+      name: event_id
+      in: path
+      required: true
+      description: 事件 ID（data_collector.events.event_id，BIGSERIAL）
+      schema: { type: integer, format: int64, minimum: 1 }
+
+  responses:
+    Unauthenticated:
+      description: 1001 未认证（Token 缺失或无效）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 1001
+            message: 未认证
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    Forbidden:
+      description: 1002 无权限（角色权限不足 / 越权访问他车数据）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 1002
+            message: 无权限
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    InvalidParameter:
+      description: 2001 / 2002 / 6001（参数校验失败 / 必填缺失 / 文件完整性校验失败）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          examples:
+            invalid:
+              value:
+                code: 2001
+                message: 参数错误
+                data: null
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+            missing:
+              value:
+                code: 2002
+                message: 参数缺失
+                data: null
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+            checksum_failed:
+              value:
+                code: 6001
+                message: OTA 包校验失败
+                data: { field: sha256, expected: "e3b0c442...", actual: "d41d8cd9..." }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+    ResourceNotFound:
+      description: 3001 资源不存在（事件 ID / 对象不存在）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 3001
+            message: 资源不存在
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    VehicleOffline:
+      description: 4001 车辆不在线（车辆离线时不允许发起文件上传/下发类操作）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 4001
+            message: 车辆不在线
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    TooManyRequests:
+      description: |
+        HTTP 429 限流（附录 D）。⚠ 附录 A 无限流专用错误码，响应体 `code` 统一复用 5001（禁止新增），
+        客户端应以 HTTP 状态码 429 与 `Retry-After` 为准。
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 5001
+            message: 服务不可用
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    ServiceUnavailable:
+      description: 5001 服务不可用（依赖服务不可用或依赖未就绪）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 5001
+            message: 服务不可用
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    InternalError:
+      description: 5000 服务器内部错误（未预期异常）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 5000
+            message: 服务器内部错误
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+  schemas:
+    ApiResponse:
+      type: object
+      description: 统一 API 响应格式（所有服务必须遵守，字段不可更改）
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code:
+          type: integer
+          description: 0=成功；非 0=预定义错误码（附录 A）
+          example: 0
+        message:
+          type: string
+          example: success
+        data:
+          nullable: true
+          description: 业务数据（结构随端点而定；无数据时为 null）
+        request_id:
+          type: string
+          format: uuid
+          description: 请求 ID（等于链路 trace_id）
+        timestamp:
+          type: integer
+          description: 服务端响应时间（Unix epoch 秒）
+          example: 1724035200
+
+    ErrorCode:
+      type: integer
+      description: 预定义错误码（附录 A，禁止新增或更改含义）
+      enum: [0, 1001, 1002, 1003, 2001, 2002, 3001, 3002, 3003, 4001, 4002, 5000, 5001,
+             6001, 6002, 6003, 7001, 7002]
+
+    ApiResponseError:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [code]
+          properties:
+            code: { $ref: "#/components/schemas/ErrorCode" }
+            data:
+              nullable: true
+              description: 错误上下文（如完整性校验失败的 expected/actual）；一般错误为 null
+
+    ApiResponseEmpty:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              nullable: true
+              description: 恒为 null（无返回数据的成功响应）
+
+    ApiResponseHealthy:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/HealthStatus" }
+
+    ApiResponseReady:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ReadyChecks" }
+
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          description: 存活标记（进程可响应即为 ok）
+
+    ReadyChecks:
+      type: object
+      required: [database, redis]
+      description: 各依赖探测结果；任一为 false 时返回 HTTP 503 + code=5001
+      properties:
+        database:
+          type: boolean
+          description: PostgreSQL / TimescaleDB 连通性（单项探测超时 2s，写路径依赖）
+        redis:
+          type: boolean
+          description: Redis 连通性（vehicle:status / vehicle:online:set 更新依赖）
+      example: { database: true, redis: true }
+
+    # ---------- 遥测（5.3.3 节消息结构的查询态；嵌套字段名与 Kafka Schema 完全一致） ----------
+    TelemetrySample:
+      type: object
+      description: |
+        单条遥测样本（= 5.3.3 节消息结构 + 入库列 `time`）。字段与
+        contracts/kafka/schemas/telemetry.schema.json 一一对应，由
+        data_collector.vehicle_telemetry 扁平列重组；`time` 为车端采集时间
+        （禁止用入库时间替代，保证回放一致性）。
+      required: [time, vehicle_id]
+      properties:
+        time:
+          type: number
+          description: 车端采集时间（Unix epoch 秒，含毫秒小数）= 消息 `timestamp`
+        vehicle_id:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+          description: 车辆标识
+        seq:
+          type: integer
+          nullable: true
+          description: 车端消息序号（幂等/丢包检测；⚠ 是否入表待确认，见 x-hunter-pending-confirmation）
+        chassis: { $ref: "#/components/schemas/TelemetryChassis" }
+        localization: { $ref: "#/components/schemas/TelemetryLocalization" }
+        perception: { $ref: "#/components/schemas/TelemetryPerception" }
+        planning: { $ref: "#/components/schemas/TelemetryPlanning" }
+        control: { $ref: "#/components/schemas/TelemetryControl" }
+        system: { $ref: "#/components/schemas/TelemetrySystem" }
+
+    TelemetryChassis:
+      type: object
+      description: 底盘段（5.3.3 节 chassis）
+      properties:
+        velocity: { type: number, nullable: true, description: "车速 m/s（前进为正）" }
+        steering_angle: { type: number, nullable: true, description: "前轮转角 rad" }
+        battery_voltage: { type: number, nullable: true, description: "电池电压 V" }
+        battery_soc:
+          type: integer
+          nullable: true
+          minimum: 0
+          maximum: 100
+          description: "剩余电量 %（DDL CHECK 0..100；<20% battery_low，<10% battery_critical）"
+        battery_current: { type: number, nullable: true, description: "电池电流 A（放电为负）" }
+        battery_temp: { type: number, nullable: true, description: "电池温度 ℃" }
+        control_mode: { type: string, nullable: true, description: "底盘控制模式（示例 CAN；⚠ 取值域待核对）" }
+        vehicle_state: { type: string, nullable: true, description: "底盘状态字（示例 NORMAL；与车辆 8 态业务状态不同域）" }
+        fault_code: { type: integer, nullable: true, description: "底盘故障码，0 表示无故障" }
+        motor_rpm: { type: array, nullable: true, items: { type: integer }, description: "各驱动电机转速 rpm" }
+        motor_current: { type: array, nullable: true, items: { type: number }, description: "各驱动电机电流 A" }
+        motor_temp: { type: array, nullable: true, items: { type: integer }, description: "各驱动电机温度 ℃" }
+
+    TelemetryLocalization:
+      type: object
+      description: 定位段（5.3.3 节 localization）
+      properties:
+        x: { type: number, nullable: true, description: "地图坐标系 X / m" }
+        y: { type: number, nullable: true, description: "地图坐标系 Y / m" }
+        z: { type: number, nullable: true, description: "地图坐标系 Z / m" }
+        roll: { type: number, nullable: true, description: "横滚角 rad" }
+        pitch: { type: number, nullable: true, description: "俯仰角 rad" }
+        heading: { type: number, nullable: true, description: "航向角 rad" }
+        linear_velocity: { type: array, nullable: true, items: { type: number }, description: "[vx, vy, vz] m/s" }
+        angular_velocity: { type: array, nullable: true, items: { type: number }, description: "[ωx, ωy, ωz] rad/s" }
+        position_std: { type: number, nullable: true, description: "定位位置标准差 m" }
+        heading_std: { type: number, nullable: true, description: "航向标准差 rad" }
+
+    TelemetryPerception:
+      type: object
+      description: 感知段（5.3.3 节 perception）
+      properties:
+        detected_objects: { type: integer, nullable: true, description: "检出目标数" }
+        fps: { type: number, nullable: true, description: "感知帧率" }
+        latency_ms: { type: number, nullable: true, description: "感知延迟 ms" }
+        object_types:
+          type: object
+          nullable: true
+          additionalProperties: { type: integer }
+          description: "按类别统计（vehicle / pedestrian / other）；落库 JSONB"
+
+    TelemetryPlanning:
+      type: object
+      description: 规划段（5.3.3 节 planning）
+      properties:
+        trajectory_length: { type: number, nullable: true, description: "规划轨迹长度 m" }
+        trajectory_points: { type: integer, nullable: true, description: "轨迹点数量" }
+        planning_latency_ms: { type: number, nullable: true, description: "规划计算延迟 ms" }
+        current_behavior: { type: string, nullable: true, description: "当前行为（示例 cruise；⚠ 取值域待核对）" }
+
+    TelemetryControl:
+      type: object
+      description: 控制段（5.3.3 节 control）
+      properties:
+        target_velocity: { type: number, nullable: true, description: "控制目标车速 m/s" }
+        target_steer: { type: number, nullable: true, description: "控制目标转角 rad" }
+        velocity_error: { type: number, nullable: true, description: "速度跟踪误差 m/s" }
+        steer_error: { type: number, nullable: true, description: "转角跟踪误差 rad" }
+        control_latency_ms: { type: number, nullable: true, description: "控制计算延迟 ms" }
+
+    TelemetrySystem:
+      type: object
+      description: 系统段（5.3.3 节 system，车载计算平台 AGX Orin）
+      properties:
+        cpu_usage: { type: number, nullable: true, minimum: 0, maximum: 100, description: "CPU 使用率 %" }
+        gpu_usage: { type: number, nullable: true, minimum: 0, maximum: 100, description: "GPU 使用率 %" }
+        memory_usage_mb: { type: integer, nullable: true, minimum: 0, description: "内存占用 MB" }
+        gpu_temp: { type: number, nullable: true, description: "GPU 温度 ℃" }
+        cpu_temp: { type: number, nullable: true, description: "CPU 温度 ℃" }
+        network_rssi: { type: integer, nullable: true, maximum: 0, description: "无线信号强度 dBm（负值）" }
+        network_latency_ms: { type: number, nullable: true, minimum: 0, description: "车-云网络往返延迟 ms" }
+
+    TelemetryQueryData:
+      type: object
+      required: [items, total, page, page_size, retention_days]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/TelemetrySample" }
+        total:
+          type: integer
+          description: "时间区间内样本数（⚠ 计数成本待确认，见 x-hunter-pending-confirmation）"
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200 }
+        retention_days:
+          type: integer
+          description: 时序表保留天数（固定 90；contracts/database/ddl/05_timeseries.sql）
+          example: 90
+
+    TelemetryQueryResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/TelemetryQueryData" }
+
+
+    # ---------- 事件（events 表；受控词表来源 contracts/database/enums.md） ----------
+    EventType:
+      type: string
+      description: 事件类型（18 种，受控词表；触发阈值不可更改，见 contracts/database/enums.md 第 3 节）
+      enum: [harsh_acceleration, harsh_braking, harsh_turning, over_speed, collision_warning,
+             manual_takeover, emergency_stop, battery_low, battery_critical, communication_loss,
+             sensor_fault, perception_fault, planning_fault, control_fault, ota_start, ota_success,
+             ota_failed, ota_rollback]
+
+    EventLevel:
+      type: string
+      description: 事件等级（3 级；由事件类型决定，代码不得放宽映射）
+      enum: [info, warning, critical]
+
+    EventItem:
+      type: object
+      description: 事件记录（一一对应 data_collector.events 列）
+      required: [event_id, vehicle_id, event_type, event_level, event_time, data_json, acknowledged]
+      properties:
+        event_id: { type: integer, format: int64, description: "events.event_id（BIGSERIAL）" }
+        vehicle_id: { type: string, description: "events.vehicle_id（逻辑外键 → vehicle_svc.vehicles）" }
+        event_type: { $ref: "#/components/schemas/EventType" }
+        event_level: { $ref: "#/components/schemas/EventLevel" }
+        event_time:
+          type: number
+          description: "事件发生时间（Unix epoch 秒，车端时间；非入库时间）"
+        description: { type: string, nullable: true, description: "事件描述" }
+        data_json:
+          type: object
+          additionalProperties: true
+          description: "事件上下文 JSONB（阈值、实测值、轨迹片段摘要等）"
+        data_file_url: { type: string, nullable: true, description: "关联文件对象地址（MinIO bucket/key）" }
+        data_file_download_url:
+          type: string
+          nullable: true
+          description: "关联文件下载地址（服务端即时签发的 15 分钟预签名 URL，不落库；无关联文件时为 null）"
+        acknowledged: { type: boolean, description: "是否已确认" }
+        acknowledged_by: { type: string, format: uuid, nullable: true, description: "确认人 user_id" }
+        acknowledge_time: { type: number, nullable: true, description: "确认时间（Unix epoch 秒）" }
+
+    EventListData:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/EventItem" }
+        total: { type: integer, description: "筛选条件下事件总数" }
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200 }
+
+    EventListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/EventListData" }
+
+    EventResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/EventItem" }
+
+    # ---------- 文件上传（5.5 节：预签名直传 + 完整性校验） ----------
+    UploadBucket:
+      type: string
+      description: 车端上传类 Bucket（MinIO Bucket 规划；仅此三个允许车辆写入）
+      enum: [hunter-raw-data, hunter-rosbag, hunter-video]
+
+    FileDataType:
+      type: string
+      description: |
+        数据类型（用于 5.5 节命名规范 `{data_type}` 段与 Bucket 映射；
+        ⚠ 取值域为契约暂定值，待确认，见 x-hunter-pending-confirmation）
+      enum: [point_cloud, camera_image, rosbag, video, other]
+
+    UploadMethod:
+      type: string
+      description: 上传方式（`put` 单次直传 / `multipart` 分片上传，大文件 ROS Bag 用分片）
+      enum: [put, multipart]
+
+    FilePresignRequest:
+      type: object
+      required: [vehicle_id, bucket, data_type, file_name, file_size]
+      properties:
+        vehicle_id:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+          description: "车辆标识（车端必须等于证书 CommonName，否则返回 1002）"
+        bucket: { $ref: "#/components/schemas/UploadBucket" }
+        data_type: { $ref: "#/components/schemas/FileDataType" }
+        file_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: "原始文件名（仅用于取扩展名，不参与对象路径生成）"
+          example: "lidar_12580.pcd"
+        file_size:
+          type: integer
+          format: int64
+          minimum: 1
+          description: "文件字节数（用于分片判定与配额校验）"
+        part_count:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 1
+          description: "分片数；>1 时返回分片上传地址（upload_id + parts[]）"
+        content_type:
+          type: string
+          maxLength: 128
+          nullable: true
+          description: "MIME 类型（如 application/octet-stream）；空则按扩展名推断"
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          nullable: true
+          description: "可选：文件 SHA-256（上传前声明，供 complete 阶段预校验）"
+
+    FilePresignPart:
+      type: object
+      required: [part_number, upload_url]
+      properties:
+        part_number: { type: integer, minimum: 1, maximum: 10000, description: "分片序号（从 1 开始）" }
+        upload_url: { type: string, description: "该分片的预签名上传地址（截止时间与 upload_url 一致）" }
+
+    FilePresignData:
+      type: object
+      required: [bucket, object_key, method, expires_in]
+      properties:
+        bucket: { $ref: "#/components/schemas/UploadBucket" }
+        object_key:
+          type: string
+          description: |
+            对象路径（服务端生成，不可由客户端指定）：
+            `{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}`
+          example: "hunter-raw-data/HUNTER-001/2024-08-19/point_cloud/1724035200_12580.pcd"
+        method: { $ref: "#/components/schemas/UploadMethod" }
+        upload_url:
+          type: string
+          nullable: true
+          description: "单次直传地址（method=put 时非空；有效期 1 小时）"
+        upload_id:
+          type: string
+          nullable: true
+          description: "分片上传 ID（method=multipart 时非空，complete 阶段必须回带）"
+        parts:
+          type: array
+          nullable: true
+          items: { $ref: "#/components/schemas/FilePresignPart" }
+          description: "分片上传地址列表（method=multipart 时非空）"
+        expires_in:
+          type: integer
+          description: "上传地址有效期（秒），固定 3600（MinIO 契约：上传 1 小时）"
+          example: 3600
+
+    FilePresignResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/FilePresignData" }
+
+    CompletedPart:
+      type: object
+      required: [part_number, etag]
+      properties:
+        part_number: { type: integer, minimum: 1, maximum: 10000, description: "分片序号" }
+        etag: { type: string, description: "分片 ETag（MinIO 返回，用于合并分片）" }
+
+    FileCompleteRequest:
+      type: object
+      required: [vehicle_id, bucket, object_key, size_bytes, md5, sha256, timestamp]
+      properties:
+        vehicle_id:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+          description: "车辆标识（必须等于证书 CommonName；对象路径前缀不匹配返回 1002）"
+        bucket: { $ref: "#/components/schemas/UploadBucket" }
+        object_key:
+          type: string
+          description: "presign 阶段返回的对象路径（必须匹配本车辆目录前缀）"
+        size_bytes: { type: integer, format: int64, minimum: 0, description: "实际上传字节数" }
+        md5: { type: string, pattern: "^[0-9a-f]{32}$", description: "文件 MD5（小写十六进制）" }
+        sha256: { type: string, pattern: "^[0-9a-f]{64}$", description: "文件 SHA-256（小写十六进制）" }
+        data_type: { $ref: "#/components/schemas/FileDataType" }
+        upload_id: { type: string, nullable: true, description: "分片上传 ID（method=multipart 时必传）" }
+        parts:
+          type: array
+          nullable: true
+          items: { $ref: "#/components/schemas/CompletedPart" }
+          description: "分片 ETag 列表（method=multipart 时必传，用于合并对象）"
+        timestamp: { type: number, description: "上传完成时间（Unix epoch 秒，车端时间）" }
+
+    FileCompleteData:
+      type: object
+      required: [bucket, object_key, size_bytes, md5, sha256, verified, notify_topic, timestamp]
+      properties:
+        bucket: { $ref: "#/components/schemas/UploadBucket" }
+        object_key: { type: string, description: "已校验的对象路径" }
+        size_bytes: { type: integer, format: int64, description: "对象实际字节数" }
+        md5: { type: string, pattern: "^[0-9a-f]{32}$" }
+        sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        data_type: { $ref: "#/components/schemas/FileDataType" }
+        verified: { type: boolean, description: "完整性校验是否通过（失败时返回 6001，不会出现 false）" }
+        notify_topic:
+          type: string
+          enum: [sensor_file]
+          description: "通知 Topic（Kafka 契约：sensor_file，key = vehicle_id）"
+        timestamp: { type: number, description: "上传完成时间（Unix epoch 秒，回带请求值）" }
+
+    FileCompleteResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/FileCompleteData" }
+
+    FileObjectItem:
+      type: object
+      required: [bucket, object_key, size_bytes, last_modified, download_url, expires_in]
+      properties:
+        bucket: { $ref: "#/components/schemas/UploadBucket" }
+        object_key: { type: string }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        etag: { type: string, nullable: true, description: "对象 ETag（MinIO 返回）" }
+        last_modified: { type: number, description: "对象最后修改时间（Unix epoch 秒）" }
+        download_url:
+          type: string
+          description: "预签名下载地址（有效期 900s，支持 Range 分片下载）"
+        expires_in:
+          type: integer
+          description: "下载地址有效期（秒），固定 900（MinIO 契约：下载 15 分钟）"
+          example: 900
+
+    FileListData:
+      type: object
+      required: [items, next_marker, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/FileObjectItem" }
+        next_marker:
+          type: string
+          nullable: true
+          description: "下一页游标（无更多数据时为 null）"
+        truncated: { type: boolean, description: "是否被截断（存在更多对象）" }
+
+    FileListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/FileListData" }
+
+
+    # （运维探针响应模型见 HealthStatus / ReadyChecks / ApiResponseHealthy / ApiResponseReady）
+
+# =====================================================================
+# 扩展字段（OpenAPI 表达能力之外、但属于系统契约的机器可读定义）
+# 实现与校验脚本（服务单测 / scripts/verify_*.py）以本节为准，禁止在代码中另立事实来源
+# =====================================================================
+x-hunter-service:
+  name: data-collector
+  port: 8082
+  gateway_prefix: /api/v1/data
+  db_schema: data_collector
+  db_tables: [vehicle_telemetry, events]
+  db_access:
+    - table: vehicle_telemetry
+      access: write+read
+      pattern: "批量 executemany 写入 + ON CONFLICT (time, vehicle_id) DO NOTHING（幂等）；hypertable 按天分块、保留 90 天"
+    - table: events
+      access: write+read+update
+      pattern: "Kafka 消费写入（唯一键 (vehicle_id, event_type, event_time) 去重）+ REST 查询/确认（acknowledged* 三列）"
+  db_tables_absent:
+    note: "⚠ 5.5 节「元信息入库」在 contracts/database 无对应表（不得擅自新增表），见 x-hunter-pending-confirmation"
+  minio_buckets: [hunter-raw-data, hunter-rosbag, hunter-video]
+  minio_bucket_lifecycle:
+    hunter-raw-data: "30 天自动删除（传感器原始数据：点云/图像）"
+    hunter-rosbag: "事件数据永久，常规 30 天"
+    hunter-video: "90 天（远程操控录像；车端触发上传的视频片段）"
+  redis_keys:
+    - pattern: "vehicle:status:{vehicle_id}"
+      type: "Hash"
+      ttl_seconds: null
+      usage: "健康数据消费写入车辆最新状态（不落 DB 明细）"
+    - pattern: "vehicle:online:set"
+      type: "Set"
+      ttl_seconds: null
+      usage: "上线加入 / 遥测中断 >10s 移出（communication_loss 判定输入）"
+    - pattern: "rate_limit:{ip}:{api}"
+      type: "String"
+      ttl_seconds: 60
+      usage: "接口限流计数（窗口 1 分钟；与附录 D 阈值配合）"
+  config_source: "pydantic-settings（环境变量 / K8s ConfigMap data-collector-config + Secret hunter-app-secrets）"
+  required_env:
+    - SERVICE_NAME
+    - API_PORT
+    - DATABASE_URL
+    - REDIS_URL
+    - KAFKA_BOOTSTRAP_SERVERS
+    - KAFKA_SECURITY_PROTOCOL
+    - KAFKA_SASL_MECHANISM
+    - MINIO_ENDPOINT
+    - MINIO_ACCESS_KEY
+    - MINIO_SECRET_KEY
+    - MINIO_BUCKET_RAW_DATA
+    - MINIO_BUCKET_ROSBAG
+    - MINIO_BUCKET_VIDEO
+    - PRESIGNED_UPLOAD_EXPIRE_SECONDS
+    - PRESIGNED_DOWNLOAD_EXPIRE_SECONDS
+    - TELEMETRY_BATCH_SIZE
+    - TELEMETRY_FLUSH_INTERVAL_MS
+    - TELEMETRY_QUERY_MAX_RANGE_HOURS
+    - FILE_UPLOAD_MAX_BYTES_PER_SECOND
+    - VEHICLE_TELEMETRY_MAX_MSG_PER_SEC
+  env_derived:
+    - name: DATABASE_URL
+      from: "POSTGRES_HOST / POSTGRES_PORT / POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB（HunterBaseConfig.database_url 派生，K8s 中无需显式配置键）"
+    - name: REDIS_URL
+      from: "REDIS_HOST / REDIS_PORT / REDIS_PASSWORD / REDIS_DB（HunterBaseConfig.redis_url 派生）"
+  performance:
+    api_p95_ms: 200                    # 13.2 节：API 响应 P95 ≤ 200ms
+    ingest_latency_ms: 1000            # 遥测数据入库延迟 ≤ 1s
+    timeseries_write_points_per_sec: 10000   # 时序写入 ≥ 10000 点/秒（批量插入）
+    alert_latency_ms: 2000             # 实时告警触发 ≤ 2s（data-analytics 侧）
+    list_default_page_size: 20
+    list_max_page_size: 200
+    telemetry_max_msg_per_sec_per_vehicle: 100
+    file_upload_mbps_per_vehicle: 10
+
+x-hunter-endpoints:
+  source: "推导来源（设计文档 12.2 节未随仓库提供，需人工逐条核对）"
+  status: pending_confirmation
+  note: "⚠ 本清单由「附录 D 限流 + 5.5 上传流程 + events 表列能力」推导，未确认前实现按本清单，禁止另起一套"
+  endpoints:
+    - "GET /api/v1/data/telemetry"
+    - "GET /api/v1/data/events"
+    - "GET /api/v1/data/events/{event_id}"
+    - "POST /api/v1/data/events/{event_id}/acknowledge"
+    - "GET /api/v1/data/files"
+    - "POST /api/v1/data/files/presign"
+    - "POST /api/v1/data/files/complete"
+  ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]
+  derivation:
+    - endpoint: "GET /api/v1/data/telemetry"
+      basis: "附录 D：`GET /data/telemetry` 单用户 20 QPS（api-gateway.yaml x-hunter-rate-limits）；数据源 data_collector.vehicle_telemetry"
+      risk: "低（限流清单已明确该路径存在）"
+    - endpoint: "GET /api/v1/data/events + {event_id}"
+      basis: "events 表索引意图：单车事件时间线 / 按类型统计（ddl/04_events.sql 注释）"
+      risk: "中（路径与分页形态待 12.2 节核对）"
+    - endpoint: "POST /api/v1/data/events/{event_id}/acknowledge"
+      basis: "events.acknowledged / acknowledged_by / acknowledge_time 三列 + 未确认告警部分索引"
+      risk: "中（确认动作的 HTTP 语义待核对：POST 子路径 / PATCH）"
+    - endpoint: "POST /api/v1/data/files/presign + /complete"
+      basis: "5.5 节上传流程（请求上传 → 预签名 URL → 车辆直传 → 完成通知 → 校验 → 元信息入库）"
+      risk: "低（流程步骤明确），路径命名待核对"
+    - endpoint: "GET /api/v1/data/files"
+      basis: "MinIO 生命周期 + DDL 注释（下载用 15 分钟预签名 URL）；用于文件清单与下载入口"
+      risk: "中（5.5 节未定义清单接口；若 12.2 节无此端点则删除）"
+
+x-hunter-ingest-pipeline:
+  source: "设计文档 5.4 节（数据预处理流程）+ 5.3.3 节（遥测消息格式）"
+  trigger:
+    topic_pattern: "hunter.*.telemetry"
+    key: vehicle_id
+    rate: "10-50Hz（单车 ≤100 msg/s）"
+  steps:
+    - "1) JSON 解析：解析失败计入解析错误指标并转入 DLQ（{topic}.dlq，保留原 topic/partition/offset 头），禁止跳过"
+    - "2) 数据校验：字段完整性（六段 chassis/localization/perception/planning/control/system 必填）+ 值域（battery_soc 0-100、cpu_usage/gpu_usage 0-100、network_rssi ≤ 0、motor_* / linear_velocity / angular_velocity 数组长度）"
+    - "3) 时间戳对齐：统一 UTC；以车端 `timestamp` 为准（禁止用入库时间替代，保证回放一致性），毫秒精度"
+    - "4) 数据清洗：异常值过滤（超出物理合理范围/跳变）+ 插值（仅限同一车辆相邻样本，跨车辆不插值）"
+    - "5) enrichment：补充车辆元信息（车型/固件版本等，来自 Redis 缓存或 vehicle-service REST；不可用时降级跳过，不阻塞写入）"
+    - "6) 序列化并写入：telemetry_raw（原样透传）+ telemetry_clean（清洗后）+ 批量写 data_collector.vehicle_telemetry"
+  routing:
+    telemetry_raw: "原样透传（供 data-analytics Flink 复算）"
+    telemetry_clean: "清洗后数据（主分析输入）"
+    vehicle_telemetry: "批量 executemany，ON CONFLICT (time, vehicle_id) DO NOTHING；batch_size=TELEMETRY_BATCH_SIZE(2000)、flush=TELEMETRY_FLUSH_INTERVAL_MS(500)"
+  idempotency_keys:
+    telemetry: "(vehicle_id, seq) 与 (vehicle_id, time)"
+    events: "(vehicle_id, event_type, event_time)"
+    health: "(vehicle_id, timestamp)"
+    command_result: "command_id"
+  targets:
+    ingest_latency_ms: 1000
+    timeseries_write_points_per_sec: 10000
+    dlq_pattern: "{original_topic}.dlq"
+
+x-hunter-file-upload-flow:
+  source: "设计文档 5.5 节（文件上传管理：预签名 URL + 完整性校验）"
+  steps:
+    - "1) 车辆请求上传：POST /api/v1/data/files/presign（车端证书 CN = vehicle_id，见 securitySchemes.deviceCertificate）"
+    - "2) 服务端校验身份与配额 → 生成 MinIO 预签名 URL（上传有效期 1 小时；分片上传返回 upload_id + parts[]）"
+    - "3) 车辆直传 MinIO（不经平台转发，支持 Range / 分片；单车带宽 ≤ 10 Mbps）"
+    - "4) 车辆上报完成：POST /api/v1/data/files/complete（size_bytes + md5 + sha256；分片上传附 parts[].etag）"
+    - "5) 服务端校验完整性（三者必须全部一致；不匹配返回 6001）"
+    - "6) 登记元信息并投递 Kafka sensor_file（⚠ 无 DB 元信息表，见 x-hunter-pending-confirmation #2）"
+  naming: "{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}"
+  naming_rules:
+    - "object_key 由服务端生成，客户端只能提供 file_name 的扩展名，禁止指定路径（防目录穿越）"
+    - "date 为 UTC 日期（YYYY-MM-DD）；timestamp 为上传时刻 Unix epoch 秒；seq 为车端消息/文件序号"
+    - "complete 阶段必须校验 object_key 前缀等于 {bucket}/{vehicle_id}/，否则返回 1002"
+  presign:
+    upload_expires_in_seconds: 3600
+    download_expires_in_seconds: 900
+    range_download: true
+    max_part_count: 10000
+    parts_url_count_limit: "与 part_count 一致（最多 10000）"
+  bucket_mapping:
+    point_cloud: hunter-raw-data
+    camera_image: hunter-raw-data
+    rosbag: hunter-rosbag
+    video: hunter-video
+    other: hunter-raw-data
+  bucket_mapping_status: pending_confirmation
+  integrity:
+    checks: [size_bytes, md5, sha256]
+    md5_pattern: "^[0-9a-f]{32}$"
+    sha256_pattern: "^[0-9a-f]{64}$"
+    on_failure_code: 6001
+    on_failure_http_status: 422
+    note: "⚠ 附录 A 无通用文件校验错误码，复用 6001（原语义：OTA 包校验失败）"
+  bandwidth_limit_mbps_per_vehicle: 10
+  notify_topic: sensor_file
+  notify_schema: contracts/kafka/schemas/sensor_file.schema.json
+
+x-hunter-telemetry-query-contract:
+  source: "5.3.3 节（遥测消息格式）× contracts/database/ddl/05_timeseries.sql（扁平列）"
+  table: data_collector.vehicle_telemetry
+  required_filters: [vehicle_id, start_time, end_time]
+  max_range:
+    env: TELEMETRY_QUERY_MAX_RANGE_HOURS
+    default_hours: 24
+    status: pending_confirmation
+    note: "⚠ 设计文档未定义单次查询时间跨度上限；上限用于保护 P95 ≤ 200ms"
+  default_order: "time DESC"
+  index: "idx_vehicle_telemetry_vehicle_time (vehicle_id, time DESC)"
+  retention_days: 90
+  nullability: "扁平列均为可空（DDL 未加 NOT NULL）；未采集到的段返回对应嵌套字段为 null"
+  column_mapping:
+    time: time
+    vehicle_id: vehicle_id
+    seq: seq
+    chassis: [velocity, steering_angle, battery_voltage, battery_soc, battery_current, battery_temp,
+              control_mode, vehicle_state, fault_code, motor_rpm, motor_current, motor_temp]
+    localization: [x, y, z, roll, pitch, heading, linear_velocity, angular_velocity,
+                   position_std, heading_std]
+    perception: [detected_objects, fps, latency_ms, object_types]
+    planning: [trajectory_length, trajectory_points, planning_latency_ms, current_behavior]
+    control: [target_velocity, target_steer, velocity_error, steer_error, control_latency_ms]
+    system: [cpu_usage, gpu_usage, memory_usage_mb, gpu_temp, cpu_temp, network_rssi, network_latency_ms]
+
+x-hunter-event-contract:
+  source: "contracts/database/ddl/04_events.sql + contracts/database/enums.md 第 2/3 节（设计文档事件类型定义）"
+  table: data_collector.events
+  level_by_type:
+    harsh_acceleration: warning
+    harsh_braking: warning
+    harsh_turning: warning
+    over_speed: critical
+    collision_warning: critical
+    manual_takeover: info
+    emergency_stop: critical
+    battery_low: warning
+    battery_critical: critical
+    communication_loss: critical
+    sensor_fault: critical
+    perception_fault: critical
+    planning_fault: critical
+    control_fault: critical
+    ota_start: info
+    ota_success: info
+    ota_failed: critical
+    ota_rollback: warning
+  thresholds:
+    note: "阈值不可更改（如 harsh_acceleration a>3m/s²、collision_warning TTC<1.5s、battery_low SOC<20%、communication_loss 遥测中断>10s）；来源见 enums.md 第 3 节，本服务不重算阈值（仅存储车端上报事件）"
+  acknowledge:
+    fields: [acknowledged, acknowledged_by, acknowledge_time]
+    acknowledged_by_source: "网关注入的 X-User-Id（禁止请求体指定，防伪造）"
+    idempotent: true
+    repeat_behavior: "已确认事件重复调用返回 200 与当前记录，不覆盖原确认人与时间"
+  duplicate_guard: "Kafka 消费幂等键 (vehicle_id, event_type, event_time)（uq_events_vehicle_type_time 唯一索引）"
+  indexes_used:
+    - "idx_events_vehicle_time (vehicle_id, event_time DESC) — 单车事件时间线"
+    - "idx_events_type_time (event_type, event_time DESC) — 按类型统计"
+    - "idx_events_unacknowledged (event_level, event_time DESC) WHERE acknowledged = FALSE — 告警中心"
+
+x-hunter-rate-limits:
+  source: "设计文档 附录 D（API 限流配置）+ contracts/openapi/api-gateway.yaml x-hunter-rate-limits"
+  algorithm: "Redis 滑动窗口计数（键 rate_limit:{ip}:{api}，窗口 1 分钟）"
+  inherit_gateway:
+    global_qps: 10000
+    per_user_qps: 100
+    per_ip_qps: 200
+  endpoint_limits:
+    - method: GET
+      path: /api/v1/data/telemetry
+      dimension: user
+      qps: 20
+      note: "附录 D 原文为 GET /data/telemetry（20 QPS）；对外实际路径含 /api/v1 前缀，已与网关契约对齐"
+  other_endpoints: "events / files 无接口级限流（附录 D 未列出），继承网关五级限流"
+  vehicle_limits:
+    - dimension: vehicle
+      metric: kafka_telemetry_msg_per_sec
+      limit: 100
+      enforcement: "消费侧限流 + 车端生产者；超限丢弃最旧遥测并告警"
+    - dimension: vehicle
+      metric: file_upload_mbps
+      limit: 10
+      enforcement: "预签名直传通道配额（服务端记录在途上传并限速）"
+  over_limit:
+    http_status: 429
+    response_code: 5001
+    retry_after_header: Retry-After
+    note: "⚠ 附录 A 无限流专用错误码，禁止新增，响应体 code 统一复用 5001"
+
+x-hunter-kafka:
+  source: "contracts/kafka/{topics,consumer-groups}.yaml（双向一致，禁止另立事实来源）"
+  consumes:
+    - topic_pattern: "hunter.*.telemetry"
+      group_id: data-collector-telemetry
+      subscribe_mode: regex_pattern
+      schema: contracts/kafka/schemas/telemetry.schema.json
+      produces: [telemetry_raw, telemetry_clean]
+      enabled: true
+    - topic_pattern: "hunter.*.event"
+      group_id: data-collector-events
+      subscribe_mode: regex_pattern
+      schema: contracts/kafka/schemas/event.schema.json
+      produces: [event_raw]
+      enabled: true
+    - topic_pattern: "hunter.*.health"
+      group_id: data-collector-health
+      subscribe_mode: regex_pattern
+      schema: contracts/kafka/schemas/health.schema.json
+      produces: []
+      enabled: true
+      reason: "仅更新 Redis vehicle:status:{vehicle_id} / vehicle:online:set，不落 DB 明细、不生产 Topic"
+    - topic_pattern: "hunter.*.command_result"
+      group_id: data-collector-command-result
+      subscribe_mode: regex_pattern
+      schema: contracts/kafka/schemas/command_result.schema.json
+      produces: []
+      enabled: true
+      reason: "指令执行结果留痕（审计）；不做业务动作"
+  produces:
+    - topic: telemetry_raw
+      schema: contracts/kafka/schemas/telemetry.schema.json
+      key: vehicle_id
+      trigger: "消费 hunter.*.telemetry 后原样透传"
+    - topic: telemetry_clean
+      schema: contracts/kafka/schemas/telemetry.schema.json
+      key: vehicle_id
+      trigger: "5.4 节预处理（校验/对齐/清洗/enrichment）后写入"
+    - topic: event_raw
+      schema: contracts/kafka/schemas/event.schema.json
+      key: vehicle_id
+      trigger: "消费 hunter.*.event 后写入（同时落库 events 表）"
+    - topic: sensor_file
+      schema: contracts/kafka/schemas/sensor_file.schema.json
+      key: vehicle_id
+      trigger: "POST /api/v1/data/files/complete 完整性校验通过后投递"
+  not_owned:
+    note: "以下 Topic 属其他模块（网关/OTA/远程操控/分析/Carla 仿真），本服务不生产、不消费，禁止擅自订阅"
+    topics:
+      - "hunter.{vehicle_id}.command"
+      - "hunter.{vehicle_id}.ota_notify"
+      - "hunter.{vehicle_id}.ota_status"
+      - "hunter.{vehicle_id}.remote_control"
+      - "hunter.broadcast.command"
+      - "analytics_result"
+      - "alert_event"
+      - "carla.{sim_id}.vil_state"
+      - "carla.{sim_id}.sensor_data"
+    carla_note: "⚠ Carla Topic 出现在设计文档 5.3.1 清单但未在 contracts/kafka/topics.yaml 登记 → 见 x-hunter-pending-confirmation #9"
+  dlq: "{original_topic}.dlq（hunter_common.kafka.consumer 统一派生，保留原 topic/partition/offset 头）"
+  offset_commit: "手动提交（handler 成功后 commit；失败转 DLQ）"
+
+x-hunter-error-status-map:
+  source: "设计文档 附录 A 错误码 + common/python/hunter_common/exceptions.py ErrorCode"
+  note: "⚠ 设计文档未定义错误码→HTTP 状态映射；此处与 services/data-collector/app/core/error_handlers.py 的 HTTP_STATUS_BY_CODE 对齐"
+  map:
+    1001: 401
+    1002: 403
+    1003: 401
+    2001: 422
+    2002: 422
+    3001: 404
+    3002: 409
+    3003: 409
+    4001: 409
+    4002: 409
+    5000: 500
+    5001: 503
+    6001: 422
+    6002: 422
+    6003: 422
+    7001: 409
+    7002: 502
+
+x-hunter-pending-confirmation:
+  source: "本契约编写过程中发现的、设计文档未明确的决策点；确认后回填契约再实现代码"
+  note: "每项均影响 Step 2 及之后的实现范围；未确认前实现必须按本契约当前取值（禁止另起一套）"
+  items:
+    - id: 1
+      question: "data-collector 的 REST 端点清单（设计文档 12.2 节未随仓库提供，无法逐条比对）"
+      contract_decision: "按附录 D 限流端点 + 5.5 上传流程 + events 表列能力推导 7 个业务端点（见 x-hunter-endpoints.derivation，逐条标注依据与风险）"
+      impact: "Step 4 路由层实现范围；若 12.2 节存在差异（如文件清单端点不存在/路径不同）需回改契约与实现"
+    - id: 2
+      question: "5.5 节步骤 6「元信息入库」在 contracts/database 无对应表（data_collector schema 仅 events / vehicle_telemetry）"
+      contract_decision: "不擅自新增表：文件元信息以 MinIO 对象列举（GET /files）+ Kafka sensor_file 通知体现；如需 DB 表须先更新 DDL 契约"
+      impact: "文件清单分页/检索能力（无 total、无法按业务字段查询）；未来新增表需 DDL→ORM→migration 同步"
+    - id: 3
+      question: "Kafka sensor_file 消息字段清单（设计文档未给出，契约原为 schema: null）"
+      contract_decision: "按 topics.yaml 描述（bucket/object_key/size/checksum）+ 5.5 命名规范定义 contracts/kafka/schemas/sensor_file.schema.json（draft-07，additionalProperties=false）"
+      impact: "Step 5 生产实现与 data-analytics 消费解析；字段增减必须先改 Schema"
+    - id: 4
+      question: "文件 data_type 取值域与 data_type → Bucket 映射（设计文档未给出）"
+      contract_decision: "data_type 暂定 {point_cloud, camera_image, rosbag, video, other}，映射见 x-hunter-file-upload-flow.bucket_mapping"
+      impact: "上传配额、MinIO 生命周期归类、文件清单筛选枚举"
+    - id: 5
+      question: "文件完整性校验失败的错误码（附录 A 无通用文件校验码）"
+      contract_decision: "复用 6001（原语义：OTA 包校验失败），HTTP 422，data 携带 field/expected/actual"
+      impact: "车端上传重试逻辑与前端错误提示文案"
+    - id: 6
+      question: "车端 REST 接入方式：presign/complete 由车端调用（设备认证），入口是经网关还是独立 Ingress mTLS 端口"
+      contract_decision: "契约按 dual security 声明（deviceCertificate + bearerAuth）；vehicle_id 一律以证书 CN 为准，禁止请求体指定他车"
+      impact: "Ingress / mTLS 证书链配置；网关是否需要放行车端流量（附录 D 单 IP 200 QPS 是否适用车端）"
+    - id: 7
+      question: "遥测查询单次时间跨度上限与 total 计数成本（hypertable COUNT 开销）"
+      contract_decision: "时间跨度上限环境变量 TELEMETRY_QUERY_MAX_RANGE_HOURS（默认 24h）；保留 total 字段但仍需确认是否改为 estimate/游标"
+      impact: "P95 ≤ 200ms 保障；前端分页组件形态"
+    - id: 8
+      question: "车辆实时状态查询端点归属（Redis vehicle:status:{vehicle_id} / vehicle:online:set 的读取接口）"
+      contract_decision: "本服务只写不暴露读端点（车辆监控页数据来源待确认：data-collector 还是 vehicle-service）"
+      impact: "前端车队视图数据来源；若落本服务需新增端点并回改契约"
+    - id: 9
+      question: "Carla Topic（carla.{sim_id}.vil_state / carla.{sim_id}.sensor_data）在 5.3.1 清单出现但未登记于 contracts/kafka/topics.yaml"
+      contract_decision: "本契约仅登记缺口（x-hunter-kafka.not_owned.carla_note），不新增 Topic（分区/acks/保留/Schema 未知）"
+      impact: "Carla 仿真数据回传链路归属（scene-service 下发 / data-collector 采集）需明确后再补契约"
+    - id: 10
+      question: "遥测 seq 是否入表（er.md 已标 ⚠）：影响查询返回与幂等键实现"
+      contract_decision: "DDL 中保留 vehicle_telemetry.seq（BIGINT），查询响应 seq 可空；若设计文档无该列需同步 DDL/ORM/migration"
+      impact: "幂等去重实现（(vehicle_id, seq) 优先，缺失时退化为 (vehicle_id, time)）"
+    - id: 11
+      question: "告警链路归属：alert_event → WebSocket/Alertmanager 由谁消费（本契约声明本服务不消费 alert_event）"
+      contract_decision: "本服务只落库 events 并投递 event_raw；实时告警推送由 data-analytics + 告警处理（落位待定）承担"
+      impact: "前端告警中心实现路径；若改由本服务推送需先更新 consumer-groups.yaml 再实现"
+    - id: 12
+      question: "车端文件上传带宽限流（单车 10 Mbps）落实方式：预签名直传链路无服务端流量计量"
+      contract_decision: "契约声明环境变量 FILE_UPLOAD_MAX_BYTES_PER_SECOND（=10 Mbps）与在途上传配额校验；实际带宽整形待确认（MinIO 侧/网络侧）"
+      impact: "限流实现位置与可观测性（是否需要 MinIO 侧速率限制或车端自律上报）"
+

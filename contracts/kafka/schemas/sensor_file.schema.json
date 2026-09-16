@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/sensor_file.schema.json",
+  "title": "HunterEdge 传感器文件通知 sensor_file",
+  "description": "平台内部 Topic `sensor_file`（3 分区，保留 7 天，key = vehicle_id）。生产者：data-collector（文件上传完成且完整性校验通过后投递，见设计文档 5.5 节）；消费者：data-analytics（离线分析，幂等键 = object_key）。消息只包含 MinIO 对象元信息，不含文件本体；对象路径遵循 5.5 节命名规范 {bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}。校验依据：bucket/object_key/size/md5/sha256 必须与 MinIO 实际对象一致（不一致时 data-collector 返回错误码 6001，不投递本消息）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vehicle_id", "timestamp", "bucket", "object_key", "data_type", "size_bytes", "md5", "sha256"],
+  "properties": {
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "车辆唯一标识，必须等于 Kafka 消息 key（保证单车辆有序）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "上传完成时间，Unix epoch 秒（含毫秒小数；车端上报时间，禁止用平台入库时间替代）"
+    },
+    "bucket": {
+      "type": "string",
+      "enum": ["hunter-raw-data", "hunter-rosbag", "hunter-video"],
+      "description": "MinIO Bucket（车端上传类；生命周期：hunter-raw-data 30 天 / hunter-rosbag 事件永久·常规 30 天 / hunter-video 90 天）"
+    },
+    "object_key": {
+      "type": "string",
+      "pattern": "^hunter-(raw-data|rosbag|video)/[A-Za-z0-9][A-Za-z0-9_-]{0,63}/[0-9]{4}-[0-9]{2}-[0-9]{2}/[a-z_]+/[0-9]+_[0-9]+\\.[A-Za-z0-9]+$",
+      "description": "对象路径（5.5 节命名规范 {bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}；consumer 幂等键）",
+      "examples": ["hunter-rosbag/HUNTER-001/2024-08-19/rosbag/1724035200_12580.bag"]
+    },
+    "data_type": {
+      "type": "string",
+      "enum": ["point_cloud", "camera_image", "rosbag", "video", "other"],
+      "description": "数据类型（对应 object_key 中的 {data_type} 段与 Bucket 映射；取值域见 data-collector.yaml x-hunter-file-upload-flow）"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "对象字节数（必须与 MinIO 对象一致）"
+    },
+    "md5": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "文件 MD5（小写十六进制），上传完成通知中声明的校验值"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "文件 SHA-256（小写十六进制），data-analytics 离线分析前可二次校验"
+    },
+    "data_file_url": {
+      "type": ["string", "null"],
+      "description": "对象逻辑地址（bucket/object_key 拼接形式，如 hunter-rosbag/HUNTER-001/2024-08-19/rosbag/1724035200_12580.bag）；不落长期签名，下载必须另签 15 分钟预签名 URL"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "车端文件/消息序号（对应命名规范 {seq} 段，用于丢包与重复检测）"
+    },
+    "etag": {
+      "type": ["string", "null"],
+      "description": "MinIO 对象 ETag（分片上传合并后由 MinIO 返回；可选，供对账）"
+    },
+    "content_type": {
+      "type": ["string", "null"],
+      "description": "MIME 类型（如 application/octet-stream；可选）"
+    }
+  },
+  "examples": [
+    {
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035200.123,
+      "bucket": "hunter-raw-data",
+      "object_key": "hunter-raw-data/HUNTER-001/2024-08-19/point_cloud/1724035200_12580.pcd",
+      "data_type": "point_cloud",
+      "size_bytes": 18874368,
+      "md5": "d41d8cd98f00b204e9800998ecf8427e",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "data_file_url": "hunter-raw-data/HUNTER-001/2024-08-19/point_cloud/1724035200_12580.pcd",
+      "seq": 12580,
+      "etag": "9f2b1a09c1d2e3f4a5b6c7d8e9f0a1b2",
+      "content_type": "application/octet-stream"
+    },
+    {
+      "vehicle_id": "HUNTER-002",
+      "timestamp": 1724035980.5,
+      "bucket": "hunter-rosbag",
+      "object_key": "hunter-rosbag/HUNTER-002/2024-08-19/rosbag/1724035980_20481.bag",
+      "data_type": "rosbag",
+      "size_bytes": 1073741824,
+      "md5": "0cc175b9c0f1b6a831c399e269772661",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "seq": 20481,
+      "content_type": "application/octet-stream"
+    }
+  ]
+}

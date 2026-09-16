@@ -15,13 +15,24 @@ data:
   API_PORT: "8082"
   DB_POOL_SIZE: "5"          # 单副本可用 CPU(2 核) × 2 + 1
   DB_MAX_OVERFLOW: "5"
-  # 消费者组（对齐 contracts/kafka：平台内部 Topic，禁止新增 Topic）
-  KAFKA_CONSUMER_GROUP: "hunter-data-collector"
-  KAFKA_CONSUMER_TOPICS: "telemetry_raw,event_raw,sensor_file"
+  # 消费者组 / 订阅（对齐 contracts/kafka/consumer-groups.yaml：车端 Topic 正则订阅，
+  # 四个数据域独立 offset，禁止擅自新增 Topic 或消费组）
+  KAFKA_CONSUMER_GROUPS: "data-collector-telemetry,data-collector-events,data-collector-health,data-collector-command-result"
+  KAFKA_SUBSCRIBE_PATTERNS: "hunter.*.telemetry,hunter.*.event,hunter.*.health,hunter.*.command_result"
+  KAFKA_PRODUCE_TOPICS: "telemetry_raw,telemetry_clean,event_raw,sensor_file"
   KAFKA_AUTO_OFFSET_RESET: "earliest"
   # 时序批量写入（性能指标：≥ 10000 点/秒，批量插入）
   TELEMETRY_BATCH_SIZE: "2000"
   TELEMETRY_FLUSH_INTERVAL_MS: "500"
+  # 遥测查询单次时间跨度上限（保护 API P95 ≤ 200ms；⚠ 上限值待确认）
+  TELEMETRY_QUERY_MAX_RANGE_HOURS: "24"
+  # 车辆维度限流（附录 D：遥测 ≤100 msg/s、文件上传 ≤10 Mbps = 1310720 B/s）
+  VEHICLE_TELEMETRY_MAX_MSG_PER_SEC: "100"
+  FILE_UPLOAD_MAX_BYTES_PER_SECOND: "1310720"
+  # MinIO Bucket（车端上传类；生命周期由 minio-init Job 配置）
+  MINIO_BUCKET_RAW_DATA: "hunter-raw-data"
+  MINIO_BUCKET_ROSBAG: "hunter-rosbag"
+  MINIO_BUCKET_VIDEO: "hunter-video"
   # 预签名 URL（上传 1h / 下载 15min，支持 Range 分片）
   PRESIGNED_UPLOAD_EXPIRE_SECONDS: "3600"
   PRESIGNED_DOWNLOAD_EXPIRE_SECONDS: "900"

@@ -9,7 +9,7 @@ Topic 命名规范：`<domain>.<entity>.<type>`，全小写，点分隔；车端
 |------|------|
 | `topics.yaml` | Topic 清单（车端 9 个 / 平台内部 6 个）：分区数、副本数、acks、保留时间、key 策略、生产者/消费者、Schema 引用；含全局 producer/consumer 默认参数与 Topic 级限流 |
 | `consumer-groups.yaml` | 消费者组契约：12 个组（`data-collector-*` / `data-analytics-*` / `ota-service-*` / `remote-control-*` / `scene-service-*` / `platform-alert-event`），含手动提交、DLQ、幂等键、延迟目标 |
-| `schemas/*.schema.json` | 8 个消息 JSON Schema（draft-07），详见 `schemas/README.md` |
+| `schemas/*.schema.json` | 9 个消息 JSON Schema（draft-07），详见 `schemas/README.md` |
 
 ## 车端 ↔ 平台 Topic
 

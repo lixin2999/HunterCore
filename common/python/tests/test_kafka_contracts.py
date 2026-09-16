@@ -50,6 +50,7 @@ SCHEMA_FILES = (
     "ota_status.schema.json",
     "remote_control.schema.json",
     "analytics_result.schema.json",
+    "sensor_file.schema.json",
 )
 
 CREATE_TOPIC_CALL_RE = re.compile(r'create_topic\s+"([\w.]+)"\s+(\d+)\s+(\d+)')
@@ -277,6 +278,47 @@ def test_pending_internal_topic_schemas_are_still_declared_null() -> None:
         entry["name"]: entry for entry in load_yaml(KAFKA_DIR / "topics.yaml")["platform_topics"]
     }
     assert platform["analytics_result"]["schema"] is not None
-    assert platform["sensor_file"]["schema"] is None
+    assert platform["sensor_file"]["schema"] is not None
     assert platform["alert_event"]["schema"] is None
+
+
+def test_sensor_file_schema_matches_upload_contract() -> None:
+    """sensor_file（设计文档 5.5 节上传完成通知）：命名规范 + 校验值 + 消费幂等键四处一致。"""
+    schema = load_schema("sensor_file.schema.json")
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {
+        "vehicle_id",
+        "timestamp",
+        "bucket",
+        "object_key",
+        "data_type",
+        "size_bytes",
+        "md5",
+        "sha256",
+    }
+    # Bucket 枚举 = 车端上传类 Bucket（MinIO Bucket 规划）
+    assert set(schema["properties"]["bucket"]["enum"]) == {
+        "hunter-raw-data",
+        "hunter-rosbag",
+        "hunter-video",
+    }
+    # 完整性校验字段与 MinIO 契约一致
+    assert schema["properties"]["md5"]["pattern"] == "^[0-9a-f]{32}$"
+    assert schema["properties"]["sha256"]["pattern"] == "^[0-9a-f]{64}$"
+    # 5.5 节命名规范：{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}
+    key_pattern = schema["properties"]["object_key"]["pattern"]
+    for fragment in ("hunter-(raw-data|rosbag|video)", "[0-9]{4}-[0-9]{2}-[0-9]{2}", "[0-9]+_[0-9]+"):
+        assert fragment in key_pattern, f"object_key 未约束命名规范片段: {fragment}"
+
+    # 契约三处一致：topics.yaml 引用（含生产者）/ Schema 文件存在 / 消费组幂等键
+    platform = {
+        entry["name"]: entry for entry in load_yaml(KAFKA_DIR / "topics.yaml")["platform_topics"]
+    }
+    assert platform["sensor_file"]["schema"] == "schemas/sensor_file.schema.json"
+    assert platform["sensor_file"]["producer"] == "data-collector"
+    assert (SCHEMA_DIR / "sensor_file.schema.json").is_file()
+    groups = load_yaml(KAFKA_DIR / "consumer-groups.yaml")["groups"]
+    analytics_group = next(g for g in groups if g["group_id"] == "data-analytics-sensor-file")
+    assert analytics_group["subscribes"] == ["sensor_file"]
+    assert analytics_group["idempotency_key"] == "object_key"
 

@@ -8,7 +8,7 @@
 |------|------|----------|------|
 | api-gateway.yaml | api-gateway | 统一入口（8080） | ✅ 已定义（认证 + 运维探针 + 路由表/限流/WebSocket 扩展字段） |
 | scene-service.yaml | scene-service | `/api/v1/scene` | ✅ 已定义（10 个业务端点 + 4.2.1/4.2.2 数据结构 + 4.4/4.5 流程扩展字段） |
-| data-collector.yaml | data-collector | `/api/v1/data` | 待开发 |
+| data-collector.yaml | data-collector | `/api/v1/data` | ✅ 已定义（7 个业务端点 + 5.3.3 遥测结构 + 5.4 预处理 / 5.5 上传流程扩展字段） |
 | data-analytics.yaml | data-analytics | `/api/v1/analytics` | 待开发 |
 | ota-service.yaml | ota-service | `/api/v1/ota` | 待开发 |
 | remote-control.yaml | remote-control | `/api/v1/remote`、`/ws/remote/**` | 待开发 |
@@ -55,6 +55,30 @@
 - **⚠ 待核对项**：`scene_type` 编码值（4.2.1 只给两级结构）、仿真进度/结果端点缺口（4.4 第 6/7 步）、
   `archived` 无归档端点、导出返回形式、`version` 递增策略 —— 全量见契约 `x-hunter-pending-confirmation`（12 项）
 
+## 数据采集契约要点（data-collector.yaml）
+
+- **业务端点**（推导清单，`x-hunter-endpoints` 逐条登记依据与风险 —— 12.2 节未随仓库提供）：
+  `GET /api/v1/data/telemetry`（附录 D 限流端点）、`GET /api/v1/data/events`、`GET /api/v1/data/events/{event_id}`、
+  `POST /api/v1/data/events/{event_id}/acknowledge`、`GET /api/v1/data/files`、
+  `POST /api/v1/data/files/presign`、`POST /api/v1/data/files/complete`
+- **数据结构**：遥测查询响应（`TelemetrySample` + 六段嵌套）与 5.3.3 节消息结构逐字段一致，
+  由 `data_collector.vehicle_telemetry` 扁平列重组（映射见 `x-hunter-telemetry-query-contract`，
+  查询必须带 `vehicle_id` + 时间区间，保留 90 天）；事件模型一一对应 `events` 表列
+  （18 种类型 / 3 级等级取 `EVENT_LEVEL_BY_TYPE`，确认写 `acknowledged*` 三列且幂等）
+- **5.4 预处理**：6 步（解析 → 校验 → 时间对齐 → 清洗 → enrichment → 序列化写入），
+  失败转 DLQ `{topic}.dlq`；入库延迟 ≤1s、时序写入 ≥10000 点/秒、单车 ≤100 msg/s
+- **5.5 文件上传**：请求上传 → 预签名（上传 1h / 下载 15min + Range）→ 直传 → 完成通知 →
+  MD5/SHA-256 校验（失败复用 6001）→ 投递 `sensor_file`；命名规范
+  `{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}`（服务端生成，禁止客户端指定）
+- **鉴权**：控制台 JWT（RBAC 资源域 `data`）；车端文件上传走 `deviceCertificate`（X.509 mTLS，
+  CN = vehicle_id，禁止请求体指定他车）
+- **Kafka**：`x-hunter-kafka` 消费 4 个车端 Topic（4 个 `data-collector-*` 消费组，正则订阅），
+  生产 `telemetry_raw` / `telemetry_clean` / `event_raw` / `sensor_file`；不消费 `alert_event`、
+  `analytics_result` 与 Carla Topic
+- **⚠ 待核对项**：端点清单来源、文件元信息缺表（5.5 第 6 步）、`data_type` 取值域与 Bucket 映射、
+  校验失败错误码复用 6001、车端 REST 接入方式、查询时间跨度上限、Carla Topic 归属 ——
+  全量见契约 `x-hunter-pending-confirmation`（12 项）
+
 ## 校验命令
 
 ```bash
@@ -63,6 +87,9 @@ pytest services/api-gateway/app/tests/test_openapi_contract.py -q
 
 # 场景服务契约 ↔ 设计文档 4 章/12.2 节 ↔ DB DDL ↔ Kafka 契约 ↔ K8s 清单（29 项）
 cd services/scene-service && pytest app/tests/test_scene_contract.py -q
+
+# 数据采集契约 ↔ 设计文档 5 章推导清单 ↔ DDL ↔ Kafka 契约（含 sensor_file Schema）↔ K8s 清单（30 项）
+cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q
 ```
 
 > 命名约定：各服务契约测试文件使用唯一文件名（如 `test_scene_contract.py`），

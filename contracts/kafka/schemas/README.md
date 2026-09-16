@@ -18,6 +18,7 @@
 | `ota_status.schema.json` | `hunter.{vehicle_id}.ota_status` | `status`/`phase` = OTA 状态机 9 态；`progress` 0-100 |
 | `remote_control.schema.json` | `hunter.{vehicle_id}.remote_control` | 20Hz；`seq` 单调递增；`target_velocity` ∈ [-2.0, 2.0] m/s；`heartbeat` 用于超时保护计时 |
 | `analytics_result.schema.json` | `analytics_result` | `result_type` ∈ {metric, corner_case, report}；`trigger_event_type` 取受控事件词表（18 种）；`clip.pre_seconds/post_seconds` 固定 10（4.5 节事件前后各 10 秒）；含 `ego_trajectory`/`objects`/`environment` |
+| `sensor_file.schema.json` | `sensor_file` | 5.5 节上传完成通知（生产者 data-collector）；`bucket` ∈ 3 个车端上传类 Bucket；`object_key` 强制命名规范 `{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}`；`md5`(32)/`sha256`(64) 与 MinIO 校验一致；幂等键 = `object_key` |
 
 ## 通用约定（所有 Schema）
 
@@ -27,14 +28,16 @@
 - 不在消息中传输敏感信息（Token/证书私钥/密码），审计仅记录操作者 ID
 - 平台内部 Topic 复用关系：`telemetry_raw`/`telemetry_clean` → `telemetry.schema.json`；
   `event_raw` → `event.schema.json`
-- 2024 变更：`analytics_result` 已补全 Schema（scene-service 实车场景自动提取依赖，设计文档 4.5 节）；
-  `sensor_file` / `alert_event` 仍为 `null`，业务实现前必须先补契约
+- 变更：`analytics_result` 已补全 Schema（scene-service 实车场景自动提取依赖，设计文档 4.5 节）；
+  `sensor_file` 已补全 Schema（data-collector 文件上传完成通知，设计文档 5.5 节）；
+  `alert_event` 仍为 `null`（告警消费方落位待定），业务实现前必须先补契约
 
 ## ⚠ 待设计文档 5.3 节核对项
 
 | 项 | 现状 |
 |----|------|
-| `sensor_file` / `alert_event` 消息结构 | **暂无 Schema**（`topics.yaml` 中 `schema: null`），业务实现前必须先补契约 |
+| `alert_event` 消息结构 | **暂无 Schema**（`topics.yaml` 中 `schema: null`），业务实现前必须先补契约 |
+| `sensor_file` 字段全集 | 已按 5.5 节上传流程定义（bucket/object_key/data_type/size/md5/sha256 + 可选 seq/etag/content_type），需与设计文档 5.5 节逐字段核对 |
 | `analytics_result` 字段全集 | 已按 4.5 节需求定义（触发事件 + 截取窗口 + 轨迹/环境），`result_type=metric|report` 的其余字段待 5.3 节确认 |
 | `analytics_result.environment.road_type` | 无 enum（取值域待确认） |
 | `command.command_type` 取值域 | 未设 enum，仅字符串 |

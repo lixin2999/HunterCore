@@ -221,8 +221,8 @@ platform_topics:
     key: vehicle_id
     producer: data-collector
     consumers: [data-analytics]
-    schema: null                               # ⚠ 消息结构待设计文档 5.3 定稿
-    description: "传感器文件通知（MinIO 对象已上传：bucket/object_key/size/checksum），不含文件本体"
+    schema: schemas/sensor_file.schema.json    # 5.5 节上传完成通知（bucket/object_key/size/md5/sha256）
+    description: "传感器文件通知（MinIO 对象已上传且完整性校验通过：bucket/object_key/data_type/size/checksum），不含文件本体；幂等键 = object_key"
 
   - name: analytics_result
     partitions: 6
