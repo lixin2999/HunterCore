@@ -1,0 +1,264 @@
+# =====================================================================
+# HunterEdge Kafka Topic 契约（单一事实来源）
+# 来源：设计文档 5.3 节 + 系统上下文基座「Kafka Topic 命名与配置」
+# 命名规范：<domain>.<entity>.<type>，全小写点分隔；车端 Topic 为 hunter.{vehicle_id}.<type>
+# 约束：禁止自行新增 Topic 或更改配置；变更需同步
+#   - contracts/kafka/schemas/*.schema.json
+#   - infra/docker/kafka/create-topics.sh
+#   - infra/k8s/jobs/kafka-init-job.yaml
+#   - common/python/hunter_common/kafka/{producer,consumer}.py
+# ⚠ 需核对：车端 Topic 的保留时间与副本数（设计文档仅给出分区数/acks/频率）；
+#   此处按平台内部同类 Topic 的值对齐（telemetry/health 7 天、event 30 天、指令类 7 天），副本数统一 3
+# =====================================================================
+schema_version: "1.0.0"
+source: "设计文档 5.3 节（Kafka Topic 与消息格式）"
+naming:
+  convention: "<domain>.<entity>.<type>"
+  case: lower_snake_case
+  separator: "."
+  vehicle_topic_pattern: "hunter.{vehicle_id}.<type>"
+  broadcast_topic: "hunter.broadcast.command"
+  # DLQ 由 hunter_common.kafka.consumer 派生：{original_topic}.dlq（保留 30 天，分区数继承源 Topic）
+  dlq_pattern: "{original_topic}.dlq"
+
+# ---------- 全局默认（未显式覆盖时生效） ----------
+defaults:
+  replication_factor: 3
+  min_insync_replicas: 2          # acks=all 时至少 2 副本落盘
+  cleanup_policy: delete
+  compression_type: lz4           # 车端生产者配置：compression.type=lz4
+  key: vehicle_id                 # 消息 key = vehicle_id，保证单车辆消息有序
+  message_format: json
+  security_protocol: SASL_SSL     # 车端与平台间强制
+  sasl_mechanism: SCRAM-SHA-512
+
+producer_defaults:                # 对齐车端生产者基准配置
+  linger_ms: 5
+  batch_size: 16384
+  retries: 3
+  local_disk_buffer_bytes: 1073741824   # 网络中断时本地磁盘缓冲 1GB
+
+consumer_defaults:
+  enable_auto_commit: false        # 手动提交 offset：处理成功后提交（hunter_common.kafka.consumer）
+  auto_offset_reset: earliest
+  max_poll_records: 100            # 单批处理量（batch_size 与 handler 幂等性配合）
+  isolation_level: read_committed
+
+# =====================================================================
+# 一、车端 ↔ 平台 Topic
+# =====================================================================
+vehicle_topics:
+  - name: "hunter.{vehicle_id}.telemetry"
+    direction: vehicle_to_platform
+    partitions: 6                    # 按 vehicle_id 哈希分区
+    partition_strategy: hash(vehicle_id)
+    acks: "1"                        # 高频遥测：容忍极少数丢失换取吞吐（acks=1）
+    frequency: "10-50Hz"
+    key: vehicle_id
+    retention_ms: 604800000
+    retention_human: "7 天"
+    producer: vehicle (HUNTER SE AGX Orin)
+    consumers: [data-collector]
+    schema: schemas/telemetry.schema.json
+    description: "车辆遥测（底盘/定位/感知/规划/控制/系统六段），单车 ≤100 msg/s"
+
+  - name: "hunter.{vehicle_id}.event"
+    direction: vehicle_to_platform
+    partitions: 3
+    partition_strategy: hash(vehicle_id)
+    acks: all
+    frequency: "事件触发"
+    key: vehicle_id
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    producer: vehicle
+    consumers: [data-collector]
+    schema: schemas/event.schema.json
+    description: "车辆事件（18 种类型/3 级等级，阈值见 contracts/database/enums.md）"
+
+  - name: "hunter.{vehicle_id}.health"
+    direction: vehicle_to_platform
+    partitions: 3
+    partition_strategy: hash(vehicle_id)
+    acks: "0"
+    frequency: "1Hz"
+    key: vehicle_id
+    retention_ms: 604800000
+    retention_human: "7 天"
+    producer: vehicle
+    consumers: [data-collector]
+    schema: schemas/health.schema.json
+    description: "系统健康数据（状态 + 车载计算平台资源/网络指标），最低可靠性要求"
+
+  - name: "hunter.{vehicle_id}.command"
+    direction: platform_to_vehicle
+    partitions: 3
+    partition_strategy: hash(vehicle_id)
+    acks: all
+    frequency: "按需"
+    key: vehicle_id
+    retention_ms: 604800000
+    retention_human: "7 天"
+    producer: [api-gateway, ota-service, remote-control]
+    consumers: [vehicle]
+    schema: schemas/command.schema.json
+    description: "控制指令（按需下发）；执行结果经 command_result 回报"
+
+  - name: "hunter.{vehicle_id}.command_result"
+    direction: vehicle_to_platform
+    partitions: 3
+    partition_strategy: hash(vehicle_id)
+    acks: all
+    frequency: "按需"
+    key: vehicle_id
+    retention_ms: 604800000
+    retention_human: "7 天"
+    producer: vehicle
+    consumers: [data-collector, remote-control]
+    schema: schemas/command_result.schema.json
+    description: "指令执行结果（command_id 关联请求，保证端到端可追溯）"
+
+  - name: "hunter.{vehicle_id}.ota_notify"
+    direction: platform_to_vehicle
+    partitions: 3
+    partition_strategy: hash(vehicle_id)
+    acks: all
+    frequency: "按需"
+    key: vehicle_id
+    retention_ms: 604800000
+    retention_human: "7 天"
+    producer: ota-service
+    consumers: [vehicle]
+    schema: schemas/ota_notify.schema.json
+    description: "OTA 升级通知（含包地址/大小/MD5/SHA-256/RSA-2048 签名，车端下载后必须逐项校验）"
+
+  - name: "hunter.{vehicle_id}.ota_status"
+    direction: vehicle_to_platform
+    partitions: 3
+    partition_strategy: hash(vehicle_id)
+    acks: all
+    frequency: "状态变更"
+    key: vehicle_id
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    producer: vehicle
+    consumers: [ota-service]
+    schema: schemas/ota_status.schema.json
+    description: "OTA 状态上报（车端状态机 IDLE→…→SUCCESS/ROLLED_BACK/FAILED，写 ota_records）"
+
+  - name: "hunter.{vehicle_id}.remote_control"
+    direction: platform_to_vehicle
+    partitions: 3
+    partition_strategy: hash(vehicle_id)
+    acks: all
+    frequency: "20Hz"
+    key: vehicle_id
+    retention_ms: 604800000
+    retention_human: "7 天"
+    producer: remote-control
+    consumers: [vehicle]
+    schema: schemas/remote_control.schema.json
+    description: "远程操控指令（20Hz/50ms 间隔，>500ms 未收到则车端自动减速停车）"
+
+  - name: "hunter.broadcast.command"
+    direction: platform_to_all_vehicles
+    partitions: 3
+    partition_strategy: none          # 广播：所有消费者组均需收到
+    acks: all
+    frequency: "按需"
+    key: none                         # 广播消息不使用 vehicle_id 作为 key
+    retention_ms: 604800000
+    retention_human: "7 天"
+    producer: [api-gateway, ota-service]
+    consumers: [vehicle]
+    schema: schemas/command.schema.json
+    description: "广播指令（全车队）；消费者按 payload.target_filter 自行过滤"
+
+# =====================================================================
+# 二、平台内部 Topic（本地开发由 infra/docker/kafka/create-topics.sh 创建；
+#     K8s 由 infra/k8s/jobs/kafka-init-job.yaml 创建；auto.create.topics.enable=false）
+# ⚠ 副本数：本地 docker-compose 单 broker = 1（与 create-topics.sh 一致）；生产 K8s = 3（min.insync.replicas=2）
+# =====================================================================
+platform_topics:
+  - name: telemetry_raw
+    partitions: 12
+    acks: all
+    retention_ms: 604800000
+    retention_human: "7 天"
+    key: vehicle_id
+    producer: data-collector
+    consumers: [data-analytics (Flink)]
+    schema: schemas/telemetry.schema.json      # 复用遥测消息结构（原样透传）
+    description: "原始遥测（消费 hunter.{vehicle_id}.telemetry 后写入）"
+
+  - name: telemetry_clean
+    partitions: 12
+    acks: all
+    retention_ms: 604800000
+    retention_human: "7 天"
+    key: vehicle_id
+    producer: data-collector
+    consumers: [data-analytics (Flink)]
+    schema: schemas/telemetry.schema.json      # 清洗后仍为同一结构，异常点已剔除/插补
+    description: "清洗后遥测（校验/去重/时间对齐/野值处理后的结果）"
+
+  - name: event_raw
+    partitions: 6
+    acks: all
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    key: vehicle_id
+    producer: data-collector
+    consumers: [data-analytics, scene-service]
+    schema: schemas/event.schema.json          # 复用事件消息结构
+    description: "事件数据（消费 hunter.{vehicle_id}.event 后写入 + 落库 events 表）"
+
+  - name: sensor_file
+    partitions: 3
+    acks: all
+    retention_ms: 604800000
+    retention_human: "7 天"
+    key: vehicle_id
+    producer: data-collector
+    consumers: [data-analytics]
+    schema: null                               # ⚠ 消息结构待设计文档 5.3 定稿
+    description: "传感器文件通知（MinIO 对象已上传：bucket/object_key/size/checksum），不含文件本体"
+
+  - name: analytics_result
+    partitions: 6
+    acks: all
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    key: vehicle_id
+    producer: data-analytics
+    consumers: [scene-service, 上层业务]
+    schema: null                               # ⚠ 消息结构待设计文档 5.3 定稿
+    description: "分析结果（指标计算 / Corner Case 挖掘 / 报告生成结果）"
+
+  - name: alert_event
+    partitions: 3
+    acks: all
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    key: vehicle_id
+    producer: data-analytics
+    consumers: [告警处理]
+    schema: null                               # ⚠ 消息结构待设计文档 5.3 定稿
+    description: "告警事件（实时告警触发 ≤2s，推送 WebSocket + Alertmanager）"
+
+# =====================================================================
+# 三、Topic 级限流（设计文档附录 D，不可放宽）
+# =====================================================================
+throttles:
+  - scope: vehicle
+    metric: telemetry_produce_rate
+    limit: 100
+    unit: msg/s
+    enforcement: "data-collector 消费侧 + 车端生产者；超限丢弃最旧遥测并告警"
+  - scope: vehicle
+    metric: file_upload_bandwidth
+    limit: 10
+    unit: Mbps
+    enforcement: "预签名 URL 上传通道（data-collector 文件上传管理）"
+
+

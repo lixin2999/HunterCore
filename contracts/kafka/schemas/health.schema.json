@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/health.schema.json",
+  "title": "HunterEdge 系统健康消息 hunter.{vehicle_id}.health",
+  "description": "车辆系统健康数据（1Hz，acks=0）。生产者：车端；消费者：data-collector（写 Redis vehicle:status:{vehicle_id} / vehicle:online:set，不落明细表）。status 取值 = 车辆状态定义（8 态，不可更改）；system 段字段与遥测消息 system 段完全一致（复用采集代码）。⚠ 磁盘/服务进程等扩展健康字段待设计文档 5.3 节核对。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vehicle_id", "timestamp", "status", "system"],
+  "properties": {
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "车辆唯一标识（Kafka 消息 key）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "上报时间（Unix epoch 秒）"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["offline", "online_idle", "auto_driving", "remote_controlled",
+               "upgrading", "charging", "fault", "emergency"],
+      "description": "车辆业务状态（8 态，不可新增/更改）"
+    },
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_usage", "gpu_usage", "memory_usage_mb", "gpu_temp", "cpu_temp", "network_rssi", "network_latency_ms"],
+      "properties": {
+        "cpu_usage": {"type": "number", "minimum": 0, "maximum": 100, "description": "CPU 使用率 %"},
+        "gpu_usage": {"type": "number", "minimum": 0, "maximum": 100, "description": "GPU 使用率 %"},
+        "memory_usage_mb": {"type": "integer", "minimum": 0, "description": "内存占用 MB"},
+        "gpu_temp": {"type": "number", "description": "GPU 温度 ℃"},
+        "cpu_temp": {"type": "number", "description": "CPU 温度 ℃"},
+        "network_rssi": {"type": "integer", "maximum": 0, "description": "无线信号强度 dBm"},
+        "network_latency_ms": {"type": "number", "minimum": 0, "description": "车-云网络往返延迟 ms"}
+      }
+    }
+  },
+  "examples": [
+    {
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035201.0,
+      "status": "auto_driving",
+      "system": {
+        "cpu_usage": 45.2, "gpu_usage": 62.8, "memory_usage_mb": 18500,
+        "gpu_temp": 68.5, "cpu_temp": 65.2, "network_rssi": -65, "network_latency_ms": 45
+      }
+    }
+  ]
+}

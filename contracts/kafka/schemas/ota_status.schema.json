@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/ota_status.schema.json",
+  "title": "HunterEdge OTA 状态上报 hunter.{vehicle_id}.ota_status",
+  "description": "车端→平台 OTA 状态上报（状态变更触发，acks=all）。消费者：ota-service（推进 ota_svc.ota_records.status/phase/progress，同步 Redis ota:progress:{task_id}）。status/phase 取值 = 车端 OTA 状态机 IDLE→PENDING→DOWNLOAD→INSTALL→TEST→SUCCESS，自检失败 → ROLLBACK → ROLLED_BACK/FAILED，不可更改。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vehicle_id", "timestamp", "task_id", "status", "progress"],
+  "properties": {
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "上报车辆（Kafka 消息 key）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "状态变更时间（Unix epoch 秒）"
+    },
+    "task_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "升级任务 ID（ota_tasks.task_id）"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["IDLE", "PENDING", "DOWNLOAD", "INSTALL", "TEST",
+               "SUCCESS", "ROLLBACK", "ROLLED_BACK", "FAILED"],
+      "description": "升级整体状态（9 态状态机）"
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["IDLE", "PENDING", "DOWNLOAD", "INSTALL", "TEST",
+               "SUCCESS", "ROLLBACK", "ROLLED_BACK", "FAILED"],
+      "description": "当前执行阶段（与 status 同域；A/B 分区切换与自检进度细化）"
+    },
+    "progress": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "当前阶段进度 %（灰度监控与前端进度条数据源）"
+    },
+    "from_version": {
+      "type": ["string", "null"],
+      "description": "升级前版本名（首次装机为 null）"
+    },
+    "to_version": {
+      "type": ["string", "null"],
+      "description": "目标版本名"
+    },
+    "error_code": {
+      "type": ["string", "null"],
+      "description": "错误码：6001 校验失败 / 6002 验签失败 / 6003 门禁不满足 / 车端自定义码"
+    },
+    "error_message": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "失败原因（禁止输出密钥/证书等敏感信息）"
+    }
+  },
+  "examples": [
+    {
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035300.2,
+      "task_id": "3f2b1a09-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+      "status": "DOWNLOAD",
+      "phase": "DOWNLOAD",
+      "progress": 42,
+      "from_version": "V1.1.0",
+      "to_version": "V1.2.0"
+    },
+    {
+      "vehicle_id": "HUNTER-003",
+      "timestamp": 1724035600.0,
+      "task_id": "3f2b1a09-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+      "status": "ROLLED_BACK",
+      "phase": "ROLLED_BACK",
+      "progress": 100,
+      "from_version": "V1.0.0",
+      "to_version": "V1.2.0",
+      "error_code": "6002",
+      "error_message": "signature verification failed, rolled back to active partition"
+    }
+  ]
+}

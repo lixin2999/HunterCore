@@ -3,6 +3,8 @@
 - 异步引擎 + async_sessionmaker（异步优先，禁止同步阻塞 IO）
 - 连接池大小 = CPU 核数 × 2 + 1（可在配置中覆盖）
 - 提供 FastAPI Depends 会话依赖；事务边界：请求成功提交 / 异常回滚
+
+模块归属：``hunter_common.database`` 包（session/base/enums/repository/models/migrations）。
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ from sqlalchemy.ext.asyncio import (
 from hunter_common.config import HunterBaseConfig
 from hunter_common.logging import get_logger
 
-logger = get_logger("hunter_common.database")
+logger = get_logger("hunter_common.database.session")
 
 
 class DatabaseSessionManager:
@@ -43,6 +45,12 @@ class DatabaseSessionManager:
         if self._engine is None:
             raise RuntimeError("DatabaseSessionManager 未初始化，请先调用 init()")
         return self._engine
+
+    @property
+    def session_factory(self) -> async_sessionmaker[AsyncSession]:
+        if self._session_factory is None:
+            raise RuntimeError("DatabaseSessionManager 未初始化，请先调用 init()")
+        return self._session_factory
 
     def init(self) -> None:
         """创建异步引擎与会话工厂（幂等）。"""
@@ -92,7 +100,7 @@ class DatabaseSessionManager:
             yield session
 
     async def check_connection(self) -> bool:
-        """就绪探针用：SELECT 1 验证数据库连通性。"""
+        """就绪探针用：SELECT 1 验证数据库连通性（失败仅告警，不抛出）。"""
         try:
             async with self.engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))

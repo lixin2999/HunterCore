@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/ota_notify.schema.json",
+  "title": "HunterEdge OTA 升级通知 hunter.{vehicle_id}.ota_notify",
+  "description": "平台→车 OTA 升级通知（按需，acks=all，key=vehicle_id）。生产者：ota-service；消费者：车端。字段与 ota_svc.ota_versions 对齐；车端下载升级包后必须完成 SHA-256 完整性校验 + RSA-2048 签名验签 + version_code 单调性检查，任一失败即拒绝升级并回报 ota_status=FAILED（错误码 6001/6002）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vehicle_id", "timestamp", "task_id", "version_name", "version_code",
+               "package_url", "package_size", "package_md5", "package_sha256", "signature"],
+  "properties": {
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "目标车辆（Kafka 消息 key）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "通知下发时间（Unix epoch 秒）"
+    },
+    "task_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "升级任务 ID（ota_tasks.task_id）；车端状态上报必须回带"
+    },
+    "version_name": {
+      "type": "string",
+      "description": "目标版本展示名（如 V1.2.0）"
+    },
+    "version_code": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "description": "目标版本单调递增编码（防回滚：车端拒绝 <= 当前版本号的包）"
+    },
+    "package_url": {
+      "type": "string",
+      "description": "升级包地址（MinIO hunter-ota-packages；预签名有效期 1 小时，含 Range 分片下载支持）"
+    },
+    "package_size": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "description": "升级包字节数（车端预校验存储空间 ≥ 2GB 门禁）"
+    },
+    "package_md5": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "升级包 MD5（小写十六进制）"
+    },
+    "package_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "升级包 SHA-256（小写十六进制）；校验失败返回 6001"
+    },
+    "signature": {
+      "type": "string",
+      "description": "RSA-2048 数字签名（base64）；验签失败返回 6002"
+    },
+    "changelog": {
+      "type": "object",
+      "description": "变更说明（JSONB；结构与 ota_versions.changelog 一致）"
+    },
+    "preconditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "升级门禁（车端执行前逐项校验，不满足返回 6003）",
+      "properties": {
+        "soc_min": {"type": "integer", "minimum": 0, "maximum": 100, "description": "最低电量 %（默认 50）"},
+        "must_be_parked": {"type": "boolean", "description": "必须静止（P 档）"},
+        "network_stable": {"type": "boolean", "description": "必须网络稳定"},
+        "min_storage_mb": {"type": "integer", "minimum": 0, "description": "最小可用存储 MB（默认 2048）"}
+      }
+    }
+  },
+  "examples": [
+    {
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035200.0,
+      "task_id": "3f2b1a09-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+      "version_name": "V1.2.0",
+      "version_code": 10200,
+      "package_url": "https://minio.hunter-edge.local/hunter-ota-packages/hunter-edge/V1.2.0.tar.gz?X-Amz-Expires=3600",
+      "package_size": 524288000,
+      "package_md5": "d41d8cd98f00b204e9800998ecf8427e",
+      "package_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "MEQCIF9k...RSA2048_BASE64_SIGNATURE...",
+      "changelog": {"features": ["感知模型升级至 v2.1"], "fixes": ["修复远程操控时延抖动"]},
+      "preconditions": {"soc_min": 50, "must_be_parked": true, "network_stable": true, "min_storage_mb": 2048}
+    }
+  ]
+}

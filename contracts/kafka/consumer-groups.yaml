@@ -1,0 +1,113 @@
+# =====================================================================
+# HunterEdge Kafka 消费者组契约
+# 来源：系统上下文基座（Kafka Topic 表）+ 服务职责（模块划分表）
+# 命名规范：<service-name>-<domain>[-<purpose>]，全小写中划线分隔
+#   - 每个 (服务, 数据域) 一个消费组，保证各域 offset 独立、互不阻塞
+#   - 车端按 vehicle_id 哈希分区，同一消费组内单车辆消息严格有序
+# ⚠ 需核对：消费组命名规范与「上层业务 / 告警处理」消费方的落位服务（设计文档 5.3 节未给出）
+# =====================================================================
+schema_version: "1.0.0"
+
+defaults:
+  enable_auto_commit: false        # 手动提交：handler 成功返回后 commit（hunter_common.kafka.consumer.run）
+  auto_offset_reset: earliest
+  max_poll_records: 100
+  dlq_enabled: true                # 失败消息转投 {topic}.dlq（保留原 topic/partition/offset 于消息头）
+  idempotency: required            # 消费幂等：以 (vehicle_id, timestamp/seq) 或业务唯一键去重
+
+groups:
+  - group_id: data-collector-telemetry
+    service: data-collector
+    subscribes: ["hunter.*.telemetry"]
+    subscribe_mode: regex_pattern        # 动态车辆：新车上线无需改配置
+    produces: [telemetry_raw, telemetry_clean]
+    handler: "预处理（字段校验 → 清洗 → 时间对齐）→ 批量写 vehicle_telemetry + 投递 raw/clean"
+    idempotency_key: "(vehicle_id, seq) 与 (vehicle_id, time)"
+    target_latency: "入库延迟 ≤ 1s"
+    notes: "批量入库 ≥ 10000 点/秒；单车限流 100 msg/s"
+
+  - group_id: data-collector-events
+    service: data-collector
+    subscribes: ["hunter.*.event"]
+    subscribe_mode: regex_pattern
+    produces: [event_raw]
+    idempotency_key: "(vehicle_id, event_type, event_time)"
+    notes: "落库 events 表；critical 事件实时推送告警链路"
+
+  - group_id: data-collector-health
+    service: data-collector
+    subscribes: ["hunter.*.health"]
+    subscribe_mode: regex_pattern
+    produces: []
+    idempotency_key: "(vehicle_id, timestamp)"
+    notes: "写 Redis vehicle:status:{vehicle_id} / vehicle:online:set；不在 DB 落明细"
+
+  - group_id: data-collector-command-result
+    service: data-collector
+    subscribes: ["hunter.*.command_result"]
+    subscribe_mode: regex_pattern
+    produces: []
+    idempotency_key: command_id
+    notes: "指令执行结果留痕（供审计与 remote-control 结果回执）"
+
+  - group_id: data-analytics-telemetry
+    service: data-analytics
+    subscribes: [telemetry_raw]
+    produces: [telemetry_clean, alert_event]
+    engine: Flink 1.18 (DataStream)
+    idempotency_key: "(vehicle_id, time)"
+    target_latency: "实时告警触发 ≤ 2s"
+    notes: "实时流处理：指标计算、异常检测（事件阈值于 contracts/database/enums.md）"
+
+  - group_id: data-analytics-telemetry-clean
+    service: data-analytics
+    subscribes: [telemetry_clean]
+    produces: [analytics_result]
+    engine: Flink 1.18 (DataStream)
+    idempotency_key: "(vehicle_id, time)"
+    notes: "清洗后遥测的二级聚合（算法指标 → algorithm_metrics）"
+
+  - group_id: data-analytics-events
+    service: data-analytics
+    subscribes: [event_raw]
+    produces: [analytics_result]
+    engine: "Flink 1.18（实时）/ Spark 3.5（离线）"
+    idempotency_key: "(vehicle_id, event_type, event_time)"
+    notes: "事件统计与 Corner Case 挖掘"
+
+  - group_id: data-analytics-sensor-file
+    service: data-analytics
+    subscribes: [sensor_file]
+    produces: [analytics_result]
+    idempotency_key: object_key
+    notes: "对上传到 MinIO 的传感器文件做离线分析（⚠ 消息结构与流程待 5.3 定稿）"
+
+  - group_id: scene-service-analytics-result
+    service: scene-service
+    subscribes: [analytics_result]
+    produces: []
+    idempotency_key: "(vehicle_id, window_start)"
+    notes: "实车场景自动提取（⚠ 需核对触发来源为 analytics_result 还是 event_raw）"
+
+  - group_id: ota-service-ota-status
+    service: ota-service
+    subscribes: ["hunter.*.ota_status"]
+    subscribe_mode: regex_pattern
+    produces: []
+    idempotency_key: "(task_id, vehicle_id, status)"
+    notes: "推进 ota_records.status/phase/progress；同步 Redis ota:progress:{task_id}；批次成功率 <95% 暂停任务并告警"
+
+  - group_id: remote-control-command-result
+    service: remote-control
+    subscribes: ["hunter.*.command_result"]
+    subscribe_mode: regex_pattern
+    produces: []
+    idempotency_key: command_id
+    notes: "操控指令回执；>500ms 无回执视为链路异常，会话降级/终止"
+
+  - group_id: platform-alert-event
+    service: "告警处理（⚠ 落位服务待定：data-analytics 告警子模块 / api-gateway 推送）"
+    subscribes: [alert_event]
+    produces: []
+    idempotency_key: "(vehicle_id, alert_id)"
+    notes: "告警聚合、WebSocket 推送前端、对接 Alertmanager"

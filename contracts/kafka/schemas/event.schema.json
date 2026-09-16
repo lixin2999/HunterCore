@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/event.schema.json",
+  "title": "HunterEdge 事件消息 hunter.{vehicle_id}.event / event_raw",
+  "description": "车辆事件（事件触发上报）。生产者：车端；消费者：data-collector（落库 data_collector.events）。event_type/event_level 取值与阈值见 contracts/database/enums.md 第 2、3 节，不可更改；类型↔等级映射由 data-collector 消费侧按 EVENT_LEVEL_BY_TYPE 校验（JSON Schema 不做跨字段映射校验）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vehicle_id", "timestamp", "event_type", "event_level"],
+  "properties": {
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "车辆唯一标识（Kafka 消息 key）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "事件发生时间（Unix epoch 秒）→ 落库 events.event_time（禁止用入库时间替代）"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "harsh_acceleration", "harsh_braking", "harsh_turning", "over_speed",
+        "collision_warning", "manual_takeover", "emergency_stop", "battery_low",
+        "battery_critical", "communication_loss", "sensor_fault", "perception_fault",
+        "planning_fault", "control_fault", "ota_start", "ota_success",
+        "ota_failed", "ota_rollback"
+      ],
+      "description": "事件类型（18 种，触发阈值不可更改）"
+    },
+    "event_level": {
+      "type": "string",
+      "enum": ["info", "warning", "critical"],
+      "description": "事件等级；必须等于该 event_type 的契约等级"
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "可读描述（落库 events.description）"
+    },
+    "data": {
+      "type": "object",
+      "description": "事件上下文（阈值、实测值、轨迹片段摘要等；结构随事件类型变化）→ 落库 events.data_json"
+    },
+    "data_file_url": {
+      "type": ["string", "null"],
+      "description": "关联文件对象地址（MinIO bucket/key，如 hunter-rosbag/events/...）→ 落库 events.data_file_url；对外下发必须另签 15 分钟预签名 URL"
+    }
+  },
+  "examples": [
+    {
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035260.5,
+      "event_type": "harsh_braking",
+      "event_level": "warning",
+      "description": "急刹：减速度 3.4 m/s² 超过 3 m/s² 阈值",
+      "data": {"deceleration": 3.4, "threshold": 3.0, "velocity": 1.8},
+      "data_file_url": "hunter-rosbag/events/HUNTER-001/20240819/1724035260.bag"
+    },
+    {
+      "vehicle_id": "HUNTER-002",
+      "timestamp": 1724035900.0,
+      "event_type": "battery_critical",
+      "event_level": "critical",
+      "description": "电量严重不足：SOC 8% 低于 10% 阈值",
+      "data": {"battery_soc": 8, "threshold": 10}
+    }
+  ]
+}

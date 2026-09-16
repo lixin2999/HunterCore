@@ -9,6 +9,9 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- 服务独立 schema（模块解耦：每个微服务独立 schema，禁止跨服务直查）
+-- 与 contracts/database/ddl/00_schemas.sql 保持一致（修改需同步两处）
+CREATE SCHEMA IF NOT EXISTS vehicle_svc;      -- 车辆主数据（vehicles）
+CREATE SCHEMA IF NOT EXISTS user_svc;         -- 用户与 RBAC（users/roles/permissions...）
 CREATE SCHEMA IF NOT EXISTS scene_svc;
 CREATE SCHEMA IF NOT EXISTS data_collector;
 CREATE SCHEMA IF NOT EXISTS data_analytics;

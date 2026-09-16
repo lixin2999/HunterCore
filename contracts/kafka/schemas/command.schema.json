@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/command.schema.json",
+  "title": "HunterEdge 控制指令 hunter.{vehicle_id}.command / hunter.broadcast.command",
+  "description": "平台→车控制指令（按需下发，acks=all）。生产者：api-gateway / ota-service / remote-control；消费者：车端。单车辆消息必须携带 vehicle_id（= 消息 key）；广播消息改用 target_filter（二选一，oneOf 强制）。command_type 取值域待设计文档 5.3 节核对（⚠ 当前不设 enum，禁止前端硬编码分支）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["command_id", "timestamp", "command_type"],
+  "oneOf": [
+    {"required": ["vehicle_id"], "not": {"required": ["target_filter"]}},
+    {"required": ["target_filter"], "not": {"required": ["vehicle_id"]}}
+  ],
+  "properties": {
+    "command_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "指令唯一标识（幂等键）；车端执行结果经 command_result.command_id 关联"
+    },
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "目标车辆（单车辆指令必填）"
+    },
+    "target_filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "广播指令的车辆筛选条件（仅 hunter.broadcast.command 使用）",
+      "properties": {
+        "models": {"type": "array", "items": {"type": "string"}, "description": "适用车型（如 [\"HUNTER_SE\"]）"},
+        "status": {
+          "type": "array",
+          "items": {"type": "string", "enum": ["offline", "online_idle", "auto_driving", "remote_controlled", "upgrading", "charging", "fault", "emergency"]},
+          "description": "按车辆状态筛选"
+        },
+        "vehicle_ids": {"type": "array", "items": {"type": "string"}, "description": "显式车辆列表（与 models/status 取交集）"}
+      }
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "指令下发时间（Unix epoch 秒）"
+    },
+    "command_type": {
+      "type": "string",
+      "description": "指令类型（⚠ 取值域待设计文档 5.3 节核对后补充 enum）"
+    },
+    "params": {
+      "type": "object",
+      "description": "指令参数（随 command_type 变化）"
+    },
+    "operator_id": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "操作者用户 ID（审计用；系统自动触发时为空）"
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "description": "指令执行超时（ms）；超时车端须保持安全状态并回报失败"
+    }
+  },
+  "examples": [
+    {
+      "command_id": "6f1a1f1c-0b1e-4b7a-8f1a-1f2c3d4e5f60",
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035200.0,
+      "command_type": "enable_auto_driving",
+      "params": {"max_velocity": 1.5},
+      "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
+      "timeout_ms": 5000
+    },
+    {
+      "command_id": "7a2b3c4d-1e2f-4a5b-9c6d-7e8f9a0b1c2d",
+      "timestamp": 1724035205.0,
+      "command_type": "enter_charging_mode",
+      "target_filter": {"models": ["HUNTER_SE"], "status": ["online_idle"]},
+      "params": {}
+    }
+  ]
+}

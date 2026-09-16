@@ -18,6 +18,8 @@ data:
   01-extensions.sql: |
     CREATE EXTENSION IF NOT EXISTS timescaledb;
 
+    CREATE SCHEMA IF NOT EXISTS vehicle_svc;
+    CREATE SCHEMA IF NOT EXISTS user_svc;
     CREATE SCHEMA IF NOT EXISTS scene_svc;
     CREATE SCHEMA IF NOT EXISTS data_collector;
     CREATE SCHEMA IF NOT EXISTS data_analytics;

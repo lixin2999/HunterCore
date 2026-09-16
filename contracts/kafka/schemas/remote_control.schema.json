@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/remote_control.schema.json",
+  "title": "HunterEdge 远程操控指令 hunter.{vehicle_id}.remote_control",
+  "description": "平台→车远程操控指令（20Hz，即 50ms 间隔，acks=all，key=vehicle_id）。生产者：remote-control；消费者：车端。安全约束：车端 >500ms 未收到控制指令必须自动减速停车；远程操控模式最高速度默认 2.0 m/s（可配置）；同一车辆同一时刻仅允许一名操作员（Redis rc:session:{vehicle_id} 互斥）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vehicle_id", "timestamp", "seq", "control"],
+  "properties": {
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "受控车辆（Kafka 消息 key）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "指令生成时间（Unix epoch 秒，含毫秒）；车端据此计算指令时延与超时"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "操控指令单调递增序号（丢包/乱序检测，保证 20Hz 时序可校验）"
+    },
+    "session_id": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "操控会话 ID（对应 Redis rc:session:{vehicle_id} 与 MinIO hunter-video 录像片段）"
+    },
+    "operator_id": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "操作员用户 ID（审计与录像关联）"
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_velocity", "target_steer"],
+      "properties": {
+        "target_velocity": {
+          "type": "number",
+          "minimum": -2.0,
+          "maximum": 2.0,
+          "description": "目标车速 m/s（上限默认 2.0，可配置；超限由服务端截断，不依赖车端裁剪）"
+        },
+        "target_steer": {
+          "type": "number",
+          "description": "目标前轮转角 rad（符号：正为左转，量程由底盘标定，服务端需做限幅）"
+        }
+      }
+    },
+    "heartbeat": {
+      "type": "boolean",
+      "default": false,
+      "description": "心跳包标记：控制量无变化时仍以 20Hz 发送，用于保持操控链路与超时保护计时"
+    }
+  },
+  "examples": [
+    {
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035200.123,
+      "seq": 8801,
+      "session_id": "9c8b7a65-4d3e-2f10-9a8b-7c6d5e4f3a2b",
+      "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
+      "control": {"target_velocity": 1.2, "target_steer": 0.05},
+      "heartbeat": false
+    },
+    {
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035200.173,
+      "seq": 8802,
+      "session_id": "9c8b7a65-4d3e-2f10-9a8b-7c6d5e4f3a2b",
+      "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
+      "control": {"target_velocity": 1.2, "target_steer": 0.05},
+      "heartbeat": true
+    }
+  ]
+}

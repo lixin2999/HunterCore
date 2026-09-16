@@ -1,0 +1,147 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/telemetry.schema.json",
+  "title": "HunterEdge 遥测消息 hunter.{vehicle_id}.telemetry",
+  "description": "车辆遥测（10-50Hz）。生产者：车端（HUNTER SE / AGX Orin）；消费者：data-collector → telemetry_raw / data_collector.vehicle_telemetry。字段名/类型/嵌套结构不可更改（来源：设计文档 5.3 节）。additionalProperties=false：新增字段必须先更新契约。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vehicle_id", "timestamp", "seq", "chassis", "localization", "perception", "planning", "control", "system"],
+  "properties": {
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "车辆唯一标识，必须等于 Kafka 消息 key（保证单车辆有序）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "车端采集时间，Unix epoch 秒（含毫秒小数）；禁止用平台入库时间替代"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "车端消息单调递增序号（幂等去重与丢包检测）"
+    },
+    "chassis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["velocity", "steering_angle", "battery_voltage", "battery_soc", "battery_current", "battery_temp", "control_mode", "vehicle_state", "fault_code", "motor_rpm", "motor_current", "motor_temp"],
+      "properties": {
+        "velocity": {"type": "number", "description": "车速 m/s（前进为正）"},
+        "steering_angle": {"type": "number", "description": "前轮转角 rad"},
+        "battery_voltage": {"type": "number", "description": "电池电压 V"},
+        "battery_soc": {"type": "integer", "minimum": 0, "maximum": 100, "description": "剩余电量 %（<20% battery_low；<10% battery_critical）"},
+        "battery_current": {"type": "number", "description": "电池电流 A（放电为负）"},
+        "battery_temp": {"type": "number", "description": "电池温度 ℃"},
+        "control_mode": {"type": "string", "description": "底盘控制模式（遥测示例值 CAN；⚠ 完整取值域待设计文档核对）"},
+        "vehicle_state": {"type": "string", "description": "底盘状态字（遥测示例值 NORMAL；与车辆 8 态业务状态不同域）"},
+        "fault_code": {"type": "integer", "description": "底盘故障码，0 表示无故障"},
+        "motor_rpm": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "description": "各驱动电机转速 rpm"},
+        "motor_current": {"type": "array", "items": {"type": "number"}, "minItems": 1, "description": "各驱动电机电流 A"},
+        "motor_temp": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "description": "各驱动电机温度 ℃"}
+      }
+    },
+    "localization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "z", "roll", "pitch", "heading", "linear_velocity", "angular_velocity", "position_std", "heading_std"],
+      "properties": {
+        "x": {"type": "number", "description": "地图坐标系 X / m"},
+        "y": {"type": "number", "description": "地图坐标系 Y / m"},
+        "z": {"type": "number", "description": "地图坐标系 Z / m"},
+        "roll": {"type": "number", "description": "横滚角 rad"},
+        "pitch": {"type": "number", "description": "俯仰角 rad"},
+        "heading": {"type": "number", "description": "航向角 rad（[-π, π]）"},
+        "linear_velocity": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "[vx, vy, vz] m/s"},
+        "angular_velocity": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "[ωx, ωy, ωz] rad/s"},
+        "position_std": {"type": "number", "minimum": 0, "description": "定位位置标准差 m（定位健康度）"},
+        "heading_std": {"type": "number", "minimum": 0, "description": "航向标准差 rad"}
+      }
+    },
+    "perception": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["detected_objects", "fps", "latency_ms", "object_types"],
+      "properties": {
+        "detected_objects": {"type": "integer", "minimum": 0, "description": "当前帧目标总数"},
+        "fps": {"type": "number", "minimum": 0, "description": "感知流水线帧率"},
+        "latency_ms": {"type": "number", "minimum": 0, "description": "感知端到端延迟 ms"},
+        "object_types": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0},
+          "description": "按类别统计（键为类别名，如 vehicle/pedestrian/other）"
+        }
+      }
+    },
+    "planning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trajectory_length", "trajectory_points", "planning_latency_ms", "current_behavior"],
+      "properties": {
+        "trajectory_length": {"type": "number", "minimum": 0, "description": "规划轨迹长度 m"},
+        "trajectory_points": {"type": "integer", "minimum": 0, "description": "轨迹点数量"},
+        "planning_latency_ms": {"type": "number", "minimum": 0, "description": "规划计算延迟 ms"},
+        "current_behavior": {"type": "string", "description": "当前行为（如 cruise；⚠ 完整取值域待核对）"}
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_velocity", "target_steer", "velocity_error", "steer_error", "control_latency_ms"],
+      "properties": {
+        "target_velocity": {"type": "number", "description": "控制目标车速 m/s"},
+        "target_steer": {"type": "number", "description": "控制目标转角 rad"},
+        "velocity_error": {"type": "number", "description": "速度跟踪误差 m/s"},
+        "steer_error": {"type": "number", "description": "转角跟踪误差 rad"},
+        "control_latency_ms": {"type": "number", "minimum": 0, "description": "控制计算延迟 ms"}
+      }
+    },
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_usage", "gpu_usage", "memory_usage_mb", "gpu_temp", "cpu_temp", "network_rssi", "network_latency_ms"],
+      "properties": {
+        "cpu_usage": {"type": "number", "minimum": 0, "maximum": 100, "description": "CPU 使用率 %"},
+        "gpu_usage": {"type": "number", "minimum": 0, "maximum": 100, "description": "GPU 使用率 %"},
+        "memory_usage_mb": {"type": "integer", "minimum": 0, "description": "内存占用 MB"},
+        "gpu_temp": {"type": "number", "description": "GPU 温度 ℃"},
+        "cpu_temp": {"type": "number", "description": "CPU 温度 ℃"},
+        "network_rssi": {"type": "integer", "maximum": 0, "description": "无线信号强度 dBm（负值，如 -65）"},
+        "network_latency_ms": {"type": "number", "minimum": 0, "description": "车-云网络往返延迟 ms"}
+      }
+    }
+  },
+  "examples": [
+    {
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035200.123,
+      "seq": 12580,
+      "chassis": {
+        "velocity": 1.52, "steering_angle": 0.12,
+        "battery_voltage": 25.6, "battery_soc": 78, "battery_current": -15.2, "battery_temp": 28.5,
+        "control_mode": "CAN", "vehicle_state": "NORMAL", "fault_code": 0,
+        "motor_rpm": [1500, 1520, 0], "motor_current": [8.5, 8.7, 2.1], "motor_temp": [45, 46, 42]
+      },
+      "localization": {
+        "x": 125.34, "y": 67.89, "z": 0.32, "roll": 0.01, "pitch": 0.02, "heading": 1.234,
+        "linear_velocity": [1.52, 0.01, 0.0], "angular_velocity": [0.0, 0.0, 0.05],
+        "position_std": 0.15, "heading_std": 0.02
+      },
+      "perception": {
+        "detected_objects": 12, "fps": 10.2, "latency_ms": 85,
+        "object_types": {"vehicle": 5, "pedestrian": 3, "other": 4}
+      },
+      "planning": {
+        "trajectory_length": 5.0, "trajectory_points": 50,
+        "planning_latency_ms": 45, "current_behavior": "cruise"
+      },
+      "control": {
+        "target_velocity": 1.6, "target_steer": 0.10,
+        "velocity_error": 0.08, "steer_error": 0.02, "control_latency_ms": 5
+      },
+      "system": {
+        "cpu_usage": 45.2, "gpu_usage": 62.8, "memory_usage_mb": 18500,
+        "gpu_temp": 68.5, "cpu_temp": 65.2, "network_rssi": -65, "network_latency_ms": 45
+      }
+    }
+  ]
+}

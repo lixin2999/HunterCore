@@ -153,7 +153,7 @@ ruff check common services                        # Lint
 ## 本地启动顺序（依赖链）
 
 1. `docker compose up -d`：TimescaleDB → Kafka（kafka-init 按契约创建平台内部 Topic）→ Redis → MinIO（minio-init 创建 7 个 Bucket + 生命周期）
-2. 安装共享库 `hunter_common`（editable）
+2. 安装共享库 `hunter_common`（editable），并执行数据库迁移：`alembic -c common/python/alembic.ini upgrade head`（建 schema/表/hypertable）
 3. 启动业务微服务（依赖基础设施）：scene-service → data-collector → data-analytics → ota-service → remote-control
 4. 启动 api-gateway（依赖上述服务就绪后统一对外路由，8080）
 5. 前端 dev server（Vite，5173，后续层级初始化）
@@ -188,6 +188,36 @@ kubectl apply -f infra/monitoring/exporters/exporters.yaml
 - **告警**：5 组规则（服务健康 / API 性能 / 数据管道 / 中间件 / 业务约束），阈值需与设计文档 15.4.2 节核对
 - **看板**：`hunter-fleet-overview`、`hunter-kafka`、`hunter-api-performance`（Git 供给，UI 只读）
 
+## 数据层与契约（L2）
+
+数据层契约（单一事实来源）已落地，后续服务开发必须先扩展契约再写实现：
+
+```bash
+# 1) 建表：扩展 + 8 个 schema + 13 张表 + hypertable（1 day 分块 / 90 天保留）
+alembic -c common/python/alembic.ini upgrade head
+
+# 2) 离线生成 SQL（无需数据库，CI/DBA 评审）
+alembic -c common/python/alembic.ini upgrade head --sql > /tmp/hunter_ddl.sql
+
+# 3) 契约一致性校验：DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema（24 项，无需数据库）
+python scripts/verify_data_layer.py
+```
+
+| 契约 | 位置 | 内容 |
+|------|------|------|
+| 数据库 DDL | `contracts/database/ddl/*.sql` | `00_schemas` 扩展/schema/公共函数；`01_core` 车辆 + RBAC 五表；`02_scene`；`03_ota`；`04_events`；`05_timeseries`（hypertable） |
+| ER / 受控词表 | `contracts/database/er.md`、`enums.md` | 关系与跨 schema 只读例外；车辆 8 态 / 事件 18 种类型 3 级等级 / OTA 9 态状态机 |
+| Kafka Topic | `contracts/kafka/topics.yaml`、`consumer-groups.yaml` | 车端 9 个 + 平台内部 6 个 Topic（分区/副本/acks/保留/key）；12 个消费者组（手动提交 + DLQ + 幂等键） |
+| 消息 Schema | `contracts/kafka/schemas/*.schema.json` | 8 个 draft-07 JSON Schema（telemetry/event/health/command/command_result/ota_notify/ota_status/remote_control），自带设计文档示例 |
+
+要点：
+
+- **ORM 与 DDL 逐列一致**：列名、类型（TEXT/UUID/JSONB/TEXT[]/TIMESTAMPTZ/CHAR(n)…）、可空性、主键三方对齐，偏差会让校验脚本失败
+- **受控词表统一**：`hunter_common.database.enums` 的 `StrEnum` 是唯一来源，DB 侧用 `TEXT + CHECK`（便于扩展），`StrEnumType` 拒绝非法取值
+- **通用 Repository**：`BaseRepository`（CRUD + 分页 + 软删除 + `ON CONFLICT DO NOTHING` 批量写入），默认过滤软删除记录，非法字段抛 2001
+- **写入性能路径**：时序/事件走 `bulk_create*`（executemany 分片），支撑遥测入库延迟 ≤ 1s、时序写入 ≥ 10000 点/秒
+- **⚠ 待核对项**（设计文档 15.2/9/5.3 到位后回填）：`vehicle_svc`/`user_svc` schema 归属、`scenes.version` 类型、`scenes.scene_type`、`ota_versions.release_type/status`、`sensor_file`/`analytics_result`/`alert_event` 消息结构（当前 `schema: null`）
+
 ## 验证命令清单
 
 | 验证点 | 命令 |
@@ -198,6 +228,9 @@ kubectl apply -f infra/monitoring/exporters/exporters.yaml
 | MinIO Bucket | 浏览器打开 `http://localhost:9001`（7 个 Bucket：hunter-raw-data / rosbag / video / ota-packages / reports / logs / scene-assets） |
 | Redis | `docker exec hunter-redis redis-cli ping` |
 | 共享库测试 | `pytest common/python/tests -q` |
+| 数据层契约校验 | `python scripts/verify_data_layer.py`（DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema，24 项） |
+| 数据库迁移 | `alembic -c common/python/alembic.ini current` / `... upgrade head` / `... upgrade head --sql`（离线预览） |
+| 表结构核对 | `docker exec hunter-postgres psql -U hunter -d hunter_edge -c "\\dt scene_svc.*"` |
 | 服务健康探针 | `curl http://localhost:<port>/healthz` |
 | 服务单元测试 | `cd services/<service> && pytest -q` |
 | 指标端点 | `curl http://localhost:<port>/metrics`（Prometheus 文本格式，含 `hunter_` 前缀指标） |
@@ -218,6 +251,6 @@ kubectl apply -f infra/monitoring/exporters/exporters.yaml
 ## 文档
 
 - `docs/`：设计文档索引与开发文档
-- `contracts/`：接口契约（当前为占位，随各层级开发逐步填充）
+- `contracts/`：接口契约（数据库 DDL/ER/受控词表、Kafka Topic 清单/消费者组/消息 JSON Schema 已完成；OpenAPI 随各服务开发填充）
 - `release.md`：版本变更记录
 

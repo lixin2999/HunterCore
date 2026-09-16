@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/command_result.schema.json",
+  "title": "HunterEdge 指令执行结果 hunter.{vehicle_id}.command_result",
+  "description": "车端→平台指令执行结果（按需，acks=all）。消费者：data-collector（留痕/审计）、remote-control（操控指令回执；>500ms 无回执视为链路异常）。command_id 必须与请求一致，保证端到端可追溯与幂等。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["command_id", "vehicle_id", "timestamp", "success"],
+  "properties": {
+    "command_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "对应指令的 command_id（幂等键）"
+    },
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "执行车辆（Kafka 消息 key）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "执行完成时间（Unix epoch 秒）"
+    },
+    "success": {
+      "type": "boolean",
+      "description": "是否执行成功"
+    },
+    "result_code": {
+      "type": ["string", "null"],
+      "description": "结果码：0/SUCCESS 或错误码（平台错误码表 / 车端自定义码；禁止在日志中输出敏感上下文）"
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "结果描述（含失败原因）"
+    },
+    "data": {
+      "type": "object",
+      "description": "执行附加数据（如生效参数、当前状态快照）"
+    }
+  },
+  "examples": [
+    {
+      "command_id": "6f1a1f1c-0b1e-4b7a-8f1a-1f2c3d4e5f60",
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035200.45,
+      "success": true,
+      "result_code": "0",
+      "message": "auto driving enabled",
+      "data": {"control_mode": "AUTO", "max_velocity": 1.5}
+    },
+    {
+      "command_id": "7a2b3c4d-1e2f-4a5b-9c6d-7e8f9a0b1c2d",
+      "vehicle_id": "HUNTER-002",
+      "timestamp": 1724035210.1,
+      "success": false,
+      "result_code": "4002",
+      "message": "vehicle busy: upgrading",
+      "data": {}
+    }
+  ]
+}
