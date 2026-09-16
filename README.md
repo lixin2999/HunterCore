@@ -208,7 +208,7 @@ python scripts/verify_data_layer.py
 | 数据库 DDL | `contracts/database/ddl/*.sql` | `00_schemas` 扩展/schema/公共函数；`01_core` 车辆 + RBAC 五表；`02_scene`；`03_ota`；`04_events`；`05_timeseries`（hypertable） |
 | ER / 受控词表 | `contracts/database/er.md`、`enums.md` | 关系与跨 schema 只读例外；车辆 8 态 / 事件 18 种类型 3 级等级 / OTA 9 态状态机 |
 | Kafka Topic | `contracts/kafka/topics.yaml`、`consumer-groups.yaml` | 车端 9 个 + 平台内部 6 个 Topic（分区/副本/acks/保留/key）；12 个消费者组（手动提交 + DLQ + 幂等键） |
-| 消息 Schema | `contracts/kafka/schemas/*.schema.json` | 10 个 draft-07 JSON Schema（telemetry/event/health/command/command_result/ota_notify/ota_status/remote_control/analytics_result/sensor_file），自带设计文档示例 |
+| 消息 Schema | `contracts/kafka/schemas/*.schema.json` | 11 个 draft-07 JSON Schema（telemetry/event/health/command/command_result/ota_notify/ota_status/remote_control/analytics_result/sensor_file/alert_event），自带设计文档示例 |
 
 要点：
 
@@ -216,7 +216,7 @@ python scripts/verify_data_layer.py
 - **受控词表统一**：`hunter_common.database.enums` 的 `StrEnum` 是唯一来源，DB 侧用 `TEXT + CHECK`（便于扩展），`StrEnumType` 拒绝非法取值
 - **通用 Repository**：`BaseRepository`（CRUD + 分页 + 软删除 + `ON CONFLICT DO NOTHING` 批量写入），默认过滤软删除记录，非法字段抛 2001
 - **写入性能路径**：时序/事件走 `bulk_create*`（executemany 分片），支撑遥测入库延迟 ≤ 1s、时序写入 ≥ 10000 点/秒
-- **⚠ 待核对项**（设计文档 15.2/9/5.3 到位后回填）：`vehicle_svc`/`user_svc` schema 归属、`scenes.version` 类型、`scenes.scene_type`、`ota_versions.release_type/status`、`alert_event` 消息结构（当前 `schema: null`）
+- **⚠ 待核对项**（设计文档 15.2/9/5.3 到位后回填）：`vehicle_svc`/`user_svc` schema 归属、`scenes.version` 类型、`scenes.scene_type`、`ota_versions.release_type/status`、`data_analytics` 报告/评估结果元信息缺表（落 MinIO `hunter-reports`）
 
 ## 接口契约（OpenAPI）
 
@@ -227,7 +227,8 @@ REST 接口契约集中在 `contracts/openapi/`，遵循「先契约、后实现
 | `api-gateway.yaml` | 统一认证（登录 / 刷新 / 登录态查询 / 注销）+ 运维探针（`/healthz`、`/readyz`、`/metrics`）+ 路由表 / 五级限流 / WebSocket / 审计日志 / 错误码映射扩展字段 | ✅ |
 | `scene-service.yaml` | 场景库 CRUD（10 端点，12.2 节）+ 4.2.1 分类体系 / 4.2.2 配置结构 / 4.3 导出 / 4.4 下发 / 4.5 实车提取扩展字段 | ✅ |
 | `data-collector.yaml` | 数据采集（7 端点：遥测查询 / 事件查询与确认 / 文件清单与预签名上传）+ 5.3.3 遥测结构 / 5.4 预处理 / 5.5 上传流程扩展字段 | ✅ |
-| `data-analytics.yaml` / `ota-service.yaml` / `remote-control.yaml` | 各业务服务资源端点 | 待开发 |
+| `data-analytics.yaml` | 数据分析（8 端点：报告列表/详情/生成、看板、感知与控制评估、场景覆盖率、Corner Case）+ 6.2 实时作业 / 6.3 离线作业 / 6.4 挖掘 / 6.5 报告扩展字段 | ✅ |
+| `ota-service.yaml` / `remote-control.yaml` | 各业务服务资源端点 | 待开发 |
 
 ```bash
 # 契约校验（29 项，无需运行服务）
@@ -236,6 +237,8 @@ pytest services/api-gateway/app/tests/test_openapi_contract.py -q
 cd services/scene-service && pytest app/tests/test_scene_contract.py -q
 # 数据采集契约校验（30 项，无需运行服务）
 cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q
+# 数据分析契约校验（32 项，无需运行服务）
+cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q
 ```
 
 要点：
@@ -255,7 +258,14 @@ cd services/data-collector && pytest app/tests/test_data_collector_contract.py -
   Kafka 消费 4 个车端 Topic（`data-collector-*` 消费组）、生产 4 个内部 Topic（含本次补全的 `sensor_file.schema.json`）
 - **⚠ 待确认**（契约内标 `pending_confirmation`）：认证端点路径与载荷、`/api/v1/vehicle|user` 归属服务（模块表仅 6 个微服务）、
   MFA / 限流错误码复用、服务发现机制与配置键名、熔断阈值；场景服务侧见其契约 `x-hunter-pending-confirmation`（12 项）；
-  数据采集侧见其契约 `x-hunter-pending-confirmation`（12 项：端点清单来源 / 文件元信息缺表 / sensor_file 字段 / Carla Topic 归属等）
+  数据采集侧见其契约 `x-hunter-pending-confirmation`（12 项：端点清单来源 / 文件元信息缺表 / sensor_file 字段 / Carla Topic 归属等）；
+  数据分析侧见其契约 `x-hunter-pending-confirmation`（12 项：报告元信息缺表 / 报告异步语义 / TTC 等级冲突 /
+  alert_event 消费方落位 / 消费组契约修正等）
+- **数据分析服务**：`data-analytics.yaml` 的 8 个业务端点与设计文档 12.4 节逐条对齐（不可增删）；
+  定位为「读模型 + 编排」——实时由 5 个 Flink 作业（6.2 节）、离线由 7 个 Spark 作业（6.3/6.4/6.5 节）承担，
+  REST 只读预计算结果（P95 ≤ 200ms），报告生成为异步（202 + 轮询）；14 项实时阈值（3.0 m/s² / 0.5s / 0.8 rad/s /
+  1.1 倍 / SOC 20%+10% / TTC 1.5s / 断联 10s 等）全部环境变量化并在 K8s ConfigMap 注入，与受控词表 `EVENT_LEVEL_BY_TYPE`
+  机器可检一致；`alert_event.schema.json` 补全后 `topics.yaml` 已无 `schema: null`（Kafka 契约 11 个 Schema 全部落地）
 
 ## 验证命令清单
 
@@ -271,6 +281,7 @@ cd services/data-collector && pytest app/tests/test_data_collector_contract.py -
 | 接口契约校验 | `pytest services/api-gateway/app/tests/test_openapi_contract.py -q`（OpenAPI ↔ 实现 ↔ K8s 清单，29 项） |
 | 场景契约校验 | `cd services/scene-service && pytest app/tests/test_scene_contract.py -q`（契约 ↔ 设计文档 4 章/12.2 节 ↔ DDL ↔ Kafka ↔ K8s，29 项） |
 | 数据采集契约校验 | `cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q`（契约 ↔ 设计文档 5 章 ↔ DDL ↔ Kafka ↔ K8s，30 项） |
+| 数据分析契约校验 | `cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q`（契约 ↔ 设计文档 6 章/12.4 节 ↔ DDL ↔ Kafka ↔ K8s，32 项） |
 | 数据库迁移 | `alembic -c common/python/alembic.ini current` / `... upgrade head` / `... upgrade head --sql`（离线预览） |
 | 表结构核对 | `docker exec hunter-postgres psql -U hunter -d hunter_edge -c "\\dt scene_svc.*"` |
 | 服务健康探针 | `curl http://localhost:<port>/healthz` |
@@ -293,6 +304,6 @@ cd services/data-collector && pytest app/tests/test_data_collector_contract.py -
 ## 文档
 
 - `docs/`：设计文档索引与开发文档
-- `contracts/`：接口契约（数据库 DDL/ER/受控词表、Kafka Topic 清单/消费者组/消息 JSON Schema、api-gateway OpenAPI 已完成；其余服务 OpenAPI 随开发填充）
+- `contracts/`：接口契约（数据库 DDL/ER/受控词表、Kafka Topic 清单/消费者组/11 个消息 JSON Schema 已完成；OpenAPI 已完成 api-gateway / scene-service / data-collector / data-analytics，ota-service / remote-control 随开发填充）
 - `release.md`：版本变更记录
 

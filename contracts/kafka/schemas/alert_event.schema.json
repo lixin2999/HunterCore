@@ -1,0 +1,207 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-edge.local/contracts/kafka/schemas/alert_event.schema.json",
+  "title": "alert_event",
+  "description": "平台内部 Topic alert_event 消息（生产者 data-analytics 的 Flink 1.18 实时作业，设计文档 6.2 节）。消费方：告警处理（⚠ 落位服务待定，见 contracts/kafka/consumer-groups.yaml 的 platform-alert-event）。语义：平台侧基于 telemetry_clean / telemetry_raw 重算触发的告警（与车端上报的 hunter.{vehicle_id}.event 相互独立，禁止混用）；实时告警触发延迟 ≤ 2s（性能指标）。level 必须等于受控词表 EVENT_LEVEL_BY_TYPE[alert_type]（contracts/database/enums.md 第 3 节，不可放宽）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "vehicle_id",
+    "alert_id",
+    "alert_type",
+    "level",
+    "source_job",
+    "event_time",
+    "timestamp",
+    "rule"
+  ],
+  "properties": {
+    "vehicle_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "车辆 ID；同时是 Kafka 消息 key（保证单车辆有序）"
+    },
+    "alert_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "告警唯一 ID（UUID，由产生告警的 Flink 作业生成；消费方幂等键）"
+    },
+    "alert_type": {
+      "enum": [
+        "harsh_acceleration",
+        "harsh_braking",
+        "harsh_turning",
+        "over_speed",
+        "collision_warning",
+        "manual_takeover",
+        "emergency_stop",
+        "battery_low",
+        "battery_critical",
+        "communication_loss",
+        "sensor_fault",
+        "perception_fault",
+        "planning_fault",
+        "control_fault",
+        "ota_start",
+        "ota_success",
+        "ota_failed",
+        "ota_rollback"
+      ],
+      "description": "告警类型（受控词表：设计文档「事件类型定义」18 种，见 contracts/database/enums.md 第 3 节；禁止新增取值）"
+    },
+    "level": {
+      "enum": ["info", "warning", "critical"],
+      "description": "告警等级；必须等于 EVENT_LEVEL_BY_TYPE[alert_type]（受控映射，代码不得放宽：harsh_acceleration/harsh_braking/harsh_turning/battery_low/ota_rollback=warning，over_speed/collision_warning/emergency_stop/battery_critical/communication_loss/*_fault/ota_failed=critical，manual_takeover/ota_start/ota_success=info）"
+    },
+    "source_job": {
+      "enum": [
+        "vehicle_state_monitor",
+        "driving_anomaly_detection",
+        "algorithm_performance_monitor",
+        "collision_risk_assessment",
+        "data_quality_monitor"
+      ],
+      "description": "产生该告警的 Flink 实时作业（设计文档 6.2 节 5 个作业，与 contracts/openapi/data-analytics.yaml 的 x-hunter-realtime-jobs 一致）"
+    },
+    "event_time": {
+      "type": "number",
+      "description": "触发告警的异常发生时间（Unix epoch 秒，含毫秒小数；取车端遥测时间戳，禁止用处理时间替代）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "告警生成时间（Unix epoch 秒）；timestamp - event_time ≤ ALERT_TRIGGER_MAX_LATENCY_SECONDS(2s)"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "触发样本的遥测 seq（幂等去重辅助键，与 telemetry.seq 同源）"
+    },
+    "window_start": {
+      "type": "number",
+      "description": "检测窗口起点（Unix epoch 秒；持续型规则如 harsh_acceleration 持续 > 0.5s 时的窗口）"
+    },
+    "window_end": {
+      "type": "number",
+      "description": "检测窗口终点（Unix epoch 秒）"
+    },
+    "rule": {
+      "type": "object",
+      "description": "命中规则与阈值（阈值来源：设计文档 6.2.2 / 6.2.3 节，不可更改；阈值本体由环境变量注入，见 contracts/openapi/data-analytics.yaml 的 x-hunter-realtime-jobs.thresholds）",
+      "additionalProperties": false,
+      "required": ["name", "metric", "comparator", "threshold"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "规则名（如 harsh_acceleration_gt_3ms2 / ttc_lt_1_5s / communication_loss_gt_10s）"
+        },
+        "metric": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "被判定指标（遥测字段路径，如 chassis.velocity / localization.angular_velocity / chassis.battery_soc）"
+        },
+        "comparator": {
+          "enum": ["gt", "gte", "lt", "lte"],
+          "description": "比较符（gt 大于 / gte 大于等于 / lt 小于 / lte 小于等于）"
+        },
+        "threshold": {
+          "type": "number",
+          "description": "阈值（受控值：3.0 m/s²、0.5 s、0.8 rad/s、超速 1.1 倍、SOC 20%/10%、TTC 1.5 s、中断 10 s 等）"
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "description": "持续时长门槛（如急加速/急减速需持续 > 0.5s；瞬时型规则省略）"
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": { "type": "number" },
+      "description": "实测值集合（如 {acceleration: 3.42, ttc: 1.18, silence_seconds: 12.5}）；键为指标名，值为数值"
+    },
+    "location": {
+      "type": "object",
+      "description": "触发位置（定位段快照，用于告警地图定位）",
+      "additionalProperties": false,
+      "required": ["x", "y"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "z": { "type": "number" },
+        "heading": { "type": "number", "description": "航向角（rad）" }
+      }
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "告警摘要（面向运维，可含实测值与阈值，禁止包含敏感信息）"
+    }
+  },
+  "examples": [
+    {
+      "vehicle_id": "HUNTER-001",
+      "alert_id": "5e2b9c74-1a3f-4d68-9c07-8b6f4a2d1e30",
+      "alert_type": "over_speed",
+      "level": "critical",
+      "source_job": "driving_anomaly_detection",
+      "event_time": 1724035200.123,
+      "timestamp": 1724035201.456,
+      "seq": 12580,
+      "window_start": 1724035195.0,
+      "window_end": 1724035200.123,
+      "rule": {
+        "name": "over_speed_gt_limit_1_1x",
+        "metric": "chassis.velocity",
+        "comparator": "gt",
+        "threshold": 5.5
+      },
+      "metrics": { "velocity": 6.12, "speed_limit": 5.0 },
+      "location": { "x": 125.34, "y": 67.89, "z": 0.32, "heading": 1.234 },
+      "description": "超速 22.4%（实测 6.12 m/s、限速 5.0 m/s，阈值 1.1 倍）"
+    },
+    {
+      "vehicle_id": "HUNTER-002",
+      "alert_id": "9c1d7f38-4b62-4e5a-8f31-2d5a6c9b0e47",
+      "alert_type": "communication_loss",
+      "level": "critical",
+      "source_job": "vehicle_state_monitor",
+      "event_time": 1724035360.0,
+      "timestamp": 1724035361.2,
+      "rule": {
+        "name": "communication_loss_gt_10s",
+        "metric": "telemetry.heartbeat_interval",
+        "comparator": "gt",
+        "threshold": 10.0
+      },
+      "metrics": { "silence_seconds": 12.5, "last_velocity": 1.52 },
+      "description": "遥测中断 12.5s（> 10s），判定车辆失联"
+    },
+    {
+      "vehicle_id": "HUNTER-003",
+      "alert_id": "1b8e4a60-7c25-4f93-a1d8-6e2f0b7c3a55",
+      "alert_type": "harsh_braking",
+      "level": "warning",
+      "source_job": "driving_anomaly_detection",
+      "event_time": 1724035420.5,
+      "timestamp": 1724035421.1,
+      "seq": 13104,
+      "window_start": 1724035419.9,
+      "window_end": 1724035420.5,
+      "rule": {
+        "name": "harsh_braking_lt_-3ms2",
+        "metric": "chassis.acceleration",
+        "comparator": "lt",
+        "threshold": -3.0,
+        "duration_seconds": 0.5
+      },
+      "metrics": { "min_acceleration": -3.42, "velocity": 0.31 },
+      "location": { "x": 126.12, "y": 68.41, "z": 0.32, "heading": 1.236 },
+      "description": "急减速 -3.42 m/s² 持续 0.6s（阈值 -3.0 m/s² 且持续 > 0.5s）"
+    }
+  ]
+}

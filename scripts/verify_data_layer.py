@@ -100,6 +100,7 @@ EXPECTED_SCHEMAS_FILES = (
     "remote_control.schema.json",
     "analytics_result.schema.json",
     "sensor_file.schema.json",
+    "alert_event.schema.json",
 )
 
 CREATE_TABLE_RE = re.compile(
@@ -530,9 +531,10 @@ def check_kafka_topics() -> dict[str, Any]:
     if topics.get("consumer_defaults", {}).get("enable_auto_commit") is not False:
         fail("消费者必须手动提交 offset（enable_auto_commit=false）")
 
-    # Schema 引用：已定义的必须存在；未定义者仅允许 alert_event
-    # （analytics_result 见 scene-service 契约补全；sensor_file 由 data-collector 契约 5.5 节补全）
-    tbd_allowed = {"alert_event"}
+    # Schema 引用：全部平台内部/车端 Topic 必须已定义 Schema（tbd 集合为空）
+    # （analytics_result 见 scene-service 契约补全；sensor_file 由 data-collector 契约 5.5 节补全；
+    #   alert_event 由 data-analytics 契约 6.2 节补全）
+    tbd_allowed: set[str] = set()
     tbd_actual: set[str] = set()
     for group in ("vehicle_topics", "platform_topics"):
         for entry in topics.get(group, []):
@@ -593,6 +595,7 @@ def check_json_schemas() -> None:
         "command.schema.json",
         "analytics_result.schema.json",
         "sensor_file.schema.json",
+        "alert_event.schema.json",
     }
     before = len(failures)
     for name in EXPECTED_SCHEMAS_FILES:

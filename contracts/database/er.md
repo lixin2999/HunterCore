@@ -92,3 +92,4 @@ ota_versions ──< ota_tasks
 | `ota_records.phase` | 与 `status` 同域（OTA 状态机 9 态） | 设计文档仅给出 `phase`，未给取值域 |
 | `ota_versions.create_time` | 未建列（严格按设计文档字段清单） | 若需要"创建时间"筛选需补充 |
 | 压缩策略 / 连续聚合 | 未启用 | 90 天保留下压缩可降存储成本；启用时机需与容量规划一并确认 |
+| `data_analytics` 报告 / 评估 / Corner Case 结果元信息 | 无表（产物落 MinIO `hunter-reports` 永久保留 + sidecar JSON） | ⚠ data-analytics 契约 `x-hunter-pending-confirmation` #1/#2：如需按业务字段检索、精确分页或数据权限隔离，需新增 `data_analytics.reports` 表并同步 DDL → ORM → Alembic migration |

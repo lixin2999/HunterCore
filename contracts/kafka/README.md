@@ -9,7 +9,7 @@ Topic 命名规范：`<domain>.<entity>.<type>`，全小写，点分隔；车端
 |------|------|
 | `topics.yaml` | Topic 清单（车端 9 个 / 平台内部 6 个）：分区数、副本数、acks、保留时间、key 策略、生产者/消费者、Schema 引用；含全局 producer/consumer 默认参数与 Topic 级限流 |
 | `consumer-groups.yaml` | 消费者组契约：12 个组（`data-collector-*` / `data-analytics-*` / `ota-service-*` / `remote-control-*` / `scene-service-*` / `platform-alert-event`），含手动提交、DLQ、幂等键、延迟目标 |
-| `schemas/*.schema.json` | 9 个消息 JSON Schema（draft-07），详见 `schemas/README.md` |
+| `schemas/*.schema.json` | 11 个消息 JSON Schema（draft-07），详见 `schemas/README.md` |
 
 ## 车端 ↔ 平台 Topic
 
@@ -34,7 +34,20 @@ Topic 命名规范：`<domain>.<entity>.<type>`，全小写，点分隔；车端
 | `event_raw` | 6 | 30 天 | data-collector | data-analytics、scene-service |
 | `sensor_file` | 3 | 7 天 | data-collector | data-analytics |
 | `analytics_result` | 6 | 30 天 | data-analytics | scene-service、上层业务 |
-| `alert_event` | 3 | 30 天 | data-analytics | 告警处理 |
+| `alert_event` | 3 | 30 天 | data-analytics | 告警处理（落位待定） |
+
+## data-analytics 消费组（6.2 节实时作业输入，⚠ 契约修正已登记）
+
+| 消费组 | 订阅 Topic | 作业 | 输出 |
+|--------|-----------|------|------|
+| `data-analytics-telemetry` | `telemetry_clean` | 车辆状态监控 / 异常驾驶检测 / 碰撞风险评估 / 算法性能监控 | `alert_event` + `analytics_result` + `algorithm_metrics` |
+| `data-analytics-telemetry-raw` | `telemetry_raw` | 数据质量监控 | `analytics_result`（指标） |
+| `data-analytics-events` | `event_raw` | 事件统计 / Corner Case 挖掘 | `analytics_result` |
+| `data-analytics-sensor-file` | `sensor_file` | 感知精度评估输入 | `analytics_result` |
+
+> 原 `data-analytics-telemetry` 订阅 `telemetry_raw` 且声明生产 `telemetry_clean`（与 topics.yaml 冲突）、
+> 原 `data-analytics-telemetry-clean` 与之重复消费，均由 data-analytics 契约 Step 1 归并修正
+> （见 `contracts/openapi/data-analytics.yaml` 的 `x-hunter-pending-confirmation` #12）。
 
 ## 一致性校验（必须保持同步的 5 处）
 

@@ -17,13 +17,54 @@ data:
   DB_MAX_OVERFLOW: "5"
   # Flink 1.18 实时作业（flink-jobs/ 目录作业提交目标）
   FLINK_JOBMANAGER_URL: "http://flink-jobmanager.hunter-edge.svc.cluster.local:8081"
+  # 实时分析输入 Topic 与消费组（contracts/kafka/consumer-groups.yaml，禁止自行更改）
+  KAFKA_CONSUMER_TOPIC_TELEMETRY_CLEAN: "telemetry_clean"
+  KAFKA_CONSUMER_TOPIC_TELEMETRY_RAW: "telemetry_raw"
+  KAFKA_CONSUMER_TOPIC_EVENT_RAW: "event_raw"
+  KAFKA_CONSUMER_TOPIC_SENSOR_FILE: "sensor_file"
+  KAFKA_CONSUMER_GROUP_TELEMETRY: "data-analytics-telemetry"
+  KAFKA_CONSUMER_GROUP_TELEMETRY_RAW: "data-analytics-telemetry-raw"
+  KAFKA_CONSUMER_GROUP_EVENTS: "data-analytics-events"
+  KAFKA_CONSUMER_GROUP_SENSOR_FILE: "data-analytics-sensor-file"
   # 分析结果与告警输出 Topic（contracts/kafka 契约）
   KAFKA_TOPIC_ANALYTICS_RESULT: "analytics_result"
   KAFKA_TOPIC_ALERT_EVENT: "alert_event"
-  # 报告输出 Bucket（hunter-reports，生命周期永久）
+  # 报告输出 Bucket（hunter-reports，生命周期永久）与下载预签名时效（15 分钟）
   MINIO_BUCKET_REPORTS: "hunter-reports"
-  # 实时告警触发延迟约束 ≤ 2s（性能指标）
+  REPORT_DOWNLOAD_EXPIRES_SECONDS: "900"
+  REPORT_MAX_RANGE_DAYS: "90"              # 报告统计窗口上限 = 时序数据保留期
+  REPORT_GENERATE_MAX_CONCURRENT: "2"      # 渲染任务并发保护（超出 3003）
+  # 分析查询跨度上限（保护 P95 ≤ 200ms）
+  ANALYTICS_QUERY_MAX_RANGE_DAYS: "7"
+  # 跨 schema 只读账号（contracts/database/er.md 第 3 节；口令在 Secret）
+  ANALYTICS_RO_DB_USER: "hunter_analytics_ro"
+  # 算法指标聚合窗口与告警窗口（6.2 节；实时告警触发延迟 ≤ 2s）
+  ALGORITHM_METRICS_WINDOW_SECONDS: "60"
   ALERT_WINDOW_SECONDS: "2"
+  ALERT_TRIGGER_MAX_LATENCY_SECONDS: "2"
+  # 依赖服务（服务间 REST；禁止跨 schema 直查）
+  DATA_COLLECTOR_BASE_URL: "http://data-collector.hunter-edge.svc.cluster.local:8082"
+  SCENE_SERVICE_BASE_URL: "http://scene-service.hunter-edge.svc.cluster.local:8081"
+  VEHICLE_SERVICE_BASE_URL: "http://vehicle-service.hunter-edge.svc.cluster.local:8086"
+  # 实时告警阈值（设计文档 6.2.2 / 6.2.3 节 + 事件类型定义，不可放宽；仅环境变量化，禁止硬编码）
+  ALERT_HARSH_ACCEL_MS2: "3.0"
+  ALERT_HARSH_ACCEL_MIN_DURATION_SECONDS: "0.5"
+  ALERT_HARSH_BRAKING_MS2: "3.0"
+  ALERT_HARSH_BRAKING_MIN_DURATION_SECONDS: "0.5"
+  ALERT_HARSH_TURN_RAD_S: "0.8"
+  ALERT_OVER_SPEED_RATIO: "1.1"
+  ALERT_BATTERY_LOW_SOC: "20"
+  ALERT_BATTERY_CRITICAL_SOC: "10"
+  ALERT_COLLISION_TTC_CRITICAL_SECONDS: "1.5"
+  ALERT_COLLISION_TTC_WARNING_SECONDS: "3.0"
+  ALERT_COMMUNICATION_LOSS_SECONDS: "10"
+  # 离线作业调度（Spark 3.5，UTC；与 x-hunter-offline-jobs 一致）
+  OFFLINE_JOB_CRON_DAILY_REPORT: "30 0 * * *"           # 每日 00:30 车辆运行日报（前一日数据）
+  OFFLINE_JOB_CRON_PERCEPTION_EVAL: "0 1 * * *"         # 每日 01:00 感知精度评估
+  OFFLINE_JOB_CRON_CONTROL_EVAL: "30 1 * * *"           # 每日 01:30 控制性能评估（6.3.3 阈值判定）
+  OFFLINE_JOB_CRON_SCENE_COVERAGE: "0 1 * * 1"          # 每周一 01:00 场景覆盖率分析
+  OFFLINE_JOB_CRON_CORNER_CASE_MINING: "0 2 * * 1"      # 每周一 02:00 Corner Case 挖掘
+  OFFLINE_JOB_CRON_MONTHLY_OPERATION: "0 3 1 * *"       # 每月 1 日 03:00 车队月度统计
 ---
 apiVersion: apps/v1
 kind: Deployment

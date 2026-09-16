@@ -250,8 +250,14 @@ platform_topics:
     key: vehicle_id
     producer: data-analytics
     consumers: [告警处理]
-    schema: null                               # ⚠ 消息结构待设计文档 5.3 定稿
-    description: "告警事件（实时告警触发 ≤2s，推送 WebSocket + Alertmanager）"
+    schema: schemas/alert_event.schema.json    # Flink 实时作业告警（6.2 节规则 + 受控词表等级映射）
+    description: "告警事件（平台侧重算触发；实时告警触发 ≤2s，推送 WebSocket + Alertmanager）"
+    # ⚠ 消费方「告警处理」落位服务待定（见 consumer-groups.yaml 的 platform-alert-event）
+    consumed_by:
+      - service: "告警处理（落位待定：data-analytics 告警子模块 / api-gateway 推送）"
+        group_id: platform-alert-event
+        usage: "告警聚合 → WebSocket 推送前端 + 对接 Alertmanager"
+    idempotency_key: "(vehicle_id, alert_id)"
 
 # =====================================================================
 # 三、Topic 级限流（设计文档附录 D，不可放宽）

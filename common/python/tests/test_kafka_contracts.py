@@ -51,6 +51,7 @@ SCHEMA_FILES = (
     "remote_control.schema.json",
     "analytics_result.schema.json",
     "sensor_file.schema.json",
+    "alert_event.schema.json",
 )
 
 CREATE_TOPIC_CALL_RE = re.compile(r'create_topic\s+"([\w.]+)"\s+(\d+)\s+(\d+)')
@@ -119,7 +120,7 @@ def test_topics_yaml_synced_with_compose_and_k8s_scripts() -> None:
 
 
 def test_all_schemas_are_valid_draft7_with_examples() -> None:
-    """9 个消息 Schema：draft-07 合法、required 非空、examples 通过自身校验。"""
+    """11 个消息 Schema：draft-07 合法、required 非空、examples 通过自身校验。"""
     jsonschema = pytest.importorskip("jsonschema")
     for name in SCHEMA_FILES:
         schema = load_schema(name)
@@ -272,14 +273,50 @@ def test_analytics_result_schema_matches_scene_extraction_contract() -> None:
     assert scene_group["produces"] == [], "scene-service 不生产 Kafka 消息（提取结果直接落库）"
 
 
-def test_pending_internal_topic_schemas_are_still_declared_null() -> None:
-    """未定稿消息结构必须保持 schema: null（禁止「先实现后补契约」）。"""
+def test_all_platform_internal_topic_schemas_are_defined() -> None:
+    """平台内部 Topic 消息结构必须全部已定义（禁止「先实现后补契约」）。"""
     platform = {
         entry["name"]: entry for entry in load_yaml(KAFKA_DIR / "topics.yaml")["platform_topics"]
     }
-    assert platform["analytics_result"]["schema"] is not None
-    assert platform["sensor_file"]["schema"] is not None
-    assert platform["alert_event"]["schema"] is None
+    for name in EXPECTED_PLATFORM_TOPICS:
+        assert platform[name]["schema"], f"{name} 仍为 schema: null（必须先补契约）"
+        assert (SCHEMA_DIR / platform[name]["schema"].split("/")[-1]).is_file()
+    # alert_event：data-analytics Flink 告警（6.2 节）已补全 Schema
+    assert platform["alert_event"]["producer"] == "data-analytics"
+    assert platform["alert_event"]["schema"] == "schemas/alert_event.schema.json"
+    assert platform["alert_event"]["idempotency_key"] == "(vehicle_id, alert_id)"
+
+
+def test_alert_event_schema_matches_realtime_job_contract() -> None:
+    """alert_event（6.2 节 Flink 告警）：类型/等级取自受控词表，source_job = 5 个实时作业。"""
+    schema = load_schema("alert_event.schema.json")
+    properties = schema["properties"]
+    assert schema["additionalProperties"] is False
+    assert set(properties["alert_type"]["enum"]) == {t.value for t in EventType}
+    assert set(properties["level"]["enum"]) == {level.value for level in EventLevel}
+    assert set(properties["source_job"]["enum"]) == {
+        "vehicle_state_monitor",
+        "driving_anomaly_detection",
+        "algorithm_performance_monitor",
+        "collision_risk_assessment",
+        "data_quality_monitor",
+    }
+    # 等级必须等于受控映射（示例逐条校验，防止实现放宽等级）
+    from hunter_common.database.enums import EVENT_LEVEL_BY_TYPE
+
+    for example in schema["examples"]:
+        assert example["level"] == EVENT_LEVEL_BY_TYPE[EventType(example["alert_type"])].value
+    # 阈值与规则元信息完整（实现侧禁止硬编码：阈值必须在 rule 中回带）
+    rule = properties["rule"]
+    assert set(rule["required"]) == {"name", "metric", "comparator", "threshold"}
+    assert set(rule["properties"]["comparator"]["enum"]) == {"gt", "gte", "lt", "lte"}
+    assert properties["alert_id"]["pattern"].startswith("^[0-9a-fA-F]{8}")
+
+    # 消费组登记（告警消费方落位待定但消费组与幂等键必须已登记）
+    groups = load_yaml(KAFKA_DIR / "consumer-groups.yaml")["groups"]
+    alert_group = next(g for g in groups if g["group_id"] == "platform-alert-event")
+    assert alert_group["subscribes"] == ["alert_event"]
+    assert alert_group["idempotency_key"] == "(vehicle_id, alert_id)"
 
 
 def test_sensor_file_schema_matches_upload_contract() -> None:

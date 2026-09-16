@@ -1,0 +1,2196 @@
+# =====================================================================
+# HunterEdge 数据分析服务契约（OpenAPI 3.0.3）—— 单一事实来源
+# 来源：设计文档 6 章（6.2 Flink 实时分析 / 6.3 Spark 离线分析 / 6.4 Corner Case 挖掘 /
+#       6.5 报告生成）+ 12.4 节（API 端点清单）+ 附录 A（错误码）+ 附录 D（API 限流）
+#       + MinIO Bucket 规划（hunter-reports 永久保留）、Redis Key 设计、性能指标
+#       （实时告警触发 ≤ 2s、API 响应 P95 ≤ 200ms、时序读取保留 90 天）
+# 实现：services/data-analytics（FastAPI 0.100+，端口 8083）；变更必须先改本文件再改代码
+#
+# 范围说明：
+#   - 网关前缀 /api/v1/analytics（不可更改，见 contracts/openapi/api-gateway.yaml 的
+#     x-hunter-gateway-routes）；网关不剥离前缀，本服务按全路径注册路由
+#   - 本服务是「读模型 + 编排」服务：重计算由 Flink（实时，flink-jobs/）/ Spark（离线，spark-jobs/）
+#     承担，REST 只做查询（读预计算结果/时序聚合）与报告生成编排
+#   - 数据接入主链路为 Kafka（消费 4 个平台内部 Topic），非 REST；
+#     Kafka 生产/消费清单见 x-hunter-kafka（与 contracts/kafka/{topics,consumer-groups}.yaml 双向一致）
+#   - 跨 schema 只读例外（contracts/database/er.md 第 3 节）：仅允许只读账号 hunter_analytics_ro
+#     SELECT data_collector.vehicle_telemetry / data_analytics.algorithm_metrics；
+#     其余数据（events / scenes / vehicles）一律经服务 REST 获取，禁止直查他人 schema
+#   - 本服务不新增数据库表：Corner Case 与报告元信息落 MinIO hunter-reports（永久），
+#     分析指标落 data_analytics.algorithm_metrics（已存在）
+#
+# ⚠ 待核对（设计文档相关章节未随仓库提供 / 未明确，需人工确认后回填；
+#    禁止擅自新增端点 / 字段 / Topic / 错误码 / 阈值）：
+#   1) 报告与 Corner Case 元信息无 DB 表（contracts/database 无 reports 表）
+#   2) 报告生成必为异步（PDF/HTML 渲染远超 P95 ≤ 200ms）→ 报告状态枚举与查询语义待确认
+#   3) 6.2.3 节「TTC < 3.0s 碰撞预警(warning)」与受控词表 collision_warning(critical) 等级冲突
+#   4) 告警消费方（platform-alert-event）落位服务待定
+#   5) 数据质量监控（6.2.5）阈值与结果落位未定义
+#   6) 感知精度评估的「真值」来源（人工标注 / 仿真真值）未定义
+#   全量清单见文末 x-hunter-pending-confirmation（12 项）
+# =====================================================================
+openapi: 3.0.3
+
+info:
+  title: HunterEdge - data-analytics
+  version: 0.1.0
+  description: |
+    数据分析服务统一契约（端口 8083，网关前缀 `/api/v1/analytics`）。
+
+    **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功，非 0 为预定义错误码（附录 A）。
+
+    **实时分析**（6.2 节，Flink 1.18 DataStream，`flink-jobs/`）：消费 `telemetry_clean`（4 个作业）
+    与 `telemetry_raw`（数据质量监控）→ 车辆状态监控 / 异常驾驶检测 / 算法性能监控 / 碰撞风险评估 /
+    数据质量监控；告警投递 `alert_event`（等级取受控词表 `EVENT_LEVEL_BY_TYPE`，实时告警触发 ≤ 2s），
+    算法指标写 `data_analytics.algorithm_metrics`，指标/报告结果投递 `analytics_result`。
+
+    **离线分析**（6.3 / 6.4 / 6.5 节，Spark 3.5，`spark-jobs/`）：日报（每日）/ 感知-规划-控制评估（每日）/
+    场景覆盖率（每周）/ Corner Case 挖掘（每周，Isolation Forest + DBSCAN）/ 车队月度统计（每月）；
+    报告产物（HTML/PDF/JSON）落 MinIO `hunter-reports`（永久保留，下载预签名 15 分钟 + Range）。
+
+    **本契约的 REST 范围**（12.4 节，不可增删）：报告列表 / 报告详情 / 报告生成 / 运营看板 /
+    感知精度评估 / 控制性能评估 / 场景覆盖率 / Corner Case 列表；运维探针 `/healthz`、`/readyz`、`/metrics`。
+
+    **鉴权**：控制台请求经网关校验 JWT 后转发（RBAC 资源域 `analytics`，action ∈ read/execute）；
+    服务间调用（data-collector / scene-service / vehicle-service）走集群内 mTLS，不透传用户身份。
+
+    **限流**：继承网关五级限流（全局 10000 QPS / 单用户 100 QPS / 单 IP 200 QPS）；
+    附录 D 未对本服务端点给出接口级阈值 → 仅继承网关限流，报告生成另设并发保护（见 x-hunter-rate-limits）。
+
+    **性能**：API 响应 P95 ≤ 200ms（长耗时报表/挖掘一律预计算，端点只读结果）；
+    实时告警触发 ≤ 2s；列表默认分页 20 条、上限 200 条。
+  license:
+    name: Proprietary - HunterEdge
+
+servers:
+  - url: https://hunter-edge.example.com
+    description: 生产环境（经网关 /api/v1/analytics 转发）
+  - url: http://localhost:8083
+    description: 本地开发（直连服务）
+
+tags:
+  - name: reports
+    description: 报告管理（6.5 节 5 类模板；产物落 MinIO hunter-reports，永久保留）
+  - name: dashboard
+    description: 运营看板（车队/数据管道/算法/告警聚合指标）
+  - name: evaluation
+    description: 算法评估（6.3 节 感知精度 / 规划质量 / 控制性能）
+  - name: corner-cases
+    description: Corner Case 挖掘结果（6.4 节 5 类异常 + Isolation Forest / DBSCAN）
+  - name: ops
+    description: 运维探针与指标（K8s probe / Prometheus 抓取）
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/analytics/reports:
+    get:
+      tags: [reports]
+      summary: 查询分析报告列表（6.5 节 5 类模板，按类型/车辆/状态/时间筛选）
+      description: |
+        查询已生成的报告元信息。**数据来源**：MinIO `hunter-reports` 对象列举（
+        报告元信息以 sidecar JSON 与产物同前缀存储，见 `x-hunter-report-storage`）；
+        无 DB 表（见 `x-hunter-pending-confirmation` #2），因此 `total` 为前缀列举计数。
+
+        默认按 `created_at DESC` 返回；`status` 过滤用于轮询生成中的报告
+        （`POST /api/v1/analytics/reports/generate` 提交后轮询本端点或报告详情端点）。
+      operationId: listReports
+      parameters:
+        - name: report_type
+          in: query
+          required: false
+          description: 报告模板类型（6.5 节 5 类，未传则不限）
+          schema: { $ref: "#/components/schemas/ReportType" }
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 车辆标识（车辆维度报告；不传则跨车辆/车队级报告）
+          schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" }
+        - name: status
+          in: query
+          required: false
+          description: 报告状态（生成中轮询用）
+          schema: { $ref: "#/components/schemas/ReportStatus" }
+        - $ref: "#/components/parameters/StartTimeQueryOptional"
+        - $ref: "#/components/parameters/EndTimeQueryOptional"
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 报告列表（分页）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReportListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/analytics/reports/{report_id}:
+    get:
+      tags: [reports]
+      summary: 查询报告详情（含下载预签名 URL，15 分钟有效 + Range）
+      description: |
+        返回报告元信息 + 各格式产物的下载预签名 URL（有效期 15 分钟，支持 Range 分片下载，
+        与 MinIO 契约一致）。报告不存在或已过期清理返回 3001（HTTP 404）。
+      operationId: getReport
+      parameters:
+        - $ref: "#/components/parameters/ReportIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 报告详情
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReportDetailResponse" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/analytics/reports/generate:
+    post:
+      tags: [reports]
+      summary: 提交报告生成任务（6.5 节 5 类模板；异步，202 返回 report_id）
+      description: |
+        **异步语义（契约决策）**：6.5 节的 HTML（交互式图表）/ PDF（ECharts + Puppeteer 渲染）
+        生成耗时远超 API P95 ≤ 200ms，故本端点只做校验与入队：立即返回 `report_id` 与
+        `status=pending`（HTTP 202），由离线作业/工作进程渲染并落 MinIO `hunter-reports`；
+        客户端轮询 `GET /api/v1/analytics/reports/{report_id}` 直至 `status=ready|failed`。
+
+        **前置校验**：`report_type` 与 `start_time`/`end_time` 必填且区间合法（≤
+        `REPORT_MAX_RANGE_DAYS`，默认 90 天，即时序数据保留期）；`vehicle_id` 如提供必须存在
+        （经 vehicle-service REST 校验，不可用时降级为「延后校验」并在报告内标注数据范围）；
+        同类型 + 同车辆 + 同区间的报告已在 `pending|generating` 时返回 3003（幂等去重，避免重复渲染）。
+
+        **限流/保护**：单用户继承网关 100 QPS，另设并发保护（`REPORT_GENERATE_MAX_CONCURRENT`，
+        超出返回 3003），防止渲染任务打满集群。
+      operationId: generateReport
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReportGenerateRequest" }
+            example:
+              report_type: vehicle_daily
+              vehicle_id: HUNTER-001
+              start_time: 1723968000
+              end_time: 1724054400
+              formats: [pdf, html, json]
+      responses:
+        "202":
+          description: 报告生成任务已受理（异步）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReportGenerateResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/analytics/dashboard:
+    get:
+      tags: [dashboard]
+      summary: 运营看板聚合指标（车队 / 数据管道 / 算法健康 / 事件与告警）
+      description: |
+        看板一次返回四个聚合块（字段与数据来源见 `x-hunter-dashboard-contract`）：
+
+        - `fleet`：车辆在线与状态分布（Redis `vehicle:online:set` / `vehicle:status:{vehicle_id}` 只读聚合）
+        - `pipeline`：数据管道健康（Kafka 消费滞后 + DLQ 水位 + 只读账号统计的遥测写入量）
+        - `algorithm`：算法模块指标（`data_analytics.algorithm_metrics` 只读聚合，模块 ∈ perception/planning/control）
+        - `events`：事件与告警统计（经 data-collector REST `GET /api/v1/data/events` 的计数）
+
+        **数据源不可用时降级**：对应聚合块返回 `available=false` + `reason`，HTTP 仍为 200（看板不允许整页失败）；
+        全部数据源不可用才返回 503（code=5001）。禁止跨服务直查他人 schema（仅 `hunter_analytics_ro` 只读例外）。
+      operationId: getDashboard
+      parameters:
+        - name: time_range
+          in: query
+          required: false
+          description: 聚合时间窗（相对当前时间；默认 24h）
+          schema:
+            type: string
+            enum: [1h, 24h, 7d, 30d]
+            default: 24h
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 车辆标识（单车看板；不传为车队级）
+          schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" }
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 看板聚合数据
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DashboardResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/analytics/perception/eval:
+    get:
+      tags: [evaluation]
+      summary: 感知精度评估（6.3.2 节：mAP 3D/BEV、IoU、Recall、Precision、平均定位误差）
+      description: |
+        返回指定时间窗的感知精度评估结果。评估由 Spark 离线作业（`spark-jobs/`，每日）计算并落
+        MinIO `hunter-reports`（JSON/HTML/PDF）+ 投递 `analytics_result`（result_type=metric）；
+        本端点只读最近一次评估文档，按 `vehicle_id` + 时间窗过滤，**不做实时真值比对**（保证 P95 ≤ 200ms）。
+
+        真值来源：⚠ 待确认（人工标注 / 仿真真值 / 车端标注流），见 `x-hunter-pending-confirmation` #6；
+        未确认前契约按「MinIO `hunter-rosbag` 标注文件 + `algorithm_metrics` 指标」实现。
+      operationId: getPerceptionEval
+      parameters:
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 车辆标识（单车评估；不传为车队汇总）
+          schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" }
+        - $ref: "#/components/parameters/StartTimeQueryOptional"
+        - $ref: "#/components/parameters/EndTimeQueryOptional"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 感知精度评估结果
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PerceptionEvalResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/analytics/control/eval:
+    get:
+      tags: [evaluation]
+      summary: 控制性能评估（6.3.3 节：速度跟踪 RMSE / 转向跟踪 RMSE / 超调 / 调节时间）
+      description: |
+        返回控制性能评估结果与阈值判定（阈值不可更改，随响应一并回带便于前端展示）：
+
+        | 指标 | 阈值 | 判定 |
+        |------|------|------|
+        | 速度跟踪 RMSE | < 0.2 m/s | `velocity_rmse_ms` |
+        | 转向跟踪 RMSE | < 0.02 rad | `steering_rmse_rad` |
+        | 超调 | < 10 % | `overshoot_percent` |
+        | 调节时间 | < 2 s | `settling_time_s` |
+
+        数据来源：`data_analytics.algorithm_metrics`（module=control）+ `data_collector.vehicle_telemetry`
+        只读聚合（`hunter_analytics_ro` 账号）；评估文档由 Spark 每日作业生成（同 6.3.3 节口径）。
+      operationId: getControlEval
+      parameters:
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 车辆标识（单车评估；不传为车队汇总）
+          schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" }
+        - $ref: "#/components/parameters/StartTimeQueryOptional"
+        - $ref: "#/components/parameters/EndTimeQueryOptional"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 控制性能评估结果（含阈值判定）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ControlEvalResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/analytics/scene/coverage:
+    get:
+      tags: [evaluation]
+      summary: 场景覆盖率分析（6.3 节：覆盖热力图 + 未覆盖清单，每周离线作业）
+      description: |
+        返回场景覆盖率分析结果（覆盖热力图 + 未覆盖清单）。计算由 Spark 每周作业完成
+        （网格化自车轨迹 + 场景类型维度统计），产物落 MinIO `hunter-reports`；
+        本端点只读最近一次覆盖率文档，`heatmap` 支持按 `max_cells` 截断（默认 5000，
+        防止响应体过大影响 P95 ≤ 200ms）。
+
+        数据来源：`data_collector.vehicle_telemetry`（只读账号，`localization.x/y` 网格化）
+        + `scene_svc.scenes`（经 scene-service REST 获取场景库维度，禁止直查 scene schema）。
+      operationId: getSceneCoverage
+      parameters:
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 车辆标识（单车覆盖；不传为车队汇总）
+          schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" }
+        - name: grid_size_m
+          in: query
+          required: false
+          description: 网格边长 m（覆盖热力图粒度；默认取自最近一次作业参数）
+          schema: { type: number, minimum: 0.5, maximum: 100, default: 10 }
+        - name: max_cells
+          in: query
+          required: false
+          description: 热力图返回的最大网格数（响应体保护；超出按覆盖次数降序截断）
+          schema: { type: integer, minimum: 1, maximum: 50000, default: 5000 }
+        - $ref: "#/components/parameters/StartTimeQueryOptional"
+        - $ref: "#/components/parameters/EndTimeQueryOptional"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 场景覆盖率分析结果
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneCoverageResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/analytics/corner-cases:
+    get:
+      tags: [corner-cases]
+      summary: Corner Case 列表（6.4 节 5 类异常 + 异常分数，分页）
+      description: |
+        返回 Corner Case 挖掘结果（Spark 每周作业，Isolation Forest 无监督异常检测 + DBSCAN 聚类，
+        见 `x-hunter-corner-case-mining`）。类别（5 类，6.4 节，不可新增）：
+        `kinematic` 运动学异常 / `perception` 感知异常 / `planning` 规划异常 /
+        `interaction` 交互异常 / `environment` 环境异常。
+
+        逐条结果同时投递 `analytics_result`（result_type=corner_case，携带事件前后各 10 秒截取窗口，
+        供 scene-service 实车场景自动提取）；本端点读取挖掘结果文档（MinIO `hunter-reports`）
+        并支持类别/车辆/时间/异常分数过滤与分页。
+      operationId: listCornerCases
+      parameters:
+        - name: category
+          in: query
+          required: false
+          description: 异常类别（6.4 节 5 类；不传则全部）
+          schema: { $ref: "#/components/schemas/CornerCaseCategory" }
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 车辆标识
+          schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" }
+        - name: algorithm
+          in: query
+          required: false
+          description: 挖掘算法（6.4 节：Isolation Forest 异常检测 / DBSCAN 聚类）
+          schema: { $ref: "#/components/schemas/CornerCaseAlgorithm" }
+        - name: min_anomaly_score
+          in: query
+          required: false
+          description: 最小异常分数（Isolation Forest decision_function 归一化到 0-1；默认 0）
+          schema: { type: number, minimum: 0, maximum: 1, default: 0 }
+        - $ref: "#/components/parameters/StartTimeQueryOptional"
+        - $ref: "#/components/parameters/EndTimeQueryOptional"
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: Corner Case 列表（分页）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CornerCaseListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: 存活探针（K8s livenessProbe）
+      description: 进程可响应即返回统一响应格式 `code=0`；不检查依赖（避免依赖抖动引发重启风暴）。
+      operationId: healthz
+      x-internal: true
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 进程存活（统一响应格式）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseHealthy" }
+
+  /readyz:
+    get:
+      tags: [ops]
+      summary: 就绪探针（K8s readinessProbe，含 DB / Redis 连通性）
+      description: |
+        每项探测内置 2s 超时（依赖挂起时快速失败，避免 probe 超时误判）。
+        依赖不可用时返回 HTTP 503 + `code=5001`，`data` 给出各依赖探测明细。
+        Kafka / MinIO / Flink 连通性在作业启动阶段检查，不纳入探针（避免探针阻塞滚动更新）。
+      operationId: readyz
+      x-internal: true
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 全部依赖就绪
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseReady" }
+        "503":
+          description: 存在未就绪依赖（code=5001，data 为探测明细）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseReady" }
+              example:
+                code: 5001
+                message: 服务不可用
+                data: { database: true, redis: false }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus 指标端点
+      description: |
+        返回 Prometheus 文本格式（`hunter_` 前缀指标：请求总数 / 时延直方图 / 进行中请求 / 服务信息）。
+        契约明确例外：**不返回**统一 JSON 响应体（由 Prometheus 抓取器消费）。
+      operationId: metrics
+      x-internal: true
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        控制台用户 JWT Access Token（2 小时），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
+        载荷结构（3.2.2 节）：`sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` /
+        `iss="hunter-platform"` / `jti`。服务侧按 RBAC 资源域 `analytics`（action ∈ read/execute）复核：
+        查询类端点需 `analytics:read`，报告生成需 `analytics:execute`。
+        校验失败映射：Token 缺失/无效 → 1001；Token 过期 → 1003；权限不足 → 1002。
+
+  headers:
+    RequestId:
+      description: 链路追踪 ID（网关透传上游 X-Request-ID，未提供则生成 UUID）
+      schema: { type: string, format: uuid }
+    RetryAfter:
+      description: 限流重试等待秒数（HTTP 429 必需，附录 D 限流约束）
+      schema: { type: integer, minimum: 1 }
+
+  parameters:
+    TraceRequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: 客户端可选传入链路追踪 ID；未提供时由网关/服务生成 UUID
+      schema: { type: string, format: uuid }
+    PageQuery:
+      name: page
+      in: query
+      required: false
+      description: 页码（≥1，与 BaseRepository.paginate 一致）
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSizeQuery:
+      name: page_size
+      in: query
+      required: false
+      description: 每页条数（上限 200，与 BaseRepository.MAX_PAGE_SIZE 一致）
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    StartTimeQueryOptional:
+      name: start_time
+      in: query
+      required: false
+      description: |
+        起始时间（Unix epoch 秒，含毫秒小数）；与 `end_time` 必须成对出现，
+        区间跨度上限 `ANALYTICS_QUERY_MAX_RANGE_DAYS`（默认 7 天，见 x-hunter-rate-limits）。
+      schema: { type: number, minimum: 0 }
+    EndTimeQueryOptional:
+      name: end_time
+      in: query
+      required: false
+      description: 结束时间（Unix epoch 秒，含毫秒小数；必须 ≥ start_time）
+      schema: { type: number, minimum: 0 }
+    ReportIdPath:
+      name: report_id
+      in: path
+      required: true
+      description: 报告 ID（UUID；由 `POST /api/v1/analytics/reports/generate` 返回）
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthenticated:
+      description: 1001 未认证（Token 缺失或无效）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 1001
+            message: 未认证
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    Forbidden:
+      description: 1002 无权限（角色权限不足 / 越权访问他车数据）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 1002
+            message: 无权限
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    InvalidParameter:
+      description: 2001 / 2002（参数校验失败 / 必填参数缺失）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 2001
+            message: 参数错误
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    NotFound:
+      description: 3001 资源不存在（报告 / 车辆 / 分析结果文档不存在）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 3001
+            message: 资源不存在
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    Conflict:
+      description: 3003 资源状态冲突（同参数报告已在生成中 / 报告生成并发数超限）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 3003
+            message: 资源状态冲突
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    TooManyRequests:
+      description: |
+        HTTP 429 限流（附录 D）。⚠ 附录 A 无限流专用错误码，响应体 `code` 统一复用 5001（禁止新增），
+        客户端应以 HTTP 状态码 429 与 `Retry-After` 为准。
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 5001
+            message: 服务不可用
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    ServiceUnavailable:
+      description: 5001 服务不可用（依赖服务 / 数据源不可用）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 5001
+            message: 服务不可用
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    InternalError:
+      description: 5000 服务器内部错误（未预期异常）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 5000
+            message: 服务器内部错误
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+  schemas:
+    ApiResponse:
+      type: object
+      description: 统一 API 响应格式（所有服务必须遵守，字段不可更改）
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code:
+          type: integer
+          description: 0=成功；非 0=预定义错误码（附录 A）
+          example: 0
+        message:
+          type: string
+          example: success
+        data:
+          nullable: true
+          description: 业务数据（结构随端点而定；无数据时为 null）
+        request_id:
+          type: string
+          format: uuid
+          description: 请求 ID（等于链路 trace_id）
+        timestamp:
+          type: integer
+          description: 服务端响应时间（Unix epoch 秒）
+          example: 1724035200
+
+    ErrorCode:
+      type: integer
+      description: 预定义错误码（附录 A，禁止新增或更改含义）
+      enum: [0, 1001, 1002, 1003, 2001, 2002, 3001, 3002, 3003, 4001, 4002, 5000, 5001,
+             6001, 6002, 6003, 7001, 7002]
+
+    ApiResponseError:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [code]
+          properties:
+            code: { $ref: "#/components/schemas/ErrorCode" }
+            data:
+              nullable: true
+              description: 错误上下文（如报告生成失败的阶段/原因）；一般错误为 null
+
+    ApiResponseEmpty:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              nullable: true
+              description: 恒为 null（无返回数据的成功响应）
+
+    ApiResponseHealthy:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/HealthStatus" }
+
+    ApiResponseReady:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ReadyChecks" }
+
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          description: 存活标记（进程可响应即为 ok）
+
+    ReadyChecks:
+      type: object
+      required: [database, redis]
+      description: 各依赖探测结果；任一为 false 时返回 HTTP 503 + code=5001
+      properties:
+        database:
+          type: boolean
+          description: PostgreSQL / TimescaleDB 连通性（单项探测超时 2s，只读分析账号 + 主账号） 
+        redis:
+          type: boolean
+          description: Redis 连通性（看板车队状态聚合依赖）
+      example: { database: true, redis: true }
+
+    # ---------- 报告（6.5 节 5 类模板） ----------
+    ReportType:
+      type: string
+      enum:
+        - vehicle_daily
+        - algorithm_eval
+        - scene_test
+        - ota_upgrade
+        - monthly_operation
+      description: |
+        报告模板类型（6.5 节 5 类标准模板，不可新增）：
+        `vehicle_daily` 车辆运行日报 / `algorithm_eval` 算法评估报告 / `scene_test` 场景测试报告 /
+        `ota_upgrade` OTA 升级报告 / `monthly_operation` 月度运营报告
+
+    ReportFormat:
+      type: string
+      enum: [html, pdf, json]
+      description: 报告输出格式（6.5 节：HTML 交互式图表 / PDF（ECharts + Puppeteer 渲染）/ JSON 数据）
+
+    ReportStatus:
+      type: string
+      enum: [pending, generating, ready, failed]
+      description: |
+        报告状态（⚠ 设计文档未定义报告状态枚举，本契约为异步生成流程定义，见
+        x-hunter-pending-confirmation #2）：`pending` 已入队 / `generating` 渲染中 /
+        `ready` 可下载 / `failed` 生成失败（data.error 给出原因）
+
+    ReportArtifact:
+      type: object
+      description: 单格式产物（MinIO hunter-reports 对象 + 下载预签名 URL）
+      required: [format, object_key, size_bytes]
+      properties:
+        format: { $ref: "#/components/schemas/ReportFormat" }
+        object_key:
+          type: string
+          description: MinIO 对象键（hunter-reports/<report_type>/<date>/<report_id>.<ext>）
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 产物大小（字节）
+        download_url:
+          type: string
+          nullable: true
+          description: |
+            下载预签名 URL（有效期 15 分钟 = 900s，支持 Range 分片下载；与 MinIO 契约一致）。
+            报告尚未 ready 时为 null。
+        expires_in:
+          type: integer
+          nullable: true
+          example: 900
+          description: 预签名有效期（秒），下载固定 900
+
+    ReportMeta:
+      type: object
+      description: 报告元信息（MinIO sidecar JSON 的字段；无 DB 表，见 x-hunter-report-storage）
+      required: [report_id, report_type, status, formats, created_at]
+      properties:
+        report_id:
+          type: string
+          format: uuid
+          description: 报告 ID（UUID；同时是对象键前缀的一部分）
+        report_type: { $ref: "#/components/schemas/ReportType" }
+        status: { $ref: "#/components/schemas/ReportStatus" }
+        vehicle_id:
+          type: string
+          nullable: true
+          description: 车辆标识（车辆维度报告）；车队级报告为 null
+        start_time:
+          type: number
+          description: 报告统计窗口起点（Unix epoch 秒）
+        end_time:
+          type: number
+          description: 报告统计窗口终点（Unix epoch 秒）
+        formats:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/ReportFormat" }
+          description: 请求生成的格式集合（6.5 节：HTML + PDF + JSON）
+        created_at:
+          type: number
+          description: 提交时间（Unix epoch 秒）
+        completed_at:
+          type: number
+          nullable: true
+          description: 完成时间（ready/failed 时填充）
+        generated_by:
+          type: string
+          nullable: true
+          description: 提交人 user_id（来自网关 X-User-Id；定时作业生成的报告为 null）
+        trigger:
+          type: string
+          enum: [manual, schedule]
+          description: 触发方式（manual 手工提交 / schedule 离线作业定时生成，如每日 00:30 日报）
+        artifacts:
+          type: array
+          items: { $ref: "#/components/schemas/ReportArtifact" }
+          description: 各格式产物（列表端点不返回 download_url，详情端点填充）
+        summary:
+          type: object
+          additionalProperties: true
+          description: 报告摘要指标（键值对，供列表页快速展示；结构随模板而定）
+
+    ReportListData:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ReportMeta" }
+        total:
+          type: integer
+          minimum: 0
+          description: 命中总数（MinIO 前缀列举计数；⚠ 非 DB COUNT，见 x-hunter-report-storage）
+        page: { type: integer, minimum: 1, example: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200, example: 20 }
+
+    ReportListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ReportListData" }
+
+    ReportDetailResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ReportMeta" }
+
+    ReportGenerateRequest:
+      type: object
+      description: 报告生成请求（6.5 节 5 类模板；异步生成）
+      required: [report_type, start_time, end_time]
+      properties:
+        report_type: { $ref: "#/components/schemas/ReportType" }
+        vehicle_id:
+          type: string
+          nullable: true
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+          description: 车辆标识（车辆维度报告必填：vehicle_daily / ota_upgrade；车队级模板可省略）
+        start_time:
+          type: number
+          minimum: 0
+          description: 统计窗口起点（Unix epoch 秒）
+        end_time:
+          type: number
+          minimum: 0
+          description: 统计窗口终点（Unix epoch 秒；必须 > start_time，跨度 ≤ REPORT_MAX_RANGE_DAYS）
+        formats:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          default: [pdf]
+          items: { $ref: "#/components/schemas/ReportFormat" }
+          description: 期望产物格式（默认 pdf；6.5 节支持 HTML/PDF/JSON）
+        force:
+          type: boolean
+          default: false
+          description: 忽略同参数去重（默认 false：同参数 pending/generating 报告存在时返回 3003）
+
+    ReportGenerateData:
+      type: object
+      required: [report_id, report_type, status, created_at]
+      properties:
+        report_id: { type: string, format: uuid }
+        report_type: { $ref: "#/components/schemas/ReportType" }
+        status: { $ref: "#/components/schemas/ReportStatus" }
+        created_at:
+          type: number
+          description: 受理时间（Unix epoch 秒）
+        estimated_ready_seconds:
+          type: integer
+          nullable: true
+          description: 预计就绪时间（秒；依据报告类型与历史渲染耗时估算，仅提示用途）
+        poll_url:
+          type: string
+          description: 轮询地址（= /api/v1/analytics/reports/{report_id}）
+
+    ReportGenerateResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ReportGenerateData" }
+
+    # ---------- 运营看板 ----------
+    FleetOverview:
+      type: object
+      description: 车队概览（Redis 只读聚合；⚠ 车辆状态读取端点归属待确认，见 x-hunter-pending-confirmation #8）
+      required: [available, total_vehicles, online_vehicles]
+      properties:
+        available: { type: boolean, description: 数据源可用性（不可用时 false + reason） }
+        reason:
+          type: string
+          nullable: true
+          description: 不可用原因（如 redis unavailable）
+        total_vehicles:
+          type: integer
+          minimum: 0
+          description: 车队车辆总数（vehicle-service REST 或 Redis 台账镜像）
+        online_vehicles:
+          type: integer
+          minimum: 0
+          description: 在线车辆数（Redis `vehicle:online:set` SCARD）
+        by_status:
+          type: object
+          additionalProperties: { type: integer }
+          description: 按车辆 8 态状态分布（offline/online_idle/auto_driving/remote_controlled/upgrading/charging/fault/emergency）
+
+    PipelineStats:
+      type: object
+      description: 数据管道健康（Kafka 消费滞后 + DLQ 水位 + 时序写入量）
+      required: [available]
+      properties:
+        available: { type: boolean }
+        reason: { type: string, nullable: true }
+        telemetry_points:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 窗口内遥测样本数（只读账号 SELECT count(*) / 近似计数，禁止全表精确 COUNT）
+        ingest_latency_ms_p95:
+          type: number
+          nullable: true
+          description: 遥测入库延迟 P95（ms），目标 ≤ 1000ms（性能指标）
+        kafka_consumer_lag:
+          type: object
+          additionalProperties: { type: integer }
+          description: 各消费组滞后（data-analytics-* 组 → 滞后条数）
+        dlq_messages:
+          type: object
+          additionalProperties: { type: integer }
+          description: DLQ 水位（`{topic}.dlq` 累计消息数，用于发现管道异常）
+
+    AlgorithmHealth:
+      type: object
+      description: 算法模块指标（只读账号聚合 data_analytics.algorithm_metrics，模块 ∈ perception/planning/control）
+      required: [available]
+      properties:
+        available: { type: boolean }
+        reason: { type: string, nullable: true }
+        perception_fps_avg:
+          type: number
+          nullable: true
+          description: "感知平均帧率（algorithm_metrics 的 perception.fps / 遥测 perception.fps 聚合）"
+        perception_latency_ms_avg:
+          type: number
+          nullable: true
+        planning_latency_ms_avg:
+          type: number
+          nullable: true
+        control_latency_ms_avg:
+          type: number
+          nullable: true
+        metrics:
+          type: object
+          additionalProperties: { type: number }
+          description: 其他指标键值（键 = `<module>.<metric_name>`，与 algorithm_metrics 结构一致）
+
+    EventStats:
+      type: object
+      description: 事件与告警统计（车端事件经 data-collector REST 计数；平台告警统计待告警消费方落位）
+      required: [available, total]
+      properties:
+        available: { type: boolean }
+        reason: { type: string, nullable: true }
+        total: { type: integer, minimum: 0, description: 窗口内事件总数 }
+        info: { type: integer, minimum: 0 }
+        warning: { type: integer, minimum: 0 }
+        critical: { type: integer, minimum: 0 }
+        unacknowledged:
+          type: integer
+          minimum: 0
+          description: 未确认事件数（告警中心默认视图）
+        by_type:
+          type: object
+          additionalProperties: { type: integer }
+          description: 按事件类型分布（18 种受控类型）
+
+    DashboardData:
+      type: object
+      required: [time_range, generated_at, fleet, pipeline, algorithm, events]
+      properties:
+        time_range:
+          type: string
+          enum: [1h, 24h, 7d, 30d]
+        vehicle_id:
+          type: string
+          nullable: true
+          description: 单车看板时的车辆标识；车队级为 null
+        generated_at:
+          type: number
+          description: 聚合生成时间（Unix epoch 秒）
+        fleet: { $ref: "#/components/schemas/FleetOverview" }
+        pipeline: { $ref: "#/components/schemas/PipelineStats" }
+        algorithm: { $ref: "#/components/schemas/AlgorithmHealth" }
+        events: { $ref: "#/components/schemas/EventStats" }
+        degraded:
+          type: array
+          items: { type: string }
+          description: 降级的数据块名列表（如 [fleet, events]）；为空表示全部数据源正常
+
+    DashboardResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/DashboardData" }
+
+    # ---------- 算法评估（6.3 节） ----------
+    EvalWindow:
+      type: object
+      description: 评估统计窗口
+      required: [start_time, end_time]
+      properties:
+        start_time: { type: number, description: "窗口起点（Unix epoch 秒）" }
+        end_time: { type: number, description: "窗口终点（Unix epoch 秒）" }
+        duration_hours: { type: number, description: "窗口时长（小时）" }
+
+    PerceptionMetrics:
+      type: object
+      description: 感知精度指标（6.3 节：mAP 3D/BEV、IoU、Recall、Precision、平均定位误差）
+      required: [map_3d, map_bev, iou, recall, precision, mean_localization_error_m]
+      properties:
+        map_3d:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 3D 目标检测 mAP（IoU 阈值按评估作业配置）
+        map_bev:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: BEV 视角 mAP
+        iou:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 平均 IoU
+        recall:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 召回率
+        precision:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 准确率
+        mean_localization_error_m:
+          type: number
+          minimum: 0
+          description: 平均定位误差（m）
+
+    PerceptionEvalData:
+      type: object
+      required: [window, sample_count, metrics, data_source, updated_at]
+      properties:
+        vehicle_id:
+          type: string
+          nullable: true
+          description: 单车评估的车辆标识；车队汇总为 null
+        window: { $ref: "#/components/schemas/EvalWindow" }
+        sample_count:
+          type: integer
+          minimum: 0
+          description: 参与评估的样本数（帧数/目标数）
+        metrics: { $ref: "#/components/schemas/PerceptionMetrics" }
+        by_object_type:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/PerceptionMetrics" }
+          description: 按目标类型分维度指标（键 ∈ vehicle/pedestrian/other，与遥测 perception.object_types 域一致）
+        data_source:
+          type: string
+          description: 数据来源描述（如 "hunter-rosbag 标注文件 + algorithm_metrics"）
+        job_name:
+          type: string
+          example: perception_eval_daily
+          description: 产出该评估的离线作业名（见 x-hunter-offline-jobs）
+        updated_at:
+          type: number
+          description: 评估文档生成时间（Unix epoch 秒）
+        report_id:
+          type: string
+          nullable: true
+          description: 关联的评估报告 ID（hunter-reports，可经 GET /reports/{id} 下载）
+
+    PerceptionEvalResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/PerceptionEvalData" }
+
+    ControlThresholdCheck:
+      type: object
+      description: 单指标阈值判定（阈值来源：设计文档 6.3.3 节，不可更改）
+      required: [value, threshold, comparator, pass]
+      properties:
+        value: { type: number, description: 实测值 }
+        threshold: { type: number, description: 契约阈值（6.3.3 节） }
+        comparator:
+          type: string
+          enum: [lt, lte, gt, gte]
+          description: 判定方向（速度/转向 RMSE、超调、调节时间均为 lt 优于阈值）
+        unit: { type: string, description: "单位（m/s、rad、%、s）" }
+        pass: { type: boolean, description: 是否满足阈值 }
+
+    ControlEvalData:
+      type: object
+      required: [window, sample_count, metrics, thresholds, overall_pass, data_source, updated_at]
+      properties:
+        vehicle_id:
+          type: string
+          nullable: true
+          description: 单车评估的车辆标识；车队汇总为 null
+        window: { $ref: "#/components/schemas/EvalWindow" }
+        sample_count:
+          type: integer
+          minimum: 0
+          description: 参与评估的控制周期样本数
+        metrics:
+          type: object
+          description: 控制性能指标（6.3.3 节口径）
+          required: [velocity_rmse_ms, steering_rmse_rad, overshoot_percent, settling_time_s]
+          properties:
+            velocity_rmse_ms: { type: number, minimum: 0, description: 速度跟踪 RMSE（m/s） }
+            steering_rmse_rad: { type: number, minimum: 0, description: 转向跟踪 RMSE（rad） }
+            overshoot_percent: { type: number, minimum: 0, description: 超调（%） }
+            settling_time_s: { type: number, minimum: 0, description: 调节时间（s） }
+        thresholds:
+          type: object
+          description: 阈值判定（键与 metrics 一一对应）
+          required: [velocity_rmse_ms, steering_rmse_rad, overshoot_percent, settling_time_s]
+          properties:
+            velocity_rmse_ms: { $ref: "#/components/schemas/ControlThresholdCheck" }
+            steering_rmse_rad: { $ref: "#/components/schemas/ControlThresholdCheck" }
+            overshoot_percent: { $ref: "#/components/schemas/ControlThresholdCheck" }
+            settling_time_s: { $ref: "#/components/schemas/ControlThresholdCheck" }
+        overall_pass:
+          type: boolean
+          description: 全部指标是否达标（任一项不达标为 false；用于算法评估报告结论）
+        data_source:
+          type: string
+          description: 数据来源描述（如 "algorithm_metrics(module=control) + vehicle_telemetry 只读聚合"）
+        job_name:
+          type: string
+          example: control_eval_daily
+          description: 产出该评估的离线作业名
+        updated_at:
+          type: number
+          description: 评估文档生成时间（Unix epoch 秒）
+        report_id:
+          type: string
+          nullable: true
+          description: 关联的评估报告 ID
+
+    ControlEvalResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ControlEvalData" }
+
+    # ---------- 场景覆盖率（6.3 节） ----------
+    CoverageCell:
+      type: object
+      description: 覆盖热力图网格单元（自车轨迹网格化计数）
+      required: [x, y, count]
+      properties:
+        x: { type: number, description: "网格中心 X（地图坐标系 m）" }
+        y: { type: number, description: "网格中心 Y（地图坐标系 m）" }
+        count: { type: integer, minimum: 0, description: "该网格通过的遥测样本数" }
+
+    UncoveredArea:
+      type: object
+      description: 未覆盖项（未覆盖区域或未测试场景类型）
+      required: [kind, description]
+      properties:
+        kind:
+          type: string
+          enum: [region, scene_type]
+          description: 未覆盖类型（region 地理区域 / scene_type 场景类型）
+        description:
+          type: string
+          description: 描述（如网格范围或场景类型名，取 scene-service 场景库维度）
+        reason:
+          type: string
+          nullable: true
+          description: 判定原因（如窗口内无样本 / 场景库缺失该类型）
+        sample_count:
+          type: integer
+          minimum: 0
+          description: 覆盖样本数（0 表示完全未覆盖）
+
+    SceneCoverageData:
+      type: object
+      required: [window, grid_size_m, covered_cells, total_cells, coverage_ratio, heatmap, uncovered, data_source, updated_at]
+      properties:
+        vehicle_id:
+          type: string
+          nullable: true
+          description: 单车覆盖的车辆标识；车队汇总为 null
+        window: { $ref: "#/components/schemas/EvalWindow" }
+        grid_size_m: { type: number, minimum: 0.5, description: "网格边长（m）" }
+        covered_cells: { type: integer, minimum: 0, description: "已覆盖网格数" }
+        total_cells: { type: integer, minimum: 0, description: "网格总数（含未覆盖）" }
+        coverage_ratio:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 覆盖率 = covered_cells / total_cells
+        heatmap:
+          type: array
+          items: { $ref: "#/components/schemas/CoverageCell" }
+          description: 覆盖热力图（按覆盖次数降序，最多 max_cells 条）
+        heatmap_truncated:
+          type: boolean
+          description: 热力图是否被 max_cells 截断
+        uncovered:
+          type: array
+          items: { $ref: "#/components/schemas/UncoveredArea" }
+          description: 未覆盖清单（6.3 节：未覆盖区域 + 未被测试的场景类型）
+        scene_type_coverage:
+          type: object
+          additionalProperties: { type: number }
+          description: 各场景类型覆盖率（键 = 场景类型，取 scene-service 场景库维度）
+        data_source:
+          type: string
+          description: 数据来源描述（如 "vehicle_telemetry 只读聚合 + scene-service REST 场景库"）
+        job_name:
+          type: string
+          example: scene_coverage_weekly
+          description: 产出该分析的离线作业名
+        updated_at:
+          type: number
+          description: 分析文档生成时间（Unix epoch 秒）
+        report_id:
+          type: string
+          nullable: true
+          description: 关联的场景覆盖率报告 ID
+
+    SceneCoverageResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SceneCoverageData" }
+
+    # ---------- Corner Case（6.4 节） ----------
+    CornerCaseCategory:
+      type: string
+      enum: [kinematic, perception, planning, interaction, environment]
+      description: |
+        Corner Case 类别（6.4 节 5 类，不可新增）：
+        `kinematic` 运动学异常 / `perception` 感知异常 / `planning` 规划异常 /
+        `interaction` 交互异常 / `environment` 环境异常
+
+    CornerCaseAlgorithm:
+      type: string
+      enum: [isolation_forest, dbscan]
+      description: 挖掘算法（6.4 节：Isolation Forest 无监督异常检测 + DBSCAN 密度聚类，可组合）
+
+    CornerCaseItem:
+      type: object
+      required: [corner_case_id, category, vehicle_id, event_time, anomaly_score, algorithm]
+      properties:
+        corner_case_id:
+          type: string
+          format: uuid
+          description: Corner Case 唯一 ID（= analytics_result.result_id，消费方幂等键）
+        category: { $ref: "#/components/schemas/CornerCaseCategory" }
+        vehicle_id: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" }
+        event_time: { type: number, description: "异常发生时间（Unix epoch 秒）" }
+        window_start: { type: number, description: "事件前窗起点（= event_time - 10s，4.5 节截取窗口）" }
+        window_end: { type: number, description: "事件后窗终点（= event_time + 10s，4.5 节截取窗口）" }
+        anomaly_score:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 异常分数（归一化 0-1，越大越异常；Isolation Forest decision_function 归一化）
+        algorithm: { $ref: "#/components/schemas/CornerCaseAlgorithm" }
+        cluster_id:
+          type: integer
+          nullable: true
+          description: DBSCAN 聚类编号（-1 表示噪声点；仅 dbscan 结果）
+        trigger_event_type:
+          type: string
+          nullable: true
+          description: 关联的受控事件类型（18 种之一，如 harsh_braking / collision_warning；无则为 null）
+        description:
+          type: string
+          nullable: true
+          description: 场景描述（供场景库检索与人工复核）
+        metrics:
+          type: object
+          additionalProperties: { type: number }
+          description: 异常时刻特征值（如 min_ttc / max_lateral_accel / perception_latency_ms）
+        data_file_url:
+          type: string
+          nullable: true
+          description: 关联数据文件（MinIO hunter-rosbag / hunter-raw-data；下载走 15 分钟预签名）
+        scene_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: scene-service 自动提取生成的场景 ID（4.5 节实车场景提取结果回填；未提取为 null）
+
+    CornerCaseMiningMeta:
+      type: object
+      description: 挖掘作业元信息（最近一次运行）
+      required: [algorithm, last_run_at]
+      properties:
+        algorithm:
+          type: array
+          items: { $ref: "#/components/schemas/CornerCaseAlgorithm" }
+          description: 本次挖掘使用的算法组合
+        last_run_at: { type: number, description: "最近一次运行时间（Unix epoch 秒）" }
+        job_name: { type: string, example: corner_case_mining_weekly, description: "离线作业名" }
+        window: { $ref: "#/components/schemas/EvalWindow" }
+        feature_count:
+          type: integer
+          minimum: 0
+          description: 参与挖掘的特征维度数（运动学/感知/规划/交互/环境特征）
+        total_found:
+          type: integer
+          minimum: 0
+          description: 本次挖掘命中总数（过滤前）
+
+    CornerCaseListData:
+      type: object
+      required: [items, total, page, page_size, mining]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/CornerCaseItem" }
+        total: { type: integer, minimum: 0, description: "命中总数（挖掘结果文档内计数）" }
+        page: { type: integer, minimum: 1, example: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200, example: 20 }
+        mining: { $ref: "#/components/schemas/CornerCaseMiningMeta" }
+        category_counts:
+          type: object
+          additionalProperties: { type: integer }
+          description: 各类别命中数量（键 = 5 类类别）
+
+    CornerCaseListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/CornerCaseListData" }
+
+x-hunter-service:
+  name: data-analytics
+  port: 8083
+  gateway_prefix: /api/v1/analytics
+  db_schema: data_analytics
+  db_tables: [algorithm_metrics]
+  db_access:
+    write:
+      - "data_analytics.algorithm_metrics（hypertable，批量 executemany + ON CONFLICT DO NOTHING）"
+    read_only:
+      - "data_collector.vehicle_telemetry（跨 schema 只读例外：contracts/database/er.md 第 3 节，账号 hunter_analytics_ro，仅 SELECT）"
+      - "data_analytics.algorithm_metrics"
+    forbidden:
+      - "禁止直查 data_collector.events / scene_svc.scenes / vehicle_svc.*（一律经服务 REST，架构原则：模块化解耦）"
+  db_tables_absent:
+    status: pending_confirmation
+    note: "报告元信息表 / Corner Case 结果表 / 数据质量结果表在 contracts/database 不存在 → 本契约不新增表（见 x-hunter-pending-confirmation #2）"
+  minio_buckets: [hunter-reports, hunter-rosbag, hunter-raw-data]
+  minio_bucket_lifecycle:
+    hunter-reports: "永久保留（分析报告，6.5 节）"
+    hunter-rosbag: "事件数据永久，常规 30 天"
+    hunter-raw-data: "30 天自动删除"
+  redis_keys:
+    note: "仅读取既有键（Redis Key 设计不可更改，禁止新增键模式）"
+    read: ["vehicle:online:set", "vehicle:status:{vehicle_id}"]
+  dependencies:
+    - service: data-collector
+      usage: "REST GET /api/v1/data/events（看板事件统计）；Kafka 平台内部 Topic 由 data-collector 产出"
+    - service: scene-service
+      usage: "REST GET /api/v1/scene（场景覆盖率分析的场景库维度）"
+    - service: vehicle-service
+      usage: "REST（车辆台账校验 / 车队总数）；⚠ 服务归属待确认（模块表仅 6 个微服务）"
+    - service: flink
+      usage: "Flink 1.18 实时作业提交与状态查询（FLINK_JOBMANAGER_URL）"
+    - service: spark
+      usage: "Spark 3.5 离线作业调度（K8s CronJob / SparkApplication）"
+  config_source: "pydantic-settings（环境变量 / K8s ConfigMap data-analytics-config + Secret hunter-app-secrets）"
+  required_env:
+    - SERVICE_NAME
+    - API_PORT
+    - DB_POOL_SIZE
+    - DB_MAX_OVERFLOW
+    - KAFKA_BOOTSTRAP_SERVERS
+    - KAFKA_TOPIC_ANALYTICS_RESULT
+    - KAFKA_TOPIC_ALERT_EVENT
+    - KAFKA_CONSUMER_TOPIC_TELEMETRY_CLEAN
+    - KAFKA_CONSUMER_TOPIC_TELEMETRY_RAW
+    - KAFKA_CONSUMER_TOPIC_EVENT_RAW
+    - KAFKA_CONSUMER_TOPIC_SENSOR_FILE
+    - KAFKA_CONSUMER_GROUP_TELEMETRY
+    - KAFKA_CONSUMER_GROUP_TELEMETRY_RAW
+    - KAFKA_CONSUMER_GROUP_EVENTS
+    - KAFKA_CONSUMER_GROUP_SENSOR_FILE
+    - FLINK_JOBMANAGER_URL
+    - MINIO_BUCKET_REPORTS
+    - REPORT_DOWNLOAD_EXPIRES_SECONDS
+    - REPORT_MAX_RANGE_DAYS
+    - REPORT_GENERATE_MAX_CONCURRENT
+    - ANALYTICS_QUERY_MAX_RANGE_DAYS
+    - ALGORITHM_METRICS_WINDOW_SECONDS
+    - ALERT_WINDOW_SECONDS
+    - ALERT_TRIGGER_MAX_LATENCY_SECONDS
+    - DATA_COLLECTOR_BASE_URL
+    - SCENE_SERVICE_BASE_URL
+    - VEHICLE_SERVICE_BASE_URL
+    - ANALYTICS_RO_DB_USER
+    - ANALYTICS_RO_DB_PASSWORD
+    - POSTGRES_HOST
+    - POSTGRES_PORT
+    - POSTGRES_USER
+    - POSTGRES_PASSWORD
+    - POSTGRES_DB
+    - REDIS_HOST
+    - REDIS_PORT
+    - REDIS_PASSWORD
+    - MINIO_ENDPOINT
+    - MINIO_ACCESS_KEY
+    - MINIO_SECRET_KEY
+    - KAFKA_SASL_USERNAME
+    - KAFKA_SASL_PASSWORD
+    - ALERT_HARSH_ACCEL_MS2
+    - ALERT_HARSH_ACCEL_MIN_DURATION_SECONDS
+    - ALERT_HARSH_BRAKING_MS2
+    - ALERT_HARSH_BRAKING_MIN_DURATION_SECONDS
+    - ALERT_HARSH_TURN_RAD_S
+    - ALERT_OVER_SPEED_RATIO
+    - ALERT_BATTERY_LOW_SOC
+    - ALERT_BATTERY_CRITICAL_SOC
+    - ALERT_COLLISION_TTC_CRITICAL_SECONDS
+    - ALERT_COLLISION_TTC_WARNING_SECONDS
+    - ALERT_COMMUNICATION_LOSS_SECONDS
+    - OFFLINE_JOB_CRON_DAILY_REPORT
+    - OFFLINE_JOB_CRON_PERCEPTION_EVAL
+    - OFFLINE_JOB_CRON_CONTROL_EVAL
+    - OFFLINE_JOB_CRON_SCENE_COVERAGE
+    - OFFLINE_JOB_CRON_CORNER_CASE_MINING
+    - OFFLINE_JOB_CRON_MONTHLY_OPERATION
+  env_derived:
+    - name: KAFKA_BOOTSTRAP_SERVERS
+      source: "hunter-common-config（共享 ConfigMap）"
+    - name: POSTGRES_HOST
+      source: "hunter-common-config（共享 ConfigMap）"
+    - name: POSTGRES_PORT
+      source: "hunter-common-config（共享 ConfigMap）"
+    - name: POSTGRES_USER
+      source: "hunter-common-config（共享 ConfigMap）"
+    - name: POSTGRES_DB
+      source: "hunter-common-config（共享 ConfigMap）"
+    - name: REDIS_HOST
+      source: "hunter-common-config（共享 ConfigMap）"
+    - name: REDIS_PORT
+      source: "hunter-common-config（共享 ConfigMap）"
+    - name: MINIO_ENDPOINT
+      source: "hunter-common-config（共享 ConfigMap）"
+    - name: POSTGRES_PASSWORD
+      source: "hunter-app-secrets（Secret）"
+    - name: REDIS_PASSWORD
+      source: "hunter-app-secrets（Secret）"
+    - name: MINIO_ACCESS_KEY
+      source: "hunter-app-secrets（Secret）"
+    - name: MINIO_SECRET_KEY
+      source: "hunter-app-secrets（Secret）"
+    - name: KAFKA_SASL_USERNAME
+      source: "hunter-app-secrets（Secret）"
+    - name: KAFKA_SASL_PASSWORD
+      source: "hunter-app-secrets（Secret）"
+    - name: ANALYTICS_RO_DB_USER
+      source: "data-analytics-config（ConfigMap；只读账号名，对应 er.md 的 hunter_analytics_ro）"
+    - name: ANALYTICS_RO_DB_PASSWORD
+      source: "hunter-app-secrets（Secret）"
+  performance:
+    api_p95_ms: 200
+    alert_trigger_latency_ms: 2000
+    timeseries_read_retention_days: 90
+    note: "长耗时计算（报告渲染 / 覆盖分析 / Corner Case 挖掘）一律离线预计算，端点只读结果"
+
+x-hunter-endpoints:
+  source: "设计文档 12.4 节（API 端点清单：模块专属指令逐条给出，不可增删）"
+  status: provided
+  note: "12.4 节给出 8 个业务端点，本契约逐条对齐；运维探针为本仓库统一约定（与 api-gateway 契约一致）"
+  endpoints:
+    - "GET /api/v1/analytics/reports"
+    - "GET /api/v1/analytics/reports/{report_id}"
+    - "POST /api/v1/analytics/reports/generate"
+    - "GET /api/v1/analytics/dashboard"
+    - "GET /api/v1/analytics/perception/eval"
+    - "GET /api/v1/analytics/control/eval"
+    - "GET /api/v1/analytics/scene/coverage"
+    - "GET /api/v1/analytics/corner-cases"
+  ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]
+  path_notes:
+    - "网关不剥离前缀（api-gateway.yaml strip_prefix=false），服务按全路径 /api/v1/analytics/... 注册路由"
+    - "除报告生成外均为只读查询；禁止新增端点（如新增 /api/v1/analytics/planning/eval 必须先核对 12.4 节并改契约）"
+  contract_gaps:
+    - "12.4 节无「规划质量评估」端点（6.3 节含规划质量评估）：当前仅在算法评估报告中体现（pending #9）"
+    - "12.4 节无「数据质量」查询端点（6.2.5 节数据质量报告）：当前经 analytics_result / 报告体现（pending #5）"
+    - "12.4 节无「报告删除」端点：报告永久保留（MinIO 生命周期），不做删除（pending #2）"
+
+x-hunter-realtime-jobs:
+  source: "设计文档 6.2 节（Flink 实时分析任务：车辆状态监控 / 异常驾驶检测 / 算法性能监控 / 碰撞风险评估 / 数据质量监控）"
+  engine: "Flink 1.18（DataStream API，作业目录 flink-jobs/）"
+  input:
+    - topic: telemetry_clean
+      consumer_group: data-analytics-telemetry
+      jobs: [vehicle_state_monitor, driving_anomaly_detection, collision_risk_assessment, algorithm_performance_monitor]
+    - topic: telemetry_raw
+      consumer_group: data-analytics-telemetry-raw
+      jobs: [data_quality_monitor]
+      reason: "数据质量监控需与清洗后数据对比（丢包率/延迟/异常值），必须消费原始流"
+  outputs:
+    alert_event: "告警（contracts/kafka/schemas/alert_event.schema.json；level 必须 = EVENT_LEVEL_BY_TYPE[alert_type]）"
+    algorithm_metrics: "算法指标（data_analytics.algorithm_metrics，module ∈ perception/planning/control）"
+    analytics_result: "指标结果（result_type=metric；含数据质量指标）"
+    dlq: "{topic}.dlq（解析/反序列化失败或处理异常的消息，保留原 topic/partition/offset）"
+  jobs:
+    - name: vehicle_state_monitor
+      section: "6.2.1"
+      input: telemetry_clean
+      logic:
+        - "心跳检测：单车超过 ALERT_COMMUNICATION_LOSS_SECONDS(10s) 无遥测 → alert_type=communication_loss（critical）"
+        - "状态变更检测：对比 vehicle_state / control_mode 跃迁，产出状态变更指标（写 algorithm_metrics；不直接写 Redis，避免与 data-collector 写路径竞争）"
+      outputs: [alert_event, algorithm_metrics]
+      idempotency: "(vehicle_id, alert_type, event_time) 去重（同一窗口重复触发只投递一次）"
+
+    - name: driving_anomaly_detection
+      section: "6.2.2"
+      input: telemetry_clean
+      rules:
+        - name: harsh_acceleration
+          condition: "加速度 > ALERT_HARSH_ACCEL_MS2(3.0 m/s²) 且持续 > ALERT_HARSH_ACCEL_MIN_DURATION_SECONDS(0.5s)"
+          level: warning
+        - name: harsh_braking
+          condition: "减速度 > ALERT_HARSH_BRAKING_MS2(3.0 m/s²) 且持续 > ALERT_HARSH_BRAKING_MIN_DURATION_SECONDS(0.5s)"
+          level: warning
+        - name: harsh_turning
+          condition: "横摆角速度 > ALERT_HARSH_TURN_RAD_S(0.8 rad/s)"
+          level: warning
+        - name: over_speed
+          condition: "速度 > 限速 × ALERT_OVER_SPEED_RATIO(1.1)"
+          level: critical
+        - name: battery_low
+          condition: "battery_soc < ALERT_BATTERY_LOW_SOC(20)"
+          level: warning
+        - name: battery_critical
+          condition: "battery_soc < ALERT_BATTERY_CRITICAL_SOC(10)"
+          level: critical
+      outputs: [alert_event]
+      note: "阈值与等级取自「事件类型定义」（contracts/database/enums.md 第 3 节），代码不得放宽或改等级"
+
+    - name: algorithm_performance_monitor
+      section: "6.2 节（算法性能监控）"
+      input: telemetry_clean
+      logic:
+        - "统计感知帧率 perception.fps（均值/最小值）与感知延迟 perception.latency_ms（P95）"
+        - "统计规划延迟 planning.planning_latency_ms、控制误差 control.velocity_error / control.steer_error"
+        - "按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 滚动窗口聚合后批量写 data_analytics.algorithm_metrics"
+      outputs: [algorithm_metrics, analytics_result]
+      metric_mapping:
+        "perception.fps": "metric_name=fps, module=perception"
+        "perception.latency_ms": "metric_name=latency_ms, module=perception"
+        "planning.planning_latency_ms": "metric_name=planning_latency_ms, module=planning"
+        "control.control_latency_ms": "metric_name=control_latency_ms, module=control"
+        "control.velocity_error": "metric_name=velocity_error_abs, module=control"
+        "control.steer_error": "metric_name=steer_error_abs, module=control"
+      writes: "data_analytics.algorithm_metrics（executemany 批量写，ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING）"
+
+    - name: collision_risk_assessment
+      section: "6.2.3"
+      input: telemetry_clean
+      logic:
+        - "TTC = d / v_rel（d 为本车与前方目标距离，v_rel 为相对速度，仅 v_rel > 0 时有效）"
+        - "TTC < ALERT_COLLISION_TTC_CRITICAL_SECONDS(1.5s) → alert_type=collision_warning（critical，投 alert_event）"
+        - "TTC < ALERT_COLLISION_TTC_WARNING_SECONDS(3.0s) → 预警：写 analytics_result(result_type=metric, metrics.min_ttc) 与 algorithm_metrics"
+      outputs: [alert_event, analytics_result, algorithm_metrics]
+      conflict_note: "⚠ 6.2.3 节 3.0s 预警（warning）与受控词表 collision_warning=critical 冲突：契约不新增事件类型、不放宽等级，故 3.0s 预警不投 alert_event（见 pending #3）"
+
+    - name: data_quality_monitor
+      section: "6.2.5"
+      input: telemetry_raw
+      logic:
+        - "丢包率：按 seq 连续性估算（seq 缺口数 / 期望条数）"
+        - "延迟：车端 timestamp 与到达时间差（P95）"
+        - "异常值占比：battery_soc 0-100、cpu_usage/gpu_usage 0-100 等物理范围外样本比例"
+      outputs: [analytics_result, algorithm_metrics]
+      note: "⚠ 数据质量阈值与结果落位（是否单独报告/表）设计文档未定义：契约按 analytics_result(result_type=metric) 输出，见 pending #5"
+
+  thresholds:
+    - name: ALERT_COMMUNICATION_LOSS_SECONDS
+      value: 10
+      unit: s
+      source: "事件类型定义 communication_loss：遥测中断 > 10s（enums.md 第 3 节）"
+    - name: ALERT_TRIGGER_MAX_LATENCY_SECONDS
+      value: 2
+      unit: s
+      source: "性能指标：实时告警触发延迟 ≤ 2s"
+    - name: ALERT_HARSH_ACCEL_MS2
+      value: 3.0
+      unit: m/s2
+      source: "6.2.2 节 / 事件类型定义 harsh_acceleration：a > 3 m/s²"
+    - name: ALERT_HARSH_ACCEL_MIN_DURATION_SECONDS
+      value: 0.5
+      unit: s
+      source: "6.2.2 节：急加速需持续 > 0.5s"
+    - name: ALERT_HARSH_BRAKING_MS2
+      value: 3.0
+      unit: m/s2
+      source: "6.2.2 节 / 事件类型定义 harsh_braking：减速度 > 3 m/s²"
+    - name: ALERT_HARSH_BRAKING_MIN_DURATION_SECONDS
+      value: 0.5
+      unit: s
+      source: "6.2.2 节：急减速需持续 > 0.5s"
+    - name: ALERT_HARSH_TURN_RAD_S
+      value: 0.8
+      unit: rad/s
+      source: "6.2.2 节 / 事件类型定义 harsh_turning：横摆角速度 > 0.8 rad/s"
+    - name: ALERT_OVER_SPEED_RATIO
+      value: 1.1
+      unit: ratio
+      source: "6.2.2 节 / 事件类型定义 over_speed：速度 > 限速 × 1.1"
+    - name: ALERT_BATTERY_LOW_SOC
+      value: 20
+      unit: percent
+      source: "6.2.2 节 / 事件类型定义 battery_low：SOC < 20%"
+    - name: ALERT_BATTERY_CRITICAL_SOC
+      value: 10
+      unit: percent
+      source: "6.2.2 节 / 事件类型定义 battery_critical：SOC < 10%"
+    - name: ALERT_COLLISION_TTC_CRITICAL_SECONDS
+      value: 1.5
+      unit: s
+      source: "6.2.3 节 / 事件类型定义 collision_warning：TTC < 1.5s"
+    - name: ALERT_COLLISION_TTC_WARNING_SECONDS
+      value: 3.0
+      unit: s
+      source: "6.2.3 节：TTC < 3.0s 碰撞预警（⚠ 等级冲突见 pending #3）"
+    - name: ALGORITHM_METRICS_WINDOW_SECONDS
+      value: 60
+      unit: s
+      source: "⚠ 6.2 节未给出算法指标统计窗口：契约取 60s 滚动窗口（pending #6）"
+    - name: ALERT_WINDOW_SECONDS
+      value: 2
+      unit: s
+      source: "性能指标：告警窗口 = 触发延迟上限（2s）"
+  timeliness:
+    target_latency_ms: 2000
+    check: "timestamp - event_time ≤ ALERT_TRIGGER_MAX_LATENCY_SECONDS"
+    ownership_note: "⚠ alert_event 消费方（platform-alert-event）落位服务待定：WebSocket 推送前端由告警处理承担（pending #4）"
+
+x-hunter-offline-jobs:
+  source: "设计文档 6.3 节（Spark 离线分析）/ 6.4 节（Corner Case 挖掘）/ 6.5 节（报告生成）"
+  engine: "Spark 3.5（PySpark，作业目录 spark-jobs/）；调度：K8s CronJob（UTC），非敏感配置走 ConfigMap"
+  data_access:
+    reads:
+      - "data_collector.vehicle_telemetry（只读账号 hunter_analytics_ro，仅 SELECT）"
+      - "data_analytics.algorithm_metrics（只读/自拥有）"
+      - "MinIO hunter-rosbag / hunter-raw-data / hunter-reports"
+    cross_service:
+      - "data-collector REST GET /api/v1/data/events（事件维度统计，禁止直查 events 表）"
+      - "scene-service REST GET /api/v1/scene（场景库维度 / 场景测试报告）"
+      - "vehicle-service REST（车辆台账，⚠ 归属待确认）"
+  outputs:
+    minio: "hunter-reports（JSON 结果 + HTML/PDF 报告，永久保留）"
+    kafka: "analytics_result（result_type=metric|corner_case|report，key=vehicle_id）"
+    db: "data_analytics.algorithm_metrics（仅需时序化留存的指标）"
+  jobs:
+    - name: daily_report
+      section: "6.3 节（每日运行报告）"
+      schedule:
+        env: OFFLINE_JOB_CRON_DAILY_REPORT
+        default_cron: "30 0 * * *"
+        timezone: UTC
+        human: "每日 00:30（统计前一日数据）"
+      inputs: [vehicle_telemetry, algorithm_metrics, data-collector events REST]
+      outputs:
+        - "report_type=vehicle_daily 的报告（HTML + PDF + JSON，落 hunter-reports）"
+        - "analytics_result(result_type=report)"
+      templates: "6.5 节 车辆运行日报"
+
+    - name: perception_eval
+      section: "6.3 节（感知精度评估）"
+      schedule:
+        env: OFFLINE_JOB_CRON_PERCEPTION_EVAL
+        default_cron: "0 1 * * *"
+        timezone: UTC
+        human: "每日 01:00"
+      inputs: [hunter-rosbag 标注文件（真值⚠ 待确认）, algorithm_metrics]
+      metrics: [map_3d, map_bev, iou, recall, precision, mean_localization_error_m]
+      outputs:
+        - "感知评估结果文档（hunter-reports；GET /perception/eval 读取）"
+        - "report_type=algorithm_eval 报告"
+
+    - name: planning_quality_eval
+      section: "6.3 节（规划质量评估）"
+      schedule:
+        env: OFFLINE_JOB_CRON_PERCEPTION_EVAL
+        default_cron: "0 1 * * *"
+        timezone: UTC
+        human: "每日 01:00（与感知评估同批次）"
+      inputs: [vehicle_telemetry, algorithm_metrics]
+      metrics: [smoothness 平滑度, deviation 轨迹偏离度, comfort 舒适度（加速度/加加速度统计）]
+      outputs:
+        - "规划质量结果并入算法评估报告（⚠ 12.4 节无独立查询端点，见 pending #9）"
+
+    - name: control_eval
+      section: "6.3.3 节（控制性能评估）"
+      schedule:
+        env: OFFLINE_JOB_CRON_CONTROL_EVAL
+        default_cron: "30 1 * * *"
+        timezone: UTC
+        human: "每日 01:30"
+      inputs: [algorithm_metrics(module=control), vehicle_telemetry]
+      thresholds:
+        - name: velocity_rmse_ms
+          threshold: 0.2
+          comparator: lt
+          unit: m/s
+          source: "6.3.3 节：速度跟踪 RMSE < 0.2 m/s"
+        - name: steering_rmse_rad
+          threshold: 0.02
+          comparator: lt
+          unit: rad
+          source: "6.3.3 节：转向跟踪 RMSE < 0.02 rad"
+        - name: overshoot_percent
+          threshold: 10
+          comparator: lt
+          unit: percent
+          source: "6.3.3 节：超调 < 10%"
+        - name: settling_time_s
+          threshold: 2
+          comparator: lt
+          unit: s
+          source: "6.3.3 节：调节时间 < 2s"
+      outputs:
+        - "控制评估结果文档（hunter-reports；GET /control/eval 读取，含阈值判定）"
+        - "report_type=algorithm_eval 报告"
+
+    - name: scene_coverage
+      section: "6.3 节（场景覆盖率分析，每周）"
+      schedule:
+        env: OFFLINE_JOB_CRON_SCENE_COVERAGE
+        default_cron: "0 1 * * 1"
+        timezone: UTC
+        human: "每周一 01:00"
+      inputs: [vehicle_telemetry(localization.x/y), scene-service REST 场景库]
+      outputs:
+        - "覆盖率结果文档（热力图 + 未覆盖清单，hunter-reports；GET /scene/coverage 读取）"
+        - "report_type=scene_test 报告"
+
+    - name: corner_case_mining
+      section: "6.4 节（Corner Case 挖掘，每周）"
+      schedule:
+        env: OFFLINE_JOB_CRON_CORNER_CASE_MINING
+        default_cron: "0 2 * * 1"
+        timezone: UTC
+        human: "每周一 02:00"
+      inputs: [vehicle_telemetry, algorithm_metrics, data-collector events REST, 车端事件流（event_raw 经 Kafka/Flink）]
+      outputs:
+        - "corner_case 结果文档（hunter-reports；GET /corner-cases 读取）"
+        - "逐条 analytics_result(result_type=corner_case) → scene-service 实车场景自动提取（4.5 节）"
+      algorithms: [isolation_forest, dbscan]
+
+    - name: monthly_operation
+      section: "6.3 节（车队运行统计，每月）"
+      schedule:
+        env: OFFLINE_JOB_CRON_MONTHLY_OPERATION
+        default_cron: "0 3 1 * *"
+        timezone: UTC
+        human: "每月 1 日 03:00"
+      inputs: [vehicle_telemetry, algorithm_metrics, events REST, ota REST（升级统计）]
+      outputs:
+        - "月报（HTML + PDF + JSON，hunter-reports）"
+        - "report_type=monthly_operation 报告"
+
+x-hunter-corner-case-mining:
+  source: "设计文档 6.4 节（Corner Case 挖掘）"
+  frequency: weekly
+  job: corner_case_mining
+  algorithms:
+    - name: isolation_forest
+      role: "无监督异常检测（多维特征异常分数）"
+      output_field: anomaly_score
+      note: "decision_function 归一化到 [0,1]；scikit-learn IsolationForest，随机种子固定保证可复现"
+    - name: dbscan
+      role: "密度聚类（异常样本分群，识别同类 Corner Case 簇）"
+      output_field: cluster_id
+      note: "-1 表示噪声点；eps/min_samples 由作业参数（环境变量）控制"
+  categories:
+    - name: kinematic
+      description: "运动学异常（速度/加速度/横摆角速度超限、轨迹跳变）"
+    - name: perception
+      description: "感知异常（检测目标数突变、感知延迟尖峰、object_types 分布异常）"
+    - name: planning
+      description: "规划异常（轨迹长度/点数异常、规划延迟尖峰、行为模式突变）"
+    - name: interaction
+      description: "交互异常（目标距离过近、TTC 触界、人工接管关联）"
+    - name: environment
+      description: "环境异常（定位标准差放大、网络 RSSI 骤降、温度越界）"
+  features:
+    note: "特征取值自 telemetry_clean 六段（chassis/localization/perception/planning/control/system）+ events（经 data-collector REST）"
+    window: "单样本=车辆时间窗（默认 10 min，⚠ 设计文档未给出窗口，见 pending #7）"
+  clipping:
+    pre_seconds: 10
+    post_seconds: 10
+    source: "4.5 节：事件前后各 10 秒（与 analytics_result.clip 一致，不可更改）"
+  output:
+    document: "hunter-reports/corner_cases/<yyyy-mm-dd>/corner_cases.json（GET /corner-cases 读取）"
+    kafka: "analytics_result（result_type=corner_case，含 clip/ego_trajectory/objects/environment）"
+    scene_service: "scene-service 消费后按 4.5 节提取为 scene_type=real_vehicle_replay、status=draft 场景"
+  dedup: "corner_case_id = analytics_result.result_id（UUID）；scene-service 幂等键 (vehicle_id, window_start)"
+
+x-hunter-report-templates:
+  source: "设计文档 6.5 节（报告生成 5 类标准模板）"
+  templates:
+    - report_type: vehicle_daily
+      name: "车辆运行日报"
+      trigger: schedule
+      cron_env: OFFLINE_JOB_CRON_DAILY_REPORT
+      scope: vehicle
+      sections: [里程与运行时长, 遥测完整率, 事件统计（按类型/等级）, 算法指标（感知/规划/控制）, 能耗与电量]
+    - report_type: algorithm_eval
+      name: "算法评估报告"
+      trigger: schedule
+      cron_env: OFFLINE_JOB_CRON_PERCEPTION_EVAL
+      scope: vehicle + fleet
+      sections: [感知精度（mAP 3D/BEV、IoU、Recall、Precision、平均定位误差）, 规划质量（平滑度/偏离度/舒适度）, 控制性能（RMSE/超调/调节时间 + 阈值判定）]
+    - report_type: scene_test
+      name: "场景测试报告"
+      trigger: schedule
+      cron_env: OFFLINE_JOB_CRON_SCENE_COVERAGE
+      scope: fleet + scene
+      sections: [场景覆盖率与热力图, 未覆盖清单, 仿真-实车结果对比（⚠ 数据来源待确认）]
+    - report_type: ota_upgrade
+      name: "OTA 升级报告"
+      trigger: manual
+      scope: task
+      sections: [升级任务与版本, 灰度批次成功率, 失败/回滚统计, 升级耗时分布]
+      dependency: "ota-service REST（升级任务与记录统计），禁止直查 ota_svc"
+    - report_type: monthly_operation
+      name: "月度运营报告"
+      trigger: schedule
+      cron_env: OFFLINE_JOB_CRON_MONTHLY_OPERATION
+      scope: fleet
+      sections: [车队运行统计（里程/时长/出勤率）, 事件与告警趋势, 算法指标趋势, 数据量与存储占用, Corner Case 汇总]
+  formats:
+    supported: [html, pdf, json]
+    html: "交互式图表（ECharts，前端可直接打开）"
+    pdf: "ECharts + Puppeteer 服务端渲染（无头 Chromium 容器）"
+    json: "报告数据（供前端自定义渲染 / 二次分析）"
+  generation:
+    mode: async
+    submit_endpoint: "POST /api/v1/analytics/reports/generate"
+    poll_endpoint: "GET /api/v1/analytics/reports/{report_id}"
+    concurrency_env: REPORT_GENERATE_MAX_CONCURRENT
+    max_range_env: REPORT_MAX_RANGE_DAYS
+    on_complete: "投递 analytics_result(result_type=report) + 写 sidecar 元信息（MinIO）"
+  retention: "hunter-reports 永久保留（MinIO Bucket 规划，不可更改）"
+
+x-hunter-report-storage:
+  source: "MinIO Bucket 规划（hunter-reports 永久）+ 契约缺口（contracts/database 无 reports 表）"
+  bucket: hunter-reports
+  object_layout:
+    artifact: "hunter-reports/{report_type}/{yyyy-mm-dd}/{report_id}.{html|pdf|json}"
+    metadata: "hunter-reports/{report_type}/{yyyy-mm-dd}/{report_id}.meta.json（sidecar，ReportMeta 全字段）"
+    eval_documents:
+      perception_eval: "hunter-reports/eval/perception/latest.json"
+      control_eval: "hunter-reports/eval/control/latest.json"
+      scene_coverage: "hunter-reports/coverage/latest.json"
+      corner_cases: "hunter-reports/corner_cases/latest.json"
+  list_semantics: "GET /reports 以前缀列举 + sidecar 解析实现；total 为列举计数（非 DB COUNT）"
+  presign:
+    download_expires_in_seconds: 900
+    range_download: true
+    upload_expires_in_seconds: 3600
+  status: pending_confirmation
+  note: "⚠ 报告/评估结果元信息无 DB 表：若需按业务字段高效检索/权限隔离，建议新增 data_analytics.reports 表（需先改 DDL/ORM/migration，见 pending #2）"
+
+x-hunter-dashboard-contract:
+  source: "6.2/6.3 节指标 + Redis Key 设计 + contracts/database/ddl/05_timeseries.sql"
+  endpoint: "GET /api/v1/analytics/dashboard"
+  blocks:
+    fleet:
+      sources:
+        - "Redis vehicle:online:set（SCARD，在线车辆数）"
+        - "Redis vehicle:status:{vehicle_id}（HGETALL，状态分布）"
+      degradation: "Redis 不可用 → available=false（看板其余块照常返回）"
+      note: "⚠ 车辆状态读取端点归属待确认（data-collector pending #8 / 本契约 pending #8）；本服务只读既有键，不新增键模式"
+    pipeline:
+      sources:
+        - "Kafka AdminClient：消费组滞后（data-analytics-* / data-collector-*）"
+        - "Kafka AdminClient：{topic}.dlq 高水位（DLQ 消息数）"
+        - "data_collector.vehicle_telemetry（只读账号，count / 近似计数，按 time 分区裁剪）"
+      limits: "单块聚合时间窗上限 ANALYTICS_QUERY_MAX_RANGE_DAYS(7d)；禁止全表精确 COUNT（hypertable 开销）"
+      ingest_latency: "遥测入库延迟 P95 取自监控指标（Prometheus 查询）或 Kafka 时间戳差估算（⚠ 实现方式待确认，pending #10）"
+    algorithm:
+      sources:
+        - "data_analytics.algorithm_metrics（module ∈ perception/planning/control，按 ALGORITHM_METRICS_WINDOW_SECONDS 聚合）"
+      metrics: [fps, latency_ms, planning_latency_ms, control_latency_ms, velocity_error_abs, steer_error_abs]
+    events:
+      sources:
+        - "data-collector REST GET /api/v1/data/events（event_level / acknowledged 维度计数，取返回 total）"
+      degradation: "data-collector 不可用 → available=false + reason，HTTP 仍为 200"
+      note: "⚠ 平台侧 alert_event 统计（本服务生产）暂无落位（alert_event 消费方待定，pending #4）"
+  response_semantics:
+    partial_failure: "任一块不可用 → 200 + 该块 available=false + degraded 列表；全部不可用 → 503"
+    cache: "不引入新 Redis 键（Redis Key 设计不可更改）；如需缓存须先评审键模式（pending #11）"
+
+x-hunter-alert-contract:
+  source: "设计文档 6.2 节（实时告警规则）+ contracts/kafka/schemas/alert_event.schema.json"
+  topic: alert_event
+  producer: data-analytics（Flink）
+  schema: contracts/kafka/schemas/alert_event.schema.json
+  level_mapping:
+    note: "alert_event.level 必须等于 EVENT_LEVEL_BY_TYPE[alert_type]（contracts/database/enums.md 第 3 节，不可放宽）"
+    by_type:
+      harsh_acceleration: warning
+      harsh_braking: warning
+      harsh_turning: warning
+      over_speed: critical
+      collision_warning: critical
+      manual_takeover: info
+      emergency_stop: critical
+      battery_low: warning
+      battery_critical: critical
+      communication_loss: critical
+      sensor_fault: critical
+      perception_fault: critical
+      planning_fault: critical
+      control_fault: critical
+      ota_start: info
+      ota_success: info
+      ota_failed: critical
+      ota_rollback: warning
+  emitted_types:
+    - "vehicle_state_monitor → communication_loss"
+    - "driving_anomaly_detection → harsh_acceleration / harsh_braking / harsh_turning / over_speed / battery_low / battery_critical"
+    - "collision_risk_assessment → collision_warning"
+    - "algorithm_performance_monitor / data_quality_monitor → 不投 alert_event（指标类输出，见各作业 outputs）"
+  not_emitted:
+    - "manual_takeover / emergency_stop / *_fault / ota_* ：由车端上报（hunter.{vehicle_id}.event → data-collector），平台侧不重算"
+  idempotency: "(vehicle_id, alert_id)；Flink 侧窗口内去重 (vehicle_id, alert_type, event_time)"
+  consumer: "platform-alert-event（⚠ 落位服务待定：data-analytics 告警子模块 / api-gateway 推送，pending #4）"
+  latency: "timestamp - event_time ≤ 2s（告警触发延迟）；端到端 WebSocket 推送 ≤ 2s"
+  ack: "告警确认沿用 data_collector.events.acknowledged（经 data-collector REST），alert_event 不做确认态存储"
+
+x-hunter-rate-limits:
+  source: "设计文档 附录 D（API 限流配置）+ contracts/openapi/api-gateway.yaml x-hunter-rate-limits"
+  algorithm: "Redis 滑动窗口计数（键 rate_limit:{ip}:{api}，窗口 1 分钟）"
+  inherit_gateway:
+    global_qps: 10000
+    per_user_qps: 100
+    per_ip_qps: 200
+  endpoint_limits: []
+  note: "⚠ 附录 D 未对本服务端点给出接口级阈值（仅 /data/telemetry 20 QPS、/ota/versions 5 QPS、/remote/session 1 QPS 被点名）→ 本服务仅继承网关五级限流，禁止自造接口级阈值"
+  heavy_protection:
+    report_generate_max_concurrent:
+      env: REPORT_GENERATE_MAX_CONCURRENT
+      default: 2
+      on_exceed: "3003（HTTP 409）"
+      note: "渲染任务（Puppeteer）资源密集，用并发保护替代 QPS 限流"
+    query_max_range_days:
+      env: ANALYTICS_QUERY_MAX_RANGE_DAYS
+      default: 7
+      on_exceed: "2001（HTTP 422）"
+      note: "评估/看板聚合查询时间跨度上限，保护 P95 ≤ 200ms（⚠ 设计文档未定义，见 pending #11）"
+    report_max_range_days:
+      env: REPORT_MAX_RANGE_DAYS
+      default: 90
+      on_exceed: "2001（HTTP 422）"
+      note: "报告统计窗口上限 = 时序数据保留期（90 天）"
+    other_query_bounds:
+      - "coverage.max_cells ≤ 50000（默认 5000）：响应体保护"
+      - "page_size ≤ 200：与 BaseRepository.MAX_PAGE_SIZE 一致"
+  over_limit:
+    http_status: 429
+    response_code: 5001
+    retry_after_header: Retry-After
+    note: "⚠ 附录 A 无限流专用错误码，禁止新增，响应体 code 统一复用 5001"
+
+x-hunter-kafka:
+  source: "contracts/kafka/{topics,consumer-groups}.yaml（双向一致，禁止另立事实来源）"
+  consumes:
+    - topic: telemetry_clean
+      group_id: data-analytics-telemetry
+      schema: contracts/kafka/schemas/telemetry.schema.json
+      jobs: [vehicle_state_monitor, driving_anomaly_detection, collision_risk_assessment, algorithm_performance_monitor]
+      enabled: true
+    - topic: telemetry_raw
+      group_id: data-analytics-telemetry-raw
+      schema: contracts/kafka/schemas/telemetry.schema.json
+      jobs: [data_quality_monitor]
+      enabled: true
+    - topic: event_raw
+      group_id: data-analytics-events
+      schema: contracts/kafka/schemas/event.schema.json
+      jobs: [corner_case_mining]
+      enabled: true
+    - topic: sensor_file
+      group_id: data-analytics-sensor-file
+      schema: contracts/kafka/schemas/sensor_file.schema.json
+      jobs: [perception_eval]
+      enabled: true
+      reason: "上传完成的传感器文件作为感知精度评估输入（MinIO 直读对象）"
+  produces:
+    - topic: analytics_result
+      schema: contracts/kafka/schemas/analytics_result.schema.json
+      key: vehicle_id
+      trigger: "实时指标（result_type=metric）/ Corner Case（corner_case）/ 报告完成（report）"
+    - topic: alert_event
+      schema: contracts/kafka/schemas/alert_event.schema.json
+      key: vehicle_id
+      trigger: "Flink 实时作业命中告警规则（6.2.1 / 6.2.2 / 6.2.3）"
+  not_owned:
+    note: "以下 Topic 属其他模块，本服务不生产、不消费，禁止擅自订阅"
+    topics:
+      - "hunter.{vehicle_id}.telemetry"
+      - "hunter.{vehicle_id}.event"
+      - "hunter.{vehicle_id}.health"
+      - "hunter.{vehicle_id}.command"
+      - "hunter.{vehicle_id}.command_result"
+      - "hunter.{vehicle_id}.ota_notify"
+      - "hunter.{vehicle_id}.ota_status"
+      - "hunter.{vehicle_id}.remote_control"
+      - "hunter.broadcast.command"
+      - "carla.{sim_id}.vil_state"
+      - "carla.{sim_id}.sensor_data"
+    carla_note: "⚠ Carla Topic 出现在设计文档 5.3.1 清单但未登记于 contracts/kafka/topics.yaml（data-collector 契约 pending #9）"
+  dlq: "{original_topic}.dlq（hunter_common.kafka.consumer 统一派生，保留原 topic/partition/offset 头）"
+  offset_commit: "手动提交（handler 成功后 commit；失败转 DLQ）"
+  idempotency_keys:
+    telemetry_clean: "(vehicle_id, time)"
+    telemetry_raw: "(vehicle_id, time)"
+    event_raw: "(vehicle_id, event_type, event_time)"
+    sensor_file: object_key
+
+x-hunter-error-status-map:
+  source: "设计文档 附录 A 错误码 + common/python/hunter_common/exceptions.py ErrorCode"
+  note: "⚠ 设计文档未定义错误码→HTTP 状态映射；此处与 services/data-analytics/app/core/error_handlers.py 的 HTTP_STATUS_BY_CODE 对齐"
+  map:
+    1001: 401
+    1002: 403
+    1003: 401
+    2001: 422
+    2002: 422
+    3001: 404
+    3002: 409
+    3003: 409
+    4001: 409
+    4002: 409
+    5000: 500
+    5001: 503
+    6001: 422
+    6002: 422
+    6003: 422
+    7001: 409
+    7002: 502
+
+x-hunter-pending-confirmation:
+  source: "本契约编写过程中发现的、设计文档未明确的决策点；确认后回填契约再实现代码"
+  note: "每项均影响 Step 2 及之后的实现范围；未确认前实现必须按本契约当前取值（禁止另起一套）"
+  items:
+    - id: 1
+      question: "报告 / Corner Case / 评估结果元信息的存储位置（contracts/database 无 reports 等表）"
+      contract_decision: "不擅自新增表：元信息与结果文档落 MinIO hunter-reports（永久保留）+ sidecar JSON；查询以对象前缀列举实现（x-hunter-report-storage）"
+      impact: "列表检索能力受限（无 DB 索引/无 total 精确计数）；如需按业务字段检索或数据权限隔离，需先新增 data_analytics.reports 表并同步 DDL/ORM/migration"
+
+    - id: 2
+      question: "报告生成语义与状态枚举（设计文档 6.5 节仅描述产物，未定义同步/异步与状态）"
+      contract_decision: "异步：POST 返回 202 + report_id + status=pending，客户端轮询报告详情；状态枚举 pending/generating/ready/failed；并发保护 REPORT_GENERATE_MAX_CONCURRENT(2)，超限 3003"
+      impact: "前端需实现轮询与失败重试；报告状态需可持久化（MinIO sidecar）；若设计文档要求同步返回需改契约与端点语义"
+
+    - id: 3
+      question: "6.2.3 节「TTC < 3.0s 碰撞预警(warning)」与受控词表 collision_warning(critical) 等级冲突"
+      contract_decision: "不放宽受控词表、不新增事件类型：alert_event.level 必须 = EVENT_LEVEL_BY_TYPE[alert_type]；3.0s 预警改写入 analytics_result(result_type=metric, metrics.min_ttc) 与 algorithm_metrics，不投 alert_event"
+      impact: "告警条数与前端告警中心口径；若设计文档确认 3.0s 必须告警，需先在 enums.md/DDL CHECK/ORM 扩展事件类型（或新增告警等级域）再实现"
+
+    - id: 4
+      question: "alert_event 消费方「告警处理」落位服务（consumer-groups.yaml 的 platform-alert-event 标注待定）"
+      contract_decision: "本契约只定义 schema（contracts/kafka/schemas/alert_event.schema.json）与生产者行为；消费与 WebSocket 推送不在本服务（网关契约亦声明不消费 Kafka）"
+      impact: "实时告警端到端链路（≤2s）落地位置；若最终由 data-analytics 承接推送，需先更新 consumer-groups.yaml 再实现"
+
+    - id: 5
+      question: "6.2.5 节数据质量监控的判定阈值与结果落位（设计文档未给出）"
+      contract_decision: "丢包率/延迟/异常值占比以 analytics_result(result_type=metric) 输出；12.4 节无对应查询端点 → 经报告与看板体现"
+      impact: "数据质量告警能力（无受控事件类型可用）；若需单独数据质量报告/端点需先确认并改契约"
+
+    - id: 6
+      question: "算法指标统计窗口（6.2 节）与感知精度评估真值来源（6.3.2 节）"
+      contract_decision: "指标窗口取 ALGORITHM_METRICS_WINDOW_SECONDS(60s，待确认)；感知评估真值暂按 MinIO hunter-rosbag 标注文件 + algorithm_metrics 实现"
+      impact: "指标口径与看板数值；评估真值方案决定 spark-jobs 感知评估作业输入"
+
+    - id: 7
+      question: "Corner Case 挖掘的特征窗口与 Isolation Forest / DBSCAN 参数（6.4 节未给出）"
+      contract_decision: "特征窗口默认 10 min（环境变量化）；Isolation Forest 随机种子固定、DBSCAN eps/min_samples 走作业参数；异常分数归一化到 [0,1]"
+      impact: "挖掘召回率与误报率；参数不当会产生大量噪声 Corner Case 并触发 scene-service 场景提取"
+
+    - id: 8
+      question: "看板车队状态数据读取：Redis vehicle:status:{vehicle_id} / vehicle:online:set 的读取端点归属（data-collector 契约 pending #8）"
+      contract_decision: "本服务看板只读既有 Redis 键（不新增键模式、不写）用于聚合；若最终归属 vehicle-service，则需改为 REST 调用"
+      impact: "看板 fleet 块实现方式；跨服务读 Redis 的合规性需与 data-collector 契约一并确认"
+
+    - id: 9
+      question: "12.4 节端点清单未包含「规划质量评估」与「数据质量」查询端点（6.3 节含规划质量评估）"
+      contract_decision: "不新增端点：规划质量指标并入算法评估报告与 analytics_result；若需独立端点须先核对 12.4 节并改契约"
+      impact: "前端算法评估页面展示粒度；缺失端点会导致用户无法直接查看规划质量时序"
+
+    - id: 10
+      question: "看板 pipeline 块「遥测入库延迟 P95」数据来源（vehicle_telemetry 无入库时间列）"
+      contract_decision: "暂定两种实现：Prometheus 查询（监控指标）或 Kafka 时间戳差估算；契约不新增列/表"
+      impact: "看板数值准确性与依赖（Prometheus 查询需额外客户端与网络策略）"
+
+    - id: 11
+      question: "分析查询时间跨度上限与看板缓存键（设计文档未定义；Redis Key 设计不可更改）"
+      contract_decision: "跨度上限 ANALYTICS_QUERY_MAX_RANGE_DAYS(7 天，超出 2001)；看板不做 Redis 缓存（避免新增键模式），如需缓存须先评审键设计"
+      impact: "P95 ≤ 200ms 保障与查询灵活性；缓存决策影响看板高并发表现"
+
+    - id: 12
+      question: "consumer-groups.yaml 的 data-analytics 消费组契约修正（原 data-analytics-telemetry 订阅 telemetry_raw 且声明生产 telemetry_clean，与 topics.yaml「telemetry_clean 生产者 = data-collector」冲突；原 data-analytics-telemetry-clean 与之重复消费同一 Topic）"
+      contract_decision: "按 6.2 节作业输入归并为 4 组：telemetry_clean → data-analytics-telemetry（4 作业）、telemetry_raw → data-analytics-telemetry-raw（数据质量监控）、event_raw → data-analytics-events、sensor_file → data-analytics-sensor-file；不再声明本服务生产 telemetry_clean"
+      impact: "实时分析作业的 Topic 订阅与消费位点（独立 offset 才可对比原始/清洗数据）；若设计文档另有归属（如 data-analytics 负责清洗）需回改 topics.yaml 与两侧契约"

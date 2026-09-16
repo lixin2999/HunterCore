@@ -9,7 +9,7 @@
 | api-gateway.yaml | api-gateway | 统一入口（8080） | ✅ 已定义（认证 + 运维探针 + 路由表/限流/WebSocket 扩展字段） |
 | scene-service.yaml | scene-service | `/api/v1/scene` | ✅ 已定义（10 个业务端点 + 4.2.1/4.2.2 数据结构 + 4.4/4.5 流程扩展字段） |
 | data-collector.yaml | data-collector | `/api/v1/data` | ✅ 已定义（7 个业务端点 + 5.3.3 遥测结构 + 5.4 预处理 / 5.5 上传流程扩展字段） |
-| data-analytics.yaml | data-analytics | `/api/v1/analytics` | 待开发 |
+| data-analytics.yaml | data-analytics | `/api/v1/analytics` | ✅ 已定义（8 个业务端点 + 6.2 实时作业 / 6.3 离线作业 / 6.4 Corner Case / 6.5 报告模板扩展字段） |
 | ota-service.yaml | ota-service | `/api/v1/ota` | 待开发 |
 | remote-control.yaml | remote-control | `/api/v1/remote`、`/ws/remote/**` | 待开发 |
 
@@ -79,6 +79,40 @@
   校验失败错误码复用 6001、车端 REST 接入方式、查询时间跨度上限、Carla Topic 归属 ——
   全量见契约 `x-hunter-pending-confirmation`（12 项）
 
+## 数据分析契约要点（data-analytics.yaml）
+
+- **业务端点**（设计文档 12.4 节逐条对齐，不可增删）：`GET /api/v1/analytics/reports`、
+  `GET /api/v1/analytics/reports/{report_id}`、`POST /api/v1/analytics/reports/generate`、
+  `GET /api/v1/analytics/dashboard`、`GET /api/v1/analytics/perception/eval`、
+  `GET /api/v1/analytics/control/eval`、`GET /api/v1/analytics/scene/coverage`、
+  `GET /api/v1/analytics/corner-cases`（除报告生成外均为只读查询）
+- **定位**：读模型 + 编排服务 —— 重计算由 Flink（实时，`flink-jobs/`）/ Spark（离线，`spark-jobs/`）承担，
+  REST 只读预计算结果（保证 P95 ≤ 200ms）；报告生成为**异步**（202 + 轮询，规避 PDF/HTML 渲染耗时）
+- **6.2 实时作业**：`x-hunter-realtime-jobs` 定义 5 个 Flink 作业（车辆状态监控 / 异常驾驶检测 /
+  算法性能监控 / 碰撞风险评估 / 数据质量监控）；阈值 14 项全部环境变量化并在 K8s ConfigMap 注入，
+  与「事件类型定义」（`EVENT_LEVEL_BY_TYPE`）机器可检一致；数据质量监控消费 `telemetry_raw`，
+  其余消费 `telemetry_clean`
+- **告警契约**：`alert_event` 消息 Schema 已补全（`alert_type` 18 种受控类型、`level` 必须等于
+  `EVENT_LEVEL_BY_TYPE[alert_type]`、`source_job` 取 5 个实时作业、`rule` 回带阈值）；6.2.3 节
+  「TTC < 3.0s 预警（warning）」与受控词表 `collision_warning`(critical) 的等级冲突已显式登记
+  （不新增类型、不放宽等级 → 3.0s 预警走 `analytics_result`）
+- **6.3 离线作业**：`x-hunter-offline-jobs` 定义 7 个 Spark 作业与 cron（日报/评估每日、覆盖率与挖掘每周、
+  月报每月，UTC）；6.3.3 节控制性能阈值（速度 RMSE < 0.2 m/s、转向 RMSE < 0.02 rad、超调 < 10%、
+  调节时间 < 2s）在契约、响应 Schema、作业定义三处一致
+- **6.4 Corner Case**：5 类异常（kinematic/perception/planning/interaction/environment）+
+  Isolation Forest / DBSCAN + 事件前后各 10 秒截取窗口（与 `analytics_result.schema.json` 一致）
+- **6.5 报告**：5 类模板（车辆日报 / 算法评估 / 场景测试 / OTA 升级 / 月度运营）× 3 格式
+  （HTML / PDF(Puppeteer) / JSON），落 MinIO `hunter-reports`（永久，下载预签名 15 分钟 + Range）
+- **数据访问边界**：写 `data_analytics.algorithm_metrics`；只读例外（er.md 第 3 节）仅
+  `data_collector.vehicle_telemetry`（`hunter_analytics_ro`）；events / scenes / vehicles 一律经
+  服务 REST（data-collector / scene-service / vehicle-service）；不新增 DB 表、不新增 Redis 键模式
+- **Kafka**：消费 4 个平台内部 Topic（`telemetry_clean` / `telemetry_raw` / `event_raw` / `sensor_file`，
+  4 个 `data-analytics-*` 消费组），生产 `analytics_result` + `alert_event`
+- **⚠ 待核对项**：报告/Case 元信息缺表、报告异步语义与状态枚举、TTC 等级冲突、`alert_event` 消费方落位、
+  数据质量阈值与落位、算法指标窗口与感知真值来源、Corner Case 参数、Redis 状态读取归属、
+  12.4 节缺规划质量/数据质量端点、看板入库延迟来源、查询跨度上限、消费组契约修正 ——
+  全量见契约 `x-hunter-pending-confirmation`（12 项）
+
 ## 校验命令
 
 ```bash
@@ -90,6 +124,9 @@ cd services/scene-service && pytest app/tests/test_scene_contract.py -q
 
 # 数据采集契约 ↔ 设计文档 5 章推导清单 ↔ DDL ↔ Kafka 契约（含 sensor_file Schema）↔ K8s 清单（30 项）
 cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q
+
+# 数据分析契约 ↔ 设计文档 6 章/12.4 节 ↔ DDL ↔ Kafka 契约（含 alert_event Schema）↔ K8s 清单（32 项）
+cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q
 ```
 
 > 命名约定：各服务契约测试文件使用唯一文件名（如 `test_scene_contract.py`），

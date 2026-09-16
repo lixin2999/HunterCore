@@ -50,37 +50,49 @@ groups:
     idempotency_key: command_id
     notes: "指令执行结果留痕（供审计与 remote-control 结果回执）"
 
+  # ⚠ 契约修正（data-analytics Step 1，待人工确认，见 contracts/openapi/data-analytics.yaml
+  #   x-hunter-pending-confirmation）：原 data-analytics-telemetry 订阅 telemetry_raw 且声明「生产 telemetry_clean」，
+  #   与 topics.yaml（telemetry_clean 生产者 = data-collector）冲突；且原 data-analytics-telemetry-clean 与之重复消费。
+  #   现按设计文档 6.2 节作业输入归并为 4 组：清洗后遥测承担 4 个作业，原始遥测仅数据质量监控（对比丢包率）。
   - group_id: data-analytics-telemetry
     service: data-analytics
-    subscribes: [telemetry_raw]
-    produces: [telemetry_clean, alert_event]
+    subscribes: [telemetry_clean]
+    produces: [alert_event, analytics_result]
+    writes: [data_analytics.algorithm_metrics]
     engine: Flink 1.18 (DataStream)
+    jobs:
+      - vehicle_state_monitor            # 6.2.1 心跳/状态变更 → communication_loss
+      - driving_anomaly_detection        # 6.2.2 急加速/急减速/急转弯/超速/低电量
+      - collision_risk_assessment        # 6.2.3 TTC 计算 → collision_warning
+      - algorithm_performance_monitor    # 6.2.4 感知帧率/规划延迟/控制误差 → algorithm_metrics
     idempotency_key: "(vehicle_id, time)"
     target_latency: "实时告警触发 ≤ 2s"
-    notes: "实时流处理：指标计算、异常检测（事件阈值于 contracts/database/enums.md）"
+    notes: "实时流处理：阈值取 contracts/database/enums.md 第 3 节，不可放宽（禁止自行新增/改等级）"
 
-  - group_id: data-analytics-telemetry-clean
+  - group_id: data-analytics-telemetry-raw
     service: data-analytics
-    subscribes: [telemetry_clean]
+    subscribes: [telemetry_raw]
     produces: [analytics_result]
     engine: Flink 1.18 (DataStream)
+    jobs: [data_quality_monitor]
     idempotency_key: "(vehicle_id, time)"
-    notes: "清洗后遥测的二级聚合（算法指标 → algorithm_metrics）"
+    notes: "6.2.5 数据质量监控：消费原始遥测统计丢包率/延迟/异常值 → analytics_result(result_type=metric)；需与 telemetry_clean 独立 offset 才可对比"
 
   - group_id: data-analytics-events
     service: data-analytics
     subscribes: [event_raw]
     produces: [analytics_result]
-    engine: "Flink 1.18（实时）/ Spark 3.5（离线）"
+    engine: "Flink 1.18（实时统计）/ Spark 3.5（离线 Corner Case 挖掘）"
+    jobs: [corner_case_mining]
     idempotency_key: "(vehicle_id, event_type, event_time)"
-    notes: "事件统计与 Corner Case 挖掘"
+    notes: "事件统计与 Corner Case 挖掘（6.4 节：Isolation Forest + DBSCAN，消费组同一幂等键）"
 
   - group_id: data-analytics-sensor-file
     service: data-analytics
     subscribes: [sensor_file]
     produces: [analytics_result]
     idempotency_key: object_key
-    notes: "对上传到 MinIO 的传感器文件做离线分析（⚠ 消息结构与流程待 5.3 定稿）"
+    notes: "对上传到 MinIO 的传感器文件做离线分析（感知精度评估 6.3.2 输入）；消息结构 contracts/kafka/schemas/sensor_file.schema.json"
 
   - group_id: scene-service-analytics-result
     service: scene-service
