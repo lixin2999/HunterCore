@@ -85,9 +85,16 @@ groups:
   - group_id: scene-service-analytics-result
     service: scene-service
     subscribes: [analytics_result]
-    produces: []
+    produces: []                 # 提取结果直接落库 scene_svc.scenes（无 Kafka 生产）
+    dlq_enabled: true
     idempotency_key: "(vehicle_id, window_start)"
-    notes: "实车场景自动提取（⚠ 需核对触发来源为 analytics_result 还是 event_raw）"
+    notes: |
+      实车场景自动提取（设计文档 4.5 节）：仅处理 result_type=corner_case 且 trigger_event_type ∈
+      {harsh_braking, collision_warning, manual_takeover} 的消息，按 clip.pre_seconds/post_seconds（各 10s）
+      截取前后数据，输出 scene_type=real_vehicle_replay、status=draft 的场景。
+      消息结构：contracts/kafka/schemas/analytics_result.schema.json。
+      ⚠ 触发来源待核对：topics.yaml 将 scene-service 列为 event_raw 消费方，但本清单未登记
+      event_raw 消费组；若确认改由 event_raw 触发，需先在此登记新消费组再改实现。
 
   - group_id: ota-service-ota-status
     service: ota-service

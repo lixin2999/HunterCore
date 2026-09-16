@@ -7,7 +7,7 @@
 | 文件 | 服务 | 路由前缀 | 状态 |
 |------|------|----------|------|
 | api-gateway.yaml | api-gateway | 统一入口（8080） | ✅ 已定义（认证 + 运维探针 + 路由表/限流/WebSocket 扩展字段） |
-| scene-service.yaml | scene-service | `/api/v1/scene` | 待开发 |
+| scene-service.yaml | scene-service | `/api/v1/scene` | ✅ 已定义（10 个业务端点 + 4.2.1/4.2.2 数据结构 + 4.4/4.5 流程扩展字段） |
 | data-collector.yaml | data-collector | `/api/v1/data` | 待开发 |
 | data-analytics.yaml | data-analytics | `/api/v1/analytics` | 待开发 |
 | ota-service.yaml | ota-service | `/api/v1/ota` | 待开发 |
@@ -39,9 +39,31 @@
 - **⚠ 待核对项**：认证端点路径与载荷、`/api/v1/vehicle|user` 归属服务（模块表仅 6 个微服务）、MFA 错误码复用 1001、
   服务发现机制与配置键名、熔断阈值
 
+## 场景服务契约要点（scene-service.yaml）
+
+- **业务端点**（设计文档 12.2 节，不可增删）：`GET/POST /api/v1/scene`、`GET/PUT/DELETE /api/v1/scene/{scene_id}`、
+  `GET /api/v1/scene/templates`、`POST /api/v1/scene/{scene_id}/duplicate|publish|run`、`POST /api/v1/scene/export`
+- **数据结构**：`SceneMeta`（7 个元信息字段 → `scene_svc.scenes` 列）+ `SceneConfig`（`map/ego_vehicle/weather/actors/events/success_criteria/duration`
+  → `config_json`）合并即 4.2.2 节完整结构；顶层字段映射见 `x-hunter-scene-config-contract`
+- **状态机**：`draft → published → archived`（`x-hunter-lifecycle`）；仅 `draft` 可编辑，`published` 可下发，删除仅限 `draft/archived`
+- **导出**：4.3 节两种格式（`carla_scenariorunner_xml` / `openscenario_1_2`），产物落 MinIO `hunter-scene-assets`，
+  下载预签名 15 分钟（`x-hunter-export`）
+- **仿真下发**：4.4 节 7 步流程 + `sim_instance_id`（`x-hunter-simulation-flow`）；Carla 管理 API 地址走环境变量
+  `CARLA_MANAGEMENT_ENDPOINT`（禁止硬编码）
+- **Kafka**：`x-hunter-kafka` 声明不生产任何 Topic，仅消费 `analytics_result`
+  （消费组 `scene-service-analytics-result`，实车场景自动提取 4.5 节）
+- **⚠ 待核对项**：`scene_type` 编码值（4.2.1 只给两级结构）、仿真进度/结果端点缺口（4.4 第 6/7 步）、
+  `archived` 无归档端点、导出返回形式、`version` 递增策略 —— 全量见契约 `x-hunter-pending-confirmation`（12 项）
+
 ## 校验命令
 
 ```bash
 # 网关契约 ↔ 实现 ↔ K8s 清单三方一致性（29 项，无需运行服务）
 pytest services/api-gateway/app/tests/test_openapi_contract.py -q
+
+# 场景服务契约 ↔ 设计文档 4 章/12.2 节 ↔ DB DDL ↔ Kafka 契约 ↔ K8s 清单（29 项）
+cd services/scene-service && pytest app/tests/test_scene_contract.py -q
 ```
+
+> 命名约定：各服务契约测试文件使用唯一文件名（如 `test_scene_contract.py`），
+> 避免 monorepo 内 `app/tests/<同名文件>` 在 pytest importlib 模式下模块名冲突。

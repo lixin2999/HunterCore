@@ -98,6 +98,7 @@ EXPECTED_SCHEMAS_FILES = (
     "ota_notify.schema.json",
     "ota_status.schema.json",
     "remote_control.schema.json",
+    "analytics_result.schema.json",
 )
 
 CREATE_TABLE_RE = re.compile(
@@ -528,8 +529,9 @@ def check_kafka_topics() -> dict[str, Any]:
     if topics.get("consumer_defaults", {}).get("enable_auto_commit") is not False:
         fail("消费者必须手动提交 offset（enable_auto_commit=false）")
 
-    # Schema 引用：已定义的必须存在；未定义者仅允许 3 个平台内部 Topic
-    tbd_allowed = {"sensor_file", "analytics_result", "alert_event"}
+    # Schema 引用：已定义的必须存在；未定义者仅允许 2 个平台内部 Topic
+    # （analytics_result 已于契约补全，见 contracts/kafka/schemas/analytics_result.schema.json）
+    tbd_allowed = {"sensor_file", "alert_event"}
     tbd_actual: set[str] = set()
     for group in ("vehicle_topics", "platform_topics"):
         for entry in topics.get(group, []):
@@ -588,6 +590,7 @@ def check_json_schemas() -> None:
         "ota_status.schema.json",
         "health.schema.json",
         "command.schema.json",
+        "analytics_result.schema.json",
     }
     before = len(failures)
     for name in EXPECTED_SCHEMAS_FILES:

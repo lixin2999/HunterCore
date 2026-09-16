@@ -49,6 +49,7 @@ SCHEMA_FILES = (
     "ota_notify.schema.json",
     "ota_status.schema.json",
     "remote_control.schema.json",
+    "analytics_result.schema.json",
 )
 
 CREATE_TOPIC_CALL_RE = re.compile(r'create_topic\s+"([\w.]+)"\s+(\d+)\s+(\d+)')
@@ -117,7 +118,7 @@ def test_topics_yaml_synced_with_compose_and_k8s_scripts() -> None:
 
 
 def test_all_schemas_are_valid_draft7_with_examples() -> None:
-    """8 个消息 Schema：draft-07 合法、required 非空、examples 通过自身校验。"""
+    """9 个消息 Schema：draft-07 合法、required 非空、examples 通过自身校验。"""
     jsonschema = pytest.importorskip("jsonschema")
     for name in SCHEMA_FILES:
         schema = load_schema(name)
@@ -229,4 +230,53 @@ def test_consumer_groups_only_reference_registered_topics() -> None:
         assert group["idempotency_key"], f"{group['group_id']} 缺少幂等键说明"
         for topic in group["subscribes"]:
             assert topic in known, f"{group['group_id']} 订阅未登记 Topic: {topic}"
+
+
+
+def test_analytics_result_schema_matches_scene_extraction_contract() -> None:
+    """实车场景自动提取契约（设计文档 4.5 节）：触发事件 + 前后各 10 秒窗口 + 三项提取内容。"""
+    schema = load_schema("analytics_result.schema.json")
+    properties = schema["properties"]
+
+    assert set(properties["result_type"]["enum"]) == {"metric", "corner_case", "report"}
+    # 触发事件类型必须取自受控词表（contracts/database/enums.md 第 3 节，18 种）
+    trigger_enum = set(properties["trigger_event_type"]["enum"])
+    assert trigger_enum <= {event_type.value for event_type in EventType}
+    assert {"harsh_braking", "collision_warning", "manual_takeover"} <= trigger_enum, (
+        "4.5 节触发条件：急刹车 / 碰撞预警 / 人工接管"
+    )
+    assert set(properties["event_level"]["enum"]) == {level.value for level in EventLevel}
+
+    # 截取窗口固定为事件前后各 10 秒（设计文档 4.5 节，不可配置）
+    clip = properties["clip"]
+    assert clip["properties"]["pre_seconds"]["enum"] == [10]
+    assert clip["properties"]["post_seconds"]["enum"] == [10]
+    assert set(clip["required"]) == {"pre_seconds", "post_seconds"}
+
+    # 4.5 节提取内容：自车轨迹 / 周边目标轨迹 / 环境条件
+    assert {"ego_trajectory", "objects", "environment"} <= set(properties)
+    point = schema["definitions"]["trajectory_point"]
+    assert set(point["required"]) == {"timestamp", "x", "y", "heading", "velocity"}
+    track = schema["definitions"]["object_track"]
+    assert set(track["properties"]["type"]["enum"]) == {"vehicle", "pedestrian", "other"}
+
+    # 契约三处一致：topics.yaml 引用 / 消费组登记 / Schema 文件
+    platform = {
+        entry["name"]: entry for entry in load_yaml(KAFKA_DIR / "topics.yaml")["platform_topics"]
+    }
+    assert platform["analytics_result"]["schema"] == "schemas/analytics_result.schema.json"
+    groups = load_yaml(KAFKA_DIR / "consumer-groups.yaml")["groups"]
+    scene_group = next(g for g in groups if g["group_id"] == "scene-service-analytics-result")
+    assert scene_group["subscribes"] == ["analytics_result"]
+    assert scene_group["produces"] == [], "scene-service 不生产 Kafka 消息（提取结果直接落库）"
+
+
+def test_pending_internal_topic_schemas_are_still_declared_null() -> None:
+    """未定稿消息结构必须保持 schema: null（禁止「先实现后补契约」）。"""
+    platform = {
+        entry["name"]: entry for entry in load_yaml(KAFKA_DIR / "topics.yaml")["platform_topics"]
+    }
+    assert platform["analytics_result"]["schema"] is not None
+    assert platform["sensor_file"]["schema"] is None
+    assert platform["alert_event"]["schema"] is None
 

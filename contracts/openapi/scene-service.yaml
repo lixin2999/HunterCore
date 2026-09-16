@@ -1,0 +1,1454 @@
+# =====================================================================
+# HunterEdge 场景生成服务契约（OpenAPI 3.0.3）—— 单一事实来源
+# 来源：设计文档 4 章（4.2.1 场景分类体系 / 4.2.2 场景配置结构 / 4.3 场景导出 /
+#       4.4 场景下发到 Carla / 4.5 实车场景自动提取）、12.2 节（scene-service REST API）、
+#       附录 A（错误码）、附录 D（限流）、MinIO Bucket 规划、Redis Key 设计
+# 实现：services/scene-service（FastAPI 0.100+，端口 8081）；变更必须先改本文件再改代码
+#
+# 范围说明：
+#   - 网关前缀 /api/v1/scene（不可更改，见 contracts/openapi/api-gateway.yaml 的
+#     x-hunter-gateway-routes）；网关不剥离前缀，本服务按全路径注册路由
+#   - 实车场景自动提取（4.5 节）无 REST 端点：由 Kafka 消费 analytics_result 触发
+#     （契约 contracts/kafka/schemas/analytics_result.schema.json）
+#
+# ⚠ 待核对（设计文档未明确，需人工确认后回填；禁止擅自新增端点 / 字段 / 错误码 / 阈值）：
+#   1) scenes.scene_type 取值域：4.2.1 节仅给出「分类 → 场景」两级结构，未给出编码值；
+#      本契约按「叶子场景」取值（如 straight_cruise），分类由 x-hunter-scene-types 映射
+#   2) 4.4 节第 6/7 步（实时监控仿真进度、保存仿真结果）设计文档未定义 REST 端点，
+#      本契约不擅自新增，端点缺口见 x-hunter-pending-confirmation
+#   3) spawn_point / actor.behavior / event.trigger / event.action 内部结构未定义
+#   4) scenes.status 含 archived，但 12.2 节无归档端点（本契约不新增）
+#   5) 场景导出返回形式（直接返回 XML 文本 / MinIO 预签名 URL）未定义；本契约按
+#      MinIO hunter-scene-assets + 预签名下载（15 分钟）
+#   6) Carla 管理 API 地址、仿真并发上限、场景时长上限未定义（禁止硬编码，需环境变量）
+# =====================================================================
+openapi: 3.0.3
+
+info:
+  title: HunterEdge - scene-service
+  version: 0.1.0
+  description: |
+    场景生成服务统一契约（端口 8081，网关前缀 `/api/v1/scene`）。
+
+    **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功，非 0 为预定义错误码（附录 A）。
+
+    **场景分类**（4.2.1 节）：基础场景（直线巡航 / 弯道行驶 / 跟车行驶 / 变道行驶）、
+    交互场景（前车切入 / 行人横穿 / 路口会车 / 施工绕行）、环境场景（雨天 / 夜间 / 雾天 / 强光逆光）、
+    极端场景 Corner Case（紧急制动 / 障碍物突现 / 传感器失效 / 多车混行）、自定义场景；
+    另有 4.5 节「实车回放」类型。编码值映射见 `x-hunter-scene-types`。
+
+    **场景配置结构**（4.2.2 节，不可更改）：场景元信息（scene_id / scene_name / scene_type /
+    description / version / creator / tags）+ map / ego_vehicle / weather / actors[] / events[] /
+    success_criteria / duration；字段与落库位置映射见 `x-hunter-scene-config-contract`。
+
+    **状态机**：`draft → published → archived`（`scenes.status`，受控词表）；仅 `draft` 可编辑。
+
+    **鉴权**：请求经网关校验 JWT 后转发，服务侧按 RBAC 资源域 `scene` 校验
+    （permissions.resource=scene，action ∈ create/read/update/delete/execute）。
+
+    **限流**：本服务无专属限流（附录 D 仅 3 条接口级限流，不含 scene），继承网关五级限流
+    （全局 10000 QPS / 单用户 100 QPS / 单 IP 200 QPS）。
+
+    **性能**：API 响应 P95 ≤ 200ms（13.2 节）；场景列表默认分页 20 条、上限 200 条。
+  license:
+    name: Proprietary - HunterEdge
+
+servers:
+  - url: https://hunter-edge.example.com
+    description: 生产环境（经网关 /api/v1/scene 转发）
+  - url: http://localhost:8081
+    description: 本地开发（直连服务）
+
+tags:
+  - name: scenes
+    description: 场景库管理（CRUD + 分类 + 标签 + 搜索 + 复制 + 发布）
+  - name: templates
+    description: 场景模板（4.2.1 分类体系预置模板，用于快速创建）
+  - name: export
+    description: 场景导出（Carla ScenarioRunner XML / OpenSCENARIO 1.2）
+  - name: simulation
+    description: 场景下发到 Carla 仿真（4.4 节下发流程）
+  - name: ops
+    description: 运维探针与指标（K8s probe / Prometheus 抓取）
+
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/scene:
+    get:
+      tags: [scenes]
+      summary: 查询场景列表（分页 + 分类/状态/标签/关键字筛选）
+      description: |
+        场景库列表。默认按 `create_time DESC` 排序（命中索引
+        `idx_scenes_status_type_create_time`）；`tags` 为包含查询（PostgreSQL `@>`，命中 GIN 索引）；
+        `keyword` 对 `scene_name`/`description` 做不区分大小写的模糊匹配。
+        软删除场景（`deleted_at` 非 NULL）一律不出现在结果中。
+      operationId: listScenes
+      parameters:
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - name: scene_type
+          in: query
+          required: false
+          description: 场景类型（取值见 `x-hunter-scene-types`）
+          schema: { $ref: "#/components/schemas/SceneType" }
+        - name: status
+          in: query
+          required: false
+          description: 场景状态（受控词表 draft/published/archived）
+          schema: { $ref: "#/components/schemas/SceneStatus" }
+        - name: tags
+          in: query
+          required: false
+          description: 标签（可重复传参，多标签为 AND 关系）
+          style: form
+          explode: true
+          schema:
+            type: array
+            maxItems: 20
+            items: { type: string, minLength: 1, maxLength: 32 }
+        - name: keyword
+          in: query
+          required: false
+          description: 名称/描述模糊搜索关键字
+          schema: { type: string, minLength: 1, maxLength: 64 }
+        - name: creator
+          in: query
+          required: false
+          description: 创建者 user_id（数据权限隔离时由服务端强制注入）
+          schema: { type: string, format: uuid }
+        - name: sort
+          in: query
+          required: false
+          description: 排序字段（白名单，禁止任意字段排序以防注入）
+          schema:
+            type: string
+            enum: [create_time, update_time, scene_name, version]
+            default: create_time
+        - name: order
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+      responses:
+        "200":
+          description: 场景列表
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    post:
+      tags: [scenes]
+      summary: 创建场景（场景编辑器保存）
+      description: |
+        创建场景，`status` 固定为 `draft`（不可由请求指定），`creator` 取自网关注入的
+        `X-User-Id`，`version` 默认 `1.0.0`。
+        `config` 结构必须与 4.2.2 节完全一致（见 `x-hunter-scene-config-contract`）。
+        `scene_name` 在同一存活场景内唯一（`uq_scenes_scene_name`），冲突返回 3002。
+      operationId: createScene
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SceneCreateRequest" }
+      responses:
+        "201":
+          description: 创建成功（返回完整场景对象，status=draft）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "409":
+          description: 场景名称已存在（code=3002）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/templates:
+    get:
+      tags: [templates]
+      summary: 查询场景模板列表
+      description: |
+        返回 4.2.1 分类体系下的预置场景模板（基础 / 交互 / 环境 / 极端场景），用于场景编辑器一键创建；
+        模板 `config` 为 4.2.2 结构，可直接作为 `POST /api/v1/scene` 的 `config` 提交。
+        `real_vehicle`（实车回放）为 4.5 节自动提取产物，无预置模板，故不在 `category` 枚举中。
+        ⚠ 模板数据来源（内置静态清单 / 数据库 / MinIO 资源）设计文档未定义，
+        见 `x-hunter-pending-confirmation`。
+      operationId: listSceneTemplates
+      parameters:
+        - name: category
+          in: query
+          required: false
+          description: 模板分类（4.2.1 节分类）
+          schema:
+            type: string
+            enum: [basic, interactive, environment, corner_case, custom]
+        - name: scene_type
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/SceneType" }
+      responses:
+        "200":
+          description: 模板列表（不分页：模板数量受 4.2.1 分类体系约束）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneTemplateListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/{scene_id}:
+    get:
+      tags: [scenes]
+      summary: 查询场景详情
+      description: |
+        返回场景完整对象（含 4.2.2 结构 `config`）。
+        结果按 Redis 契约缓存：`cache:scene:{scene_id}`（String(JSON)，TTL 1 小时），
+        任何写操作（PUT / DELETE / publish / duplicate 的源场景无关）后失效。
+      operationId: getScene
+      parameters:
+        - $ref: "#/components/parameters/SceneIdPath"
+      responses:
+        "200":
+          description: 场景详情
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneResponse" }
+        "404": { $ref: "#/components/responses/SceneNotFound" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    put:
+      tags: [scenes]
+      summary: 更新场景（仅 draft 可编辑）
+      description: |
+        全量更新场景可编辑字段。规则（4.2 节 + `scenes.status` 受控词表）：
+        - 仅 `draft` 状态可编辑；`published` / `archived` 返回 3003
+        - `scene_id` / `creator` / `create_time` / `status` / `version` 不可被请求修改
+        - `scene_name` 与其它存活场景冲突返回 3002
+        - 更新成功后 `update_time` 由触发器/ORM 自动维护
+      operationId: updateScene
+      parameters:
+        - $ref: "#/components/parameters/SceneIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SceneUpdateRequest" }
+      responses:
+        "200":
+          description: 更新后的场景对象
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneResponse" }
+        "404": { $ref: "#/components/responses/SceneNotFound" }
+        "409": { $ref: "#/components/responses/SceneStateConflict" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    delete:
+      tags: [scenes]
+      summary: 删除场景（软删除）
+      description: |
+        软删除：置 `deleted_at`，不物理删除（保留审计与历史引用）。
+        仅 `draft` / `archived` 可删除；`published` 场景必须先归档，直接删除返回 3003
+        （⚠ 该规则由契约补充，设计文档只规定「仅 draft 可编辑」，见 `x-hunter-pending-confirmation`）。
+      operationId: deleteScene
+      parameters:
+        - $ref: "#/components/parameters/SceneIdPath"
+      responses:
+        "200":
+          description: 删除结果
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneDeleteResponse" }
+        "404": { $ref: "#/components/responses/SceneNotFound" }
+        "409": { $ref: "#/components/responses/SceneStateConflict" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/{scene_id}/duplicate:
+    post:
+      tags: [scenes]
+      summary: 复制场景（生成新草稿）
+      description: |
+        以源场景 `config` 为模板创建新场景：新 `scene_id`，`status=draft`，
+        `creator` = 当前用户，`version` 重置为 `1.0.0`；
+        未指定 `new_scene_name` 时按 `<源名称>-copy`（冲突则追加序号）生成，仍冲突返回 3002。
+      operationId: duplicateScene
+      parameters:
+        - $ref: "#/components/parameters/SceneIdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SceneDuplicateRequest" }
+      responses:
+        "201":
+          description: 复制成功（返回新场景，status=draft）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneResponse" }
+        "404": { $ref: "#/components/responses/SceneNotFound" }
+        "409":
+          description: 新场景名称已存在（code=3002）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+
+  /api/v1/scene/{scene_id}/publish:
+    post:
+      tags: [scenes]
+      summary: 发布场景（draft → published）
+      description: |
+        发布后场景不可再编辑（仅 `draft` 可编辑），可被 `POST /api/v1/scene/{scene_id}/run`
+        下发到 Carla 仿真与导出。
+        规则：仅 `draft` 可发布，其它状态返回 3003；发布前服务端再做一次 4.2.2 结构完整性校验。
+        ⚠ 版本号递增策略（是否在发布时提升 `version`）设计文档未定义：本契约规定
+        `version` 在发布时保持不变，由请求显式指定时才更新（见 `x-hunter-pending-confirmation`）。
+      operationId: publishScene
+      parameters:
+        - $ref: "#/components/parameters/SceneIdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ScenePublishRequest" }
+      responses:
+        "200":
+          description: 发布后的场景对象（status=published）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneResponse" }
+        "404": { $ref: "#/components/responses/SceneNotFound" }
+        "409": { $ref: "#/components/responses/SceneStateConflict" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/export:
+    post:
+      tags: [export]
+      summary: 导出场景（Carla ScenarioRunner XML / OpenSCENARIO 1.2）
+      description: |
+        按 4.3 节将场景配置导出为仿真可执行文件：
+
+        | format | 产物 | 说明 |
+        |--------|------|------|
+        | `carla_scenariorunner_xml` | `.xml` | Carla ScenarioRunner 场景文件 |
+        | `openscenario_1_2` | `.xosc` | OpenSCENARIO 1.2 标准描述文件（写入 `x-scenario-version`） |
+
+        产物上传 MinIO `hunter-scene-assets`（生命周期：永久），返回预签名下载地址
+        （MinIO 契约：下载有效期 15 分钟，支持 Range 分片下载）。
+        ⚠ 导出返回形式（文本直返 / MinIO 地址）设计文档未定义，本契约按 MinIO 方案，
+        见 `x-hunter-pending-confirmation`。
+      operationId: exportScenes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SceneExportRequest" }
+      responses:
+        "200":
+          description: 导出结果（含预签名下载地址）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneExportResponse" }
+        "404": { $ref: "#/components/responses/SceneNotFound" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/{scene_id}/run:
+    post:
+      tags: [simulation]
+      summary: 下发场景到 Carla 仿真（4.4 节流程）
+      description: |
+        按 4.4 节流程下发：① 校验场景配置完整性 → ② 调用 Carla 管理 API 创建仿真实例 →
+        ③ 下发场景配置 JSON → ④ Carla 加载地图、生成参与者、设置环境 →
+        ⑤ 返回 `sim_instance_id`，场景运行状态置 `running` → ⑥ 实时监控仿真进度 →
+        ⑦ 仿真结束回收资源并保存结果（步骤 6/7 的实现方式见 `x-hunter-simulation-flow`）。
+
+        规则：
+        - 仅 `published` 场景可下发，其它状态返回 3003
+        - Carla 管理 API 不可达/超时返回 5001（依赖服务不可用）
+        - 同一场景已有 `running` 实例时按 `sim_config.allow_parallel` 决定复用或 3003
+        - 参数覆盖（`param_overrides`）仅覆盖 4.2.2 白名单路径，禁止新增结构字段
+      operationId: runScene
+      parameters:
+        - $ref: "#/components/parameters/SceneIdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SceneRunRequest" }
+      responses:
+        "200":
+          description: 下发成功（返回仿真实例信息）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneRunResponse" }
+        "404": { $ref: "#/components/responses/SceneNotFound" }
+        "409": { $ref: "#/components/responses/SceneStateConflict" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: 存活探针（K8s livenessProbe）
+      operationId: healthz
+      security: []
+      responses:
+        "200":
+          description: 进程存活（code=0）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+
+  /readyz:
+    get:
+      tags: [ops]
+      summary: 就绪探针（K8s readinessProbe，含 DB/Redis 连通性）
+      description: 依赖不可用时返回 HTTP 503 + code=5001（`data` 为各项探测结果）。
+      operationId: readyz
+      security: []
+      responses:
+        "200":
+          description: 就绪（code=0，data 为 {database, redis}）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadyResponse" }
+        "503":
+          description: 未就绪（code=5001，data 为各项探测结果）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReadyResponse" }
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus 指标端点
+      description: 契约例外：返回 Prometheus 文本格式（非统一 JSON），由 infra/monitoring 抓取。
+      operationId: metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus 文本指标
+          content:
+            text/plain:
+              schema:
+                type: string
+
+
+# =====================================================================
+# 组件：安全方案 / 参数 / 请求头 / 共用错误响应
+# =====================================================================
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT Access Token（2 小时，网关签发）。载荷：`sub`(user_id) / `username` / `roles` / `permissions` /
+        `iat` / `exp` / `iss` / `jti`。网关校验后注入 `X-User-Id`、`X-Roles`、`X-Trace-Id`，
+        服务侧据此执行 RBAC（`permissions.resource=scene`，action ∈ create/read/update/delete/execute）
+        与数据权限（按 creator/项目隔离）。
+    deviceCertificate:
+      type: mutualTLS
+      description: |
+        车辆设备认证：X.509 双向 TLS，证书 CommonName = vehicle_id。
+        本服务无车端 REST 端点，此处仅声明全系统安全约定（车-云数据通道为 Kafka SASL_SSL）。
+
+  parameters:
+    SceneIdPath:
+      name: scene_id
+      in: path
+      required: true
+      description: 场景 ID（UUID，对应 scene_svc.scenes.scene_id）
+      schema: { type: string, format: uuid }
+    PageQuery:
+      name: page
+      in: query
+      required: false
+      description: 页码（≥1）
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSizeQuery:
+      name: page_size
+      in: query
+      required: false
+      description: 每页条数（1-200，与 hunter_common BaseRepository.paginate 上限一致）
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    TraceRequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: |
+        链路追踪 ID：由网关生成/透传；直连服务时缺省自动生成 UUID，
+        并回带同名响应头（hunter_common.logging trace_id）。
+      schema: { type: string, maxLength: 64 }
+
+  headers:
+    RequestId:
+      description: 链路追踪 ID（与请求头 `X-Request-ID` 一致）
+      schema: { type: string, maxLength: 64 }
+
+  responses:
+    Unauthenticated:
+      description: 未认证（code=1001，Token 缺失或无效）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 1001
+            message: 未认证
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    TokenExpired:
+      description: Token 过期（code=1003，客户端调用网关 /api/v1/user/refresh）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 1003
+            message: Token 过期
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    Forbidden:
+      description: 无权限（code=1002，RBAC 资源域 scene 权限不足）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 1002
+            message: 无权限
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    InvalidParameter:
+      description: 参数错误（code=2001，请求体/查询参数校验失败；HTTP 422，见 x-hunter-error-status-map）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 2001
+            message: 参数错误
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    MissingParameter:
+      description: 参数缺失（code=2002，必填参数未提供）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 2002
+            message: 参数缺失
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    SceneNotFound:
+      description: 场景不存在（code=3001，含已软删除场景）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 3001
+            message: 资源不存在
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    SceneNameConflict:
+      description: 场景名称已存在（code=3002，唯一索引 uq_scenes_scene_name）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 3002
+            message: 资源已存在
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    SceneStateConflict:
+      description: |
+        资源状态冲突（code=3003）：非 draft 编辑 / published 删除 / 非 published 下发 /
+        已有运行中仿真实例且未允许并行。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 3003
+            message: 资源状态冲突
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    ServiceUnavailable:
+      description: 服务不可用（code=5001）：PostgreSQL / Redis / MinIO / Carla 管理 API 不可达
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 5001
+            message: 服务不可用
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    InternalError:
+      description: 服务器内部错误（code=5000，未预期异常）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 5000
+            message: 服务器内部错误
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+
+
+  schemas:
+    # ---------- 统一响应与错误码（不可更改） ----------
+    ErrorCode:
+      type: integer
+      description: |
+        预定义错误码（附录 A，禁止自定义）。本服务可能返回的子集：
+        `0` 成功 / `1001` 未认证 / `1002` 无权限 / `1003` Token 过期 /
+        `2001` 参数错误 / `2002` 参数缺失 / `3001` 资源不存在 / `3002` 资源已存在 /
+        `3003` 资源状态冲突 / `5000` 服务器内部错误 / `5001` 服务不可用。
+      enum: [0, 1001, 1002, 1003, 2001, 2002, 3001, 3002, 3003, 4001, 4002, 5000, 5001, 6001, 6002, 6003, 7001, 7002]
+
+    ApiResponse:
+      type: object
+      description: 统一响应格式（所有业务响应/错误响应均为该结构）
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+          example: success
+        data:
+          nullable: true
+          description: 业务数据；错误时为 null 或错误上下文
+        request_id:
+          type: string
+          description: 请求追踪 ID（等于响应头 X-Request-ID）
+          example: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+        timestamp:
+          type: integer
+          format: int64
+          description: Unix epoch 秒
+          example: 1724035200
+
+    HealthResponse:
+      type: object
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code: { $ref: "#/components/schemas/ErrorCode" }
+        message: { type: string }
+        data:
+          type: object
+          required: [status]
+          properties:
+            status: { type: string, enum: [ok] }
+
+    ReadyResponse:
+      type: object
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code: { $ref: "#/components/schemas/ErrorCode" }
+        message: { type: string }
+        data:
+          type: object
+          description: 各依赖探测结果（true=可用）
+          required: [database, redis]
+          properties:
+            database: { type: boolean }
+            redis: { type: boolean }
+
+    # ---------- 受控词表 ----------
+    SceneStatus:
+      type: string
+      description: |
+        场景状态受控词表（contracts/database/enums.md 第 6 节，DB CHECK 约束同源）。
+        `draft` 可编辑；`published` 可下发/导出；`archived` 只读可删。
+      enum: [draft, published, archived]
+
+    SceneType:
+      type: string
+      description: |
+        场景类型（4.2.1 分类体系的叶子场景；"分类 → 类型"映射见 `x-hunter-scene-types`）。
+        ⚠ 编码值由本契约提出（设计文档未给出编码），需人工确认后落库，禁止前端硬编码分支。
+      enum:
+        - straight_cruise       # 基础场景：直线巡航
+        - curve_driving         # 基础场景：弯道行驶
+        - car_following         # 基础场景：跟车行驶
+        - lane_change           # 基础场景：变道行驶
+        - cut_in                # 交互场景：前车切入
+        - pedestrian_crossing   # 交互场景：行人横穿
+        - intersection_meeting  # 交互场景：路口会车
+        - construction_detour   # 交互场景：施工绕行
+        - rainy                 # 环境场景：雨天
+        - night                 # 环境场景：夜间
+        - foggy                 # 环境场景：雾天
+        - backlight             # 环境场景：强光逆光
+        - emergency_braking     # 极端场景：紧急制动
+        - obstacle_appearance   # 极端场景：障碍物突现
+        - sensor_failure        # 极端场景：传感器失效
+        - multi_vehicle_mixed   # 极端场景：多车混行
+        - custom                # 自定义场景
+        - real_vehicle_replay   # 实车回放（4.5 节实车场景自动提取产物）
+
+    SimulationStatus:
+      type: string
+      description: |
+        Carla 仿真实例运行状态（4.4 节"运行中"）。
+        ⚠ 设计文档仅给出"运行中"，其余取值由本契约补充，见 `x-hunter-pending-confirmation`。
+      enum: [pending, running, succeeded, failed, canceled]
+
+
+    # ---------- 4.2.2 场景配置结构（字段名不可更改） ----------
+    SpawnPoint:
+      type: object
+      description: |
+        生成点（自车/参与者）。⚠ 4.2.2 节仅给出 `spawn_point` 字段名，未定义内部结构；
+        本契约按 Carla transform 语义定义（位置 m + 朝向 rad），需人工确认。
+      required: [x, y, yaw]
+      properties:
+        x: { type: number, description: "X 坐标（m）" }
+        y: { type: number, description: "Y 坐标（m）" }
+        z: { type: number, default: 0.0, description: "Z 坐标（m）" }
+        yaw: { type: number, minimum: -3.141592653589793, maximum: 3.141592653589793, description: "朝向（rad）" }
+        lane_id: { type: string, nullable: true, description: "车道 ID（⚠ 语义待确认，可选）" }
+
+    MapType:
+      type: string
+      description: "地图类型（⚠ 编码值为契约提出，设计文档未给出取值域）"
+      enum: [carla_town, hd_map, site_map]
+
+    SceneMap:
+      type: object
+      description: 场景地图段（4.2.2 节 map）
+      required: [map_id, map_type, spawn_point]
+      properties:
+        map_id: { type: string, minLength: 1, maxLength: 128, description: "地图标识（Carla 地图名 / 高精地图 ID）" }
+        map_type: { $ref: "#/components/schemas/MapType" }
+        spawn_point: { $ref: "#/components/schemas/SpawnPoint" }
+
+    EgoVehicle:
+      type: object
+      description: 自车初始状态段（4.2.2 节 ego_vehicle）
+      required: [model, initial_speed, initial_steer]
+      properties:
+        model: { type: string, minLength: 1, maxLength: 64, example: HUNTER_SE, description: "车型（车端基线：HUNTER SE）" }
+        initial_speed: { type: number, minimum: 0, description: "初始速度（m/s）" }
+        initial_steer: { type: number, minimum: -1, maximum: 1, description: "初始转向（归一化 -1..1）" }
+
+    Weather:
+      type: object
+      description: |
+        环境条件段（4.2.2 节 weather，7 个字段全部必填）。
+        取值范围按 Carla WeatherParameters 语义定义（设计文档未给出取值范围，见 x-hunter-pending-confirmation）。
+      required: [cloudiness, rain, wetness, fog, wind, sun_azimuth, sun_altitude]
+      properties:
+        cloudiness: { type: number, minimum: 0, maximum: 100, description: "云量 %" }
+        rain: { type: number, minimum: 0, maximum: 100, description: "降雨强度 %" }
+        wetness: { type: number, minimum: 0, maximum: 100, description: "地面积水 %" }
+        fog: { type: number, minimum: 0, maximum: 100, description: "雾浓度 %" }
+        wind: { type: number, minimum: 0, maximum: 100, description: "风速强度 %" }
+        sun_azimuth: { type: number, minimum: 0, maximum: 360, description: "太阳方位角（度）" }
+        sun_altitude: { type: number, minimum: -90, maximum: 90, description: "太阳高度角（度，负值为夜间）" }
+
+    ActorType:
+      type: string
+      description: "参与者类型（与遥测 perception.object_types 域一致：vehicle/pedestrian/other）"
+      enum: [vehicle, pedestrian, other]
+
+    ActorBehavior:
+      type: object
+      description: |
+        参与者行为编排（4.2.2 节 actors[].behavior）。
+        ⚠ behavior_type 取值域设计文档未定义（建议：lane_follow / speed_change / cut_in /
+        lane_change / stop）；parameters 为行为参数自由结构；均需人工确认。
+      required: [behavior_type]
+      properties:
+        behavior_type: { type: string, minLength: 1, maxLength: 64, example: lane_follow }
+        parameters:
+          type: object
+          additionalProperties: true
+          description: 行为参数（如目标速度、加减速度、触发距离），结构随 behavior_type 而定
+
+    Actor:
+      type: object
+      description: 场景参与者（4.2.2 节 actors[]）
+      required: [actor_id, type, spawn_point, behavior]
+      properties:
+        actor_id: { type: string, minLength: 1, maxLength: 64, description: "场景内参与者唯一标识" }
+        type: { $ref: "#/components/schemas/ActorType" }
+        spawn_point: { $ref: "#/components/schemas/SpawnPoint" }
+        behavior: { $ref: "#/components/schemas/ActorBehavior" }
+
+
+    SceneEventType:
+      type: string
+      description: |
+        场景事件类型（4.2.2 节 events[].type）。
+        ⚠ 设计文档未定义取值域；本契约按 4.2.1 场景与 4.5 实车触发事件提出候选值，需人工确认。
+      enum:
+        - collision
+        - cut_in
+        - pedestrian_crossing
+        - emergency_brake
+        - manual_takeover
+        - sensor_failure
+        - obstacle_appearance
+
+    SceneEventTrigger:
+      type: object
+      description: |
+        事件触发条件（4.2.2 节 events[].trigger）。
+        ⚠ 内部结构设计文档未定义：condition 为触发表达式标识（如 OpenSCENARIO 条件名或
+        `ego.position.x > 10`），parameters 为其参数。
+      required: [condition]
+      properties:
+        condition: { type: string, minLength: 1, maxLength: 256 }
+        parameters: { type: object, additionalProperties: true }
+
+    SceneEventAction:
+      type: object
+      description: |
+        事件触发后的动作（4.2.2 节 events[].action）。
+        ⚠ 内部结构设计文档未定义：action_type 建议取 speed_change / lane_change / stop /
+        emergency_stop / actor_spawn。
+      required: [action_type]
+      properties:
+        action_type: { type: string, minLength: 1, maxLength: 64, example: speed_change }
+        parameters: { type: object, additionalProperties: true }
+
+    SceneEvent:
+      type: object
+      description: 场景事件（4.2.2 节 events[]）
+      required: [event_id, type, trigger, action]
+      properties:
+        event_id: { type: string, minLength: 1, maxLength: 64, description: "场景内事件唯一标识" }
+        type: { $ref: "#/components/schemas/SceneEventType" }
+        trigger: { $ref: "#/components/schemas/SceneEventTrigger" }
+        action: { $ref: "#/components/schemas/SceneEventAction" }
+
+    SuccessCriteria:
+      type: object
+      description: 场景成功判据（4.2.2 节 success_criteria）
+      required: [max_speed_deviation, no_collision, min_safe_distance]
+      properties:
+        max_speed_deviation: { type: number, minimum: 0, description: "最大速度偏差（m/s）" }
+        no_collision: { type: boolean, default: true, description: "是否要求全程无碰撞（true=通过判据）" }
+        min_safe_distance: { type: number, minimum: 0, description: "最小安全距离（m）" }
+
+    SceneConfig:
+      type: object
+      description: |
+        场景仿真配置（4.2.2 节结构中的仿真相关段，落库 scenes.config_json）。
+        7 个字段全部必填，与 x-hunter-scene-config-contract 声明一致。
+      required: [map, ego_vehicle, weather, actors, events, success_criteria, duration]
+      properties:
+        map: { $ref: "#/components/schemas/SceneMap" }
+        ego_vehicle: { $ref: "#/components/schemas/EgoVehicle" }
+        weather: { $ref: "#/components/schemas/Weather" }
+        actors:
+          type: array
+          maxItems: 100
+          description: 参与者列表（可为空数组）
+          items: { $ref: "#/components/schemas/Actor" }
+        events:
+          type: array
+          maxItems: 100
+          description: 事件列表（可为空数组）
+          items: { $ref: "#/components/schemas/SceneEvent" }
+        success_criteria: { $ref: "#/components/schemas/SuccessCriteria" }
+        duration: { type: number, exclusiveMinimum: 0, description: "场景时长（s）；⚠ 上限未定义，下发前校验" }
+
+
+    SceneMeta:
+      type: object
+      description: |
+        场景元信息（4.2.2 节结构中的元信息段，一一对应 scene_svc.scenes 列）。
+        与 SceneConfig 合并即为 4.2.2 节完整场景配置结构。
+      required: [scene_id, scene_name, scene_type, description, version, creator, tags, status, create_time, update_time]
+      properties:
+        scene_id: { type: string, format: uuid }
+        scene_name: { type: string, minLength: 1, maxLength: 128 }
+        scene_type: { $ref: "#/components/schemas/SceneType" }
+        description: { type: string, nullable: true, maxLength: 1024 }
+        version: { type: string, pattern: "^\\d+\\.\\d+\\.\\d+$", example: 1.0.0, description: "语义化版本（导出时写入 x-scenario-version）" }
+        creator: { type: string, format: uuid, description: "创建者 user_id（逻辑外键 → user_svc.users）" }
+        tags:
+          type: array
+          maxItems: 20
+          items: { type: string, minLength: 1, maxLength: 32 }
+        status: { $ref: "#/components/schemas/SceneStatus" }
+        create_time: { type: string, format: date-time }
+        update_time: { type: string, format: date-time }
+
+    Scene:
+      description: 场景完整对象 = SceneMeta（元信息，4.2.2 元信息段）+ config（仿真配置段）
+      allOf:
+        - $ref: "#/components/schemas/SceneMeta"
+        - type: object
+          required: [config]
+          properties:
+            config: { $ref: "#/components/schemas/SceneConfig" }
+
+    SceneTemplate:
+      type: object
+      description: 场景模板（4.2.1 分类体系预置；config 可直接作为创建请求的 config 提交）
+      required: [template_id, template_name, scene_type, description, config]
+      properties:
+        template_id: { type: string, minLength: 1, maxLength: 64 }
+        template_name: { type: string, minLength: 1, maxLength: 128 }
+        scene_type: { $ref: "#/components/schemas/SceneType" }
+        description: { type: string, nullable: true }
+        config: { $ref: "#/components/schemas/SceneConfig" }
+
+    # ---------- 业务数据段（统一响应 data 字段） ----------
+    SceneListData:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Scene" }
+        total: { type: integer, minimum: 0, description: "满足筛选条件的总数（软删除数据不计入）" }
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200 }
+
+    SceneTemplateListData:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/SceneTemplate" }
+        total: { type: integer, minimum: 0 }
+
+    SceneDeleteData:
+      type: object
+      required: [scene_id, deleted]
+      properties:
+        scene_id: { type: string, format: uuid }
+        deleted: { type: boolean, description: "软删除结果（true=deleted_at 已写入）" }
+
+    SceneExportData:
+      type: object
+      required: [format, file_name, object_key, size_bytes, download_url, expires_in]
+      properties:
+        format: { $ref: "#/components/schemas/SceneExportFormat" }
+        file_name: { type: string, description: "导出文件名（含扩展名）" }
+        object_key: { type: string, description: "MinIO hunter-scene-assets 对象键" }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        sha256: { type: string, pattern: "^[0-9a-f]{64}$", nullable: true, description: "文件 SHA-256（完整性校验）" }
+        download_url: { type: string, format: uri, description: "预签名下载地址（有效期 15 分钟，支持 Range 分片下载）" }
+        expires_in: { type: integer, description: "预签名过期秒数（MinIO 契约：下载 900 秒）" }
+
+    SceneRunData:
+      type: object
+      required: [sim_instance_id, scene_id, status, started_at]
+      properties:
+        sim_instance_id: { type: string, description: "Carla 仿真实例 ID（4.4 节第 5 步）" }
+        scene_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/SimulationStatus" }
+        started_at: { type: string, format: date-time, description: "下发成功时间（UTC）" }
+        param_overrides:
+          type: object
+          additionalProperties: true
+          description: "实际生效的参数覆盖（回显，便于追溯）"
+
+
+    # ---------- 成功响应（data 已定型，便于前端 TS 类型生成） ----------
+    SceneResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/Scene" }
+
+    SceneListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SceneListData" }
+
+    SceneTemplateListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SceneTemplateListData" }
+
+    SceneDeleteResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SceneDeleteData" }
+
+    SceneExportResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SceneExportData" }
+
+    SceneRunResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SceneRunData" }
+
+    # ---------- 请求体 ----------
+    SceneCreateRequest:
+      type: object
+      description: |
+        创建场景请求：元信息（写入 scenes 列）+ config（写入 config_json，4.2.2 结构）。
+        status / creator / version / create_time 由服务端生成，不接收客户端传值。
+      required: [scene_name, scene_type, config]
+      additionalProperties: false
+      properties:
+        scene_name: { type: string, minLength: 1, maxLength: 128 }
+        scene_type: { $ref: "#/components/schemas/SceneType" }
+        description: { type: string, nullable: true, maxLength: 1024 }
+        tags:
+          type: array
+          maxItems: 20
+          default: []
+          items: { type: string, minLength: 1, maxLength: 32 }
+        config: { $ref: "#/components/schemas/SceneConfig" }
+
+    SceneUpdateRequest:
+      type: object
+      description: |
+        更新场景请求（PUT 全量语义）。元信息与 config 必须整体提交，
+        运行中/已发布场景返回 3003；status / version / creator 不可改。
+      required: [scene_name, scene_type, config]
+      additionalProperties: false
+      properties:
+        scene_name: { type: string, minLength: 1, maxLength: 128 }
+        scene_type: { $ref: "#/components/schemas/SceneType" }
+        description: { type: string, nullable: true, maxLength: 1024 }
+        tags:
+          type: array
+          maxItems: 20
+          default: []
+          items: { type: string, minLength: 1, maxLength: 32 }
+        config: { $ref: "#/components/schemas/SceneConfig" }
+
+    SceneDuplicateRequest:
+      type: object
+      description: 复制场景请求（可省略请求体）
+      additionalProperties: false
+      properties:
+        new_scene_name:
+          type: string
+          nullable: true
+          minLength: 1
+          maxLength: 128
+          description: "新场景名称；省略时按 <源名称>-copy 生成（冲突追加序号）"
+
+    ScenePublishRequest:
+      type: object
+      description: |
+        发布场景请求（可省略请求体）。
+        ⚠ 版本号策略：本契约规定仅在显式传 version 时更新 scenes.version，否则保持不变。
+      additionalProperties: false
+      properties:
+        version:
+          type: string
+          nullable: true
+          pattern: "^\\d+\\.\\d+\\.\\d+$"
+          description: "发布版本（可选，语义化版本；需 ≥ 当前版本）"
+
+    SceneExportFormat:
+      type: string
+      description: 导出格式（4.3 节：Carla ScenarioRunner XML + OpenSCENARIO 1.2）
+      enum: [carla_scenariorunner_xml, openscenario_1_2]
+
+    SceneExportRequest:
+      type: object
+      description: |
+        导出请求：支持批量导出（一次一个文件，多场景合并写入同一导出文件集）。
+        ⚠ 批量语义（单文件内多场景 vs 多文件打包）设计文档未定义，见 x-hunter-pending-confirmation。
+      required: [scene_ids, format]
+      additionalProperties: false
+      properties:
+        scene_ids:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { type: string, format: uuid }
+        format: { $ref: "#/components/schemas/SceneExportFormat" }
+
+    SceneRunRequest:
+      type: object
+      description: |
+        场景下发请求（可省略请求体）。
+        param_overrides 仅允许覆盖 4.2.2 结构中的白名单路径（如 ego_vehicle.initial_speed、
+        weather.*、duration），服务端以白名单校验后深合并；禁止覆盖 map.map_id。
+      additionalProperties: false
+      properties:
+        param_overrides:
+          type: object
+          additionalProperties: true
+          description: "参数化覆盖（白名单路径深合并；键为点分路径）"
+        sim_config:
+          type: object
+          description: "仿真运行配置（⚠ 设计文档未定义配置项，见 x-hunter-pending-confirmation）"
+          additionalProperties: false
+          properties:
+            allow_parallel:
+              type: boolean
+              default: false
+              description: "允许同一场景并行运行多个实例（默认 false，避免资源争抢）"
+
+
+# =====================================================================
+# 扩展字段：机器可校验契约（由 services/scene-service/app/tests/test_openapi_contract.py 强制校验）
+# =====================================================================
+x-hunter-service:
+  name: scene-service
+  port: 8081
+  gateway_prefix: /api/v1/scene
+  db_schema: scene_svc
+  db_tables: [scenes]
+  minio_buckets: [hunter-scene-assets]
+  redis_keys:
+    - pattern: "cache:scene:{scene_id}"
+      type: "String(JSON)"
+      ttl_seconds: 3600
+      usage: "GET /api/v1/scene/{scene_id} 场景详情缓存（写操作后主动失效）"
+  config_source: "pydantic-settings（环境变量 / K8s ConfigMap scene-service-config + Secret hunter-app-secrets）"
+  required_env:
+    - SERVICE_NAME
+    - API_PORT
+    - DATABASE_URL
+    - REDIS_URL
+    - MINIO_ENDPOINT
+    - MINIO_BUCKET_SCENE_ASSETS
+    - CARLA_MANAGEMENT_ENDPOINT   # ⚠ 键名待确认（禁止在代码中硬编码 Carla 地址）
+  performance:
+    api_p95_ms: 200             # 13.2 节：API 响应 P95 ≤ 200ms
+    list_default_page_size: 20
+    list_max_page_size: 200
+
+#: 设计文档 12.2 节 scene-service REST 端点清单（本契约不得擅自增删；回归测试逐条比对）
+x-hunter-endpoints:
+  source: "设计文档 12.2 节"
+  endpoints:
+    - "GET /api/v1/scene"
+    - "GET /api/v1/scene/{scene_id}"
+    - "POST /api/v1/scene"
+    - "PUT /api/v1/scene/{scene_id}"
+    - "DELETE /api/v1/scene/{scene_id}"
+    - "POST /api/v1/scene/{scene_id}/duplicate"
+    - "POST /api/v1/scene/{scene_id}/publish"
+    - "POST /api/v1/scene/export"
+    - "POST /api/v1/scene/{scene_id}/run"
+    - "GET /api/v1/scene/templates"
+  ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]
+
+x-hunter-scene-types:
+  source: "设计文档 4.2.1 节（分类体系）+ 4.5 节（实车回放类型）"
+  status: pending_confirmation
+  note: "设计文档未给出编码值；categories[].types 的并集必须等于 SceneType 枚举全集"
+  categories:
+    - value: basic
+      label: 基础场景
+      types: [straight_cruise, curve_driving, car_following, lane_change]
+      type_labels:
+        straight_cruise: 直线巡航
+        curve_driving: 弯道行驶
+        car_following: 跟车行驶
+        lane_change: 变道行驶
+    - value: interactive
+      label: 交互场景
+      types: [cut_in, pedestrian_crossing, intersection_meeting, construction_detour]
+      type_labels:
+        cut_in: 前车切入
+        pedestrian_crossing: 行人横穿
+        intersection_meeting: 路口会车
+        construction_detour: 施工绕行
+    - value: environment
+      label: 环境场景
+      types: [rainy, night, foggy, backlight]
+      type_labels:
+        rainy: 雨天
+        night: 夜间
+        foggy: 雾天
+        backlight: 强光逆光
+    - value: corner_case
+      label: 极端场景（Corner Case）
+      types: [emergency_braking, obstacle_appearance, sensor_failure, multi_vehicle_mixed]
+      type_labels:
+        emergency_braking: 紧急制动
+        obstacle_appearance: 障碍物突现
+        sensor_failure: 传感器失效
+        multi_vehicle_mixed: 多车混行
+    - value: custom
+      label: 自定义场景
+      types: [custom]
+      type_labels:
+        custom: 自定义
+    - value: real_vehicle
+      label: 实车回放
+      source: "4.5 节：实车场景自动提取产物标记为「实车回放」类型"
+      types: [real_vehicle_replay]
+      type_labels:
+        real_vehicle_replay: 实车回放
+
+x-hunter-scene-config-contract:
+  source: "设计文档 4.2.2 节（场景配置 JSON 结构，字段名不可更改）"
+  note: "metadata_fields 一一对应 scene_svc.scenes 列；simulation_fields 写入 scenes.config_json"
+  metadata_fields: [scene_id, scene_name, scene_type, description, version, creator, tags]
+  simulation_fields: [map, ego_vehicle, weather, actors, events, success_criteria, duration]
+  nested_fields:
+    map: [map_id, map_type, spawn_point]
+    ego_vehicle: [model, initial_speed, initial_steer]
+    weather: [cloudiness, rain, wetness, fog, wind, sun_azimuth, sun_altitude]
+    actors: [actor_id, type, spawn_point, behavior]
+    events: [event_id, type, trigger, action]
+    success_criteria: [max_speed_deviation, no_collision, min_safe_distance]
+  storage:
+    metadata_fields: "scene_svc.scenes 独立列"
+    simulation_fields: "scene_svc.scenes.config_json (JSONB，GIN 索引 idx_scenes_config_json)"
+  required_all: true          # 上述字段全部必填（actors/events 允许空数组）
+
+x-hunter-lifecycle:
+  source: "contracts/database/enums.md 第 6 节（scenes.status）+ 设计文档 12.2 节"
+  states: [draft, published, archived]
+  editable_states: [draft]
+  deployable_states: [published]
+  exportable_states: [draft, published, archived]
+  deletable_states: [draft, archived]
+  transitions:
+    - {from: draft, to: published, endpoint: "POST /api/v1/scene/{scene_id}/publish"}
+    - {from: published, to: archived, endpoint: null}
+  note: "⚠ archived 仅存在于状态词表，12.2 节未定义归档端点，本契约不擅自新增（见 x-hunter-pending-confirmation）"
+
+x-hunter-export:
+  source: "设计文档 4.3 节"
+  formats:
+    - value: carla_scenariorunner_xml
+      extension: .xml
+      description: "Carla ScenarioRunner 场景文件（可直接由 scenario_runner.py 执行）"
+    - value: openscenario_1_2
+      extension: .xosc
+      description: "OpenSCENARIO 1.2 标准描述文件（写入 x-scenario-version 字段）"
+  bucket: hunter-scene-assets
+  object_prefix: "scenarios/"
+  presign_expires_in_seconds: 900     # MinIO 契约：下载预签名 15 分钟
+  range_download: true                # MinIO 契约：支持 Range 分片下载
+  naming: "scene-{scene_id}-{version}.{ext}"
+
+
+x-hunter-simulation-flow:
+  source: "设计文档 4.4 节（场景下发流程，7 步）"
+  status_values: [pending, running, succeeded, failed, canceled]
+  steps:
+    - "① 校验场景配置完整性（4.2.2 结构 + 状态必须为 published）"
+    - "② 调用 Carla 管理 API 创建仿真实例（连接超时/重试，失败返回 5001）"
+    - "③ 下发场景配置 JSON（4.2.2 结构 + param_overrides 白名单深合并）"
+    - "④ Carla 加载地图、生成参与者、设置环境（weather/actors）"
+    - "⑤ 返回 sim_instance_id，场景运行状态更新为 running"
+    - "⑥ 实时监控仿真进度（⚠ 12.2 节无进度查询端点）"
+    - "⑦ 仿真结束 → 回收资源 → 保存结果（⚠ 12.2 节无结果保存端点）"
+  implementations_pending:
+    - "⑥ 进度监控：建议由 Carla 回调或服务端轮询后经 WebSocket 推送（需确认方案与端点）"
+    - "⑦ 结果保存：建议写入 MinIO hunter-scene-assets 或 hunter-rosbag（需确认）"
+  entrypoint_env: CARLA_MANAGEMENT_ENDPOINT   # ⚠ 键名待确认
+  timeout_policy: "连接/读超时与重试次数需环境变量化（禁止硬编码）"
+
+x-hunter-real-vehicle-extraction:
+  source: "设计文档 4.5 节"
+  transport: kafka
+  produces: []                 # 提取结果直接落库，不经 Kafka（contracts/kafka 无 scene 生产方）
+  consume:
+    topic: analytics_result
+    group_id: scene-service-analytics-result
+    schema: contracts/kafka/schemas/analytics_result.schema.json
+  triggers:
+    - {event_type: harsh_braking, condition: "减速度 > 3 m/s²", event_level: warning}
+    - {event_type: collision_warning, condition: "TTC < 1.5 s", event_level: critical}
+    - {event_type: manual_takeover, condition: "人工接管", event_level: info}
+  window: {pre_seconds: 10, post_seconds: 10}       # 事件前后各 10 秒
+  extracted: [ego_trajectory, object_trajectories, environment]
+  output:
+    scene_type: real_vehicle_replay
+    status: draft
+    config_storage: "scene_svc.scenes.config_json"
+  idempotency_key: "(vehicle_id, window_start)"
+  note: "⚠ 触发来源待核对：topics.yaml 将 scene-service 列为 event_raw 消费方，consumer-groups.yaml 仅登记 analytics_result"
+
+x-hunter-rate-limits:
+  source: "设计文档 附录 D（接口限流配置）"
+  endpoint_limits: []          # 附录 D 的 3 条接口级限流不含 scene 域端点
+  inherit_gateway:
+    global_qps: 10000
+    per_user_qps: 100
+    per_ip_qps: 200
+  over_limit_response: "HTTP 429 + code=5001 + Retry-After（复用错误码，见 x-hunter-pending-confirmation）"
+
+x-hunter-kafka:
+  produces: []
+  consumes:
+    - topic: analytics_result
+      group_id: scene-service-analytics-result
+      schema: contracts/kafka/schemas/analytics_result.schema.json
+      enabled: true
+    - topic: event_raw
+      group_id: null
+      schema: contracts/kafka/schemas/event.schema.json
+      enabled: false
+      reason: "⚠ 触发源待核对（event_raw 未登记 scene-service 消费组，禁止擅自新增消费组）"
+
+x-hunter-error-status-map:
+  source: "设计文档 附录 A 错误码 + common/python/hunter_common/exceptions.py ErrorCode"
+  note: "⚠ 设计文档未定义错误码→HTTP 状态映射；此处与 services/scene-service/app/core/error_handlers.py 的 HTTP_STATUS_BY_CODE 对齐"
+  map:
+    1001: 401
+    1002: 403
+    1003: 401
+    2001: 422
+    2002: 422
+    3001: 404
+    3002: 409
+    3003: 409
+    4001: 409
+    4002: 409
+    5000: 500
+    5001: 503
+    6001: 422
+    6002: 422
+    6003: 422
+    7001: 409
+    7002: 502
+
+
+x-hunter-pending-confirmation:
+  source: "本契约编写过程中发现的、设计文档未明确的决策点；确认后回填契约再实现代码"
+  note: "每项均影响 Step 2 及之后的实现范围，未确认前实现必须按本契约当前取值（禁止另起一套）"
+  items:
+    - id: 1
+      question: "scenes.scene_type 取值域：设计文档只给出「分类 → 场景」两级结构，未给出编码值"
+      contract_decision: "scene_type 取「叶子场景」编码（如 straight_cruise），分类映射见 x-hunter-scene-types"
+      impact: "DB 无 CHECK 约束、前后端筛选与 OpenSCENARIO 导出映射"
+    - id: 2
+      question: "4.4 节第 6/7 步（实时监控仿真进度、保存仿真结果）无 REST 端点"
+      contract_decision: "不擅自新增端点；缺口登记于 x-hunter-simulation-flow.implementations_pending"
+      impact: "仿真进度前端展示方案（轮询 / WebSocket / Carla 回调）"
+    - id: 3
+      question: "spawn_point / actor.behavior / event.trigger / event.action 内部结构未定义"
+      contract_decision: "按 Carla transform 与 OpenSCENARIO 条件语义给出最小结构，behavior_type/action_type 暂为字符串"
+      impact: "场景编辑器字段级校验与导出实现"
+    - id: 4
+      question: "scenes.status 含 archived，但 12.2 节无归档端点"
+      contract_decision: "契约不新增归档端点；lifecycle.transitions 中 published→archived 的 endpoint 为 null"
+      impact: "归档能力是否本期交付"
+    - id: 5
+      question: "删除规则：published 场景是否允许直接删除"
+      contract_decision: "仅 draft/archived 可删除，published 返回 3003（需先归档）"
+      impact: "DELETE /scene/{scene_id} 状态校验分支"
+    - id: 6
+      question: "场景导出返回形式：XML 文本直返 / MinIO 预签名 URL；批量导出语义"
+      contract_decision: "MinIO hunter-scene-assets + 预签名 15 分钟；批量导出为单文件集（命名 scene-{scene_id}-{version}.{ext}）"
+      impact: "网关响应体大小、前端下载体验、MinIO 生命周期（永久）"
+    - id: 7
+      question: "version 语义：发布时是否自动递增"
+      contract_decision: "仅当请求显式传 version 时更新；否则保持不变"
+      impact: "publish 实现与前端展示"
+    - id: 8
+      question: "rate limit 超限响应错误码（附录 A 无 429 专属码）"
+      contract_decision: "复用 5001 + HTTP 429 + Retry-After 响应头（与网关契约一致）"
+      impact: "网关/服务错误处理"
+    - id: 9
+      question: "Carla 管理 API 地址与配置键名、仿真并发上限、场景时长上限"
+      contract_decision: "键名暂定 CARLA_MANAGEMENT_ENDPOINT，值域与上限均需环境变量化"
+      impact: "Step 3 服务层实现与 K8s ConfigMap"
+    - id: 10
+      question: "实车场景提取触发源：analytics_result 还是 event_raw"
+      contract_decision: "以 consumer-groups.yaml 登记为准，仅消费 analytics_result；event_raw 标记 enabled=false"
+      impact: "Step 5 消费者实现与 data-analytics 的 analytics_result 契约"
+    - id: 11
+      question: "场景模板数据来源（内置静态清单 / DB 表 / MinIO 资源）"
+      contract_decision: "契约只定义响应结构，不新增 DB 表；来源待确认"
+      impact: "GET /scene/templates 实现方式与是否需要新表"
+    - id: 12
+      question: "weather 各字段取值范围（设计文档未给）"
+      contract_decision: "按 Carla WeatherParameters 语义（0-100 / 方位角 0-360 / 高度角 -90~90）"
+      impact: "场景编辑器滑块范围与导出映射"
+

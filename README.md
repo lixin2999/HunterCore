@@ -225,11 +225,14 @@ REST 接口契约集中在 `contracts/openapi/`，遵循「先契约、后实现
 | 契约 | 覆盖范围 | 状态 |
 |------|----------|------|
 | `api-gateway.yaml` | 统一认证（登录 / 刷新 / 登录态查询 / 注销）+ 运维探针（`/healthz`、`/readyz`、`/metrics`）+ 路由表 / 五级限流 / WebSocket / 审计日志 / 错误码映射扩展字段 | ✅ |
-| `scene-service.yaml` / `data-collector.yaml` / `data-analytics.yaml` / `ota-service.yaml` / `remote-control.yaml` | 各业务服务资源端点 | 待开发 |
+| `scene-service.yaml` | 场景库 CRUD（10 端点，12.2 节）+ 4.2.1 分类体系 / 4.2.2 配置结构 / 4.3 导出 / 4.4 下发 / 4.5 实车提取扩展字段 | ✅ |
+| `data-collector.yaml` / `data-analytics.yaml` / `ota-service.yaml` / `remote-control.yaml` | 各业务服务资源端点 | 待开发 |
 
 ```bash
 # 契约校验（29 项，无需运行服务）
 pytest services/api-gateway/app/tests/test_openapi_contract.py -q
+# 场景服务契约校验（29 项，无需运行服务）
+cd services/scene-service && pytest app/tests/test_scene_contract.py -q
 ```
 
 要点：
@@ -240,8 +243,11 @@ pytest services/api-gateway/app/tests/test_openapi_contract.py -q
 - **转发约定**：网关按 `x-hunter-gateway-routes` 的 7 个前缀转发（不可更改），注入 `X-User-Id`、`X-Roles`、`X-Trace-Id`（覆盖客户端同名头）
 - **限流**：附录 D 阈值（全局 10000 / 用户 100 / IP 200 QPS 等），超限 **HTTP 429 + `Retry-After`**（响应体 `code` 复用 5001）
 - **Kafka**：网关不生产/不消费任何 Topic（`x-hunter-kafka`）；若承接告警推送须先更新 `contracts/kafka/consumer-groups.yaml`
+- **场景服务**：`scene-service.yaml` 与设计文档 12.2 节逐条对齐（不得增删端点）；4.2.2 场景配置结构拆为 `SceneMeta`（→ `scenes` 列）
+  + `SceneConfig`（→ `config_json`），映射关系由 `x-hunter-scene-config-contract` 声明；Kafka 仅消费 `analytics_result`
+  （`analytics_result.schema.json` 已按 4.5 节补全：触发事件 + 前后各 10 秒截取窗口）
 - **⚠ 待确认**（契约内标 `pending_confirmation`）：认证端点路径与载荷、`/api/v1/vehicle|user` 归属服务（模块表仅 6 个微服务）、
-  MFA / 限流错误码复用、服务发现机制与配置键名、熔断阈值
+  MFA / 限流错误码复用、服务发现机制与配置键名、熔断阈值；场景服务侧见其契约 `x-hunter-pending-confirmation`（12 项）
 
 ## 验证命令清单
 
@@ -255,6 +261,7 @@ pytest services/api-gateway/app/tests/test_openapi_contract.py -q
 | 共享库测试 | `pytest common/python/tests -q` |
 | 数据层契约校验 | `python scripts/verify_data_layer.py`（DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema，24 项） |
 | 接口契约校验 | `pytest services/api-gateway/app/tests/test_openapi_contract.py -q`（OpenAPI ↔ 实现 ↔ K8s 清单，29 项） |
+| 场景契约校验 | `cd services/scene-service && pytest app/tests/test_scene_contract.py -q`（契约 ↔ 设计文档 4 章/12.2 节 ↔ DDL ↔ Kafka ↔ K8s，29 项） |
 | 数据库迁移 | `alembic -c common/python/alembic.ini current` / `... upgrade head` / `... upgrade head --sql`（离线预览） |
 | 表结构核对 | `docker exec hunter-postgres psql -U hunter -d hunter_edge -c "\\dt scene_svc.*"` |
 | 服务健康探针 | `curl http://localhost:<port>/healthz` |

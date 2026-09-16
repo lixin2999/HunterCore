@@ -232,8 +232,15 @@ platform_topics:
     key: vehicle_id
     producer: data-analytics
     consumers: [scene-service, 上层业务]
-    schema: null                               # ⚠ 消息结构待设计文档 5.3 定稿
-    description: "分析结果（指标计算 / Corner Case 挖掘 / 报告生成结果）"
+    schema: schemas/analytics_result.schema.json
+    description: |
+      分析结果（指标计算 / Corner Case 挖掘 / 报告生成结果）；
+      scene-service 消费该 Topic 做实车场景自动提取（设计文档 4.5 节：触发事件 + 前后各 10 秒截取窗口）
+    result_types: [metric, corner_case, report]
+    consumed_by:
+      - service: scene-service
+        group_id: scene-service-analytics-result
+        usage: "实车场景自动提取 → 生成 scene_type=real_vehicle_replay 的 draft 场景"
 
   - name: alert_event
     partitions: 3
