@@ -218,6 +218,31 @@ python scripts/verify_data_layer.py
 - **写入性能路径**：时序/事件走 `bulk_create*`（executemany 分片），支撑遥测入库延迟 ≤ 1s、时序写入 ≥ 10000 点/秒
 - **⚠ 待核对项**（设计文档 15.2/9/5.3 到位后回填）：`vehicle_svc`/`user_svc` schema 归属、`scenes.version` 类型、`scenes.scene_type`、`ota_versions.release_type/status`、`sensor_file`/`analytics_result`/`alert_event` 消息结构（当前 `schema: null`）
 
+## 接口契约（OpenAPI）
+
+REST 接口契约集中在 `contracts/openapi/`，遵循「先契约、后实现」；契约 ↔ 实现 ↔ K8s 清单三方一致性由契约测试强制校验。
+
+| 契约 | 覆盖范围 | 状态 |
+|------|----------|------|
+| `api-gateway.yaml` | 统一认证（登录 / 刷新 / 登录态查询 / 注销）+ 运维探针（`/healthz`、`/readyz`、`/metrics`）+ 路由表 / 五级限流 / WebSocket / 审计日志 / 错误码映射扩展字段 | ✅ |
+| `scene-service.yaml` / `data-collector.yaml` / `data-analytics.yaml` / `ota-service.yaml` / `remote-control.yaml` | 各业务服务资源端点 | 待开发 |
+
+```bash
+# 契约校验（29 项，无需运行服务）
+pytest services/api-gateway/app/tests/test_openapi_contract.py -q
+```
+
+要点：
+
+- **统一响应**：`{code, message, data, request_id, timestamp}`；错误码仅取预定义值（附录 A），错误码 → HTTP 状态映射与
+  `app/core/error_handlers.py:HTTP_STATUS_BY_CODE` 完全一致（契约内以 `x-hunter-error-status-map` 声明并可机检）
+- **认证**：Bearer JWT（Access Token 2h / Refresh Token 7d）；车辆设备为 X.509 双向 TLS（`mutualTLS`，CommonName = vehicle_id），非 REST
+- **转发约定**：网关按 `x-hunter-gateway-routes` 的 7 个前缀转发（不可更改），注入 `X-User-Id`、`X-Roles`、`X-Trace-Id`（覆盖客户端同名头）
+- **限流**：附录 D 阈值（全局 10000 / 用户 100 / IP 200 QPS 等），超限 **HTTP 429 + `Retry-After`**（响应体 `code` 复用 5001）
+- **Kafka**：网关不生产/不消费任何 Topic（`x-hunter-kafka`）；若承接告警推送须先更新 `contracts/kafka/consumer-groups.yaml`
+- **⚠ 待确认**（契约内标 `pending_confirmation`）：认证端点路径与载荷、`/api/v1/vehicle|user` 归属服务（模块表仅 6 个微服务）、
+  MFA / 限流错误码复用、服务发现机制与配置键名、熔断阈值
+
 ## 验证命令清单
 
 | 验证点 | 命令 |
@@ -229,6 +254,7 @@ python scripts/verify_data_layer.py
 | Redis | `docker exec hunter-redis redis-cli ping` |
 | 共享库测试 | `pytest common/python/tests -q` |
 | 数据层契约校验 | `python scripts/verify_data_layer.py`（DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema，24 项） |
+| 接口契约校验 | `pytest services/api-gateway/app/tests/test_openapi_contract.py -q`（OpenAPI ↔ 实现 ↔ K8s 清单，29 项） |
 | 数据库迁移 | `alembic -c common/python/alembic.ini current` / `... upgrade head` / `... upgrade head --sql`（离线预览） |
 | 表结构核对 | `docker exec hunter-postgres psql -U hunter -d hunter_edge -c "\\dt scene_svc.*"` |
 | 服务健康探针 | `curl http://localhost:<port>/healthz` |
@@ -251,6 +277,6 @@ python scripts/verify_data_layer.py
 ## 文档
 
 - `docs/`：设计文档索引与开发文档
-- `contracts/`：接口契约（数据库 DDL/ER/受控词表、Kafka Topic 清单/消费者组/消息 JSON Schema 已完成；OpenAPI 随各服务开发填充）
+- `contracts/`：接口契约（数据库 DDL/ER/受控词表、Kafka Topic 清单/消费者组/消息 JSON Schema、api-gateway OpenAPI 已完成；其余服务 OpenAPI 随开发填充）
 - `release.md`：版本变更记录
 

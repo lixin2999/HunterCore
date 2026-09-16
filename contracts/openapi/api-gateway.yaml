@@ -1,0 +1,830 @@
+# =====================================================================
+# HunterEdge API 网关契约（OpenAPI 3.0.3）—— 单一事实来源
+# 来源：设计文档 3 章（API 网关：认证鉴权 / 限流熔断 / 路由转发 / 日志审计）、
+#       3.4 节（网关路由表）、12.1 节（REST API 规范）、14.1 节（认证与授权）、
+#       附录 A（错误码）、附录 D（API 限流配置）
+# 实现：services/api-gateway（FastAPI 0.100+）；变更必须先改本文件再改代码
+#
+# 范围说明：
+#   - 网关自持端点：统一认证（登录 / 刷新 / 登出 / 当前用户）+ 运维探针（/healthz、/readyz、/metrics）
+#   - 网关转发端点：见扩展字段 x-hunter-gateway-routes（前缀 → 目标服务，路径前缀不可更改）；
+#     各后端服务的资源端点由各自契约 contracts/openapi/{service}.yaml 定义，本文件不重复声明
+#
+# ⚠ 待核对（设计文档未明确，需人工确认后回填；禁止擅自新增端点 / 错误码 / 阈值）：
+#   1) 认证端点路径与载荷：3.2.1 节仅给出登录流程，12 章未列出登录 / 刷新 / 登出接口；
+#      本契约按「路由表 /api/v1/user/**」的约定将认证端点落在网关自持
+#   2) user-service / vehicle-service 不在本项目模块表（仅 6 个微服务）内，
+#      /api/v1/user/**、/api/v1/vehicle/** 的其余资源端点归属待确认
+#   3) MFA(TOTP)：设计文档要求支持，但附录 A 无 MFA 专用错误码，校验失败统一复用 1001
+#   4) 限流超限响应：附录 A 无限流错误码，统一复用 5001 + HTTP 429 + Retry-After
+#   5) 网关不生产 / 不消费任何 Kafka Topic（contracts/kafka/consumer-groups.yaml 12 个组无网关归属）
+# =====================================================================
+openapi: 3.0.3
+
+info:
+  title: HunterEdge - api-gateway
+  version: 0.1.0
+  description: |
+    数据采集与分析系统 API 网关统一接入契约（端口 8080）。
+
+    **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功，非 0 为预定义错误码（附录 A）。
+
+    **认证**：`Authorization: Bearer <JWT>`；Access Token 2h、Refresh Token 7d，支持 MFA(TOTP)。
+    车辆设备采用 X.509 双向 TLS（CommonName = vehicle_id）+ Kafka SASL_SSL，不通过 REST 认证。
+
+    **链路追踪**：入口优先透传 `X-Request-ID`，未提供则生成 UUID；转发后端时附加
+    `X-User-Id`、`X-Roles`、`X-Trace-Id`（网关覆盖同名入参，禁止客户端伪造身份头）。
+
+    **限流**：全局 10000 QPS / 单用户 100 QPS / 单 IP 200 QPS；接口级 POST /ota/versions 5 QPS、
+    POST /remote/session 1 QPS、GET /data/telemetry 20 QPS；超限返回 HTTP 429 + `Retry-After`。
+    阈值来源：附录 D，不可更改。
+
+    **性能**：API 响应 P95 ≤ 200ms（设计文档 13.2 节）。
+  license:
+    name: Proprietary - HunterEdge
+
+servers:
+  - url: https://hunter-edge.example.com
+    description: 生产环境（Ingress TLS，全链路 HTTPS）
+  - url: http://localhost:8080
+    description: 本地开发
+
+tags:
+  - name: auth
+    description: 统一认证（登录 / 令牌刷新 / 注销 / 当前用户）
+  - name: ops
+    description: 运维探针与指标（K8s probe / Prometheus 抓取，不经 /api/v1 前缀）
+  - name: gateway
+    description: 网关转发路由（由 x-hunter-gateway-routes 声明，资源定义见各服务契约）
+
+paths:
+  /api/v1/user/login:
+    post:
+      operationId: userLogin
+      tags: [auth]
+      summary: 用户登录（用户名密码 + 可选 MFA(TOTP)）
+      description: |
+        设计文档 3.2.1 节登录流程：验证用户名密码 → 生成 JWT Access Token(2h) + Refresh Token(7d)。
+
+        - MFA(TOTP)：请求携带 `totp_code`；缺失或校验失败返回 1001（附录 A 无 MFA 专用错误码，禁止新增）
+        - 暴力破解防护（14.5 节）：登录失败次数限制 + IP 锁定；失败/成功均审计留痕（禁止记录密码）
+        - 成功后更新 `user_svc.users.last_login_time`，并写 Redis `session:{user_id}`（2 小时）
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TraceRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: 登录成功（返回 Token 对）
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseTokenPair'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/InvalidParameter'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/user/refresh:
+    post:
+      operationId: userRefreshToken
+      tags: [auth]
+      summary: 刷新 Access Token（Refresh Token 有效期 7 天）
+      description: |
+        以 Refresh Token 换取新的 Token 对（设计文档 14.1 节会话管理）。
+
+        - Refresh Token 失效/过期 → 1003（需重新登录）
+        - 轮换策略：一次一换，旧 Refresh Token 立即作废（防重放）
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TraceRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: 刷新成功（返回新 Token 对）
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseTokenPair'
+        '401':
+          $ref: '#/components/responses/TokenExpired'
+        '422':
+          $ref: '#/components/responses/InvalidParameter'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/user/logout:
+    post:
+      operationId: userLogout
+      tags: [auth]
+      summary: 注销会话（主动登出）
+      description: |
+        设计文档 14.1 节：支持主动注销。
+
+        - 清除 Redis `session:{user_id}`；Access Token 加入黑名单直至其自然过期（≥ 2h 保留窗口）
+        - 幂等：Token 已失效仍返回 code=0（不泄露 Token 状态）
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TraceRequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+      responses:
+        '200':
+          description: 注销成功（data 为 null）
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseEmpty'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/user/me:
+    get:
+      operationId: getCurrentUser
+      tags: [auth]
+      summary: 当前登录用户信息与权限
+      description: |
+        返回 JWT 解析结果（sub / username / roles / permissions）及用户资料；
+        前端据此渲染菜单与 `v-permission` 指令（设计文档 14.1 节 RBAC）。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TraceRequestId'
+      responses:
+        '200':
+          description: 当前用户信息
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseUserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ------------------------------------------------------------------
+  # 运维端点（非 /api/v1 前缀；K8s probe 与 Prometheus 抓取使用，不经网关路由表）
+  # ------------------------------------------------------------------
+  /healthz:
+    get:
+      operationId: healthz
+      tags: [ops]
+      summary: 存活探针（K8s startupProbe / livenessProbe）
+      x-internal: true
+      security: []
+      responses:
+        '200':
+          description: 进程存活（统一响应格式）
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseHealth'
+
+  /readyz:
+    get:
+      operationId: readyz
+      tags: [ops]
+      summary: 就绪探针（K8s readinessProbe，含 DB / Redis 连通性）
+      description: |
+        每项探测内置 2s 超时（依赖挂起时快速失败，避免 probe 超时误判）。
+        依赖不可用时返回 HTTP 503 + `code=5001`，`data` 给出各依赖探测明细。
+      x-internal: true
+      security: []
+      responses:
+        '200':
+          description: 全部依赖就绪
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseReady'
+        '503':
+          description: 存在未就绪依赖（code=5001，data 为探测明细）
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseReady'
+              example:
+                code: 5001
+                message: 服务不可用
+                data:
+                  database: true
+                  redis: false
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+
+  /metrics:
+    get:
+      operationId: metrics
+      tags: [ops]
+      summary: Prometheus 指标端点
+      description: |
+        返回 Prometheus 文本格式（`hunter_` 前缀指标：请求总数 / 时延直方图 / 进行中请求 / 服务信息）。
+        契约明确例外：**不返回**统一 JSON 响应体（由 Prometheus 抓取器消费）。
+      x-internal: true
+      security: []
+      responses:
+        '200':
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+# =====================================================================
+# 组件（全部服务复用：安全方案 / 请求头 / 共用响应）
+# =====================================================================
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT Access Token（2 小时）。载荷结构（设计文档 3.2.2 节）：
+        `sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` / `iss="hunter-platform"` / `jti`。
+
+        校验失败映射：Token 缺失或无效 → 1001；Token 过期 → 1003（客户端调用 /api/v1/user/refresh）；
+        角色权限不足 → 1002（RBAC，服务端按 resource:action 校验）。
+    deviceCertificate:
+      type: mutualTLS
+      description: |
+        车辆设备认证：X.509 双向 TLS，证书 CommonName = vehicle_id（出厂烧录，CRL / OCSP 吊销）。
+        车端另经 Kafka `SASL_SSL + SCRAM-SHA-512` 接入；本契约不含车端 REST 资源端点
+        （文件上传走 MinIO 预签名 URL 直传，见数据采集契约）。
+
+  headers:
+    RequestId:
+      description: 链路追踪 ID（网关透传上游 X-Request-ID，未提供则生成 UUID）
+      schema:
+        type: string
+        format: uuid
+    RetryAfter:
+      description: 限流重试等待秒数（HTTP 429 必需，附录 D 限流约束）
+      schema:
+        type: integer
+        minimum: 1
+    RateLimitLimit:
+      description: 当前维度窗口配额（⚠ 非设计文档定义，按业界惯例补充；如需裁剪以人工确认为准）
+      schema:
+        type: integer
+    RateLimitRemaining:
+      description: 当前维度窗口剩余配额（⚠ 同上）
+      schema:
+        type: integer
+    RateLimitReset:
+      description: 窗口重置时间（Unix epoch 秒，⚠ 同上）
+      schema:
+        type: integer
+
+  parameters:
+    TraceRequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: 客户端可选传入链路追踪 ID；未提供时由网关生成 UUID
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Unauthenticated:
+      description: 1001 未认证（Token 缺失或无效）
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+          example:
+            code: 1001
+            message: 未认证
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+    TokenExpired:
+      description: 1003 Token 过期（需刷新 Token 后重试）
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+          example:
+            code: 1003
+            message: Token 已过期
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+    Forbidden:
+      description: 1002 无权限（角色权限不足）
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+          example:
+            code: 1002
+            message: 无权限
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+    InvalidParameter:
+      description: 2001 参数错误（请求参数校验失败）
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+          example:
+            code: 2001
+            message: 参数错误
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+    MissingParameter:
+      description: 2002 参数缺失（必填参数未提供）
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+          example:
+            code: 2002
+            message: 参数缺失
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+    TooManyRequests:
+      description: |
+        HTTP 429 限流（附录 D）。⚠ 附录 A 无限流专用错误码，响应体 `code` 统一复用 5001（禁止新增错误码），
+        客户端应以 HTTP 状态码 429 与 `Retry-After` 为准。
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/RateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/RateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+          example:
+            code: 5001
+            message: 服务不可用
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+    ServiceUnavailable:
+      description: 5001 服务不可用（依赖服务不可用或依赖未就绪）
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+          example:
+            code: 5001
+            message: 服务不可用
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+    InternalError:
+      description: 5000 服务器内部错误（未预期异常）
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiResponseError'
+          example:
+            code: 5000
+            message: 服务器内部错误
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+  # ===================================================================
+  # 数据模型
+  # ===================================================================
+  schemas:
+    # ---------- 统一响应（五字段，不可更改） ----------
+    ApiResponse:
+      type: object
+      description: 统一 API 响应格式（所有服务必须遵守，字段不可更改）
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code:
+          type: integer
+          description: 0=成功；非 0=预定义错误码（附录 A）
+          example: 0
+        message:
+          type: string
+          example: success
+        data:
+          nullable: true
+          description: 业务数据（结构随端点而定；无数据时为 null）
+        request_id:
+          type: string
+          format: uuid
+          description: 请求 ID（等于链路 trace_id）
+        timestamp:
+          type: integer
+          description: 服务端响应时间（Unix epoch 秒）
+          example: 1724035200
+
+    ErrorCode:
+      type: integer
+      description: 预定义错误码（附录 A，禁止新增或更改含义）
+      enum: [0, 1001, 1002, 1003, 2001, 2002, 3001, 3002, 3003, 4001, 4002, 5000, 5001, 6001,
+             6002, 6003, 7001, 7002]
+
+    ApiResponseError:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          required: [code]
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            data:
+              nullable: true
+              description: 错误上下文（如就绪探针的依赖明细）；一般错误为 null
+
+    ApiResponseEmpty:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              nullable: true
+              description: 恒为 null（无返回数据的成功响应）
+
+    ApiResponseTokenPair:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/TokenPair'
+
+    ApiResponseUserProfile:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/UserProfile'
+
+    ApiResponseHealth:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/HealthStatus'
+
+    ApiResponseReady:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/ReadyChecks'
+
+    # ---------- 认证 ----------
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: 用户名（user_svc.users.username）
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          writeOnly: true
+          description: 明文密码（TLS 传输；服务端 bcrypt 校验；禁止写入日志）
+        totp_code:
+          type: string
+          pattern: '^[0-9]{6}$'
+          nullable: true
+          description: MFA(TOTP) 动态口令（6 位数字）；账号未启用 MFA 时忽略
+
+    RefreshTokenRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          writeOnly: true
+          description: 登录返回的 Refresh Token（有效期 7 天）
+
+    LogoutRequest:
+      type: object
+      properties:
+        refresh_token:
+          type: string
+          nullable: true
+          writeOnly: true
+          description: 可选；提供时一并作废，不提供则仅注销当前 Access Token 会话
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in, refresh_expires_in, user]
+      properties:
+        access_token:
+          type: string
+          description: JWT Access Token（2 小时）
+        refresh_token:
+          type: string
+          writeOnly: true
+          description: Refresh Token（7 天，单次使用轮换）
+        token_type:
+          type: string
+          enum: [Bearer]
+          default: Bearer
+        expires_in:
+          type: integer
+          example: 7200
+          description: Access Token 有效期（秒）
+        refresh_expires_in:
+          type: integer
+          example: 604800
+          description: Refresh Token 有效期（秒）
+        user:
+          $ref: '#/components/schemas/UserProfile'
+
+    UserProfile:
+      type: object
+      required: [user_id, username, roles]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: user_svc.users.user_id（JWT `sub`）
+        username:
+          type: string
+          description: user_svc.users.username
+        real_name:
+          type: string
+          nullable: true
+        roles:
+          type: array
+          items:
+            type: string
+          description: 角色编码列表（user_svc.roles.role_code，如 admin / operator / analyst / viewer）
+        permissions:
+          type: array
+          items:
+            type: string
+          description: 权限编码列表（user_svc.permissions.permission_code，形如 `scene:read`）
+
+    # ---------- 运维探测 ----------
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          description: 存活标记（进程可响应即为 ok）
+
+    ReadyChecks:
+      type: object
+      required: [database, redis]
+      description: 各依赖探测结果；任一为 false 时返回 HTTP 503 + code=5001
+      properties:
+        database:
+          type: boolean
+          description: PostgreSQL / TimescaleDB 连通性（单项探测超时 2s）
+        redis:
+          type: boolean
+          description: Redis 连通性（单项探测超时 2s）
+      example:
+        database: true
+        redis: true
+
+# =====================================================================
+# 扩展字段（OpenAPI 表达能力之外、但属于系统契约的机器可读定义）
+# 实现与校验脚本（服务单测 / scripts/verify_*.py）以本节为准，禁止在代码中另立事实来源
+# =====================================================================
+
+# ---------- 网关路由表（设计文档 3.4 节；路径前缀不可更改） ----------
+x-hunter-gateway-routes:
+  source: "设计文档 3.4 节 + 系统上下文基座「网关路由表」"
+  route_headers:
+    description: 网关转发至后端时注入的请求头（客户端同名头一律被覆盖，防身份伪造）
+    headers: [X-User-Id, X-Roles, X-Trace-Id]
+  strip_prefix: false        # 后端按 /api/v1/<domain>/... 全路径注册路由（与各服务契约一致）
+  routes:
+    - prefix: /api/v1/scene
+      target_service: scene-service
+      target_port: 8081
+      auth: jwt
+    - prefix: /api/v1/data
+      target_service: data-collector
+      target_port: 8082
+      auth: jwt
+    - prefix: /api/v1/analytics
+      target_service: data-analytics
+      target_port: 8083
+      auth: jwt
+    - prefix: /api/v1/ota
+      target_service: ota-service
+      target_port: 8084
+      auth: jwt
+    - prefix: /api/v1/remote
+      target_service: remote-control
+      target_port: 8085
+      auth: jwt
+    - prefix: /api/v1/vehicle
+      target_service: vehicle-service
+      target_port: null
+      auth: jwt
+      status: pending_confirmation
+      note: "⚠ 本项目模块表仅 6 个微服务（无 vehicle-service），归属待确认"
+    - prefix: /api/v1/user
+      target_service: user-service
+      target_port: null
+      auth: mixed
+      status: pending_confirmation
+      note: "⚠ 登录 / 刷新 / 登出 / 当前用户由网关自持（见 paths）；其余 /api/v1/user/** 归属待确认"
+  service_discovery:
+    mechanism: "Nacos / Consul 服务发现（设计文档 3.1 节）"
+    status: pending_confirmation
+    note: "⚠ 集群内亦可直接用 K8s Service DNS；最终方案与配置键名待人工确认后写入本契约与 ConfigMap"
+  # 熔断降级：后端不可用/超时时返回统一响应（禁止透传裸错误）
+  circuit_breaker:
+    failure_response_http_status: 503
+    failure_response_code: 5001
+    status: pending_confirmation
+    note: "⚠ 熔断阈值/半开策略设计文档未定义，实现阶段确认（默认：连续 5 次失败或超时率 > 50% 熔断 30s）"
+
+# ---------- 限流配置（设计文档附录 D；阈值不可更改） ----------
+x-hunter-rate-limits:
+  source: "设计文档 附录 D（API 限流配置）"
+  algorithm: "Redis 滑动窗口计数（键 rate_limit:{ip}:{api}，窗口 1 分钟）"
+  global_qps: 10000
+  per_user_qps: 100
+  per_ip_qps: 200
+  endpoint_limits:
+    - method: POST
+      path: /api/v1/ota/versions
+      dimension: user
+      qps: 5
+      note: "OTA 升级包上传"
+    - method: POST
+      path: /api/v1/remote/session
+      dimension: user
+      qps: 1
+      note: "远程操控会话创建（互斥：同车同时仅一名操作员，冲突返回 7001）"
+    - method: GET
+      path: /api/v1/data/telemetry
+      dimension: user
+      qps: 20
+      note: "⚠ 附录 D 原文为 GET /data/telemetry；对外实际路径含 /api/v1 前缀，具体资源路径待 data-collector 契约确定"
+  vehicle_limits:
+    - dimension: vehicle
+      metric: kafka_telemetry_msg_per_sec
+      limit: 100
+      note: "车端遥测上报侧约束，由 data-collector 与 Kafka 配额落实（非网关 HTTP 限流）"
+    - dimension: vehicle
+      metric: file_upload_mbps
+      limit: 10
+      note: "车端文件上传带宽约束（MinIO 预签名直传链路）"
+  over_limit:
+    http_status: 429
+    response_code: 5001
+    retry_after_header: Retry-After
+    note: "⚠ 附录 A 无限流专用错误码，禁止新增，响应体 code 统一复用 5001；客户端以 429 + Retry-After 为准"
+
+# ---------- WebSocket 路由（/ws/remote/**，远程操控） ----------
+x-hunter-websocket-routes:
+  - path: /ws/remote/**
+    target_service: remote-control
+    target_port: 8085
+    protocol: websocket
+    security_protocol: WSS（TLS，设计文档 14.2 节）
+    auth: "JWT（握手阶段校验）"
+    auth_detail: "⚠ 传送方式（Authorization 头 / Sec-WebSocket-Protocol / 首帧认证）待人工确认；禁止查询串明文携带 Token（日志泄露风险）"
+    constraints:
+      - "控制指令 20Hz（50ms 间隔）；>500ms 未收到指令，车辆自动减速停车"
+      - "远程操控最高速度 2.0 m/s（可配置）；视频 720p@30fps、H.264 硬编码、码率 2-4Mbps、关键帧间隔 1s"
+      - "端到端视频延迟 ≤ 200ms、指令延迟 ≤ 100ms（设计文档 13.2 节）"
+      - "响应/发送超时 3600s、关闭代理缓冲（infra/k8s/ingress.yaml 已配置）"
+    error_codes: [1001, 1002, 4001, 4002, 5001, 7001, 7002]
+
+# ---------- 访问日志与审计（设计文档 3.4 节、15.4.1 节） ----------
+x-hunter-audit-log:
+  format: "JSON → stdout（由 ELK / Loki 采集）"
+  access_log_fields: [time, method, path, status_code, duration_ms, user_id, client_ip, trace_id]
+  audit_events: ["登录/登出（成功与失败）", "权限拒绝（1002）", "限流触发（429）", "OTA 发布/回滚", "远程操控会话开始/结束", "场景下发"]
+  masking: "禁止记录密码、Token、证书私钥；敏感字段脱敏（hunter_common.logging）"
+
+# ---------- Kafka 参与度 ----------
+x-hunter-kafka:
+  produces: []
+  consumes: []
+  note: |
+    网关不参与 Kafka 消息生产 / 消费（仅转发 REST 与 WebSocket 流量），
+    因此 contracts/kafka/ 下无网关 Topic 与消费者组。
+    ⚠ 若将 alert_event 的 WebSocket 推送落在网关，须先更新 contracts/kafka/consumer-groups.yaml
+    （现为 platform-alert-event 落位待定），不得先实现后补契约。
+
+# ---------- 错误码 → HTTP 状态映射（与各服务 error_handlers 实现保持一致） ----------
+x-hunter-error-status-map:
+  source: "附录 A 错误码 + common/python/hunter_common/exceptions.py ErrorCode"
+  note: "⚠ 设计文档未定义错误码→HTTP 状态映射，此处与 services/*/app/core/error_handlers.py 的 HTTP_STATUS_BY_CODE 对齐"
+  map:
+    1001: 401
+    1002: 403
+    1003: 401
+    2001: 422
+    2002: 422
+    3001: 404
+    3002: 409
+    3003: 409
+    4001: 409
+    4002: 409
+    5000: 500
+    5001: 503
+    6001: 422
+    6002: 422
+    6003: 422
+    7001: 409
+    7002: 502
+
+
