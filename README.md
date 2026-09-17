@@ -326,10 +326,37 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
   （`scene:read|create|update|delete|execute`、`data:read`、`analytics:read|execute`、`ota:read|create|execute`、`remote:read|create|execute`），前端仅做展示控制，鉴权以后端为准
 - **已知折衷**：Token 存 `localStorage`（无 HttpOnly Cookie 端点契约）；`OtaReleaseType` 未定义 enum（pending #2）、`RC_MAX_STEER_RAD`（pending #18）、WS JWT 传送方式（pending #20，现用子协议 `hunter-jwt`）
 
+## L5 测试层（集成 / 端到端 / 性能）
+
+基于 testcontainers 的三层测试体系（`tests/`），按「契约即示例即测试数据」组织，覆盖系统关键约束三条主链路与第 10 条性能指标：
+
+| 层级 | 位置 | 内容 | 依赖 |
+|------|------|------|------|
+| 集成 | `tests/integration/` | 11.1 遥测链路（Topic 分区/保留契约、字节级往返、落库列覆盖、入库延迟、幂等、hypertable 配置、丢包检测）；API 契约面（统一响应/trace_id/就绪探针/契约外端点拦截，6 服务进程实测） | Docker（Postgres/Kafka/MinIO）+ uvicorn 进程 |
+| 端到端 | `tests/e2e/` | 11.2 OTA（版本防回滚 6003、SHA-256/RSA 校验顺序、门禁 6003、车端状态机与回滚路径、灰度 5/20/50/100 与 95% 门槛、Kafka 下发/上报往返、Redis 进度 Hash TTL、MinIO 预签名包仓库）；11.3 远程操控（互斥 7001/4001/4002、限幅 2.0 m/s、20Hz 节奏、500ms 超时安全停车、Kafka 20Hz 指令流延迟 ≤100ms、Redis 互斥锁/会话/车辆状态） | 纯逻辑可跑；Kafka/Redis 部分需 Docker |
+| 性能 | `tests/performance/` | API P95 ≤ 200ms（/healthz 全链路）、遥测入库延迟 ≤ 1s、时序写入 ≥ 10000 点/s、Kafka 吞吐回归下限（阈值 `tests/support/thresholds.py`，来源逐条登记，禁止魔法数字） | Docker + api-gateway 进程 |
+
+```powershell
+# 全量运行（无 Docker 时容器型用例自动 skip，绝不伪造结果）
+python -m pytest tests -q
+
+# 生成 L5 测试报告（docs/test-reports/ 下 Markdown + JSON，CI artifact）
+python -m pytest tests -q --l5-report
+
+# 测试层自检：pytest.ini 标记 ↔ report.MARKERS、阈值来源登记、报告模板占位符、用例号
+python scripts/verify_test_layer.py
+```
+
+- **支撑模块**（`tests/support/`）：`contracts`（契约加载，所有常量唯一来源）、`messages`（消息工厂，契约示例派生 + Schema 回校）、`flow`（11.1/11.2/11.3 平台侧逻辑基准：路由/事件判定/OTA 状态机/灰度/RC 会话/P95）、`broker`（Kafka 生产消费 + Topic 管理 + S3 SigV4 纯标准库实现）、`db`（asyncpg 落库/查询）、`infra`（容器夹具 + uvicorn 服务进程）、`thresholds`（阈值常量 + 来源登记）、`report`（L5 报告聚合，模板 `tests/report-template.md` 渲染）
+- **无 Docker 环境降级**：容器型夹具探测 Docker 不可用时 skip（附原因），纯逻辑用例照常运行；CI 在具备 Docker 的 runner 上跑完整套件（`.gitlab-ci.yml`：lint → unit → integration → e2e → performance → report）
+
 ## 验证命令清单
 
 | 验证点 | 命令 |
 |--------|------|
+| L5 测试层全量 | `python -m pytest tests -q`（无 Docker 时容器型用例自动 skip） |
+| L5 测试报告 | `python -m pytest tests -q --l5-report`（`docs/test-reports/`，Markdown + JSON） |
+| 测试层自检 | `python scripts/verify_test_layer.py`（标记/阈值来源/模板占位符/用例号） |
 | 基础设施健康 | `docker compose ps` |
 | TimescaleDB 扩展 | `docker exec hunter-postgres psql -U hunter -d hunter_edge -c "SELECT extname FROM pg_extension WHERE extname='timescaledb';"` |
 | Kafka 平台内部 Topic | `docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list` |

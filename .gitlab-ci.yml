@@ -1,0 +1,148 @@
+# HunterEdge Monorepo CI（GitLab CI）
+# 阶段：lint（风格/类型/测试层自检）→ unit（无容器）→ integration（容器化中间件）
+#       → e2e（业务链路）→ performance（第 10 条性能门槛）→ report（L5 报告 artifact）
+#
+# 说明：
+# - integration/e2e/performance 依赖 testcontainers，需要 Docker-in-Docker（dind）服务；
+#   无 Docker 的 runner 上这些用例自动 skip（infra.docker_available 探测，绝不伪造结果）
+# - Python 3.11 + 依赖安装：共享库 dev extras（含 pytest/testcontainers/confluent-kafka/asyncpg）
+# - 基准规模通过 HUNTER_BENCH_* 环境变量调整（默认值保证 CI 时长可控）
+
+stages:
+  - lint
+  - unit
+  - integration
+  - e2e
+  - performance
+  - report
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # dind：禁用 TLS 包装以使用本地 socket
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_HOST: "tcp://docker:2375"
+  # 基准规模（可按 runner 性能放大）
+  HUNTER_BENCH_API_REQUESTS: "300"
+  HUNTER_BENCH_TELEMETRY_MESSAGES: "2000"
+  HUNTER_BENCH_TIMESERIES_POINTS: "50000"
+
+default:
+  image: python:3.11-slim
+  cache:
+    key: "$CI_COMMIT_REF_SLUG-pip"
+    paths:
+      - .cache/pip
+  before_script:
+    - python -m pip install --upgrade pip
+    - pip install -e "common/python[dev]"
+
+.docker-job:
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_DRIVER: overlay2
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq docker.io > /dev/null
+    - python -m pip install --upgrade pip
+    - pip install -e "common/python[dev]"
+    - python scripts/verify_test_layer.py
+    - docker info
+
+lint:
+  stage: lint
+  script:
+    - python scripts/verify_test_layer.py
+    - ruff check tests common/python services
+    # 仅校验 L5 测试层（存量脚本 verify_data_layer/verify_infra 的类型问题单独治理）；
+    # stub 缺失（yaml/jsonschema/asyncpg）不阻塞，真实类型错误仍拦截
+    - mypy --ignore-missing-imports --disable-error-code=import-untyped tests/support scripts/verify_test_layer.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+unit:
+  stage: unit
+  script:
+    - pytest tests -m unit -q
+    # 共享库与各服务单元测试（不依赖容器）
+    - pytest common/python services -m "not integration and not e2e and not performance" -q
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+integration:
+  stage: integration
+  extends: .docker-job
+  script:
+    - pytest tests/integration -m integration -q --l5-report --junitxml=docs/test-reports/junit.xml
+  artifacts:
+    when: always
+    paths:
+      - docs/test-reports/
+      - .pytest_cache/service-logs/
+    reports:
+      junit: docs/test-reports/junit.xml
+    expire_in: 7 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+e2e:
+  stage: e2e
+  extends: .docker-job
+  script:
+    - pytest tests/e2e -m e2e -q --l5-report
+  artifacts:
+    when: always
+    paths:
+      - docs/test-reports/
+      - .pytest_cache/service-logs/
+    expire_in: 7 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+performance:
+  stage: performance
+  extends: .docker-job
+  script:
+    # 性能门槛：任一指标未达标即失败（阈值来自 tests/support/thresholds.py，不可放宽）
+    - pytest tests/performance -m performance -q --l5-report
+  artifacts:
+    when: always
+    paths:
+      - docs/test-reports/
+      - .pytest_cache/service-logs/
+    expire_in: 7 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+report:
+  stage: report
+  image: python:3.11-slim
+  dependencies:
+    - integration
+    - e2e
+    - performance
+  script:
+    - python - <<'PY'
+      import json, pathlib
+      path = pathlib.Path("docs/test-reports/l5-results.json")
+      if not path.exists():
+          raise SystemExit("缺少 L5 结果 JSON（各 stage 需 --l5-report）")
+      data = json.loads(path.read_text(encoding="utf-8"))
+      print("L5 报告版本:", data.get("version"))
+      print("套件汇总:", json.dumps(data.get("summary", {}), ensure_ascii=False))
+      for record in data.get("performance", []):
+          print("PERF", record["metric"], record["value"], record["unit"],
+                "PASS" if record["passed"] else "FAIL")
+      PY
+  artifacts:
+    paths:
+      - docs/test-reports/
+    expire_in: 30 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
