@@ -1,0 +1,1904 @@
+openapi: 3.0.3
+
+info:
+  title: HunterEdge - remote-control
+  version: 0.1.0
+  description: |
+    远程操控服务 REST 契约（网关前缀 `/api/v1/remote` → remote-control:8085；
+    WebSocket 前缀 `/ws/remote/**` → remote-control:8085，见 `x-hunter-websocket-contract`）。
+
+    模块职责（不可自行新增或合并模块）：WebRTC 视频流转发、控制指令转发（20Hz）、
+    操作员权限管理、操控会话与录像记录。
+
+    ## 契约边界
+    - **端点清单来源**：设计文档远程操控模块节（§12.6）与 §8.3–8.5 原文**未随仓库提供**
+      → 本清单由「附录 D 接口级限流端点 `POST /api/v1/remote/session` + 网关契约
+      `x-hunter-websocket-routes`（`/ws/remote/**`）+ 远程操控安全约束（20Hz / >500ms 停车 /
+      ≤2.0 m/s / 会话互斥）+ MinIO `hunter-video` 录像 + 本仓库统一运维探针」推导。
+      逐条依据与风险见 `x-hunter-endpoints` 与 `x-hunter-pending-confirmation`
+      （确认原文后回填再实现代码）。
+    - **数据层**：**不新增数据库表** —— `contracts/database/er.md` 与 `ddl/00_schemas.sql`
+      已约定 `remote_control` schema 为预留：会话态存 Redis `rc:session:{vehicle_id}`，
+      操控录像落 MinIO `hunter-video`，会话归档元信息以 sidecar JSON 随录像同桶存放
+      （见 `x-hunter-history-archive`）。如需按业务字段精确检索 / 强一致分页 / 数据权限隔离，
+      须先新增 `remote_control.sessions` 表并同步 DDL → ORM → Alembic migration
+      （见 `x-hunter-pending-confirmation` #1）。
+    - **Kafka**：生产 `hunter.{vehicle_id}.remote_control`（20Hz）；消费 `hunter.*.command_result`
+      （消费组 `remote-control-command-result`）。**不新增 Topic / 不修改 Topic 配置**。
+    - **安全**：JWT + RBAC（资源域 `remote`）+ 会话互斥（Redis 分布式锁）+ WSS / TLS 1.3 +
+      日志脱敏（禁止输出 Token / 密钥 / 预签名 URL 全量查询串），见 `x-hunter-control-safety`。
+    - **统一响应**：`{code, message, data, request_id, timestamp}`（不可更改，错误码取附录 A）。
+
+    ## 状态与约束（不可更改）
+    - 车辆状态（8 态，读 Redis `vehicle:status:{vehicle_id}`）：
+      `offline / online_idle / auto_driving / remote_controlled / upgrading / charging / fault / emergency`
+    - 控制指令 20Hz（50ms 间隔）；车端 **>500ms** 未收到控制指令自动减速停车
+    - 远程操控最高速度 **2.0 m/s**（可配置，配置键 `RC_MAX_SPEED_MPS`）
+    - 同一车辆同一时刻**仅允许一名操作员**（互斥冲突返回 7001）
+    - 视频：H.264 硬编码（车端 AGX Orin NVENC）720p@30fps、2–4 Mbps、关键帧间隔 1s
+    - 会话心跳 10s（`x-hunter-session-heartbeat`）；操控录像保留 **90 天**（`hunter-video`）
+  contact:
+    name: HunterEdge Platform Team
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.hunter-edge.example.com
+    description: 经 API 网关（8080）统一入口；网关按前缀 /api/v1/remote 转发至 remote-control:8085
+  - url: http://remote-control:8085
+    description: 集群内直连（mTLS；仅联调与内部调用使用）
+
+tags:
+  - name: vehicles
+    description: 可操控车辆（在线状态 / 占用状态 / 不可操控原因）
+  - name: sessions
+    description: 操控会话（创建 / 状态 / 结束；同车互斥）
+  - name: history
+    description: 操控记录与录像（列表 / 详情 / 录像预签名下载）
+  - name: ops
+    description: 运维探针（x-internal，安全域外）
+
+# 默认全局鉴权：所有业务端点需 JWT（网关校验后转发）；ops 端点用 `security: []` 显式退出
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/remote/vehicles:
+    get:
+      tags: [vehicles]
+      summary: 查询可操控车辆列表（分页）
+      description: |
+        车辆可用性来自 Redis 读模型（**权威值属 vehicle-service**，本服务只读不写）：
+        - `vehicle:online:set`：在线车辆集合（在线判定）
+        - `vehicle:status:{vehicle_id}`：车辆最新状态 Hash（`status` / `battery_soc` /
+          `velocity` / `last_online_time` 等）
+
+        `controllable=false` 时返回 `block_reason`（不可操控原因），前端据此禁用「接管操控」按钮：
+        `offline`（离线，错误码 4001）/ `upgrading`（OTA 中，4002）/ `fault`、`emergency`（车辆故障，
+        4002）/ `charging`（充电中，4002）/ `already_controlled`（已被其他操作员操控，7001）。
+
+        ⚠ 车辆状态 Hash 字段与 `block_reason` 值域未在设计文档给出（见
+        `x-hunter-pending-confirmation` #2 / #3）；`total` 为 Redis 读模型匹配数量（非 DB COUNT），
+        不作为强一致分页依据。
+      operationId: listControllableVehicles
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: 按车辆状态过滤（8 态受控词表，见 contracts/database/enums.md）
+          schema: { $ref: "#/components/schemas/VehicleStatus" }
+        - name: controllable_only
+          in: query
+          required: false
+          description: 仅返回当前可被操控的车辆（false 时返回全部在线车辆并附 block_reason）
+          schema: { type: boolean, default: true }
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 车辆标识精确匹配（= 设备证书 CommonName / Kafka 消息 key）
+          schema: { $ref: "#/components/schemas/VehicleId" }
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 可操控车辆列表
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ControllableVehicleListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/remote/sessions:
+    get:
+      tags: [sessions]
+      summary: 查询当前进行中的操控会话（分页）
+      description: |
+        数据源为 Redis 会话键（`rc:session:{vehicle_id}`，Key 模式不可更改，`SCAN` 读取）：
+
+        - 单车辆同一时刻至多一个会话 → 会话总数 ≤ 在线车辆数（规模小，无需 DB 索引）
+        - `total` 为匹配到的 Redis 键数量（非 DB COUNT），且为**最终一致**视图
+          （会话结束与键删除之间可能短暂残留，`x-hunter-pending-confirmation` #5）
+        - 用于运维核查「哪台车被谁占用」，前端管控台同步展示 `vehicle:status` 为
+          `remote_controlled` 的车辆
+      operationId: listRemoteSessions
+      parameters:
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 按车辆过滤
+          schema: { $ref: "#/components/schemas/VehicleId" }
+        - name: operator_id
+          in: query
+          required: false
+          description: 按操作员过滤（user_id；普通用户仅能查询自身会话，见 x-hunter-control-safety.authorization）
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 进行中的会话列表
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RemoteSessionListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/remote/session:
+    post:
+      tags: [sessions]
+      summary: 创建操控会话（抢占视频/控制通道，同车互斥）
+      description: |
+        会话创建流程（见 `x-hunter-session-lifecycle`）：
+
+        1. 校验车辆在线（`vehicle:online:set`）→ 否则 **4001**（车辆不在线）
+        2. 校验车辆状态允许接管（`vehicle:status:{vehicle_id}`）：`upgrading`（OTA 中）/`fault`/
+           `emergency`/`charging` → **4002**（车辆忙）；`auto_driving` 允许接管（切换为
+           `remote_controlled`，车端由控制指令切换模式）
+        3. 互斥判定：Redis 分布式锁 / `EXISTS rc:session:{vehicle_id}` → 已存在活跃会话
+           → **7001**（远程操控会话冲突，响应 `data` 携带占用者 `operator_id` / `session_id` /
+           `started_at`，前端提示「已被 xxx 接管」）
+        4. 生成 `session_id`（UUID）+ 下发车端 `remote_control` 指令（Kafka，20Hz 通道启动前
+           的 `session_start` 帧，见 `x-hunter-control-channel`）
+        5. 写 Redis `rc:session:{vehicle_id}`（Hash：session_id / operator_id / started_at /
+           status / seq_last / video_object_key）；启动 SRS 拉流登记与录像任务
+           （MinIO `hunter-video`，90 天）
+        6. 返回会话上下文（视频参数 / WebRTC 信令与控制通道地址 / 20Hz 与超时保护参数 /
+           录像对象键）
+
+        **限流**：附录 D 明列 `POST /api/v1/remote/session` 单用户 **1 QPS**（超限 429，code 5001）。
+        **RBAC**：`remote:create`；`operator_id` 一律取自 JWT（`X-User-Id`），**禁止请求体指定**。
+        **视频参数**：默认取环境变量 `RC_VIDEO_WIDTH/HEIGHT/FPS/MIN_BITRATE_KBPS/MAX_BITRATE_KBPS/
+        KEYFRAME_INTERVAL_S`；请求体仅允许在契约允许区间内微调（禁止越界，越界 → 2001）。
+      operationId: createRemoteSession
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRemoteSessionRequest" }
+      responses:
+        "200":
+          description: 会话创建成功（含视频 / 信令 / 控制通道与录像上下文）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RemoteSessionResponse" }
+        "422":
+          description: 参数错误（越界视频参数 / 缺少 vehicle_id；错误码 2001 或 2002）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseError" }
+        "409":
+          description: |
+            资源状态冲突：**4001** 车辆不在线 / **4002** 车辆忙（OTA 中 / 充电中 / 故障）/
+            **7001** 远程操控会话冲突（车辆已被其他操作员操控）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseError" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "502": { $ref: "#/components/responses/VideoSetupFailed" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/remote/session/{session_id}:
+    get:
+      tags: [sessions]
+      summary: 查询操控会话状态与实时统计
+      description: |
+        数据源 Redis `rc:session:{vehicle_id}`（Hash）+ 进程内会话统计（指令计数 / 回执延迟 /
+        视频质量），用于前端会话面板刷新与超时判定可视化：
+
+        - `control`：本轮会话已发送指令数 / 已回执数 / 回执延迟（均值、P95；目标 ≤100ms）/
+          连续超时次数（>500ms 无回执计一次，见 `x-hunter-control-channel.timeout_protection`）
+        - `video`：当前码率 / 帧率 / RTT / 丢包率 / 端到端延迟估算（目标 ≤200ms）/ 丢帧数
+        - `last_heartbeat_at`：最近一次会话心跳时间（间隔 10s，见 `x-hunter-session-heartbeat`）
+
+        ⚠ 会话统计随进程内存存在（多副本部署下统计为「本副本视角」，聚合需经 Redis
+        Hash 字段汇总），见 `x-hunter-pending-confirmation` #6。
+        会话已结束（Redis 键不存在）→ **3001**（资源不存在），改用
+        `GET /api/v1/remote/history/{session_id}` 查询归档记录。
+      operationId: getRemoteSession
+      parameters:
+        - $ref: "#/components/parameters/SessionIdPath"
+        - name: include_stats
+          in: query
+          required: false
+          description: 是否返回实时统计块（control / video / latency），默认 true；false 时仅返回会话元信息与状态
+          schema: { type: boolean, default: true }
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 会话状态与统计
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RemoteSessionDetailResponse" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    delete:
+      tags: [sessions]
+      summary: 结束操控会话（释放车辆占用并封存录像）
+      description: |
+        结束流程（**先安全后清理**，顺序不可颠倒）：
+
+        1. 下发车端 `session_end` 信令（Kafka `hunter.{vehicle_id}.remote_control`）→
+           车端按安全约束减速停车（>500ms 无后续指令同样会触发停车）
+        2. 停止 WebRTC 转发与录像，封存录像对象并写入 sidecar JSON 归档元信息
+           （`x-hunter-history-archive`）
+        3. 删除 Redis `rc:session:{vehicle_id}` + 释放互斥锁；车辆状态由 `remote_controlled`
+           回落（车端上报 / vehicle-service 更新，本服务不写车辆权威状态）
+
+        **RBAC**：`remote:execute`（结束会话是执行类动作，非资源删除：操控记录与录像必须保留，
+        `hunter-video` 生命周期 90 天由 MinIO 规则管理）。
+        **越权保护**：仅会话所属操作员或具备 `remote:execute` 的管理员可结束；
+        非本人且无管理权限 → **1002**。
+        **幂等**：会话已结束（Redis 键不存在）→ **3001**，前端以「会话已结束」提示，
+        不重复下发车端信令。
+      operationId: endRemoteSession
+      parameters:
+        - $ref: "#/components/parameters/SessionIdPath"
+        - name: reason
+          in: query
+          required: false
+          description: 结束原因（用于归档 sidecar 与审计；默认 operator_end）
+          schema: { $ref: "#/components/schemas/SessionEndReason" }
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 会话已结束（返回归档摘要；录像对象键用于历史查询）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RemoteSessionResultResponse" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/remote/history:
+    get:
+      tags: [history]
+      summary: 查询操控记录列表（分页）
+      description: |
+        **数据源为 MinIO `hunter-video`**（不新增数据库表，见 `x-hunter-history-archive`）：
+        每场会话产生 1 个录像对象 + 1 个 sidecar JSON（归档元信息：session_id / vehicle_id /
+        operator_id / started_at / ended_at / end_reason / 指令与回执统计 / 视频参数 /
+        端到端延迟统计）。
+
+        对象键规范（`x-hunter-history-archive.object_key_pattern`）按
+        `remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.mp4`（+ `.json`）组织，
+        因此**时间范围过滤通过对象键前缀 + `Last-Modified` 过滤**，不是 SQL 查询：
+
+        - `total` 为列举出的 sidecar 数量（非 DB COUNT），`started_from` / `started_to` 以
+          MinIO 对象时间为粗筛（最终以 sidecar JSON 内 `started_at` 精确过滤，逐条解析）
+        - 时间范围上限由 `RC_HISTORY_QUERY_MAX_RANGE_DAYS` 控制（默认 31，见
+          `x-hunter-pending-confirmation` #7）；超限 → **2001**
+        - **数据权限**：普通用户仅可查询自身 `operator_id` 的记录；管理员（`remote:read` +
+          管理角色）可按车辆/操作员查询（按车辆/项目隔离，见 `x-hunter-control-safety`）
+        - 录像保留 **90 天**（MinIO 生命周期规则），过期对象自动消失 → 列表同步收缩
+
+        ⚠ 无 DB 表带来的能力边界：不支持按「指令数 / 延迟 / 结束原因」等业务字段做服务端
+        WHERE 过滤与高效分页；如需求出现，须先新增 `remote_control.sessions` 表
+        （`x-hunter-pending-confirmation` #1）。
+      operationId: listControlHistory
+      parameters:
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 按车辆过滤（映射到对象键前缀）
+          schema: { $ref: "#/components/schemas/VehicleId" }
+        - name: operator_id
+          in: query
+          required: false
+          description: 按操作员过滤（sidecar JSON 字段；普通用户忽略该参数，强制为自身 user_id）
+          schema: { type: string, format: uuid }
+        - name: started_from
+          in: query
+          required: false
+          description: 会话开始时间下界（Unix epoch 秒，含）
+          schema: { type: number, example: 1724035200 }
+        - name: started_to
+          in: query
+          required: false
+          description: 会话开始时间上界（Unix epoch 秒，含）；与 started_from 跨度不得超过 RC_HISTORY_QUERY_MAX_RANGE_DAYS
+          schema: { type: number, example: 1724121600 }
+        - name: end_reason
+          in: query
+          required: false
+          description: 按结束原因过滤（sidecar JSON 字段，服务端逐条解析后过滤）
+          schema: { $ref: "#/components/schemas/SessionEndReason" }
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 操控记录列表
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ControlHistoryListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/remote/history/{session_id}:
+    get:
+      tags: [history]
+      summary: 查询单场操控记录详情
+      description: |
+        读取 sidecar JSON（`remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.json`），
+        返回归档元信息 + 统计（指令/回执/延迟、视频参数与质量、结束原因、是否触发超时保护）。
+
+        由于无 DB 表，定位方式为：按 `session_id` 在 `hunter-video` 桶内按前缀检索
+        `*.json` 对象（`x-hunter-pending-confirmation` #8 记录检索成本风险：
+        sidecar 数量大时 `ListObjectsV2` 分页开销上升，需靠日期前缀收敛）。
+      operationId: getControlHistoryDetail
+      parameters:
+        - $ref: "#/components/parameters/SessionIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 操控记录详情
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ControlHistoryDetailResponse" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/remote/history/{session_id}/video:
+    get:
+      tags: [history]
+      summary: 获取操控录像下载/播放地址（15 分钟预签名）
+      description: |
+        服务端签发 MinIO 预签名 URL（**下载有效期 15 分钟**，系统约束第 7 条，不可更改），
+        支持 HTTP `Range` 分片下载（前端 video 标签拖拽 seek）。
+
+        - 录像对象：`hunter-video` 桶（生命周期 90 天，过期返回 **3001**）
+        - 预签名 URL 不落库、不落日志（日志仅记录对象键，见 `x-hunter-control-safety.data_protection`）
+        - 对象缺失（归档未完成 / 已过期回收）→ **3001**；对象存在但仍在写入（未封存完成）→ **3003**
+      operationId: getControlVideo
+      parameters:
+        - $ref: "#/components/parameters/SessionIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 预签名播放地址
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ControlVideoAccessResponse" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/StateConflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: 存活探针（K8s livenessProbe）
+      operationId: healthz
+      security: []
+      responses:
+        "200":
+          description: 进程存活
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseHealthy" }
+
+  /readyz:
+    get:
+      tags: [ops]
+      summary: 就绪探针（K8s readinessProbe：Postgres 连接 / Redis 连通性）
+      description: |
+        就绪项与实现一致（`services/remote-control/app/routers/health.py`）：`database`（共享
+        `DatabaseSessionManager` 连接自检）+ `redis`（会话状态与互斥锁强依赖）；
+        任一为 false → HTTP 503 + code=5001，`data` 返回各项明细。
+        ⚠ 本服务不建表，是否保留 `database` 就绪项见 `x-hunter-pending-confirmation` #9。
+      operationId: readyz
+      security: []
+      responses:
+        "200":
+          description: 依赖就绪
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseReady" }
+        "503":
+          description: 依赖未就绪（code 5001 服务不可用，data 为各项布尔明细）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseError" }
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus 指标抓取端点
+      operationId: metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus 文本格式指标
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        网关校验的 JWT Access Token（2h；Refresh Token 7d）。
+        网关透传 `X-User-Id` / `X-Roles` / `X-Request-ID`（服务侧二次校验角色与资源域 `remote`，
+        见 `x-hunter-control-safety.authorization`）；**禁止**用查询串 / 请求体传递 Token。
+
+  headers:
+    RequestId:
+      description: 链路追踪 ID（与响应体 request_id 一致；透传上游或服务端生成）
+      schema: { type: string, format: uuid }
+    RetryAfter:
+      description: 限流后建议重试秒数
+      schema: { type: integer, minimum: 1 }
+
+  parameters:
+    TraceRequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: 链路追踪 ID（网关注入；缺省由服务端生成 UUID）
+      schema: { type: string, format: uuid }
+    PageQuery:
+      name: page
+      in: query
+      required: false
+      description: 页码（从 1 开始）
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSizeQuery:
+      name: page_size
+      in: query
+      required: false
+      description: 每页条数
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    SessionIdPath:
+      name: session_id
+      in: path
+      required: true
+      description: 操控会话 ID（UUID；创建会话时由服务端生成）
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthenticated:
+      description: 未认证 / Token 无效（**1001**）或 Token 过期（**1003**）；HTTP 401
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+    Forbidden:
+      description: 无权限（**1002**；缺少 `remote:read` / `remote:create` / `remote:execute`，或数据权限不含该车辆）；HTTP 403
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+    InvalidParameter:
+      description: 参数错误（**2001**；含视频参数越界、时间跨度超限、session_id 非 UUID）；HTTP 422
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+    MissingParameter:
+      description: 参数缺失（**2002**；vehicle_id 等必填项未提供）；HTTP 422
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+    NotFound:
+      description: |
+        资源不存在（**3001**）：会话已结束 / Redis 键不存在、录像或 sidecar 对象不存在
+        （归档未完成或已过 90 天生命周期）；HTTP 404
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+    StateConflict:
+      description: |
+        资源状态冲突（**3003**）：如录像对象存在但未封存完成、归档 sidecar 写入中；HTTP 409
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+    TooManyRequests:
+      description: |
+        触发限流（附录 D）：响应体 code 复用 **5001**（附录 A 无线流专用码，禁止新增自定义码）；
+        HTTP 429 + `Retry-After` 头（见 `x-hunter-rate-limits`）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+    VideoSetupFailed:
+      description: |
+        远程操控视频建立失败（**7002**）：SRS 转推/拉流登记失败、WebRTC 信令不可用、
+        车端 NVENC 编码未就绪；HTTP 502（前端提示「视频通道建立失败，可重试创建会话」）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+    ServiceUnavailable:
+      description: 依赖服务不可用（**5001**）：Redis / Kafka / SRS / MinIO 不可达；HTTP 503
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+    InternalError:
+      description: 服务器内部错误（**5000**：未预期异常，日志含 trace_id）；HTTP 500
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+
+  schemas:
+    # ---------- 统一响应与公共类型 ----------
+    ApiResponse:
+      type: object
+      description: 统一 API 响应格式（所有服务必须遵守，字段不可更改）
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code:
+          type: integer
+          description: 0=成功；非 0=预定义错误码（附录 A）
+          example: 0
+        message:
+          type: string
+          example: success
+        data:
+          nullable: true
+          description: 业务数据（结构随端点而定；无数据时为 null）
+        request_id:
+          type: string
+          format: uuid
+          description: 请求 ID（等于链路 trace_id）
+        timestamp:
+          type: integer
+          description: 服务端响应时间（Unix epoch 秒）
+          example: 1724035200
+
+    ErrorCode:
+      type: integer
+      description: 预定义错误码（附录 A，禁止新增或更改含义）
+      enum: [0, 1001, 1002, 1003, 2001, 2002, 3001, 3002, 3003, 4001, 4002, 5000, 5001,
+             6001, 6002, 6003, 7001, 7002]
+
+    ApiResponseError:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [code]
+          properties:
+            code: { $ref: "#/components/schemas/ErrorCode" }
+            data:
+              nullable: true
+              description: |
+                错误上下文：
+                - 7001 会话冲突 → `{session_id, operator_id, started_at}`
+                - 4001 / 4002 → `{vehicle_id, vehicle_status, last_online_time}`
+                - 2001 视频参数越界 → `{field, min, max, actual}`
+                - 3001 录像缺失 → `{bucket, object_key}`
+                其余错误一般为 null
+      example:
+        code: 7001
+        message: 远程操控会话冲突
+        data: { session_id: 6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90, operator_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301, started_at: 1724035100.482 }
+
+    ApiResponseHealthy:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/HealthStatus" }
+
+    ApiResponseReady:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ReadyChecks" }
+
+    HealthStatus:
+      type: object
+      description: 存活探针响应体（与 services/remote-control/app/routers/health.py 实现一致）
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+      example: { status: ok }
+
+    ReadyChecks:
+      type: object
+      description: |
+        就绪探针明细（任一 false → HTTP 503 + code=5001，data 即该明细）。
+        与 services/remote-control/app/routers/health.py 当前实现一致（database + redis）。
+        ⚠ 本服务无业务表，postgres 就绪项仅为共享 `DatabaseSessionManager` 连接自检，
+        是否保留由 SRE 评审（见 x-hunter-pending-confirmation #9）。
+      required: [database, redis]
+      properties:
+        database: { type: boolean, description: Postgres 连接自检（共享连接池；本服务无业务表） }
+        redis: { type: boolean, description: Redis ping（会话状态 / 互斥锁强依赖） }
+      example: { database: true, redis: true }
+
+    # ---------- 受控词表 ----------
+    VehicleId:
+      type: string
+      description: 车辆标识（= 设备证书 CommonName = Kafka 消息 key；车型 HUNTER_SE）
+      pattern: "^HUNTER-[0-9]{3}$"
+      example: HUNTER-001
+
+    VehicleStatus:
+      type: string
+      description: 车辆状态（8 态受控词表，不可新增或更改；来源 contracts/database/enums.md）
+      enum: [offline, online_idle, auto_driving, remote_controlled, upgrading, charging, fault, emergency]
+
+    BlockReason:
+      type: string
+      description: |
+        不可操控原因（`controllable=false` 时给出，前端据此禁用接管按钮）；
+        错误码映射：offline→4001；upgrading/charging/fault/emergency→4002；already_controlled→7001。
+        ⚠ 值域为契约推导（见 x-hunter-pending-confirmation #3）
+      enum: [offline, upgrading, charging, fault, emergency, already_controlled]
+
+    SessionStatus:
+      type: string
+      description: |
+        会话状态：`connecting`（已建会话，视频/控制通道握手中）→ `active`（双通道就绪）→
+        `degraded`（链路质量不达标：连续指令超时 / 丢包超阈）→ `ended`（已结束，仅归档可见）。
+        ⚠ 状态名未在设计文档给出（见 x-hunter-pending-confirmation #4）
+      enum: [connecting, active, degraded, ended]
+
+    SessionEndReason:
+      type: string
+      description: |
+        会话结束原因（写入归档 sidecar + 审计日志）：`operator_end`（操作员主动结束）/
+        `admin_terminate`（管理员强制结束）/ `heartbeat_timeout`（会话心跳超时）/
+        `command_timeout`（指令链路超时保护触发）/ `vehicle_offline`（车辆掉线）/
+        `vehicle_fault`（车端故障上报）/ `video_lost`（视频链路不可恢复）/
+        `server_shutdown`（服务优雅停机）
+      enum: [operator_end, admin_terminate, heartbeat_timeout, command_timeout, vehicle_offline,
+             vehicle_fault, video_lost, server_shutdown]
+
+    # ---------- 视频 / 信令 / 控制通道 ----------
+    VideoConfig:
+      type: object
+      description: |
+        视频编码参数（系统约束第 15 条，不可更改）：H.264 硬编码（车端 AGX Orin NVENC）、
+        720p@30fps、2–4 Mbps、关键帧间隔 1s。默认取环境变量
+        `RC_VIDEO_WIDTH/HEIGHT/FPS/MIN_BITRATE_KBPS/MAX_BITRATE_KBPS/KEYFRAME_INTERVAL_S`
+      required: [codec, width, height, fps, min_bitrate_kbps, max_bitrate_kbps, keyframe_interval_s]
+      properties:
+        codec: { type: string, enum: [h264], description: 仅 H.264（NVENC 硬编码） }
+        width: { type: integer, enum: [1280], description: 720p 宽（固定 1280） }
+        height: { type: integer, enum: [720], description: 720p 高（固定 720） }
+        fps: { type: integer, maximum: 30, description: 帧率上限 30（不可提高） }
+        min_bitrate_kbps: { type: integer, minimum: 2048, description: 码率下限（2 Mbps 档，`RC_VIDEO_MIN_BITRATE_KBPS` 默认 2048） }
+        max_bitrate_kbps: { type: integer, maximum: 4096, description: 码率上限（4 Mbps 档，`RC_VIDEO_MAX_BITRATE_KBPS` 默认 4096） }
+        keyframe_interval_s: { type: integer, enum: [1], description: 关键帧间隔 1s（不可更改） }
+      example: { codec: h264, width: 1280, height: 720, fps: 30, min_bitrate_kbps: 2048, max_bitrate_kbps: 4096, keyframe_interval_s: 1 }
+
+    ControlChannelInfo:
+      type: object
+      description: |
+        控制指令通道参数（系统约束第 15 条，不可更改）：20Hz（50ms 间隔）、指令延迟 ≤100ms、
+        车端 >500ms 未收到指令自动减速停车、远程操控最高速度 2.0 m/s
+      required: [hz, interval_ms, ack_timeout_ms, stop_on_timeout_ms, max_speed_mps]
+      properties:
+        hz: { type: integer, enum: [20], description: 指令发送频率 20Hz（不可更改） }
+        interval_ms: { type: integer, enum: [50], description: 发送间隔 50ms }
+        ack_timeout_ms: { type: integer, maximum: 100, description: 指令端到端延迟指标上限 ≤100ms（性能指标） }
+        stop_on_timeout_ms: { type: integer, enum: [500], description: 车端超时保护：>500ms 无指令自动减速停车 }
+        max_speed_mps: { type: number, maximum: 2.0, description: 最高速度 2.0 m/s（RC_MAX_SPEED_MPS 可配置，不可上调） }
+      example: { hz: 20, interval_ms: 50, ack_timeout_ms: 100, stop_on_timeout_ms: 500, max_speed_mps: 2.0 }
+
+    SessionHeartbeat:
+      type: object
+      description: |
+        会话心跳（前端经 WS 控制通道发送）：间隔 10s；连续 3 次缺失（30s）置 `degraded`，
+        60s 无心跳自动结束（`end_reason=heartbeat_timeout`）。
+        ⚠ 10s 间隔来自约束；30s/60s 阈值与「degraded 后是否自动下发停车」为契约推导
+        （见 x-hunter-pending-confirmation #4）
+      required: [interval_s, degraded_after_misses, end_after_s]
+      properties:
+        interval_s: { type: integer, enum: [10], description: 心跳间隔 10s（不可放宽） }
+        degraded_after_misses: { type: integer, example: 3, description: 连续缺失次数 → 会话置 degraded }
+        end_after_s: { type: integer, example: 60, description: 无心跳持续时长 → 自动结束会话 }
+
+    WebRtcConnectionInfo:
+      type: object
+      description: |
+        WebRTC 视频链路接入信息（原生 WebRTC，媒体经 SRS 5.0 转发，传输层 SRTP 加密）：
+        车端 H.264 硬编码（NVENC）推流 → SRS → 浏览器拉流；延迟预算见 `x-hunter-video-contract`。
+        ⚠ SRS 应用名/流名规范与 WHIP/WHEP 端点命名未在设计文档给出
+        （见 x-hunter-pending-confirmation #10）
+      required: [signal_ws_url, control_ws_url, transport, ice_servers, media_server]
+      properties:
+        signal_ws_url:
+          type: string
+          description: WebRTC 信令通道（WSS；JWT 经握手 Authorization 头携带，禁止查询串明文 Token）
+          example: "wss://api.hunter-edge.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/signal"
+        control_ws_url:
+          type: string
+          description: 控制指令通道（WSS；20Hz 指令 + 回执 + 10s 心跳）
+          example: "wss://api.hunter-edge.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/control"
+        publisher: { type: string, enum: [vehicle], description: 车端为唯一发布方（前端只订阅） }
+        subscriber: { type: string, enum: [browser], description: 浏览器为订阅方（前端不得推流） }
+        transport: { type: string, enum: [srtp], description: WebRTC SRTP（UDP 优先 / TCP 兜底，TLS 1.3 信令） }
+        ice_servers:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/IceServer" }
+        media_server: { $ref: "#/components/schemas/SrsMediaInfo" }
+      example:
+        signal_ws_url: "wss://api.hunter-edge.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/signal"
+        control_ws_url: "wss://api.hunter-edge.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/control"
+        publisher: vehicle
+        subscriber: browser
+        transport: srtp
+        ice_servers: [{ urls: ["stun:stun.hunter-edge.example.com:3478"], credential_ttl_s: 7200 }]
+        media_server: { app: remote_control, stream: HUNTER-001_6f1c2b8e }
+
+    IceServer:
+      type: object
+      description: ICE 服务器（STUN/TURN）；TURN 凭证随会话短期签发，禁止写入日志
+      required: [urls]
+      properties:
+        urls: { type: array, items: { type: string }, example: ["turn:turn.hunter-edge.example.com:3478?transport=udp"] }
+        username: { type: string, description: 短期 TURN 凭证用户名（禁止写入日志/审计） }
+        credential: { type: string, description: 短期 TURN 凭证（禁止写入日志/审计） }
+        credential_ttl_s: { type: integer, minimum: 1, description: 凭证有效期（秒），应覆盖会话时长 }
+
+    SrsMediaInfo:
+      type: object
+      description: SRS 5.0 媒体服务器接入信息（WebRTC/RTMP 转发；录像产物回写 MinIO `hunter-video`）
+      required: [app, stream]
+      properties:
+        app: { type: string, example: remote_control, description: SRS 应用名 }
+        stream: { type: string, example: HUNTER-001_6f1c2b8e, description: 流名（vehicle_id + session_id 前 8 位） }
+        whip_url: { type: string, description: 车端推流端点（WebRTC-HTTP Ingest，或 RTMP 推流地址） }
+        whep_url: { type: string, description: 浏览器拉流端点（WebRTC-HTTP Egress） }
+        rtmp_url: { type: string, description: RTMP 兜底播放地址（H.264，低延迟模式） }
+
+    RecordArchiveInfo:
+      type: object
+      description: 本次会话录像归档位置与保留策略（见 `x-hunter-history-archive`）
+      required: [bucket, object_key, sidecar_object_key, retention_days, container, codec]
+      properties:
+        bucket: { type: string, enum: [hunter-video], description: 录像 Bucket（不可更改） }
+        object_key:
+          type: string
+          description: 录像对象键（`remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.mp4`）
+          example: remote-control/HUNTER-001/2024/08/19/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90.mp4
+        sidecar_object_key:
+          type: string
+          description: 归档元信息对象键（同目录同名 `.json`，见 ControlHistoryDetail.sidecar）
+          example: remote-control/HUNTER-001/2024/08/19/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90.json
+        retention_days: { type: integer, enum: [90], description: 录像保留 90 天（MinIO 生命周期自动清理） }
+        container: { type: string, enum: [mp4], description: 容器格式（支持 HTTP Range seek） }
+        codec: { type: string, enum: [h264], description: 编码格式（与直播一致） }
+
+    # ---------- 可操控车辆 ----------
+    ControllableVehicle:
+      type: object
+      description: |
+        可操控车辆视图。数据源为 Redis 读模型（**权威值属 vehicle-service，本服务只读**）：
+        `vehicle:online:set`（在线集合）+ `vehicle:status:{vehicle_id}`（最新状态 Hash）。
+        ⚠ Redis Hash 字段清单未在设计文档给出 → 字段名以本契约为准（pending #2）
+      required: [vehicle_id, status, controllable, battery_soc, last_online_time]
+      properties:
+        vehicle_id: { $ref: "#/components/schemas/VehicleId" }
+        vehicle_name: { type: string, nullable: true, description: 车辆别名（`vehicles.vehicle_name` 读模型；缺失为 null） }
+        model: { type: string, enum: [HUNTER_SE], description: 车型（硬件基线固定） }
+        status: { $ref: "#/components/schemas/VehicleStatus" }
+        controllable: { type: boolean, description: 当前是否允许创建操控会话（false 时看 block_reason） }
+        block_reason: { $ref: "#/components/schemas/BlockReason" }
+        battery_soc: { type: integer, minimum: 0, maximum: 100, description: 电量百分比（接管前提示） }
+        velocity: { type: number, description: 当前速度 m/s（接管前提示；远程操控上限 2.0 m/s） }
+        last_online_time: { type: number, description: 最近在线时间（Unix epoch 秒） }
+        active_session: { $ref: "#/components/schemas/ActiveSessionBrief" }
+      example:
+        vehicle_id: HUNTER-001
+        vehicle_name: 园区巡逻车 1 号
+        model: HUNTER_SE
+        status: online_idle
+        controllable: true
+        battery_soc: 78
+        velocity: 0.0
+        last_online_time: 1724035200.482
+
+    ActiveSessionBrief:
+      type: object
+      description: 车辆当前占用的操控会话摘要（`status=remote_controlled` / block_reason=already_controlled 时给出）
+      required: [session_id, operator_id, started_at]
+      properties:
+        session_id: { type: string, format: uuid }
+        operator_id: { type: string, format: uuid, description: 占用者（user_id） }
+        operator_name: { type: string, nullable: true, description: 占用者显示名（user-service 读模型；缺失为 null） }
+        started_at: { type: number, description: 会话开始时间（Unix epoch 秒） }
+
+    ControllableVehicleList:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ControllableVehicle" }
+        total: { type: integer, minimum: 0, description: Redis 读模型匹配数量（非 DB COUNT；最终一致） }
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200 }
+        source: { type: string, enum: [redis_read_model], description: 数据来源标注（便于前端展示「实时视图」） }
+        generated_at: { type: number, description: 视图生成时间（Unix epoch 秒） }
+
+    ControllableVehicleListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ControllableVehicleList" }
+
+    # ---------- 会话创建 ----------
+    VideoPreference:
+      type: object
+      description: |
+        视频参数微调（可选）。仅允许在安全区间内调整；`width` / `height` / `codec` /
+        `keyframe_interval_s` **不可通过请求修改**（固定 1280×720 / h264 / 1s）。
+        越界 → 2001（`data: {field, min, max, actual}`）
+      properties:
+        fps: { type: integer, minimum: 1, maximum: 30, description: 目标帧率（上限 30，不可提高） }
+        target_bitrate_kbps:
+          type: integer
+          minimum: 2048
+          maximum: 4096
+          description: 目标码率（须落在 [min_bitrate_kbps, max_bitrate_kbps] 内；契约档位 2048–4096 kbps = 2–4 Mbps）
+
+    CreateRemoteSessionRequest:
+      type: object
+      description: 创建操控会话请求（`operator_id` 取 JWT，禁止请求体指定）
+      required: [vehicle_id]
+      additionalProperties: false
+      properties:
+        vehicle_id: { $ref: "#/components/schemas/VehicleId" }
+        video: { $ref: "#/components/schemas/VideoPreference" }
+        note:
+          type: string
+          maxLength: 200
+          description: 操作备注（写入归档 sidecar 与审计日志；禁止写入敏感信息）
+      example: { vehicle_id: HUNTER-001, video: { fps: 30, target_bitrate_kbps: 3000 }, note: 接管控巡检车 1 号 }
+
+    # ---------- 会话统计 ----------
+    ControlStats:
+      type: object
+      description: |
+        控制指令统计（会话维度；目标：指令端到端延迟 ≤100ms，20Hz）。
+        ⚠ 多副本下由 Redis `rc:session:{vehicle_id}` Hash 字段汇总，存在秒级延迟（pending #6）
+      required: [commands_sent, commands_acked, timeout_events, last_seq]
+      properties:
+        commands_sent: { type: integer, minimum: 0, description: 已下发指令数（含心跳帧） }
+        commands_acked: { type: integer, minimum: 0, description: 收到 command_result 回执数（幂等键 command_id） }
+        ack_latency_ms_avg: { type: number, description: 回执延迟均值（ms；目标 ≤100ms） }
+        ack_latency_ms_p95: { type: number, description: 回执延迟 P95（ms；性能指标守护值） }
+        timeout_events: { type: integer, minimum: 0, description: ">500ms 未收到回执的次数（超时保护触发计数）" }
+        last_seq: { type: integer, minimum: 0, description: 最近一次指令序号（Kafka 消息 seq；车端据此判重/丢包） }
+        last_ack_at: { type: number, nullable: true, description: 最近回执时间（Unix epoch 秒） }
+
+    VideoStats:
+      type: object
+      description: |
+        视频链路质量统计（会话维度）。性能指标：端到端延迟 ≤200ms
+        （采集编码 ≤50ms + 网络 ≤100ms + 解码渲染 ≤30ms，见 `x-hunter-video-contract.latency_budget`）
+      required: [bitrate_kbps, fps, rtt_ms, packet_loss_rate]
+      properties:
+        bitrate_kbps: { type: integer, minimum: 0, description: 当前码率（kbps；稳态区间 2048–4096） }
+        fps: { type: number, description: 当前实际帧率（目标 30） }
+        rtt_ms: { type: number, description: 网络往返时延（ms） }
+        packet_loss_rate: { type: number, minimum: 0, maximum: 1, description: 丢包率（0–1） }
+        frames_dropped: { type: integer, minimum: 0, description: 累计丢帧数 }
+        e2e_latency_ms: { type: number, description: 端到端延迟估算（ms；目标 ≤200ms，超阈置会话 degraded） }
+
+    # ---------- 会话对象 ----------
+    RemoteSessionInfo:
+      type: object
+      description: |
+        操控会话上下文（创建成功返回；状态查询复用同一结构）。
+        **会话态唯一事实来源为 Redis `rc:session:{vehicle_id}`（Hash），本服务不建表**
+        （见 `x-hunter-service.db_access`）
+      required: [session_id, vehicle_id, operator_id, status, started_at, video,
+                 control_channel, heartbeat, webrtc, record]
+      properties:
+        session_id: { type: string, format: uuid, description: 会话 ID（服务端生成） }
+        vehicle_id: { $ref: "#/components/schemas/VehicleId" }
+        operator_id: { type: string, format: uuid, description: 操作员 user_id（取自 JWT，不可请求体指定） }
+        operator_name: { type: string, nullable: true, description: 操作员显示名（user-service 读模型） }
+        status: { $ref: "#/components/schemas/SessionStatus" }
+        started_at: { type: number, description: 会话开始时间（Unix epoch 秒） }
+        video: { $ref: "#/components/schemas/VideoConfig" }
+        control_channel: { $ref: "#/components/schemas/ControlChannelInfo" }
+        heartbeat: { $ref: "#/components/schemas/SessionHeartbeat" }
+        webrtc: { $ref: "#/components/schemas/WebRtcConnectionInfo" }
+        record: { $ref: "#/components/schemas/RecordArchiveInfo" }
+      example:
+        session_id: 6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90
+        vehicle_id: HUNTER-001
+        operator_id: 3f2504e0-4f89-41d3-9a0c-0305e82c3301
+        status: connecting
+        started_at: 1724035200.482
+        video: { codec: h264, width: 1280, height: 720, fps: 30, min_bitrate_kbps: 2000, max_bitrate_kbps: 4000, keyframe_interval_s: 1 }
+        control_channel: { hz: 20, interval_ms: 50, ack_timeout_ms: 100, stop_on_timeout_ms: 500, max_speed_mps: 2.0 }
+        heartbeat: { interval_s: 10, degraded_after_misses: 3, end_after_s: 60 }
+
+    RemoteSessionDetail:
+      allOf:
+        - $ref: "#/components/schemas/RemoteSessionInfo"
+        - type: object
+          description: 追加实时统计（`include_stats=true` 时返回；false 时统计块为 null）
+          properties:
+            last_heartbeat_at: { type: number, nullable: true, description: 最近心跳时间（Unix epoch 秒） }
+            control_stats: { $ref: "#/components/schemas/ControlStats" }
+            video_stats: { $ref: "#/components/schemas/VideoStats" }
+            degraded: { type: boolean, description: 是否处于降级态（视频或指令链路不达标） }
+            degraded_reasons:
+              type: array
+              items: { type: string, enum: [command_timeout, video_latency, packet_loss, heartbeat_miss] }
+              description: 降级原因集合（前端展示告警条）
+
+    RemoteSessionResult:
+      type: object
+      description: 会话结束摘要（结束响应 / 归档回执；`status` 恒为 ended）
+      required: [session_id, vehicle_id, operator_id, status, end_reason, started_at, ended_at, duration_s, record]
+      properties:
+        session_id: { type: string, format: uuid }
+        vehicle_id: { $ref: "#/components/schemas/VehicleId" }
+        operator_id: { type: string, format: uuid }
+        status: { type: string, enum: [ended] }
+        end_reason: { $ref: "#/components/schemas/SessionEndReason" }
+        started_at: { type: number, description: 开始时间（Unix epoch 秒） }
+        ended_at: { type: number, description: 结束时间（Unix epoch 秒） }
+        duration_s: { type: integer, minimum: 0, description: 会话时长（秒） }
+        control_stats: { $ref: "#/components/schemas/ControlStats" }
+        video_stats: { $ref: "#/components/schemas/VideoStats" }
+        record: { $ref: "#/components/schemas/RecordArchiveInfo" }
+        sidecar_written: { type: boolean, description: 归档 sidecar JSON 是否写入成功（false → 需人工核查录像与元信息） }
+
+    RemoteSessionList:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/RemoteSessionInfo" }
+        total: { type: integer, minimum: 0, description: Redis 会话键匹配数（非 DB COUNT；最终一致） }
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200 }
+
+    # ---------- 响应包装 ----------
+    RemoteSessionResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/RemoteSessionInfo" }
+
+    RemoteSessionDetailResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/RemoteSessionDetail" }
+
+    RemoteSessionResultResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/RemoteSessionResult" }
+
+    RemoteSessionListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/RemoteSessionList" }
+
+    # ---------- 操控记录与录像（MinIO hunter-video + sidecar JSON） ----------
+    ControlHistoryItem:
+      type: object
+      description: |
+        操控记录摘要（来源：`hunter-video` 中归档 sidecar JSON；字段即
+        `x-hunter-history-archive.sidecar_schema` 的列表投影）
+      required: [session_id, vehicle_id, operator_id, started_at, ended_at, duration_s,
+                 end_reason, video_object_key, sidecar_object_key]
+      properties:
+        session_id: { type: string, format: uuid }
+        vehicle_id: { $ref: "#/components/schemas/VehicleId" }
+        operator_id: { type: string, format: uuid }
+        operator_name: { type: string, nullable: true, description: 操作员显示名（user-service 读模型） }
+        started_at: { type: number, description: 开始时间（Unix epoch 秒） }
+        ended_at: { type: number, description: 结束时间（Unix epoch 秒） }
+        duration_s: { type: integer, minimum: 0, description: 会话时长（秒） }
+        end_reason: { $ref: "#/components/schemas/SessionEndReason" }
+        end_reason_source: { type: string, enum: [platform, vehicle, timeout], description: 结束触发方 }
+        commands_sent: { type: integer, minimum: 0, description: 指令总数（含心跳帧） }
+        commands_acked: { type: integer, minimum: 0, description: 回执总数 }
+        ack_latency_ms_avg: { type: number, description: 回执延迟均值（ms） }
+        ack_latency_ms_p95: { type: number, description: 回执延迟 P95（ms；目标 ≤100ms） }
+        timeout_events: { type: integer, minimum: 0, description: 超时保护触发次数（>500ms 无回执） }
+        video_e2e_latency_ms_p95: { type: number, description: 视频端到端延迟 P95（ms；目标 ≤200ms） }
+        video_config: { $ref: "#/components/schemas/VideoConfig" }
+        video_object_key: { type: string, description: 录像对象键（`hunter-video`） }
+        video_size_bytes: { type: integer, format: int64, minimum: 0, description: 录像文件大小（字节） }
+        video_sha256: { type: string, pattern: "^[0-9a-f]{64}$", description: 录像 SHA-256（完整性/取证） }
+        sidecar_object_key: { type: string, description: 归档元信息对象键（同名 `.json`） }
+        note: { type: string, nullable: true, description: 操作员创建会话时的备注 }
+
+    ControlHistoryList:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ControlHistoryItem" }
+        total: { type: integer, minimum: 0, description: 列举并解析出的 sidecar 数量（非 DB COUNT） }
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200 }
+        source: { type: string, enum: [minio_sidecar], description: 数据来源标注（MinIO 归档元信息） }
+        retention_days: { type: integer, enum: [90], description: 录像保留期（超出即被生命周期回收） }
+
+    ControlHistoryDetail:
+      allOf:
+        - $ref: "#/components/schemas/ControlHistoryItem"
+        - type: object
+          properties:
+            sidecar:
+              type: object
+              additionalProperties: true
+              description: |
+                原始 sidecar JSON（keys: schema_version / session_id / vehicle_id / operator_id /
+                started_at / ended_at / end_reason / video{...} / control{...} / degraded_events[] /
+                environment{service_version, config_digest}）；字段集合见
+                `x-hunter-history-archive.sidecar_schema`（修改需先更新契约）
+            video_available: { type: boolean, description: 录像对象当前是否可下载（false = 已过 90 天或未封存） }
+
+    ControlHistoryListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ControlHistoryList" }
+
+    ControlHistoryDetailResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ControlHistoryDetail" }
+
+    ControlVideoAccess:
+      type: object
+      description: 录像访问信息（预签名 URL 有效期 15 分钟，支持 Range 分片；禁止日志记录 URL 全量）
+      required: [video_url, expires_in, content_type, range_supported]
+      properties:
+        video_url: { type: string, description: MinIO 预签名下载地址（15 分钟有效；勿缓存、勿落日志） }
+        expires_in: { type: integer, enum: [900], description: 有效期（秒）= 15 分钟（系统约束第 7 条，不可更改） }
+        content_type: { type: string, enum: [video/mp4] }
+        range_supported: { type: boolean, enum: [true], description: 支持 HTTP Range 分片下载（前端 seek） }
+        size_bytes: { type: integer, format: int64, minimum: 0, description: 录像大小（字节） }
+        duration_s: { type: integer, minimum: 0, description: 录像时长（秒，约等于会话时长） }
+        etag: { type: string, description: MinIO 对象 ETag（完整性核对） }
+
+    ControlVideoAccessResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ControlVideoAccess" }
+
+x-hunter-service:
+  name: remote-control
+  module: "远程操控（WebRTC 视频流转发 / 控制指令转发 20Hz / 操作员权限管理 / 操控会话与录像记录）"
+  port: 8085
+  gateway_prefix: /api/v1/remote
+  ws_prefixes: ["/ws/remote/**"]
+  db_schema: remote_control
+  db_tables: []
+  db_access: |
+    **无业务表**：`contracts/database/ddl/00_schemas.sql` 已创建 `remote_control` schema 作为
+    预留（`contracts/database/er.md` 归属说明），但**没有任何表**。因此：
+    - 会话态唯一事实来源 = Redis `rc:session:{vehicle_id}`（Hash）
+    - 操控记录 = MinIO `hunter-video` 录像对象 + sidecar JSON 归档元信息（方案 A，
+      见 `x-hunter-history-archive`）
+    - 本服务**不产生 ORM 模型 / 不产生 Alembic migration**（Step 2 数据层范围为空）
+    - `DatabaseSessionManager` 与 `DB_POOL_*` 配置仅为统一生命周期/就绪探针复用
+      （见 `x-hunter-pending-confirmation` #9）
+    如需强一致查询/统计/数据权限隔离，须先更新 DDL 契约新增 `remote_control.sessions` 表
+    （DDL → ORM → migration → 契约同步，见 `x-hunter-pending-confirmation` #1）。
+  db_cross_service_policy: |
+    禁止跨服务直连其他 schema：车辆在线/状态/电量仅读 Redis 读模型
+    `vehicle:online:set` / `vehicle:status:{vehicle_id}`（权威值属 vehicle-service，本服务只读不写）；
+    操作员身份只取 JWT 声明（`X-User-Id` / `X-Roles`）与 Redis 会话记录，不查 user-service 表。
+  minio_buckets: [hunter-video]
+  minio_bucket_lifecycle:
+    hunter-video: |
+      录像保留 **90 天**（生命周期规则自动回收，不可更改）；SSE-S3 服务端加密；
+      上传：SRS 录制产物由服务端写入（不经浏览器）；下载：预签名 URL 15 分钟 + Range 分片下载。
+  redis_keys:
+    - pattern: "rc:session:{vehicle_id}"
+      type: Hash
+      ttl_seconds: null
+      usage: |
+        会话唯一事实来源（字段：session_id / operator_id / operator_name / started_at / status /
+        seq_last / last_heartbeat_at / commands_sent / commands_acked / video_object_key /
+        sidecar_object_key）；会话期间不过期，结束后删除（归档转 MinIO sidecar）。
+        字段名以本契约为准（⚠ pending #6）
+    - pattern: "rc:lock:{vehicle_id}"
+      type: String
+      ttl_seconds: 30
+      usage: |
+        **会话互斥锁**（同车同时仅一名操作员）：`hunter_common.redis.RedisManager.acquire_lock`
+        （redis-py `client.lock`，锁值唯一、超时自动释放、结束会话时显式释放）。
+        ⚠ 该键为 `rc:` 命名空间下的实现派生键（Redis Key 表未列），见
+        `x-hunter-pending-confirmation` #11 —— 键模式一旦确认不得再改
+    - pattern: "vehicle:status:{vehicle_id}"
+      type: Hash
+      ttl_seconds: null
+      usage: "只读：接管前车辆状态/电量/速度判定（block_reason 与 4001/4002 决策）"
+    - pattern: "vehicle:online:set"
+      type: Set
+      ttl_seconds: null
+      usage: "只读：在线判定（离线 → 4001 车辆不在线）"
+    - pattern: "rate_limit:{ip}:{api}"
+      type: String
+      ttl_seconds: 60
+      usage: "接口限流计数（窗口 1 分钟；`POST /api/v1/remote/session` 单用户 1 QPS）"
+  dependencies:
+    redis: "会话态/互斥锁/限流计数（强依赖；不可用 → 503 + code 5001，禁止降级为无锁模式）"
+    kafka: "指令下发 `hunter.{vehicle_id}.remote_control`（20Hz）+ 回执消费 `hunter.*.command_result`"
+    minio: "hunter-video（录像 + sidecar 归档元信息；SSE-S3；预签名 15 分钟）"
+    srs: "SRS 5.0 媒体服务器（H.264 转发 / 录像回写；接入参数见 x-hunter-pending-confirmation #12）"
+    postgresql: "无业务表（仅共享连接池与就绪探针）"
+    services: |
+      无同步 REST 依赖。车辆状态经 Redis 读模型获取（vehicle-service / data-collector 写入，
+      归属见 pending #13）；操作员权限由 user-service RBAC 授予，本服务仅校验 JWT 角色与资源域。
+  config_source: "pydantic-settings（环境变量 / K8s ConfigMap hunter-common-config + remote-control-config + Secret hunter-app-secrets）"
+  required_env:
+    # 服务私有（remote-control-config）
+    - SERVICE_NAME
+    - API_PORT
+    - DB_POOL_SIZE
+    - DB_MAX_OVERFLOW
+    - RC_COMMAND_HZ
+    - RC_COMMAND_TIMEOUT_MS
+    - RC_MAX_SPEED_MPS
+    - RC_SESSION_EXCLUSIVE
+    - RC_VIDEO_WIDTH
+    - RC_VIDEO_HEIGHT
+    - RC_VIDEO_FPS
+    - RC_VIDEO_MIN_BITRATE_KBPS
+    - RC_VIDEO_MAX_BITRATE_KBPS
+    - RC_VIDEO_KEYFRAME_INTERVAL_S
+    - MINIO_BUCKET_VIDEO
+    # 共享（hunter-common-config）
+    - ENVIRONMENT
+    - LOG_LEVEL
+    - DEBUG
+    - CORS_ORIGINS
+    - POSTGRES_HOST
+    - POSTGRES_PORT
+    - POSTGRES_USER
+    - POSTGRES_DB
+    - KAFKA_BOOTSTRAP_SERVERS
+    - KAFKA_SECURITY_PROTOCOL
+    - KAFKA_SASL_MECHANISM
+    - KAFKA_SSL_CAFILE
+    - KAFKA_PRODUCER_ACKS
+    - KAFKA_COMPRESSION_TYPE
+    - KAFKA_LINGER_MS
+    - KAFKA_BATCH_SIZE
+    - KAFKA_RETRIES
+    - REDIS_HOST
+    - REDIS_PORT
+    - REDIS_DB
+    - MINIO_ENDPOINT
+    - MINIO_SECURE
+    - JWT_ALGORITHM
+    # 敏感（hunter-app-secrets；禁止写入代码/日志）
+    - POSTGRES_PASSWORD
+    - REDIS_PASSWORD
+    - MINIO_ACCESS_KEY
+    - MINIO_SECRET_KEY
+    - KAFKA_SASL_USERNAME
+    - KAFKA_SASL_PASSWORD
+    - JWT_SECRET_KEY
+  env_to_add: |
+    ⚠ 以下配置键在本契约中新引入，尚未出现在 infra/k8s 配置中，Step 2/3 需同步补齐
+    （见 x-hunter-pending-confirmation #12）：
+    - RC_SESSION_HEARTBEAT_INTERVAL_S（默认 10，不可放宽）
+    - RC_SESSION_HEARTBEAT_TIMEOUT_S / RC_SESSION_DEGRADED_MISSES
+    - RC_HISTORY_QUERY_MAX_RANGE_DAYS（默认 31）
+    - RC_ACK_TIMEOUT_MS（默认 100，性能指标守护值）
+    - RC_COMMAND_RESULT_TOPIC_CONSUMER_GROUP（默认 remote-control-command-result）
+    - SRS_API_URL / SRS_RTC_HTTP_URL / SRS_HOST / SRS_RTMP_PORT / SRS_RTC_UDP_PORT
+    - RC_STUN_URLS / RC_TURN_URLS / RC_TURN_SHARED_SECRET / RC_ICE_CREDENTIAL_TTL_S
+    - RC_PRESIGNED_DOWNLOAD_EXPIRE_SECONDS（默认 900）
+
+x-hunter-endpoints:
+  note: |
+    契约定义顺序 = 实现顺序（契约先行）。每条端点均标注来源依据：`derived` 表示设计文档
+    §12.6（远程操控模块 REST 清单）与 §8.3–8.5 原文未随仓库提供，由「附录 D 接口级限流端点
+    `POST /api/v1/remote/session` + 网关契约 `x-hunter-websocket-routes`（`/ws/remote/**`）+
+    远程操控安全约束（20Hz / >500ms 停车 / ≤2.0 m/s / 会话互斥）+ MinIO `hunter-video` 录像 +
+    本仓库统一探针」推导；确认设计文档原文后回填本清单再进入 Step 4 路由实现。
+  items:
+    - { operationId: listControllableVehicles, method: GET,    path: "/api/v1/remote/vehicles",                rbac: "remote:read",    source: derived }
+    - { operationId: listRemoteSessions,      method: GET,    path: "/api/v1/remote/sessions",                rbac: "remote:read",    source: derived }
+    - { operationId: createRemoteSession,     method: POST,   path: "/api/v1/remote/session",                 rbac: "remote:create",  source: "附录 D 明列（POST /api/v1/remote/session）", rate_limit: "1 QPS/用户" }
+    - { operationId: getRemoteSession,        method: GET,    path: "/api/v1/remote/session/{session_id}",    rbac: "remote:read",    source: derived }
+    - { operationId: endRemoteSession,        method: DELETE, path: "/api/v1/remote/session/{session_id}",    rbac: "remote:execute", source: derived, note: "执行类动作而非资源删除（记录与录像保留）" }
+    - { operationId: listControlHistory,      method: GET,    path: "/api/v1/remote/history",                 rbac: "remote:read",    source: derived }
+    - { operationId: getControlHistoryDetail, method: GET,    path: "/api/v1/remote/history/{session_id}",    rbac: "remote:read",    source: derived }
+    - { operationId: getControlVideo,         method: GET,    path: "/api/v1/remote/history/{session_id}/video", rbac: "remote:read", source: derived, note: "预签名 15 分钟 + Range 分片" }
+    - { operationId: wsRemoteControl,         method: WS,     path: "/ws/remote/{session_id}/control",        rbac: "remote:execute", source: "网关 x-hunter-websocket-routes（/ws/remote/**）；子路径为契约推导", note: "20Hz 指令 + 回执 + 10s 心跳" }
+    - { operationId: wsRemoteSignal,          method: WS,     path: "/ws/remote/{session_id}/signal",         rbac: "remote:create",  source: "网关 x-hunter-websocket-routes（/ws/remote/**）；子路径为契约推导", note: "WebRTC SDP/ICE 信令中继" }
+    - { operationId: healthz,                 method: GET,    path: "/healthz",  rbac: none, source: "本仓库统一探针", security: [] }
+    - { operationId: readyz,                  method: GET,    path: "/readyz",   rbac: none, source: "本仓库统一探针", security: [] }
+    - { operationId: metrics,                 method: GET,    path: "/metrics",  rbac: none, source: "Prometheus 抓取", security: [] }
+  forbidden:
+    - "禁止新增端点而不先更新本契约（规则 7）"
+    - |
+      禁止提供 REST 形式的控制指令端点（如 `POST /remote/command`）：20Hz（50ms 间隔）指令必须走
+      WS 控制通道 → Kafka `hunter.{vehicle_id}.remote_control`，HTTP 单发开销与连接复用成本会破坏
+      「指令延迟 ≤100ms」性能指标
+    - |
+      禁止为普通用户提供「抢占他人会话」端点：会话互斥（同一车辆同一时间仅一名操作员，错误码 7001）
+      不可更改；管理员强制结束统一走 `DELETE /api/v1/remote/session/{id}?reason=admin_terminate`
+    - |
+      禁止提供「修改车辆权威状态」端点（如直接把 vehicle:status 置为 remote_controlled）：
+      车辆状态权威值属 vehicle-service，本服务只读 Redis 读模型
+
+x-hunter-session-lifecycle:
+  source: "系统约束第 15 条（远程操控安全约束，不可更改）+ 错误码 7001/4001/4002 + Redis rc:session"
+  states: [connecting, active, degraded, ended]
+  transitions:
+    - { from: "(none)",     to: connecting, trigger: "POST /session 成功（锁占用 + Redis 写入 + 车端 session_start 下发）" }
+    - { from: connecting,   to: active,     trigger: "视频（SRS 拉流就绪）与控制通道（WS 建连 + 首个 20Hz 指令回执）双就绪" }
+    - { from: connecting,   to: ended,      trigger: "连接超时 / 视频建立失败（7002）→ 释放锁 + 下发 session_end + 归档" }
+    - { from: active,       to: degraded,   trigger: "连续指令超时（>500ms 无回执）/ 视频 E2E > 200ms / 丢包超阈 / 心跳连续缺失 3 次" }
+    - { from: degraded,     to: active,     trigger: "链路指标恢复（连续 3 个采样周期达标）" }
+    - { from: active,       to: ended,      trigger: "DELETE /session（operator_end / admin_terminate）/ 心跳超时 / 车辆掉线 / 车端故障 / 服务停机" }
+    - { from: degraded,     to: ended,      trigger: "上述结束条件任一命中" }
+  end_convergence:
+    - "先下发 `session_end`（车端减速停车）→ 再停止转发与录像 → 再封存 sidecar → 最后释放锁 + 删除 Redis 会话键"
+    - "**任何路径都不依赖车端回执**：车端超时保护（>500ms 无指令自动减速停车）作为兜底，平台侧不下发『保持行驶』语义的指令"
+    - "服务优雅停机（server_shutdown）：K8s terminationGracePeriodSeconds=60，先广播 session_end 再退出（见 infra/k8s/services/remote-control.yaml）"
+  concurrency:
+    - "创建会话：Redis 分布式锁（rc:lock:{vehicle_id}，超时自动释放）+ EXISTS rc:session 双检，冲突返回 7001"
+    - "结束会话：仅持锁者可释放（锁值校验），避免他人误删他人会话"
+    - "多副本：WS 长连接需会话粘性（Ingress/网关按 session_id 哈希），跨副本状态经 Redis 会话 Hash 共享"
+  idempotency:
+    - "创建：同用户对同车辆重复提交 → 第二次命中 7001（已存在会话），不产生双会话"
+    - "结束：会话已结束 → 3001（视为不存在），不重复下发车端信令"
+    - "指令：Kafka 消息含 session_id + seq，车端按 (session_id, seq) 判重"
+
+x-hunter-websocket-contract:
+  source: |
+    网关契约 `contracts/openapi/api-gateway.yaml` → `x-hunter-websocket-routes`
+    （`/ws/remote/**` → remote-control:8085；JWT 握手 + WSS + 1 QPS 限流 + 冲突码 7001）。
+    子路径（`/control`、`/signal`）为契约推导（见 x-hunter-pending-confirmation #15）。
+  paths:
+    - operationId: wsRemoteControl
+      path: "/ws/remote/{session_id}/control"
+      purpose: "控制指令上行（20Hz）+ 回执/状态下行 + 10s 会话心跳"
+      rbac: "remote:execute"
+    - operationId: wsRemoteSignal
+      path: "/ws/remote/{session_id}/signal"
+      purpose: "WebRTC 信令中继（浏览器 ↔ 车端/SRS：SDP offer/answer、ICE candidate）"
+      rbac: "remote:create"
+  sticky_routing: |
+    WS 为长连接：网关/Ingress 按 `session_id` 哈希做会话粘性路由（同一会话固定同一副本）；
+    会话状态经 Redis `rc:session:{vehicle_id}` 共享，副本滚动重启（maxUnavailable=0）时客户端自动重连
+    并复用同一会话（重连不重新占用锁）。⚠ 副本故障转移后的会话续期策略见 pending #14。
+  handshake:
+    auth: |
+      JWT 经握手请求头携带：`Authorization: Bearer <token>`（或 `Sec-WebSocket-Protocol` 子协议传递，
+      由前端统一封装）。**禁止**查询串明文 Token（违反日志脱敏与 URL 泄漏防护）。
+    checks:
+      - "JWT 签名/有效期校验：缺失或无效 → 1001；过期 → 1003"
+      - "资源域校验：资源 `remote` + 动作（control 通道 execute / signal 通道 create）→ 不足 1002"
+      - "会话归属校验：session_id 必须存在（Redis）且归属当前 user_id（管理员除外）→ 否则 1002 / 3001"
+      - "会话状态校验：`ended` 或不存在 → 3001"
+      - "Origin 白名单校验（CORS_ORIGINS）防跨站 WebSocket 劫持"
+    failure: "握手阶段直接以 HTTP 4xx 拒绝（不进入帧循环）：1001 / 1003 / 1002 / 3001 / 7001"
+  frames:
+    control_uplink:
+      - { type: control,   direction: "browser→platform", frequency: "20Hz（50ms）", fields: "session_id, seq, timestamp, control{target_velocity, target_steer, gear}" }
+      - { type: heartbeat, direction: "browser→platform", interval_s: 10, fields: "session_id, timestamp" }
+      - { type: estop,     direction: "browser→platform", fields: "session_id, reason", note: "紧急停车：立即下发 target_velocity=0 并按 x-hunter-control-channel.emergency 收敛会话" }
+    control_downlink:
+      - { type: ack,    direction: "platform→browser", fields: "session_id, seq, ack_latency_ms, vehicle_state", note: "来源 Kafka hunter.{vehicle_id}.command_result；受契约限制按 (session_id, seq) 时序近似关联（remote_control 无 command_id，见 x-hunter-control-channel.ack.correlation）" }
+      - { type: status, direction: "platform→browser", fields: "status, degraded_reasons[], control_stats, video_stats", frequency: "1Hz 或状态变更时" }
+      - { type: error,  direction: "platform→browser", fields: "code, message, request_id", note: "code 取预定义错误码（禁止自定义）" }
+    signal:
+      - { type: sdp,  direction: "both", fields: "sdp_type(offer/answer), sdp" }
+      - { type: ice,  direction: "both", fields: "candidate, sdpMid, sdpMLineIndex" }
+    close_codes:
+      - { code: 1008, reason: "认证/权限失效（Token 过期或角色被回收）" }
+      - { code: 4001, reason: "会话已结束或不存在（3001 语义）" }
+      - { code: 4003, reason: "心跳超时（end_after_s 到达）" }
+      - { code: 4010, reason: "被管理员强制结束（admin_terminate）" }
+      - { code: 4008, reason: "同一会话建立了新连接（旧连接被替代）" }
+  flow_control:
+    - "上行超频（>25Hz）：服务端丢弃多余控制帧并计入 hunter_remote_control_frame_dropped_total{reason=\"over_frequency\"}；WS 不适用 HTTP 429"
+    - "下行积压：发送队列滞后 > 200ms 时**优先丢弃旧 control/status 帧**（保时效），`ack` / `error` 不丢弃"
+    - "单会话上行窗口：服务端仅保留最近 1 帧待处理控制指令（后到覆盖先到，20Hz 控制语义即最新值优先）"
+  disconnect:
+    - "浏览器断开 → 会话进入 `degraded`，等待心跳超时（60s）自动结束；期间车辆因 >500ms 无指令已减速停车"
+    - "车端指令链路断开（Kafka 无回执）→ 会话 `degraded` + 前端 status 帧推送 degraded_reasons=[command_timeout]"
+
+x-hunter-session-heartbeat:
+  source: "系统约束第 15 条（心跳 10s）"
+  interval_s: 10
+  transport: "WS 控制通道 heartbeats 帧（前端每 10s 发送）；服务端刷新 Redis rc:session:{vehicle_id}.last_heartbeat_at"
+  degraded_after_misses: 3
+  end_after_s: 60
+  on_end:
+    - "下发 session_end（车端减速停车）→ 归档 → 释放锁 → 删除 Redis 会话键"
+    - "归档 sidecar.end_reason=heartbeat_timeout，end_reason_source=timeout"
+  metrics: "hunter_remote_control_heartbeat_timeout_total{vehicle_id}"
+  pending: "⚠ 30s/60s 派生阈值见 x-hunter-pending-confirmation #4"
+
+x-hunter-control-channel:
+  source: "系统约束第 4/15 条 + contracts/kafka/schemas/remote_control.schema.json + contracts/kafka/topics.yaml（producer: remote-control）"
+  transport: "浏览器 --WS(20Hz)--> remote-control --Kafka(20Hz)--> 车端（AGX Orin）"
+  topic:
+    name: "hunter.{vehicle_id}.remote_control"
+    direction: platform_to_vehicle
+    partitions: 3
+    partition_strategy: hash(vehicle_id)
+    key: vehicle_id
+    acks: all
+    frequency: "20Hz（50ms 间隔）"
+    retention: "7 天"
+    schema: "contracts/kafka/schemas/remote_control.schema.json"
+  message_mapping:
+    note: "WS 上行帧 → Kafka 消息字段一一映射；**不得新增字段**（schema additionalProperties=false）"
+    fields:
+      vehicle_id: "取自会话（rc:session:{vehicle_id}）"
+      timestamp: "服务端生成时间（Unix epoch 秒，含毫秒）"
+      seq: "会话内单调递增（rc:session.{vehicle_id}.seq_last 由服务端 INCR；不复用前端 seq 以防伪造）"
+      session_id: "当前会话 UUID"
+      operator_id: "JWT sub（操作员用户 ID）"
+      control.target_velocity: "限幅到 [-RC_MAX_SPEED_MPS, +RC_MAX_SPEED_MPS]（默认 ±2.0 m/s）；服务端截断，不依赖车端裁剪"
+      control.target_steer: "底盘转角量程标定值待确认 → 按 RC_MAX_STEER_RAD 限幅（pending #18）"
+      heartbeat: "控制量无变化时仍以 20Hz 发送，heartbeat=true 维持链路与超时保护计时"
+    ws_only: "WS 上行帧仅使用上述字段（不新增 gear 等未契约化字段）；前端附加字段由平台侧丢弃"
+  ack:
+    topic: "hunter.{vehicle_id}.command_result"
+    consumer_group: "remote-control-command-result（contracts/kafka/consumer-groups.yaml 已登记，零改动）"
+    subscribe_mode: regex_pattern
+    idempotency_key: command_id
+    latency_slo_ms: 100
+    degrade_on_timeout_ms: 500
+    correlation: |
+      ✅ 时延判定：以「最近一次下发指令的 timestamp ↔ 回执到达时间」做链路时延统计；
+      ⚠ 精确逐条关联受限：`remote_control` 契约**无 command_id 字段**，而 command_result 以
+      command_id 为幂等键 → 当前仅能按 (vehicle_id, session_id, 时序窗口) 近似关联，
+      见 `x-hunter-pending-confirmation` #16（如需精确关联，须先为操控指令契约补充 command_id
+      或改用 command topic 承载）
+  timing_guard:
+    - "发送侧节流：单会话令牌桶 20Hz（50ms）；无新控制值时按 heartbeat=true 填充，保证车端超时计时不被触发"
+    - "指令间隔 jitter ≤ ±5ms（100ms 端到端指标的 5%）"
+    - "指令延迟 >100ms 连续 3 次 → 会话 degraded + 告警指标 hunter_remote_control_command_latency_seconds（见 x-hunter-observability.metrics）"
+  session_signalling:
+    topic: "hunter.{vehicle_id}.command"
+    command_types_proposed: [rc_session_start, rc_session_end]
+    note: |
+      会话开始/结束的平台→车信令经 `hunter.{vehicle_id}.command` 下发（topics.yaml 已登记
+      remote-control 为该 Topic 生产者），携带 command_id（可被 command_result 精确关联），
+      params 内嵌 session_id / max_speed_mps / timeout_ms。
+      ⚠ `command.schema.json` 的 `command_type` 取值域尚未定稿（"待设计文档 5.3 节核对"），
+      上述两个取值需人工确认后回填契约，见 `x-hunter-pending-confirmation` #17
+
+x-hunter-control-safety:
+  source: "系统约束第 15 条（远程操控安全约束，不可更改）"
+  command_hz: 20
+  command_interval_ms: 50
+  timeout_protection:
+    vehicle_side_timeout_ms: 500
+    behavior: "车端 >500ms 未收到控制指令 → 自动减速停车（车端兜底，不可依赖平台在线）"
+    platform_side: ">500ms 无回执 → 会话 degraded；连续 3 次 → 结束会话并下发 session_end"
+  speed_limit:
+    max_speed_mps: 2.0
+    configurable: RC_MAX_SPEED_MPS
+    enforcement: "服务端对 target_velocity 限幅（Kafka schema 亦限制 ±2.0）；前端 UI 同步限幅仅作提示，不作安全依据"
+  exclusivity:
+    rule: "同一车辆同一时间仅允许一名操作员操控"
+    mechanism: "Redis 分布式锁 rc:lock:{vehicle_id} + rc:session:{vehicle_id} 存在性双检"
+    conflict_code: 7001
+    http_status: 409
+  authorization:
+    rbac_resources: "remote（读 remote:read / 建 remote:create / 执行 remote:execute）"
+    data_scope: "按车辆/项目隔离（user-service 授予）；操作员须显式被授予可操控车辆集合"
+    audit: "创建/结束会话、紧急停车、管理员强制结束均写结构化审计日志（trace_id + operator_id + vehicle_id + session_id + 结果）"
+  degraded_actions:
+    - { condition: "指令回执超时 / 视频质量跌落 / 心跳缺失", action: "会话 degraded + 前端 status 帧推送 + 保持链路自愈（车端已因超时停车）" }
+    - { condition: "车辆状态变为 fault / emergency / offline", action: "立即结束会话（4001/3003 语义归档 end_reason），不下发任何继续行驶指令" }
+    - { condition: "OTA/充电中（车辆忙）", action: "禁止创建会话（4002），已在会话中则结束并归档" }
+  forbidden:
+    - "禁止绕过互斥（如共享 session 或复用他人 rc:session 键）"
+    - "禁止在 degraded/ended 会话上继续下发控制指令（必须重新建会话）"
+    - "禁止下发『保持速度』类指令对抗车端超时保护"
+
+x-hunter-video-contract:
+  source: "系统约束第 15 条（视频编码：H.264 硬编码 NVENC / 720p@30fps / 2–4Mbps / 关键帧 1s）+ 性能指标（端到端 ≤200ms）"
+  encoding:
+    codec: H.264
+    encoder: "车端 AGX Orin NVENC 硬件编码（云端只转发/录制，不做转码）"
+    profile: "待确认（`High` 或 `Baseline`，影响丢包恢复与浏览器兼容）→ pending #19"
+    resolution: { width: 1280, height: 720 }
+    fps: 30
+    keyframe_interval_s: 1
+    gop_frames: 30
+    bitrate_kbps:
+      min: 2048
+      max: 4096
+      config_keys: [RC_VIDEO_MIN_BITRATE_KBPS, RC_VIDEO_MAX_BITRATE_KBPS]
+      adaptation: "起始取 RC_VIDEO_MAX_BITRATE_KBPS，网络劣化时自适应下探至 RC_VIDEO_MIN_BITRATE_KBPS（2–4 Mbps 区间不可越界）"
+  transport:
+    media: "WebRTC / SRTP（DTLS-SRTP 加密，媒体面不经 api-gateway）"
+    signalling: "WSS `/ws/remote/{session_id}/signal` 中继 SDP/ICE（见 x-hunter-websocket-contract）"
+    server: "SRS 5.0（WebRTC 转发 + 录像回写；应用名/流名与 WHIP/WHEP 端点待确认 → pending #10）"
+    ice:
+      stun: RC_STUN_URLS
+      turn: RC_TURN_URLS
+      credential: "TURN 短期凭据（HMAC-SHA1，TTL = RC_ICE_CREDENTIAL_TTL_S）"
+      pending: "#12（SRS/TURN 接入参数需同步 K8s ConfigMap）"
+    udp_exposure: "媒体 UDP 端口需在 K8s 以 NodePort/LoadBalancer 暴露（端口取值待契约确认后补齐，禁止预设未定义端口，见 infra/k8s/services/remote-control.yaml 注释）"
+  latency_budget_ms:
+    capture_encode: 50
+    network: 100
+    decode_render: 30
+    total: 200
+    measurement: "以 WebRTC getStats()（jitterBufferDelay + framesDecoded 时间轴）与服务端 RTP 时间戳换算；P95 写入归档 sidecar.video.e2e_latency_ms_p95"
+  quality_guard:
+    - "关键帧间隔 1s → 丢包后 1s 内可恢复画面（GOP=30）"
+    - "码率/分辨率不支持浏览器侧上调（前端仅能请求降档，最终由车端 NVENC 与网络预算决定）"
+    - "视频 E2E P95 > 200ms 持续 3 个采样周期 → 会话 degraded 并在 status 帧中携带 video_stats"
+  ui: "前端原生 WebRTC（RTCPeerConnection + recvonly transceiver）；禁止使用第三方云视频服务"
+  cross_reference: "schemas.VideoConfig / VideoStats / SrsMediaInfo / IceServer / RecordArchiveInfo"
+
+x-hunter-history-archive:
+  decision: |
+    **方案 A（用户已确认）**：不新增数据库表 / ORM / Alembic migration。会话态唯一来源为 Redis
+    `rc:session:{vehicle_id}`，操控记录持久化为「MinIO 录像对象 + 同目录 sidecar JSON」。
+    如后续出现强一致统计/复杂过滤/数据权限强制隔离需求，须走
+    「DDL → ORM → migration → 契约同步」完整链路（pending #1）。
+  store: "MinIO hunter-video（SSE-S3 加密）"
+  object_key_pattern:
+    video: "remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.mp4"
+    sidecar: "remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.json"
+    note: "键规范与 schemas.RecordArchiveInfo / history 端点描述一致，**修改需先更新契约**"
+  retention:
+    days: 90
+    managed_by: "MinIO 生命周期规则（系统约束第 7 条，不可更改）"
+    on_expired: "对象自动消失 → `GET /history` 列表收缩、`GET /history/{id}/video` 返回 3001"
+  upload: "SRS 录制产物由服务端直传 MinIO（不经浏览器）；预签名上传仅用于异常人工补录（1 小时有效）"
+  download: "预签名 URL 15 分钟（900s）+ HTTP Range 分片（前端 seek）；URL 禁止落日志/缓存"
+  sidecar_schema:
+    schema_version: "1"
+    note: "键名固定；实现侧 Pydantic 模型与之 1:1（写入前 JSON Schema 自校验）"
+    keys:
+      schema_version: string
+      session_id: string(uuid)
+      vehicle_id: string
+      operator_id: string(uuid)
+      operator_name: string|null
+      started_at: number
+      ended_at: number
+      duration_s: integer
+      end_reason: "SessionEndReason（operator_end / admin_terminate / vehicle_offline / vehicle_fault / command_timeout / heartbeat_timeout / video_lost / server_shutdown）"
+      end_reason_source: "platform | vehicle | timeout"
+      degraded_events: "array<{at, reason, detail}>（降级/恢复时间线）"
+      video:
+        object_key: string
+        size_bytes: int64
+        sha256: string
+        container: "mp4"
+        codec: "h264"
+        width: integer
+        height: integer
+        fps: integer
+        bitrate_kbps_avg: integer
+        keyframe_interval_s: number
+        e2e_latency_ms_p95: number
+      control:
+        commands_sent: integer
+        commands_acked: integer
+        ack_latency_ms_avg: number
+        ack_latency_ms_p95: number
+        timeout_events: integer
+        max_speed_mps: number
+      note: string|null
+      environment: "{service_version: string, config_digest: string}"
+  discoverability:
+    by_vehicle_and_date: "前缀 `remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/` → ListObjectsV2 单次列举"
+    by_session_id: |
+      仅知 session_id 时需按桶内前缀检索（`ListObjectsV2` + 分页），对象量增大后开销上升
+      （pending #8）；**约定 sidecar 与录像严格同前缀**，故可用
+      `remote-control/` + 日期粗筛上限 RC_HISTORY_QUERY_MAX_RANGE_DAYS（默认 31）
+  consistency:
+    - "封存顺序：录像对象 PutObject 成功 → sidecar JSON PutObject 成功 → 才释放锁/删 Redis 键；sidecar 缺失视为归档失败并告警 hunter_remote_control_archive_failed_total"
+    - "会话进行中录像对象可能存在但**未封存**：`GET /history` 仅列举 sidecar（未结束会话不出现），避免半成品可见"
+    - "Redis 键删除与 MinIO 归档之间的最终一致残留窗口见 pending #5"
+
+x-hunter-websocket-routes:
+  authority: "权威定义在 `contracts/openapi/api-gateway.yaml` → `x-hunter-websocket-routes`；此处为镜像 + 本服务侧职责细化，**修改网关侧须同步本段**"
+  routes:
+    - path: /ws/remote/**
+      target_service: remote-control
+      target_port: 8085
+      protocol: websocket
+      security_protocol: "WSS（TLS 1.3）"
+      auth: "JWT（握手阶段校验）"
+      auth_detail: |
+        本服务实现按 `Authorization: Bearer <token>` 头读取；网关侧「传送方式（Authorization 头 /
+        Sec-WebSocket-Protocol / 首帧认证）」待人工确认（api-gateway 契约同标注），见
+        `x-hunter-pending-confirmation` #20。**禁止查询串明文携带 Token**。
+      constraints:
+        - "控制指令 20Hz（50ms 间隔）；>500ms 未收到指令，车辆自动减速停车"
+        - "远程操控最高速度 2.0 m/s（可配置）；视频 720p@30fps、H.264 硬编码、码率 2048–4096 kbps、关键帧间隔 1s"
+        - "端到端视频延迟 ≤ 200ms、指令延迟 ≤ 100ms"
+        - "响应/发送超时 3600s、关闭代理缓冲"
+      rate_limit: "握手 1 QPS/用户（与 POST /api/v1/remote/session 同档，见 x-hunter-rate-limits）"
+      error_codes: [1001, 1002, 4001, 4002, 5001, 7001, 7002]
+  media_plane: "WebRTC 媒体（SRTP/UDP）**不经** api-gateway / Ingress，须在 K8s 单独暴露 UDP（见 x-hunter-video-contract.transport.udp_exposure）"
+
+x-hunter-kafka:
+  source: "contracts/kafka/topics.yaml + consumer-groups.yaml + schemas/*.schema.json（本服务相关条目均已登记，**本契约零改动**）"
+  produces:
+    - topic: "hunter.{vehicle_id}.remote_control"
+      direction: platform_to_vehicle
+      schema: "schemas/remote_control.schema.json"
+      key: vehicle_id
+      partitions: 3
+      acks: all
+      frequency: "20Hz（50ms）"
+      compression: "lz4（KAFKA_COMPRESSION_TYPE，对齐车端）"
+      linger_ms: 5
+      batch_size: 16384
+      retries: 3
+      purpose: "控制指令（target_velocity / target_steer / heartbeat）"
+    - topic: "hunter.{vehicle_id}.command"
+      direction: platform_to_vehicle
+      schema: "schemas/command.schema.json"
+      key: vehicle_id
+      partitions: 3
+      acks: all
+      frequency: "按需"
+      purpose: "会话开始/结束信令（command_type 建议 rc_session_start / rc_session_end，取值域待确认 pending #17）"
+  consumes:
+    - topic_pattern: "hunter.*.command_result"
+      group_id: remote-control-command-result
+      subscribe_mode: regex_pattern
+      schema: "schemas/command_result.schema.json"
+      idempotency_key: command_id
+      offset_commit: "手动提交（处理成功后提交；禁止自动提交）"
+      purpose: "操控指令回执（success / result_code / data）"
+      degrade_rule: ">500ms 无回执视为链路异常 → 会话 degraded / 终止"
+      failure_handling: "解析或处理失败 → 重试（有限次）→ 死信队列(DLQ) + 告警，不阻塞分区消费（禁止吞异常）"
+  security: "SASL_SSL + SCRAM-SHA-512（KAFKA_SECURITY_PROTOCOL / KAFKA_SASL_MECHANISM）；禁止 PLAINTEXT"
+  producer_lifecycle: |
+    Producer **单例**（common/python/hunter_common/kafka 封装，lifespan 初始化）；禁止按会话创建 Producer
+    （20Hz × N 会话会耗尽连接与线程）。消费侧 rdkafka 使用异步回调，禁止在回调中阻塞等待。
+  contract_change_needed: "无（除非采纳 pending #16/#17 的改动建议，届时须先更新 Kafka 契约）"
+
+x-hunter-rate-limits:
+  source: "系统约束第 11 条（附录 D）"
+  global: { qps: 10000, scope: "整个平台" }
+  per_user: { qps: 100, scope: "单用户全部接口" }
+  per_ip: { qps: 200, scope: "单 IP 全部接口" }
+  endpoint_specific:
+    - { endpoint: "POST /api/v1/remote/session", limit: "1 QPS/用户", source: "附录 D 明列", reason: "接管创建属重动作（占用车辆 + 建媒体流）" }
+    - { endpoint: "WS 握手 /ws/remote/**", limit: "1 QPS/用户", source: "网关契约", note: "仅限握手，已建立连接的 20Hz 指令不受 QPS 限流约束（否则无法满足 20Hz）" }
+    - { endpoint: "其他 /api/v1/remote/**", limit: "未单列 → 适用全局 10000 / 单用户 100 / 单 IP 200" }
+  kafka_side_limits:
+    - "操控指令下行 20Hz/会话（由令牌桶保证，非 Redis 限流）"
+    - "车端上行遥测单车 ≤100 msg/s（非本服务职责，仅引用系统约束）"
+  implementation: |
+    Redis 计数器 `rate_limit:{ip}:{api}`（INCR + EXPIRE，窗口 60s，见 `hunter_common.redis.incr_with_expire`）；
+    超限 → **HTTP 429** + `code=5001`（错误码表无专用限流码，**禁止自造**）+ `Retry-After`，
+    并计入 `hunter_remote_control_rate_limited_total`。
+  no_bypass: "限流在服务侧与网关侧双重生效；禁止仅为压测关闭限流（生产配置 ENVIRONMENT=prod 时强制开启）"
+
+x-hunter-error-status-map:
+  note: "统一响应体 `{code,message,data,request_id,timestamp}`（规则 2）；**code 仅取预定义错误码表，禁止自造**；HTTP 状态码与 code 的映射如下（全服务一致）"
+  mapping:
+    - { code: 0,    http: 200, meaning: "成功（含会话创建/结束的归档摘要返回）" }
+    - { code: 1001, http: 401, meaning: "未认证（Token 缺失/无效；REST 与 WS 握手一致）" }
+    - { code: 1003, http: 401, meaning: "Token 过期（响应头可带 X-Request-ID 便于追踪）" }
+    - { code: 1002, http: 403, meaning: "无权限（缺 remote:read/create/execute 或数据域不含该车辆）" }
+    - { code: 2001, http: 422, meaning: "参数错误（视频参数越界、page_size>200、时间范围超限）" }
+    - { code: 2002, http: 422, meaning: "参数缺失（vehicle_id 等必填缺失）" }
+    - { code: 3001, http: 404, meaning: "资源不存在（会话已结束/不存在、录像或 sidecar 缺失、车辆不存在）" }
+    - { code: 3002, http: 409, meaning: "资源已存在（保留：本服务无唯一键写入场景，仅当采纳 pending #1 建表后启用）" }
+    - { code: 3003, http: 409, meaning: "资源状态冲突（如会话处于 connecting 尚不可结束、录像未封存完成）" }
+    - { code: 4001, http: 409, meaning: "车辆不在线（vehicle:online:set 不含该车）" }
+    - { code: 4002, http: 409, meaning: "车辆忙（OTA 中 / 充电中 / fault / emergency）" }
+    - { code: 5000, http: 500, meaning: "服务器内部错误（未预期异常；响应不含堆栈，细节入日志）" }
+    - { code: 5001, http: 503, meaning: "服务不可用（Redis/Kafka/MinIO/SRS 依赖不可用）" }
+    - { code: 5001, http: 429, meaning: "限流触发（复用 5001，无专用限流码；响应带 Retry-After，见 x-hunter-rate-limits）" }
+    - { code: 6001, http: 502, meaning: "（OTA 域，本服务不使用）" }
+    - { code: 6002, http: 502, meaning: "（OTA 域，本服务不使用）" }
+    - { code: 6003, http: 409, meaning: "（OTA 域，本服务不使用）" }
+    - { code: 7001, http: 409, meaning: "远程操控会话冲突（车辆已被其他操作员操控；data 携带占用者信息）" }
+    - { code: 7002, http: 502, meaning: "远程操控视频建立失败（SRS/WebRTC 协商失败，会话不成立）" }
+  conventions:
+    - "`request_id` 与 `X-Request-ID` 响应头一致；日志与响应同源（trace_id 贯穿）"
+    - "错误响应 `data` 可为结构化上下文（如 7001 的占用者、3001 的 bucket/object_key），但**禁止含 Token/密码/私钥/预签名 URL 全量**"
+    - "WS 帧错误不改变 HTTP 映射：以 `{type: error, code, message, request_id}` 下发同一 code"
+
+x-hunter-observability:
+  source: "规则 6（可观测性）+ 共享库 common/python/hunter_common（logging / metrics / middleware）"
+  logging:
+    library: "structlog（JSON 输出）"
+    required_fields: [timestamp, level, service, trace_id, request_id]
+    conditional_fields: "vehicle_id / session_id / operator_id（涉及时必带）；**禁止输出 password / token / 私钥 / 预签名 URL**"
+    audit_events: ["会话创建/结束（session_id, vehicle_id, operator_id, end_reason）", "紧急停车（estop）", "管理员强制结束", "限流触发", "会话冲突（7001）"]
+  metrics:
+    shared:
+      - "hunter_http_requests_total{method,path,status}"
+      - "hunter_http_request_duration_seconds{method,path}（P95 ≤ 200ms 由 Grafana 计算）"
+      - "hunter_http_requests_in_progress"
+      - "hunter_service_info"
+    service_specific:
+      - "hunter_remote_control_sessions_active{vehicle_id}（Gauge，当前活跃会话数；互斥下单车 ≤1）"
+      - "hunter_remote_control_session_conflicts_total{vehicle_id}（Counter，7001 次数）"
+      - "hunter_remote_control_commands_total{result=\"sent|acked|timeout\"}（Counter，20Hz 指令与回执）"
+      - "hunter_remote_control_command_latency_seconds（Histogram，桶 0.01/0.05/0.1/0.2/0.5；目标 P95 ≤ 0.1）"
+      - "hunter_remote_control_video_e2e_latency_seconds（Histogram，桶 0.05/0.1/0.2/0.5/1；目标 P95 ≤ 0.2）"
+      - "hunter_remote_control_frame_dropped_total{reason}（Counter，over_frequency|backpressure）"
+      - "hunter_remote_control_heartbeat_timeout_total{vehicle_id}（Counter）"
+      - "hunter_remote_control_archive_failed_total{stage=\"video|sidecar\"}（Counter）"
+      - "hunter_remote_control_rate_limited_total{endpoint}（Counter）"
+    endpoint: "GET /metrics（Prometheus 抓取；K8s 注解 prometheus.io/scrape=true / port=8085 / path=/metrics）"
+  tracing: "trace_id 由网关注入（X-Request-ID / traceparent），本服务透传至 Kafka 消息头与日志；WS 连接级 trace_id"
+  probes:
+    healthz: "GET /healthz → 200 {status: healthy}（存活；不依赖外部组件）"
+    readyz: "GET /readyz → 200/503 {status, checks{database, redis}}（就绪；database 仅作共享连接池自检，本服务无业务表 → pending #9）"
+  alerts_proposed:
+    - { condition: "session_conflicts_total 5 分钟内增幅 > 10", severity: warning, note: "疑似脚本抢占或多操作员争抢" }
+    - { condition: "archive_failed_total 增幅 > 0", severity: critical, note: "录像/元信息归档失败，取证数据缺失" }
+    - { condition: "video_e2e_latency P95 > 0.2s 持续 5 分钟", severity: critical, note: "违反 ≤200ms 性能指标" }
+    - { condition: "command_latency P95 > 0.1s 持续 5 分钟", severity: critical, note: "违反 ≤100ms 性能指标" }
+
+x-hunter-pending-confirmation:
+  note: |
+    以下条目**必须在 Step 4（路由/业务实现）之前人工确认**。标记 `blocking` 的条目若未确认，
+    实现将依赖本契约的推导结论（可能偏离设计文档 §8.3–8.5 / §12.6 原文）。设计文档原文未随仓库提供，
+    故本契约端点与扩展字段均为推导结果。
+  items:
+    - id: 1
+      title: "操控记录的持久化载体（方案 A 已定，确认其能力边界可接受）"
+      status: decided
+      decision: "不新增数据库表：会话态 = Redis rc:session:{vehicle_id}；操控记录 = MinIO hunter-video 录像 + 同目录 sidecar JSON"
+      consequence: "历史查询无 SQL 过滤/聚合能力（仅 MinIO 列举 + 逐条解析 sidecar），total 非 DB COUNT；数据权限靠应用层判断；不支持跨会话统计报表"
+      blocking: false
+      files: [contracts/openapi/remote-control.yaml, contracts/database/ddl/00_schemas.sql]
+      escalate_if: "产品要求『按延迟/结束原因/指令数排序与聚合』或『强制按车辆/项目隔离到存储层』→ 需新增 remote_control.sessions 表（DDL→ORM→migration→契约同步）"
+    - id: 2
+      title: "Redis vehicle:status:{vehicle_id} 的 Hash 字段清单（本服务只读依赖）"
+      status: open
+      current: "本契约按 status / battery_soc / velocity / last_online_time / (fault_code / control_mode 可能) 消费；字段名与实际写入方（vehicle-service）必须一致"
+      blocking: true
+      files: [contracts/openapi/remote-control.yaml, services/vehicle-service, contracts/database]
+      decision_needed: "由 vehicle-service 契约（或共同约定的 Redis 读模型契约）定稿字段名与语义；本服务不写该键"
+    - id: 3
+      title: "block_reason 值域"
+      status: open
+      current: "[offline, upgrading, charging, fault, emergency, already_controlled]（契约推导）"
+      blocking: false
+      files: [contracts/openapi/remote-control.yaml]
+      decision_needed: "是否需细分（如 low_battery / network_unstable / max_speed_exceeded）；值域须与前端提示文案映射一致"
+    - id: 4
+      title: "会话状态名与心跳超时阈值"
+      status: open
+      current: "状态 [connecting, active, degraded, ended]；心跳 10s（不可改），degraded 判定=连续缺失 3 次（派生），超时结束=60s（派生）"
+      blocking: false
+      files: [contracts/openapi/remote-control.yaml, common/python/hunter_common/database/enums.py]
+      decision_needed: "degraded 后是否允许自动恢复为 active（本契约允许）；缺失 3 次/60s 是否需调整；状态名是否需进入共享枚举"
+    - id: 5
+      title: "会话结束与 Redis 键删除的最终一致残留窗口"
+      status: open
+      current: "顺序：session_end 下发 → 停止转发/录像 → 封存 sidecar → 释放锁 → 删除 rc:session"
+      risk: "删除前若副本崩溃，残留 rc:session 会导致重建会话被误判 7001（车辆实际已停车）"
+      blocking: false
+      files: [contracts/openapi/remote-control.yaml, common/python/hunter_common/redis.py]
+      decision_needed: "是否需要 rc:session 键设置硬 TTL（如 6h）与『陈旧会话自动清理』守护逻辑；清理判定依据（车辆状态非 remote_controlled + 无 WS 连接）"
+    - id: 6
+      title: "多副本下会话统计的聚合方式与 Redis 会话字段名"
+      status: open
+      current: "GET /session/{id} 的 control/video 统计为『本副本视角』（进程内）；Redis 仅存计数基线"
+      blocking: false
+      files: [contracts/openapi/remote-control.yaml, common/python/hunter_common/redis.py]
+      decision_needed: "是否把 commands_sent/acked/延迟分位写入 Redis Hash 字段（字段名以本契约为准）并在读取时汇总；分位统计是否降级为均值+P95 近似"
+    - id: 7
+      title: "RC_HISTORY_QUERY_MAX_RANGE_DAYS 默认值"
+      status: open
+      current: "31 天（推导，理由：<=90 天保留期内控制 ListObjectsV2 前缀枚举量）；超限返回 2001"
+      blocking: false
+      files: [contracts/openapi/remote-control.yaml, infra/k8s/services/remote-control.yaml]
+      decision_needed: "确认 31 或放宽/收紧；是否需要按角色分级（管理员可查满 90 天）"
+    - id: 8
+      title: "按 session_id 检索 sidecar 的成本上限"
+      status: open
+      current: "依赖『录像与 sidecar 同前缀』约定 + 日期粗筛；GET /history/{session_id} 需前缀检索"
+      risk: "对象数量增长后单次请求的 ListObjectsV2 分页次数上升，可能突破 API P95 ≤ 200ms"
+      blocking: false
+      files: [contracts/openapi/remote-control.yaml, services/remote-control]
+      decision_needed: "是否引入额外的索引对象（如 remote-control/_index/{session_id}.json）或接受按车辆+日期前缀的强制定位（前端必须带日期范围）"
+    - id: 9
+      title: "/readyz 是否保留 database 就绪项"
+      status: open
+      current: "沿用共享探针实现：checks{database, redis}（database 仅为共享连接池自检；本服务无业务表）"
+      blocking: false
+      files: [services/remote-control/app/routers/health.py]
+      decision_needed: "保留（编排统一、但引入与业务无关的依赖失败面）或改为仅 redis/kafka/minio/srs 检查（需与共享探针模板对齐）"
+    - id: 10
+      title: "SRS 应用名/流名规范与 WHIP/WHEP 端点命名"
+      status: open
+      current: "SrsMediaInfo 返回 app/stream 与推拉流端点（未在仓库契约中定义具体命名）"
+      blocking: true
+      files: [contracts/openapi/remote-control.yaml, infra/docker, infra/k8s]
+      decision_needed: "约定 SRS app（建议 live 或 rc）/stream（建议 {vehicle_id}）命名与 WHIP(推流, 车端)/WHEP(拉流, 浏览器) 端点路径；一旦定稿不得更改"
+    - id: 11
+      title: "Redis 互斥锁键 rc:lock:{vehicle_id} 的命名确认"
+      status: open
+      current: "依据 `hunter_common/redis.py` 的 acquire_lock 用法示例（`rc:lock:vehicle-1`）与 `rc:` 命名空间推导"
+      blocking: false
+      files: [contracts/openapi/remote-control.yaml]
+      decision_needed: "系统约束第 8 条的 Redis Key 表未列出该键 → 是否将 rc:lock:{vehicle_id} 正式登记进契约文档；确认后**不得再改**（否则并发创建期间出现锁分裂，互斥失效）"
+    - id: 12
+      title: "新增环境变量需同步 infra/k8s 配置"
+      status: open
+      current: "本契约引入 RC_SESSION_HEARTBEAT_*、RC_HISTORY_QUERY_MAX_RANGE_DAYS、RC_ACK_TIMEOUT_MS、RC_COMMAND_RESULT_TOPIC_CONSUMER_GROUP、SRS_*、RC_STUN_URLS/RC_TURN_*/RC_ICE_CREDENTIAL_TTL_S、RC_PRESIGNED_DOWNLOAD_EXPIRE_SECONDS"
+      blocking: true
+      files: [infra/k8s/services/remote-control.yaml, infra/k8s/base/01-configmap-common.yaml, infra/docker/docker-compose.yml]
+      decision_needed: "补齐 remote-control-config / hunter-common-config / Secret（TURN 共享密钥）并确认 SRS 与 TURN 的部署形态（容器内 SRS 还是独立 StatefulSet；TURN 是否需要）"
+    - id: 13
+      title: "Redis 车辆读模型的写入方归属"
+      status: open
+      current: "本服务只读 vehicle:status:{vehicle_id} / vehicle:online:set"
+      blocking: false
+      files: [contracts/kafka/consumer-groups.yaml, services/vehicle-service, services/data-collector]
+      decision_needed: "确认写入方（vehicle-service 或 data-collector 的遥测消费者）与更新频率（遥测 10–50Hz 下的写入节流策略），避免『无写入方』导致接管判定长期失效"
+    - id: 14
+      title: "多副本下 WS 连接故障转移与会话续期"
+      status: open
+      current: "会话状态存 Redis，副本重启后客户端自动重连并复用会话（不重新占锁）"
+      risk: "长连接在副本故障时不迁移；若车辆已进入 remote_controlled 而平台未重连，只能依赖车端超时停车兜底"
+      blocking: true
+      files: [contracts/openapi/remote-control.yaml, infra/k8s/ingress.yaml, infra/k8s/services/remote-control.yaml]
+      decision_needed: "确认粘性路由实现（Ingress session affinity / 网关一致性哈希）与重连窗口（建议 ≤10s）；是否需要在车端增加『平台心跳丢失』上报通道（如 event/health 主题）"
+    - id: 15
+      title: "WS 子路径 /control 与 /signal 的拆分"
+      status: open
+      current: "契约推导：控制指令与 WebRTC 信令分两条 WS 连接（职责隔离、限流与权限不同）"
+      blocking: true
+      files: [contracts/openapi/remote-control.yaml, contracts/openapi/api-gateway.yaml]
+      decision_needed: "确认拆分或合并为单连接（单连接可减少握手开销但权限/限流粒度变粗）；定稿后同步网关契约与前端封装"
+    - id: 16
+      title: "操控指令回执的精确关联（command_id 缺失）"
+      status: open
+      current: "remote_control.schema.json 无 command_id；command_result 以 command_id 为幂等键 → 当前按 (session_id, seq, 时序窗口) 近似关联"
+      blocking: true
+      files: [contracts/kafka/schemas/remote_control.schema.json, contracts/kafka/consumer-groups.yaml]
+      decision_needed: "三选一：①为 remote_control 增加 command_id（20Hz 下 UUID 生成开销与消息体积上升）；②回执关联仅用于链路健康统计（接受近似）；③改用 command topic 承载 20Hz 指令（违背严格 20Hz 通道设计意图，需评估）。选定前不得实现精确逐条关联"
+    - id: 17
+      title: "会话开始/结束信令的 command_type 取值"
+      status: open
+      current: "建议 rc_session_start / rc_session_end（经 hunter.{vehicle_id}.command 下发）"
+      blocking: true
+      files: [contracts/kafka/schemas/command.schema.json, contracts/kafka/topics.yaml]
+      decision_needed: "command.schema.json 的 command_type 取值域待设计文档 5.3 节定稿；本服务需在契约定稿后再实现下发逻辑（禁止硬编码分支）"
+    - id: 18
+      title: "target_steer 限幅参数与底盘转角量程"
+      status: open
+      current: "Kafka schema 未限定 steer 量程；服务端需限幅（待定 RC_MAX_STEER_RAD）"
+      blocking: false
+      files: [contracts/kafka/schemas/remote_control.schema.json, services/remote-control/app/config.py]
+      decision_needed: "确认 HUNTER SE 前轮转角量程（rad）与限幅建议值；是否需要在契约中为 target_steer 增加 minimum/maximum"
+    - id: 19
+      title: "H.264 profile 取值"
+      status: open
+      current: "未指定（NVENC 支持 Baseline/Main/High）"
+      blocking: false
+      files: [contracts/openapi/remote-control.yaml, services/remote-control/app/config.py]
+      decision_needed: "确认 profile 与 level（影响浏览器兼容性与弱网表现）；定稿后写入 VideoConfig 与车端编码配置"
+    - id: 20
+      title: "WS 握手 JWT 的传送方式"
+      status: open
+      current: "本服务实现按 Authorization: Bearer 头读取；网关契约同项待确认（Authorization 头 / Sec-WebSocket-Protocol / 首帧认证）"
+      blocking: true
+      files: [contracts/openapi/api-gateway.yaml, contracts/openapi/remote-control.yaml, frontend/src/api]
+      decision_needed: "选定后同步前端封装与网关实现；**任何方案都禁止查询串明文携带 Token**"

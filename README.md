@@ -229,7 +229,7 @@ REST 接口契约集中在 `contracts/openapi/`，遵循「先契约、后实现
 | `data-collector.yaml` | 数据采集（7 端点：遥测查询 / 事件查询与确认 / 文件清单与预签名上传）+ 5.3.3 遥测结构 / 5.4 预处理 / 5.5 上传流程扩展字段 | ✅ |
 | `data-analytics.yaml` | 数据分析（8 端点：报告列表/详情/生成、看板、感知与控制评估、场景覆盖率、Corner Case）+ 6.2 实时作业 / 6.3 离线作业 / 6.4 挖掘 / 6.5 报告扩展字段 | ✅ |
 | `ota-service.yaml` | OTA 管理（15 端点：版本仓库 CRUD/发布/废弃、升级任务 CRUD/start|pause|resume|cancel|rollback、升级记录）+ 8/9 章 DDL 与 Kafka 对齐 + 版本上传两步式 / 灰度批次 / 发布校验扩展字段 | ✅ |
-| `remote-control.yaml` | 远程操控资源端点 | 待开发 |
+| `remote-control.yaml` | 远程操控（8 端点：可操控车辆 / 会话列表-创建-详情-结束 / 操控记录列表-详情-录像）+ WebSocket 契约（控制 20Hz + 信令）/ 会话生命周期 / 控制通道与安全约束 / 视频 / MinIO 归档扩展字段 | ✅ |
 
 ```bash
 # 契约校验（29 项，无需运行服务）
@@ -263,7 +263,10 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
   数据分析侧见其契约 `x-hunter-pending-confirmation`（12 项：报告元信息缺表 / 报告异步语义 / TTC 等级冲突 /
   alert_event 消费方落位 / 消费组契约修正等）；
   OTA 管理侧见其契约 `x-hunter-pending-confirmation`（19 项：12.5 节原文缺失 / `release_type` 取值域 / 跳批策略 /
-  publish 网关超时与异步化 / DLQ Topic 登记 / command_result 与 broadcast 归属 / 审计保留期等）
+  publish 网关超时与异步化 / DLQ Topic 登记 / command_result 与 broadcast 归属 / 审计保留期等）；
+  远程操控侧见其契约 `x-hunter-pending-confirmation`（20 项，其中 8 项 `blocking`：12.6 节原文缺失 /
+  会话状态名与心跳阈值 / SRS 应用名与 WHIP-WHEP 端点 / WS 子路径拆分 / 操控指令 `command_id` 缺失（回执精确关联） /
+  `command_type` 取值域 / WS 握手 JWT 传送方式 / 车辆状态读模型字段清单与写入方 / 多副本粘性路由等）
 - **数据分析服务**：`data-analytics.yaml` 的 8 个业务端点与设计文档 12.4 节逐条对齐（不可增删）；
   定位为「读模型 + 编排」——实时由 5 个 Flink 作业（6.2 节）、离线由 7 个 Spark 作业（6.3/6.4/6.5 节）承担，
   REST 只读预计算结果（P95 ≤ 200ms），报告生成为异步（202 + 轮询）；14 项实时阈值（3.0 m/s² / 0.5s / 0.8 rad/s /
@@ -275,6 +278,18 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
   灰度 4 批 `5%→20%→50%→100%`、每批观察 24h、成功率 ≥0.95（`OTA_CANARY_MIN_SUCCESS_RATE`）才推进，否则暂停 + 告警；
   Kafka 消费 `hunter.*.ota_status`（消费组 `ota-service-ota-status`，DLQ `{topic}.dlq`），生产 `ota_notify`（逐车 1 小时预签名）
   与 `command`（仅 `ota_rollback`）；最小权限仅写 `ota_svc` schema（禁止 DELETE），`publish` 作为唯一性能例外已登记
+- **远程操控服务**：`remote-control.yaml` 的 8 个业务端点由「附录 D 明列端点 `POST /api/v1/remote/session` +
+  网关 `x-hunter-websocket-routes`（`/ws/remote/**`）+ 第 15 条安全约束 + MinIO `hunter-video` 录像」推导
+  （12.6 节未随仓库提供，推导依据在 `x-hunter-endpoints.items` 逐条登记）；不可更改阈值已在契约中固化：
+  指令 20Hz（50ms）→ Kafka `hunter.{vehicle_id}.remote_control`、>500ms 无指令车端自动减速停车、服务端对
+  `target_velocity` 限幅 ±2.0 m/s、同车同一时间仅一名操作员（Redis 分布式锁 + 错误码 7001）、视频 720p@30fps
+  H.264（NVENC）2048–4096 kbps 关键帧 1s、视频端到端 ≤200ms、指令 ≤100ms；会话状态机
+  `connecting → active → degraded → ended`，结束收敛顺序「session_end → 停录像 → 封存 sidecar → 释放锁 → 删 Redis 键」；
+  **操控记录不落数据库**（方案 A）：会话态 = Redis `rc:session:{vehicle_id}`，操控记录 = MinIO `hunter-video`
+  录像 `remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.mp4` + 同目录 sidecar JSON（保留 90 天），
+  代价是历史查询无 SQL 过滤/聚合能力（需按日期前缀收敛，`RC_HISTORY_QUERY_MAX_RANGE_DAYS` 默认 31）；
+  Kafka 仅消费 `hunter.*.command_result`（消费组 `remote-control-command-result`），`contracts/kafka/` 相关条目
+  均已登记、本契约零改动；媒体面 SRTP/UDP 不经网关，须在 K8s 单独暴露 UDP
 
 ## 验证命令清单
 
@@ -291,6 +306,8 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 | 场景契约校验 | `cd services/scene-service && pytest app/tests/test_scene_contract.py -q`（契约 ↔ 设计文档 4 章/12.2 节 ↔ DDL ↔ Kafka ↔ K8s，29 项） |
 | 数据采集契约校验 | `cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q`（契约 ↔ 设计文档 5 章 ↔ DDL ↔ Kafka ↔ K8s，30 项） |
 | 数据分析契约校验 | `cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q`（契约 ↔ 设计文档 6 章/12.4 节 ↔ DDL ↔ Kafka ↔ K8s，32 项） |
+| 远程操控契约校验 | `cd services/remote-control && pytest app/tests/test_remote_control_contract.py -q`（契约 ↔ 设计文档 15 条安全约束/12.6 节推导 ↔ Kafka ↔ MinIO 归档 ↔ K8s，契约测试随实现步骤落地） |
+| 契约文件静态校验 | `python -c "import yaml; yaml.safe_load(open('contracts/openapi/remote-control.yaml', encoding='utf-8'))"`（YAML 语法 + `$ref` 解析，无需服务） |
 | 数据库迁移 | `alembic -c common/python/alembic.ini current` / `... upgrade head` / `... upgrade head --sql`（离线预览） |
 | 表结构核对 | `docker exec hunter-postgres psql -U hunter -d hunter_edge -c "\\dt scene_svc.*"` |
 | 服务健康探针 | `curl http://localhost:<port>/healthz` |
@@ -313,6 +330,6 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 ## 文档
 
 - `docs/`：设计文档索引与开发文档
-- `contracts/`：接口契约（数据库 DDL/ER/受控词表、Kafka Topic 清单/消费者组/11 个消息 JSON Schema 已完成；OpenAPI 已完成 api-gateway / scene-service / data-collector / data-analytics，ota-service / remote-control 随开发填充）
+- `contracts/`：接口契约（数据库 DDL/ER/受控词表、Kafka Topic 清单/消费者组/11 个消息 JSON Schema 已完成；OpenAPI 已完成 api-gateway / scene-service / data-collector / data-analytics / ota-service / remote-control，六个服务契约齐备）
 - `release.md`：版本变更记录
 

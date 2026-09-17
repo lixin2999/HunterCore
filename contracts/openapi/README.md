@@ -11,7 +11,7 @@
 | data-collector.yaml | data-collector | `/api/v1/data` | ✅ 已定义（7 个业务端点 + 5.3.3 遥测结构 + 5.4 预处理 / 5.5 上传流程扩展字段） |
 | data-analytics.yaml | data-analytics | `/api/v1/analytics` | ✅ 已定义（8 个业务端点 + 6.2 实时作业 / 6.3 离线作业 / 6.4 Corner Case / 6.5 报告模板扩展字段） |
 | ota-service.yaml | ota-service | `/api/v1/ota` | ✅ 已定义（15 个业务端点 + 8/9 章 DDL 与 Kafka 对齐 + 版本上传 / 发布校验 / 灰度批次 / 回滚扩展字段；12.5 节原文缺失 → 推导清单） |
-| remote-control.yaml | remote-control | `/api/v1/remote`、`/ws/remote/**` | 待开发 |
+| remote-control.yaml | remote-control | `/api/v1/remote`、`/ws/remote/**` | ✅ 已定义（8 个业务端点 + 3 个运维端点 + WebSocket 契约 / 会话生命周期 / 控制通道（20Hz）/ 视频 / 归档扩展字段；12.6 节原文缺失 → 推导清单） |
 
 ## 统一约定（所有服务强制）
 
@@ -146,6 +146,45 @@
   升级包大小上限、小车队批次取整、审计保留期、灰度停用通道、安全开关、vehicle-service 依赖、门禁数据缺失放行 ——
   全量见契约 `x-hunter-pending-confirmation`（19 项）
 
+## 远程操控契约要点（remote-control.yaml）
+
+- **业务端点**（8 个，推导清单 —— 设计文档 §12.6 / §8.3–8.5 原文未随仓库提供，逐条依据登记在
+  `x-hunter-endpoints.items`）：车辆 `GET /api/v1/remote/vehicles`；会话 `GET /api/v1/remote/sessions`、
+  `POST /api/v1/remote/session`（附录 D 明列端点，1 QPS/用户）、`GET|DELETE /api/v1/remote/session/{session_id}`；
+  操控记录 `GET /api/v1/remote/history`、`GET /api/v1/remote/history/{session_id}`、
+  `GET /api/v1/remote/history/{session_id}/video`（预签名 15 分钟 + Range）
+- **WebSocket（`x-hunter-websocket-routes` / `x-hunter-websocket-contract`）**：`/ws/remote/{session_id}/control`
+  （20Hz 指令上行 + ack/status/error 下行 + 10s 心跳）与 `/ws/remote/{session_id}/signal`（SDP/ICE 中继）；
+  WSS + JWT 握手校验（1001/1003/1002/3001/7001 直接以 HTTP 4xx 拒绝、不进帧循环）；
+  媒体面 SRTP/UDP **不经** api-gateway，须在 K8s 单独暴露 UDP
+- **控制通道（`x-hunter-control-channel` / `x-hunter-control-safety`，不可更改）**：20Hz（50ms）→
+  Kafka `hunter.{vehicle_id}.remote_control`（key=vehicle_id、acks=all、压缩 lz4）；>500ms 无指令车端自动减速停车
+  （车端兜底 + 平台侧 degraded）；服务端对 `target_velocity` 限幅 ±2.0 m/s；指令延迟 ≤100ms、视频端到端 ≤200ms；
+  同一车辆同一时间仅一名操作员（Redis 分布式锁 + 7001）
+- **会话生命周期（`x-hunter-session-lifecycle` / `x-hunter-session-heartbeat`）**：
+  `connecting → active → degraded → ended`；心跳 10s、连续缺失 3 次降级、60s 结束（派生阈值，pending #4）；
+  结束收敛顺序「session_end → 停录像 → 封存 sidecar → 释放锁 → 删 Redis 键」，全程不依赖车端回执
+- **视频（`x-hunter-video-contract`）**：H.264（AGX Orin NVENC 硬编码）/ 720p@30fps / 2048–4096 kbps /
+  关键帧 1s；延迟预算 采集编码 ≤50ms + 网络 ≤100ms + 解码渲染 ≤30ms（合计 ≤200ms）；SRS 5.0 转发
+- **操控记录（`x-hunter-history-archive`，方案 A，用户已确认）**：**不新增数据库表 / ORM / Alembic**；
+  会话态唯一来源 Redis `rc:session:{vehicle_id}`；操控记录 = MinIO `hunter-video` 录像
+  `remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.mp4` + 同目录 sidecar JSON（保留 90 天）；
+  代价：历史查询无 SQL 过滤/聚合能力（必须带日期前缀收敛，`RC_HISTORY_QUERY_MAX_RANGE_DAYS` 默认 31）
+- **Kafka（`x-hunter-kafka`）**：生产 `hunter.{vehicle_id}.remote_control` 与 `hunter.{vehicle_id}.command`
+  （会话开始/结束信令）；消费 `hunter.*.command_result`（消费组 `remote-control-command-result`，手动提交 + DLQ）——
+  `contracts/kafka/` 相关条目**均已登记，本契约零改动**
+- **数据访问边界**：无业务表（`remote_control` schema 为预留）；只读 Redis 读模型
+  `vehicle:status:{vehicle_id}` / `vehicle:online:set`（权威值属 vehicle-service）；不跨服务直连 DB
+- **⚠ 待核对项**（全量 20 项见契约 `x-hunter-pending-confirmation`，其中 `blocking=true` **8 项**：
+  #2 Redis 车辆状态字段清单 / #10 SRS 应用名与流名 / #12 新增环境变量同步 K8s / #14 多副本 WS 故障转移与粘性路由 /
+  #15 WS 子路径拆分 / #16 操控指令 `command_id` 缺失（回执精确关联）/ #17 会话信令 `command_type` 取值 /
+  #20 WS 握手 JWT 传送方式）：
+  操控记录载体能力边界、Redis 车辆状态字段清单、`block_reason` 值域、会话状态名与心跳阈值、Redis 键残留窗口、
+  多副本统计聚合、查询跨度默认值、按 session_id 检索成本、`/readyz` 保留 database 项、SRS 应用名/流名、
+  `rc:lock:{vehicle_id}` 键登记、新增环境变量同步 K8s、车辆读模型写入方、WS 故障转移与粘性路由、
+  WS 子路径拆分、操控指令 `command_id` 缺失（回执精确关联）、`command_type` 取值域（会话信令）、
+  `target_steer` 限幅与转角量程、H.264 profile、WS 握手 JWT 传送方式
+
 ## 校验命令
 
 ```bash
@@ -163,6 +202,14 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 
 # OTA 管理契约 ↔ 设计文档 8/9/12.5 节 ↔ DDL（ota_* 三表）↔ Kafka 契约（ota_notify/ota_status）↔ K8s 清单
 # （契约测试随 ota-service 实现步骤落地）
+
+# 远程操控契约 ↔ 设计文档 15 节安全约束 / 12.6 节（原文缺失 → 推导）↔ Kafka 契约（remote_control/command_result）
+# ↔ MinIO hunter-video 归档 ↔ K8s 清单（含 RC_* 环境变量；契约测试随 remote-control 实现步骤落地）
+cd services/remote-control && pytest app/tests/test_remote_control_contract.py -q
+
+# 契约文件本身的静态校验（Step 1 即可运行，无需服务）
+python -c "import yaml; yaml.safe_load(open('contracts/openapi/remote-control.yaml', encoding='utf-8'))"
+python -c "import json,glob; [json.load(open(f, encoding='utf-8')) for f in glob.glob('contracts/kafka/schemas/*.json')]"
 ```
 
 > 命名约定：各服务契约测试文件使用唯一文件名（如 `test_scene_contract.py`），
