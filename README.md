@@ -199,7 +199,7 @@ alembic -c common/python/alembic.ini upgrade head
 # 2) 离线生成 SQL（无需数据库，CI/DBA 评审）
 alembic -c common/python/alembic.ini upgrade head --sql > /tmp/hunter_ddl.sql
 
-# 3) 契约一致性校验：DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema（24 项，无需数据库）
+# 3) 契约一致性校验：DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema + Redis Key + MinIO（26 项，无需数据库）
 python scripts/verify_data_layer.py
 ```
 
@@ -209,6 +209,8 @@ python scripts/verify_data_layer.py
 | ER / 受控词表 | `contracts/database/er.md`、`enums.md` | 关系与跨 schema 只读例外；车辆 8 态 / 事件 18 种类型 3 级等级 / OTA 9 态状态机 |
 | Kafka Topic | `contracts/kafka/topics.yaml`、`consumer-groups.yaml` | 车端 9 个 + 平台内部 6 个 Topic（分区/副本/acks/保留/key）；12 个消费者组（手动提交 + DLQ + 幂等键） |
 | 消息 Schema | `contracts/kafka/schemas/*.schema.json` | 11 个 draft-07 JSON Schema（telemetry/event/health/command/command_result/ota_notify/ota_status/remote_control/analytics_result/sensor_file/alert_event），自带设计文档示例 |
+| Redis Key | `contracts/database/redis-keys.yaml` | 缓存契约（设计文档 9.5 节 + 约束第 8 条）：8 个受控键（7 个约定键 + `rc:lock:{vehicle_id}` 派生键）的类型 / TTL / 字段结构 / 失效路径 / 读写方 / 跨服务引用 |
+| 对象存储 | `contracts/database/object-storage.yaml` | MinIO 契约（设计文档 9.4.1/9.4.2 节 + 约束第 7、9 条）：7 个 Bucket 的生命周期（`hunter-rosbag` 前缀级 `regular/` 30 天 + `events/` 永久）/ SSE-S3 / 读写方 / 对象键约定，预签名策略（上传 3600s / 下载 900s / Range / 禁止落日志） |
 
 要点：
 
@@ -217,6 +219,13 @@ python scripts/verify_data_layer.py
 - **通用 Repository**：`BaseRepository`（CRUD + 分页 + 软删除 + `ON CONFLICT DO NOTHING` 批量写入），默认过滤软删除记录，非法字段抛 2001
 - **写入性能路径**：时序/事件走 `bulk_create*`（executemany 分片），支撑遥测入库延迟 ≤ 1s、时序写入 ≥ 10000 点/秒
 - **⚠ 待核对项**（设计文档 15.2/9/5.3 到位后回填）：`vehicle_svc`/`user_svc` schema 归属、`scenes.version` 类型、`scenes.scene_type`、`ota_versions.release_type/status`、`data_analytics` 报告/评估结果元信息缺表（落 MinIO `hunter-reports`）
+
+存储契约（Redis / MinIO）要点：
+
+- **单一事实来源**：Cache 与对象存储的键模式、Bucket 名称、生命周期、预签名有效期只在两份 YAML 中定义；各服务 OpenAPI 的 `x-hunter-service.redis_keys` / `minio_buckets` 是**声明**而非定义，校验器逐项比对键模式 / 类型 / TTL / 读写方 / 生命周期天数，声明未登记资源即失败（禁止实现侧发明 Redis 前缀或新 Bucket）
+- **三方一致**：MinIO 契约 ↔ `infra/docker/minio/init-buckets.sh` ↔ `infra/k8s/jobs/minio-init-job.yaml`（`create_bucket` 集合、`add_expiry` 天数、`encrypt_bucket` SSE-S3 覆盖 7 个 Bucket）；Redis 契约 ↔ 6 份服务契约（兼容「对象列表」与 `{read: [...]}` 两种既有声明形态）
+- **校验器条目**：`verify_data_layer.py` 校验 9（Redis Key）、校验 10（对象存储）；单测见 `common/python/tests/test_storage_contracts.py`
+- **⚠ 待确认项**（`x-hunter-pending-confirmation` 共 15 项 / 标阻塞 8 项）：Redis —— `vehicle:status:{vehicle_id}` 字段清单与写入方归属、`rc:lock:{vehicle_id}` 派生键登记、**网关登出 Token 黑名单键模式缺失（安全缺陷）**；对象存储 —— 对象键是否含 Bucket 名前缀、**`hunter-rosbag` `regular/` 前缀与 5.5 节命名规范冲突（现行命名 rosbag 不匹配任何过期规则 → 永久占用）**、分片上传 `part_size_bytes` 未定、MinIO 配置项未进入 `hunter_common.config`
 
 ## 接口契约（OpenAPI）
 
@@ -301,7 +310,8 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 | MinIO Bucket | 浏览器打开 `http://localhost:9001`（7 个 Bucket：hunter-raw-data / rosbag / video / ota-packages / reports / logs / scene-assets） |
 | Redis | `docker exec hunter-redis redis-cli ping` |
 | 共享库测试 | `pytest common/python/tests -q` |
-| 数据层契约校验 | `python scripts/verify_data_layer.py`（DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema，24 项） |
+| 数据层契约校验 | `python scripts/verify_data_layer.py`（DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema + Redis Key + MinIO，26 项） |
+| 存储契约单元测试 | `pytest common/python/tests/test_storage_contracts.py -q`（Redis Key / MinIO Bucket ↔ 服务声明 ↔ 初始化脚本，9 项） |
 | 接口契约校验 | `pytest services/api-gateway/app/tests/test_openapi_contract.py -q`（OpenAPI ↔ 实现 ↔ K8s 清单，29 项） |
 | 场景契约校验 | `cd services/scene-service && pytest app/tests/test_scene_contract.py -q`（契约 ↔ 设计文档 4 章/12.2 节 ↔ DDL ↔ Kafka ↔ K8s，29 项） |
 | 数据采集契约校验 | `cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q`（契约 ↔ 设计文档 5 章 ↔ DDL ↔ Kafka ↔ K8s，30 项） |
@@ -330,6 +340,6 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 ## 文档
 
 - `docs/`：设计文档索引与开发文档
-- `contracts/`：接口契约（数据库 DDL/ER/受控词表、Kafka Topic 清单/消费者组/11 个消息 JSON Schema 已完成；OpenAPI 已完成 api-gateway / scene-service / data-collector / data-analytics / ota-service / remote-control，六个服务契约齐备）
+- `contracts/`：接口契约（数据库 DDL/ER/受控词表 + Redis Key / MinIO 对象存储契约、Kafka Topic 清单/消费者组/11 个消息 JSON Schema 已完成；OpenAPI 已完成 api-gateway / scene-service / data-collector / data-analytics / ota-service / remote-control，六个服务契约齐备）
 - `release.md`：版本变更记录
 

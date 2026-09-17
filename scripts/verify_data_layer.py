@@ -10,6 +10,10 @@
   6. Kafka Topic 契约三处同步（contracts/kafka/topics.yaml、docker create-topics.sh、K8s kafka-init Job）
   7. JSON Schema（draft-07）：结构合法、required 非空、examples 通过自身校验
   8. consumer-groups.yaml 消费的 Topic 均已登记、消费者组 ID 唯一
+  9. Redis 键契约（contracts/database/redis-keys.yaml）↔ 各服务 x-hunter-service.redis_keys
+     （键模式 / 类型 / TTL / 读写方归属；8 个受控键与系统约束第 8 条一致）
+ 10. 对象存储契约（contracts/database/object-storage.yaml）↔ docker 与 K8s MinIO 初始化脚本
+     ↔ 各服务 x-hunter-service.minio_buckets / minio_bucket_lifecycle / 预签名 TTL（三方一致）
 
 用法：python scripts/verify_data_layer.py
 退出码：0 全部通过；1 存在失败项
@@ -33,6 +37,11 @@ SCHEMA_DIR = KAFKA_CONTRACT_DIR / "schemas"
 COMPOSE_TOPICS_SCRIPT = ROOT / "infra" / "docker" / "kafka" / "create-topics.sh"
 K8S_TOPICS_JOB = ROOT / "infra" / "k8s" / "jobs" / "kafka-init-job.yaml"
 ALEMBIC_INI = ROOT / "common" / "python" / "alembic.ini"
+SERVICE_CONTRACT_DIR = ROOT / "contracts" / "openapi"
+REDIS_CONTRACT = DB_CONTRACT_DIR / "redis-keys.yaml"
+OBJECT_STORAGE_CONTRACT = DB_CONTRACT_DIR / "object-storage.yaml"
+MINIO_DOCKER_INIT = ROOT / "infra" / "docker" / "minio" / "init-buckets.sh"
+MINIO_K8S_INIT = ROOT / "infra" / "k8s" / "jobs" / "minio-init-job.yaml"
 
 sys.path.insert(0, str(ROOT / "common" / "python"))
 
@@ -88,6 +97,48 @@ EXPECTED_VEHICLE_TOPICS: dict[str, tuple[int, str, str]] = {
     "hunter.broadcast.command": (3, "all", "按需"),
 }
 
+#: Redis 受控键契约（键模式 → (类型, TTL 秒)；None = 不过期）——来源：系统关键约束第 8 条
+#: 改动需同步 contracts/database/redis-keys.yaml 与各服务 x-hunter-service.redis_keys 声明
+EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
+    "session:{user_id}": ("String", 7200),
+    "vehicle:status:{vehicle_id}": ("Hash", None),
+    "vehicle:online:set": ("Set", None),
+    "rate_limit:{ip}:{api}": ("String", 60),
+    "ota:progress:{task_id}": ("Hash", 86400),
+    "rc:session:{vehicle_id}": ("Hash", None),
+    "cache:scene:{scene_id}": ("String(JSON)", 3600),
+    "rc:lock:{vehicle_id}": ("String", 30),
+}
+
+#: MinIO Bucket 契约（名称 → 过期天数；None = 永久）——来源：系统关键约束第 7 条（名称不可更改）
+EXPECTED_BUCKETS: dict[str, int | None] = {
+    "hunter-raw-data": 30,
+    "hunter-rosbag": 30,  # 前缀级规则：regular/ 30 天，events/ 永久（见 EXPECTED_ROSBAG_PREFIX_DAYS）
+    "hunter-video": 90,
+    "hunter-ota-packages": None,
+    "hunter-reports": None,
+    "hunter-logs": 30,
+    "hunter-scene-assets": None,
+}
+
+#: hunter-rosbag 前缀级生命周期（前缀 → 过期天数；None = 无过期规则 = 永久）
+EXPECTED_ROSBAG_PREFIX_DAYS: dict[str, int | None] = {"regular/": 30, "events/": None}
+
+#: 预签名 URL 有效期（系统关键约束第 7 条：上传 1 小时 / 下载 15 分钟）
+EXPECTED_PRESIGN_TTL: dict[str, int] = {
+    "upload_expires_in_seconds": 3600,
+    "download_expires_in_seconds": 900,
+}
+
+#: 各服务契约必须声明的预签名 TTL 集合（object-storage.yaml cross_check 第 3 条）
+EXPECTED_SERVICE_PRESIGN_TTL: dict[str, set[int]] = {
+    "data-collector": {3600, 900},
+    "data-analytics": {3600, 900},
+    "ota-service": {3600, 900},
+    "scene-service": {900},
+    "remote-control": {900},
+}
+
 #: 必须存在的消息 Schema（topic/pattern → schema 文件）
 EXPECTED_SCHEMAS_FILES = (
     "telemetry.schema.json",
@@ -121,6 +172,15 @@ COLUMN_STOP_WORDS = {
     "COLLATE",
     "CONSTRAINT",
 }
+
+#: MinIO 初始化脚本解析（docker init-buckets.sh 与 K8s Job 内嵌脚本同格式）
+MINIO_CREATE_BUCKET_RE = re.compile(r'create_bucket\s+"([\w.-]+)"')
+MINIO_ADD_EXPIRY_RE = re.compile(r'add_expiry\s+"([\w.-]+)"\s+(\d+)(?:\s+"([^"]*)")?')
+MINIO_ENCRYPT_BUCKET_RE = re.compile(r'encrypt_bucket\s+"([\w.-]+)"')
+#: 契约中以配置键形式声明的预签名 TTL（如 remote-control：RC_PRESIGNED_DOWNLOAD_EXPIRE_SECONDS（默认 900））
+PRESIGN_CONFIG_TTL_RE = re.compile(r"[A-Z_]*(?:PRESIGN)[A-Z_]*(?:EXPIRE)[A-Z_]*（默认\s*(\d+)）")
+#: Redis 键命名规范 <domain>:<entity>[:<qualifier>]（全小写 + 冒号分隔 + 花括号占位符）
+REDIS_KEY_NAMING_RE = re.compile(r"^[a-z0-9_:{}-]+$")
 
 failures: list[str] = []
 checks: list[str] = []
@@ -665,6 +725,275 @@ def check_consumer_groups() -> None:
         ok(f"消费者组契约合法（{len(groups)} 个组，订阅 Topic 均已登记、幂等键齐备）")
 
 
+def normalize_redis_declarations(node: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """归一化 ``x-hunter-service.redis_keys`` 声明（返回（字段可比对声明, 宽松字符串声明））。
+
+    兼容两种既有形态（结构统一列为 redis-keys.yaml 待确认 #8）：
+    1) 对象列表：``[{pattern, type, ttl_seconds, usage}, ...]``
+    2) 只读映射：``{note: ..., read: ["vehicle:status:{vehicle_id}", ...]}``
+    """
+    if isinstance(node, list):
+        return [item for item in node if isinstance(item, dict) and item.get("pattern")], []
+    if isinstance(node, dict):
+        entries: list[dict[str, Any]] = []
+        loose: list[str] = []
+        for section in ("read", "write"):
+            for item in node.get(section) or []:
+                if isinstance(item, str):
+                    loose.append(item)
+                elif isinstance(item, dict) and item.get("pattern"):
+                    entries.append(item)
+        return entries, loose
+    return [], []
+
+
+def check_redis_keys() -> None:
+    """校验 9：Redis 键契约 ↔ 各服务 OpenAPI 声明（键模式 / 类型 / TTL / 读写方归属）。"""
+    contract = load_yaml(REDIS_CONTRACT)
+    before = len(failures)
+
+    keys: dict[str, dict[str, Any]] = {
+        str(entry.get("pattern")): entry for entry in contract.get("keys") or []
+    }
+    if set(keys) != set(EXPECTED_REDIS_KEYS):
+        fail(
+            f"Redis 键契约清单不一致: 契约={sorted(keys)} 期望={sorted(EXPECTED_REDIS_KEYS)}"
+            "（新增/删除键模式必须先改系统约束第 8 条）"
+        )
+    for pattern, (expected_type, expected_ttl) in EXPECTED_REDIS_KEYS.items():
+        entry = keys.get(pattern)
+        if entry is None:
+            continue
+        if entry.get("type") != expected_type:
+            fail(f"Redis 键 {pattern}: type={entry.get('type')} != {expected_type}")
+        if entry.get("ttl_seconds") != expected_ttl:
+            fail(f"Redis 键 {pattern}: ttl_seconds={entry.get('ttl_seconds')} != {expected_ttl}")
+        if not str(entry.get("lifecycle") or "").strip():
+            fail(f"Redis 键 {pattern}: 必须显式声明失效路径（lifecycle）")
+        if expected_ttl is None:
+            ops = " ".join(str(op) for op in entry.get("ops") or [])
+            if "DEL" not in ops and "SREM" not in ops:
+                fail(f"Redis 键 {pattern}: 无 TTL 时必须声明主动清理（ops 需含 DEL / SREM）")
+        if not (entry.get("writers") and entry.get("readers")):
+            fail(f"Redis 键 {pattern}: writers / readers 不能为空（键归属必须明确）")
+        if not REDIS_KEY_NAMING_RE.match(pattern):
+            fail(f"Redis 键命名不符 <domain>:<entity>[:<qualifier>] 规范（全小写冒号分隔）: {pattern}")
+        owner = entry.get("owner_service")
+        allowed = set(entry.get("writers") or []) | set(entry.get("readers") or [])
+        if owner is not None and owner not in allowed:
+            fail(f"Redis 键 {pattern}: owner_service={owner} 既非 writers 也非 readers")
+
+    # 各服务契约声明 ↔ 本契约（cross_check.contracts 为声明文件清单的单一事实来源）
+    declared_files = [
+        str(rel) for rel in (contract.get("cross_check") or {}).get("contracts") or []
+    ]
+    for rel in declared_files:
+        path = ROOT / rel
+        if not path.is_file():
+            fail(f"Redis 契约 cross_check 引用的契约文件不存在: {rel}")
+            continue
+        service = path.stem
+        node = (load_yaml(path).get("x-hunter-service") or {}).get("redis_keys")
+        entries, loose = normalize_redis_declarations(node)
+        for pattern in loose + [str(entry.get("pattern")) for entry in entries]:
+            target = keys.get(pattern)
+            if target is None:
+                fail(f"{service}: 声明了契约未登记的 Redis 键 {pattern}")
+                continue
+            allowed = set(target.get("writers") or []) | set(target.get("readers") or [])
+            if service not in allowed:
+                fail(f"{service}: 声明使用 {pattern} 但不在契约 writers ∪ readers 中")
+        for entry in entries:
+            target = keys.get(str(entry.get("pattern")))
+            if target is None:
+                continue
+            if entry.get("type") is not None and entry.get("type") != target.get("type"):
+                fail(
+                    f"{service}: {entry['pattern']} 类型 {entry.get('type')} "
+                    f"!= 契约 {target.get('type')}"
+                )
+            if "ttl_seconds" in entry and entry.get("ttl_seconds") != target.get("ttl_seconds"):
+                fail(
+                    f"{service}: {entry['pattern']} ttl_seconds={entry.get('ttl_seconds')} "
+                    f"!= 契约 {target.get('ttl_seconds')}"
+                )
+
+    if len(failures) == before:
+        ok(
+            f"Redis 键契约一致（{len(keys)} 个受控键 ↔ {len(declared_files)} 份服务契约声明，"
+            "键模式 / 类型 / TTL / 读写方全部匹配）"
+        )
+
+
+def expected_expiry_rules() -> dict[str, list[tuple[int, str | None]]]:
+    """由契约基准值推导 MinIO 生命周期期望（bucket → [(过期天数, 前缀), ...]）。"""
+    rules: dict[str, list[tuple[int, str | None]]] = {
+        name: ([] if days is None else [(days, None)]) for name, days in EXPECTED_BUCKETS.items()
+    }
+    # hunter-rosbag 为前缀级规则（events/ 无过期规则 → 永久）
+    rules["hunter-rosbag"] = [
+        (days, prefix) for prefix, days in EXPECTED_ROSBAG_PREFIX_DAYS.items() if days is not None
+    ]
+    return rules
+
+
+def collect_presign_ttls(node: Any, in_presign: bool = False) -> list[int]:
+    """递归收集契约中的预签名有效期声明（预签名上下文 + 键名含 expire 的整数值）。"""
+    found: list[int] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            name = str(key).lower()
+            context = in_presign or "presign" in name
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int) and context and "expire" in name:
+                found.append(value)
+            elif isinstance(value, (dict, list)):
+                found.extend(collect_presign_ttls(value, context))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(collect_presign_ttls(item, in_presign))
+    return found
+
+
+def check_object_storage() -> None:
+    """校验 10：对象存储契约 ↔ MinIO 初始化脚本 ↔ 各服务契约（Bucket/生命周期/预签名/SSE）。"""
+    contract = load_yaml(OBJECT_STORAGE_CONTRACT)
+    before = len(failures)
+
+    buckets: dict[str, dict[str, Any]] = {
+        str(entry.get("name")): entry for entry in contract.get("buckets") or []
+    }
+    if set(buckets) != set(EXPECTED_BUCKETS):
+        fail(
+            f"MinIO Bucket 契约清单不一致: 契约={sorted(buckets)} 期望={sorted(EXPECTED_BUCKETS)}"
+            "（Bucket 名称不可更改，也不可新增）"
+        )
+    for name, expected_days in EXPECTED_BUCKETS.items():
+        entry = buckets.get(name)
+        if entry is None:
+            continue
+        lifecycle = entry.get("lifecycle") or {}
+        mode = lifecycle.get("mode")
+        if mode == "expire":
+            if lifecycle.get("expire_days") != expected_days:
+                fail(
+                    f"Bucket {name}: expire_days={lifecycle.get('expire_days')} != {expected_days}"
+                )
+        elif mode == "permanent":
+            if expected_days is not None or lifecycle.get("expire_days") is not None:
+                fail(f"Bucket {name}: 永久保留但声明 expire_days={lifecycle.get('expire_days')}")
+        elif mode == "mixed":
+            rules = {
+                str(rule.get("prefix")): rule.get("expire_days")
+                for rule in lifecycle.get("rules") or []
+            }
+            if rules != EXPECTED_ROSBAG_PREFIX_DAYS:
+                fail(f"Bucket {name}: 前缀生命周期 {rules} != {EXPECTED_ROSBAG_PREFIX_DAYS}")
+        else:
+            fail(f"Bucket {name}: 非法生命周期 mode={mode}")
+        if not (entry.get("writers") and entry.get("readers")):
+            fail(f"Bucket {name}: writers / readers 不能为空")
+        if entry.get("sse") != "sse-s3":
+            fail(f"Bucket {name}: 必须启用 SSE-S3 服务端加密（数据安全约束）")
+
+    presign = contract.get("presign_policy") or {}
+    for field, expected in EXPECTED_PRESIGN_TTL.items():
+        if presign.get(field) != expected:
+            fail(f"预签名策略 {field}={presign.get(field)} != {expected}")
+    if presign.get("range_download") is not True:
+        fail("预签名策略必须支持 Range 分片下载（大文件断点续传）")
+    if presign.get("url_logging") != "forbidden":
+        fail("预签名 URL 禁止落日志（presign_policy.url_logging 必须为 forbidden）")
+
+    # MinIO 初始化脚本（docker 与 K8s Job 两处必须与契约一致）
+    expected_rules = expected_expiry_rules()
+    for script in (MINIO_DOCKER_INIT, MINIO_K8S_INIT):
+        rel = script.relative_to(ROOT).as_posix()
+        if not script.is_file():
+            fail(f"缺少 MinIO 初始化脚本: {rel}")
+            continue
+        text = script.read_text(encoding="utf-8")
+        created = MINIO_CREATE_BUCKET_RE.findall(text)
+        if set(created) != set(EXPECTED_BUCKETS) or len(created) != len(EXPECTED_BUCKETS):
+            fail(
+                f"{rel}: create_bucket 集合 {sorted(set(created))} != 契约 {sorted(EXPECTED_BUCKETS)}"
+            )
+        actual: dict[str, list[tuple[int, str | None]]] = {}
+        for bucket, days, prefix in MINIO_ADD_EXPIRY_RE.findall(text):
+            actual.setdefault(bucket, []).append((int(days), prefix or None))
+        for bucket, rules in expected_rules.items():
+            if sorted(actual.get(bucket, [])) != sorted(rules):
+                fail(
+                    f"{rel}: {bucket} 生命周期 {sorted(actual.get(bucket, []))} "
+                    f"!= 契约 {sorted(rules)}"
+                )
+        for bucket in actual:
+            if bucket not in EXPECTED_BUCKETS:
+                fail(f"{rel}: 为未登记 Bucket {bucket} 配置了生命周期规则")
+
+    k8s_text = MINIO_K8S_INIT.read_text(encoding="utf-8") if MINIO_K8S_INIT.is_file() else ""
+    encrypted = set(MINIO_ENCRYPT_BUCKET_RE.findall(k8s_text))
+    if encrypted != set(EXPECTED_BUCKETS):
+        fail(f"minio-init-job.yaml: SSE-S3 未覆盖全部 Bucket: {sorted(encrypted)}")
+
+    # 各服务契约声明 ↔ 本契约（cross_check.service_contracts 为声明文件清单）
+    service_contracts = [
+        str(rel) for rel in (contract.get("cross_check") or {}).get("service_contracts") or []
+    ]
+    for rel in service_contracts:
+        path = ROOT / rel
+        if not path.is_file():
+            fail(f"对象存储契约 cross_check 引用的契约文件不存在: {rel}")
+            continue
+        service = path.stem
+        doc = load_yaml(path)
+        node = doc.get("x-hunter-service") or {}
+        for bucket in node.get("minio_buckets") or []:
+            entry = buckets.get(str(bucket))
+            if entry is None:
+                fail(f"{service}: 声明了契约未登记的 Bucket {bucket}（Bucket 名称不可更改）")
+                continue
+            allowed = set(entry.get("writers") or []) | set(entry.get("readers") or [])
+            if service not in allowed:
+                fail(f"{service}: 声明使用 {bucket} 但不在契约 writers ∪ readers 中")
+        for bucket, text in (node.get("minio_bucket_lifecycle") or {}).items():
+            if str(bucket) not in EXPECTED_BUCKETS:
+                continue
+            declared_days = [int(value) for value in re.findall(r"(\d+)\s*天", str(text))]
+            expected_days = EXPECTED_BUCKETS[str(bucket)]
+            if expected_days is None:
+                if declared_days:
+                    fail(f"{service}: {bucket} 声明 {declared_days} 天，与契约「永久保留」不一致")
+            elif expected_days not in declared_days:
+                fail(
+                    f"{service}: {bucket} 生命周期未声明 {expected_days} 天"
+                    f"（文本：{str(text)[:40]}...）"
+                )
+        # 预签名 TTL（契约 cross_check 第 3 条：上传 3600s / 下载 900s）
+        raw_text = path.read_text(encoding="utf-8")
+        ttls = set(collect_presign_ttls(doc)) | {
+            int(value) for value in PRESIGN_CONFIG_TTL_RE.findall(raw_text)
+        }
+        required = EXPECTED_SERVICE_PRESIGN_TTL.get(service)
+        if required is not None:
+            missing = sorted(required - ttls)
+            if missing:
+                fail(f"{service}: 未声明预签名 TTL {missing}（契约：上传 3600s / 下载 900s）")
+        unexpected = sorted(ttls - set(EXPECTED_PRESIGN_TTL.values()))
+        if unexpected:
+            fail(
+                f"{service}: 预签名 TTL {unexpected} 不属于契约允许值 "
+                f"{sorted(set(EXPECTED_PRESIGN_TTL.values()))}"
+            )
+
+    if len(failures) == before:
+        ok(
+            f"对象存储契约一致（{len(buckets)} 个 Bucket ↔ 2 份初始化脚本 ↔ "
+            f"{len(service_contracts)} 份服务契约：生命周期 / 预签名 TTL / 读写方全部匹配）"
+        )
+
+
 def main() -> int:
     # Windows 控制台默认 GBK：显式以 UTF-8 输出，避免契约符号（↔ / ⚠）编码失败
     for stream in (sys.stdout, sys.stderr):
@@ -682,6 +1011,8 @@ def main() -> int:
     check_kafka_topics()
     check_json_schemas()
     check_consumer_groups()
+    check_redis_keys()
+    check_object_storage()
     print("-" * 78)
     for line in checks:
         print(line)
@@ -693,5 +1024,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

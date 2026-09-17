@@ -1,0 +1,251 @@
+# =====================================================================
+# HunterEdge Redis Key 契约（单一事实来源）
+#
+# 来源：系统关键约束第 8 条「Redis Key 设计（不可更改命名模式）」+ 设计文档 9.5 节
+# 客户端：redis-py 异步封装 hunter_common/redis.py（RedisManager，进程级单例）
+# 校验：scripts/verify_data_layer.py（本契约 ↔ 各服务 OpenAPI x-hunter-service.redis_keys）
+#       + common/python/tests/test_storage_contracts.py
+#
+# 规则（禁止绕过）：
+#   1) 本文件的键模式是唯一来源：禁止在任何服务中新增键模式或改写拼写（含大小写与分隔符）
+#   2) 键值拼接必须经共享库键构造常量（Step 2 落地），业务代码禁止硬编码键字面量
+#   3) 变更顺序：先改本文件 → 再改受影响服务契约（x-hunter-service.redis_keys）→ 最后改实现
+# =====================================================================
+
+version: 1
+source: "系统关键约束第 8 条（Redis Key 设计）；设计文档 9.5 节"
+engine: "Redis 7.x（AOF 持久化，maxmemory-policy=noeviction）"
+client: "redis-py 异步（hunter_common.redis.RedisManager）"
+
+naming:
+  convention: "<domain>:<entity>[:<qualifier>]"
+  rules:
+    - "全小写，冒号分隔；占位符统一使用花括号（如 {vehicle_id}）"
+    - "键模式（含占位符）为契约常量；实际键 = 模式替换占位符后的字符串"
+    - "禁止为环境/租户隔离新增前缀（隔离由 Redis 实例与 db 编号承担）"
+  db_index: 0
+
+key_builder:
+  runtime_helper: "hunter_common.redis.RedisManager（get/set/delete/exists/incr_with_expire/acquire_lock）"
+  constants_module: null
+  status: pending_confirmation
+  note: "⚠ 键构造常量的模块位置与函数签名（如 hunter_common/redis_keys.py 的 vehicle_status_key()）在 Step 2 落地并回填本字段"
+
+common_rules:
+  - "禁止在任何键值中写入明文密码/私钥/证书；session:{user_id} 值为 JWT，必须受日志脱敏规则保护（不落日志/审计/异常响应）"
+  - "计数类键必须使用 INCR + EXPIRE(NX) 原子组合（hunter_common.redis.RedisManager.incr_with_expire），禁止先读后写导致窗口语义漂移"
+  - "每个键必须显式声明失效路径（主动 DEL 或 TTL），禁止出现无失效路径的键"
+  - "强依赖键（session / rc:session / rc:lock）不可用时返回 HTTP 503 + code=5001，禁止降级为无会话或无锁模式"
+  - "只读键（如 data-analytics / ota-service / remote-control 读 vehicle:status:*）禁止由读取方写入，写方以本契约 writers 为准"
+
+keys:
+  # ---------------------------------------------------------------- 1
+  - pattern: "session:{user_id}"
+    type: "String"
+    value: "JWT Access Token 字符串（原样存储）"
+    ttl_seconds: 7200
+    ttl_source: "系统约束第 8 条（2 小时）；与 HunterBaseConfig.jwt_access_token_expire_minutes=120 一致"
+    owner_service: api-gateway
+    writers: [api-gateway]
+    readers: [api-gateway]
+    lifecycle: "登录成功写入；刷新 Token 时覆盖；登出时 DEL，同时将 Access Token 加入黑名单直至其自然过期"
+    sensitive: true
+    ops: ["SET key value EX 7200", "GET", "EXISTS", "DEL"]
+    refs: ["contracts/openapi/api-gateway.yaml（POST /api/v1/user/login、POST /api/v1/user/logout）"]
+
+  # ---------------------------------------------------------------- 2
+  - pattern: "vehicle:status:{vehicle_id}"
+    type: "Hash"
+    value: "车辆最新状态读模型（写入方持续覆盖，读取方只读）"
+    ttl_seconds: null
+    ttl_source: "系统约束第 8 条（不过期，持续更新）"
+    owner_service: null
+    owner_service_note: "⚠ 归属待确认：模块表仅定义 6 个微服务，无 vehicle-service；当前写入方为 data-collector（health 消息消费）"
+    writers: [data-collector]
+    readers: [data-analytics, ota-service, remote-control]
+    lifecycle: "随 hunter.{vehicle_id}.health（1Hz）与遥测消息持续 HSET 覆盖；车辆下线不删除键（在线判定以 vehicle:online:set 为准）"
+    sensitive: false
+    ops: ["HSET key field value [field value ...]", "HGETALL", "HGET", "HDEL"]
+    fields_status: pending_confirmation
+    fields_draft:
+      - {name: vehicle_id, type: string, source: "键名占位符冗余（便于 HGETALL 直取）", status: required}
+      - {name: status, type: "enum(车辆状态 8 态)", source: "health.status（受控词表见 contracts/database/enums.md）", status: required}
+      - {name: battery_soc, type: "int 0..100", source: "telemetry.chassis.battery_soc（OTA 升级门禁 ≥50%）", status: required}
+      - {name: vehicle_state, type: string, source: "telemetry.chassis.vehicle_state（升级门禁 P 档静止判定）", status: required}
+      - {name: updated_at, type: "epoch seconds", source: "health.timestamp（陈旧判定依据）", status: required}
+      - {name: network_latency_ms, type: number, source: "health.system.network_latency_ms", status: pending}
+      - {name: cpu_usage, type: "number 0..100", source: "health.system.cpu_usage", status: pending}
+      - {name: gpu_usage, type: "number 0..100", source: "health.system.gpu_usage", status: pending}
+      - {name: memory_usage_mb, type: integer, source: "health.system.memory_usage_mb", status: pending}
+      - {name: velocity, type: number, source: "telemetry.chassis.velocity（操控接管前速度判定 ≤2.0 m/s）", status: pending}
+      - {name: control_mode, type: string, source: "telemetry.chassis.control_mode", status: pending}
+      - {name: fault_code, type: integer, source: "telemetry.chassis.fault_code（故障态判定）", status: pending}
+    refs:
+      - "contracts/kafka/schemas/health.schema.json（写入来源）"
+      - "contracts/openapi/data-collector.yaml（写入方声明）"
+      - "contracts/openapi/ota-service.yaml（只读：升级门禁）"
+      - "contracts/openapi/remote-control.yaml（只读：接管判定，pending #2）"
+      - "contracts/openapi/data-analytics.yaml（只读：看板 fleet 块 HGETALL）"
+
+  # ---------------------------------------------------------------- 3
+  - pattern: "vehicle:online:set"
+    type: "Set"
+    value: "在线车辆集合，成员 = vehicle_id"
+    ttl_seconds: null
+    ttl_source: "系统约束第 8 条（不设过期时间）"
+    owner_service: data-collector
+    writers: [data-collector]
+    readers: [data-analytics, ota-service, remote-control]
+    lifecycle: "上线/收到遥测时 SADD；遥测中断 >10s 时 SREM（communication_loss 判定输入）"
+    sensitive: false
+    ops: ["SADD", "SREM", "SCARD", "SISMEMBER", "SMEMBERS"]
+    refs:
+      - "contracts/openapi/data-collector.yaml（写方声明）"
+      - "contracts/openapi/data-analytics.yaml（看板 SCARD 在线车辆数）"
+
+  # ---------------------------------------------------------------- 4
+  - pattern: "rate_limit:{ip}:{api}"
+    type: "String"
+    value: "窗口计数器（整数字符串）"
+    ttl_seconds: 60
+    ttl_source: "系统约束第 8 条（1 分钟）"
+    owner_service: api-gateway
+    writers: [api-gateway, scene-service, data-collector, data-analytics, ota-service, remote-control]
+    readers: [api-gateway, scene-service, data-collector, data-analytics, ota-service, remote-control]
+    lifecycle: "首次 INCR 时设置 TTL（EXPIRE NX），窗口结束自动过期，无需主动清理"
+    sensitive: false
+    ops: ["INCR", "EXPIRE key 60 NX", "GET"]
+    refs:
+      - "contracts/openapi/api-gateway.yaml#x-hunter-rate-limits（附录 D 五级限流 + 接口级 5/1/20 QPS）"
+      - "contracts/kafka/topics.yaml（车辆级：单车遥测 ≤100 msg/s、文件上传 ≤10 Mbps）"
+
+  # ---------------------------------------------------------------- 5
+  - pattern: "ota:progress:{task_id}"
+    type: "Hash"
+    value: "升级任务进度热点视图（权威快照在 ota_svc.ota_tasks.progress JSONB）"
+    ttl_seconds: 86400
+    ttl_source: "系统约束第 8 条（任务结束后 1 天）"
+    owner_service: ota-service
+    writers: [ota-service]
+    readers: [ota-service]
+    lifecycle: "任务创建时初始化；消费 hunter.{vehicle_id}.ota_status 时 HSET 累加；任务终态后不主动删除，按 TTL 自然过期（回落 DB 快照）"
+    sensitive: false
+    ops: ["HSET", "HINCRBY", "HGETALL", "EXPIRE key 86400"]
+    refs:
+      - "contracts/openapi/ota-service.yaml#x-hunter-service.redis_keys"
+      - "contracts/openapi/ota-service.yaml（GET /api/v1/ota/tasks/{task_id}/rollout 进度来源）"
+
+  # ---------------------------------------------------------------- 6
+  - pattern: "rc:session:{vehicle_id}"
+    type: "Hash"
+    value: "远程操控会话唯一事实来源（会话期间为权威态，结束后归档为 MinIO sidecar）"
+    ttl_seconds: null
+    ttl_source: "系统约束第 8 条（会话期间不过期）"
+    owner_service: remote-control
+    writers: [remote-control]
+    readers: [remote-control]
+    lifecycle: "会话创建 HSET；心跳刷新 last_heartbeat_at；结束时按「session_end → 停止转发/录像 → 封存 sidecar → 释放锁 → DEL rc:session」顺序清理"
+    sensitive: true
+    ops: ["HSET", "HINCRBY", "HGETALL", "EXISTS", "DEL"]
+    fields:
+      - {name: session_id, type: "string(UUID)", source: "会话创建时生成", status: required}
+      - {name: operator_id, type: "string(UUID)", source: "JWT sub（操作员）", status: required}
+      - {name: operator_name, type: string, source: "用户信息快照（禁止存 Token）", status: required}
+      - {name: started_at, type: "epoch seconds", source: "会话创建时刻（UTC）", status: required}
+      - {name: status, type: "enum(connecting/active/degraded/ended)", source: "contracts/openapi/remote-control.yaml#x-hunter-session-lifecycle", status: required}
+      - {name: seq_last, type: "integer", source: "服务端 INCR（指令序号，防伪造）", status: required}
+      - {name: last_heartbeat_at, type: "epoch seconds", source: "WS heartbeats 帧（前端每 10s）", status: required}
+      - {name: commands_sent, type: "integer", source: "20Hz 指令计数", status: required}
+      - {name: commands_acked, type: "integer", source: "command_result 回执计数", status: required}
+      - {name: video_object_key, type: string, source: "MinIO hunter-video 录像对象键", status: pending}
+      - {name: sidecar_object_key, type: string, source: "MinIO hunter-video sidecar JSON 对象键", status: pending}
+    refs: ["contracts/openapi/remote-control.yaml#x-hunter-service.redis_keys（⚠ pending #5 硬 TTL / 残留清理）"]
+
+  # ---------------------------------------------------------------- 7
+  - pattern: "cache:scene:{scene_id}"
+    type: "String(JSON)"
+    value: "场景详情缓存（SceneMeta + SceneConfig 序列化 JSON）"
+    ttl_seconds: 3600
+    ttl_source: "系统约束第 8 条（1 小时）"
+    owner_service: scene-service
+    writers: [scene-service]
+    readers: [scene-service]
+    lifecycle: "GET /api/v1/scene/{scene_id} 未命中时回填；场景写操作（更新/发布/归档/删除）后主动 DEL 失效"
+    sensitive: false
+    ops: ["SET key json EX 3600", "GET", "DEL"]
+    refs: ["contracts/openapi/scene-service.yaml#x-hunter-service.redis_keys"]
+
+  # ---------------------------------------------------------------- 8
+  - pattern: "rc:lock:{vehicle_id}"
+    type: "String"
+    value: "互斥锁持有者令牌（redis-py client.lock 生成随机值，禁止业务写入）"
+    ttl_seconds: 30
+    ttl_source: "契约推导（锁超时自动释放）；⚠ 见 x-hunter-pending-confirmation #3"
+    owner_service: remote-control
+    writers: [remote-control]
+    readers: [remote-control]
+    lifecycle: "创建会话前 acquire（hunter_common.redis.RedisManager.acquire_lock）；会话结束显式 release；异常退出由 30s 锁超时兜底"
+    sensitive: false
+    ops: ["SET key token NX PX 30000（client.lock）", "GET", "DEL（Lua 比对释放）"]
+    status: pending_confirmation
+    refs: ["contracts/openapi/remote-control.yaml#x-hunter-service.redis_keys（待正式登记：pending #11）"]
+
+# =====================================================================
+# 交叉校验（scripts/verify_data_layer.py / common/python/tests/test_storage_contracts.py）
+#   1) 各服务 openapi 的 x-hunter-service.redis_keys 声明的键 ∈ 本文件 keys[].pattern
+#   2) 声明中的 type / ttl_seconds 与本文件一致
+#   3) 声明键的服务 ∈ 本文件 writers ∪ readers
+#   4) 8 个受控键的 TTL 与系统约束第 8 条一致：session 7200 / rate_limit 60 /
+#      ota:progress 86400 / cache:scene 3600 / vehicle:* 与 rc:session 不过期（null）
+# =====================================================================
+cross_check:
+  contracts:
+    - contracts/openapi/api-gateway.yaml
+    - contracts/openapi/scene-service.yaml
+    - contracts/openapi/data-collector.yaml
+    - contracts/openapi/data-analytics.yaml
+    - contracts/openapi/ota-service.yaml
+    - contracts/openapi/remote-control.yaml
+  runtime:
+    - common/python/hunter_common/redis.py
+  infra:
+    - infra/k8s/base/01-configmap-common.yaml
+    - infra/k8s/statefulsets/redis.yaml
+
+x-hunter-pending-confirmation:
+  # 结构对齐各服务 OpenAPI 既有约定：{id, question, impact, contract_decision}（禁止自行发明键名）
+  items:
+    - id: 1
+      question: "vehicle:status:{vehicle_id} Hash 字段清单未定稿（当前 fields_draft 12 个字段，仅 status/battery_soc/vehicle_state/updated_at 标记 required，其余 pending）"
+      impact: "阻塞（blocking）：写入方 data-collector health 消费与读取方 data-analytics 看板 / ota-service 门禁 / remote-control 接管判定均依赖字段名，字段改名会造成跨服务静默破读；remote-control 契约 pending #2 同步等待"
+      contract_decision: "与写入方及三个读取方确认最终字段集与字段名，定稿后回填本文件 fields（去掉 draft 标记）与各服务契约；一经定稿不得再改"
+    - id: 2
+      question: "vehicle:status:{vehicle_id} 写入方归属未确认（模块表仅 6 个微服务，无 vehicle-service；当前 writers = [data-collector]，按 health/telemetry 消费路径推导）"
+      impact: "阻塞（blocking）：多写方会造成同一 Hash 字段互相覆盖（电量/状态滞后），影响 OTA 门禁与接管决策"
+      contract_decision: "明确唯一写方（data-collector 长期承担，或后续新增 vehicle-service 并改模块表/网关路由）；确认前实现只能由 data-collector 写"
+    - id: 3
+      question: "rc:lock:{vehicle_id} 未在系统约束第 8 条登记（由 redis-py client.lock 在 rc: 命名空间派生）"
+      impact: "阻塞（blocking）：键模式冻结前改名会造成锁分裂、同车多操作员互斥失效（违反 15 章互斥规则）"
+      contract_decision: "确认是否将该键正式纳入系统约束第 8 条；确认后键模式冻结（remote-control 契约 pending #11 同步）"
+    - id: 4
+      question: "rc:session:{vehicle_id} 无硬 TTL（ttl_seconds = null，会话期间不过期，依赖结束流程 DEL）"
+      impact: "非阻塞：remote-control 副本崩溃导致残留会话时，同车后续接管会被误判 7001（远程操控会话冲突）"
+      contract_decision: "确认是否设置硬 TTL（如 6h）并增加陈旧会话守护清理（判定依据：车辆状态非 remote_controlled 且无 WS 连接）"
+    - id: 5
+      question: "vehicle:online:set 无 TTL（离线由「遥测中断 >10s」SREM 触发，进程崩溃/漏删时会残留在线车辆）"
+      impact: "非阻塞：在线数量统计与「车辆不在线 4001」判定可能失真"
+      contract_decision: "确认是否增加周期性对账任务（比对 vehicles.last_online_time 后 SREM）"
+    - id: 6
+      question: "网关登出 Token 黑名单键模式缺失：api-gateway 契约声明「登出后 Access Token 加入黑名单直至自然过期（≥2h）」，但系统约束第 8 条 7 个键模式中无黑名单键"
+      impact: "阻塞（blocking）：登出后旧 Token 在有效期内仍可调用业务接口（安全缺陷，违反 9 章认证要求）"
+      contract_decision: "三选一：①新增受控键模式（先改系统约束第 8 条与本契约）②复用 session:{user_id} 语义（删除会话 + jti 校验替代黑名单）③黑名单键由网关定义并登记回本契约；禁止实现阶段自行发明键名"
+    - id: 7
+      question: "键构造常量模块位置与函数签名未定（当前 key_builder.constants_module = null，待 Step 2 落地）"
+      impact: "非阻塞：常量散落各服务会造成键拼写漂移（如 session 与 session: 前缀不一致）"
+      contract_decision: "确认常量/构造函数放置位置（建议 hunter_common/redis_keys.py）与命名（如 vehicle_status_key()、rate_limit_key(ip, api)）"
+    - id: 8
+      question: "各服务 Redis 键声明结构不统一：data-collector / ota-service / remote-control / scene-service 用「对象列表（pattern/type/ttl_seconds）」，data-analytics 用「read: [key, ...]」字符串列表"
+      impact: "非阻塞：校验器与测试需同时兼容两种形态，字段级比对在字符串列表形态下无法进行（丢失去重/类型校验能力）"
+      contract_decision: "统一为对象列表（推荐）或在校验器与测试中同时支持两种形式；统一后各服务契约同步调整"
+
+

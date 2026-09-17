@@ -1,0 +1,265 @@
+# =====================================================================
+# HunterEdge 对象存储（MinIO）契约（单一事实来源）
+#
+# 来源：系统关键约束第 7 条「MinIO Bucket 规划（名称与生命周期不可更改）」+ 第 9 条
+#       「数据安全：SSE-S3」+ 设计文档 5.5 节（文件上传命名规范）、6.5 节（报告产物）、
+#       6 章（OTA 升级包）、9.4.1/9.4.2 节（Bucket 与预签名 URL）
+# 客户端：minio-py（S3 兼容）；配置来自环境变量（MINIO_ENDPOINT / MINIO_ACCESS_KEY /
+#         MINIO_SECRET_KEY / MINIO_SECURE），禁止硬编码
+# 校验：scripts/verify_data_layer.py（本契约 ↔ docker/k8s 初始化脚本 ↔ 各服务 x-hunter-*）
+#       + common/python/tests/test_storage_contracts.py
+#
+# 规则（禁止绕过）：
+#   1) Bucket 名称、生命周期、SSE 策略以本文件为准；禁止新增 Bucket 或改期
+#   2) 预签名有效期固定「上传 3600s / 下载 900s」，禁止按接口随意调整（附录 D 与各服务契约一致）
+#   3) 对象键一律由服务端生成；客户端只能提供扩展名，禁止指定路径（防目录穿越）
+#   4) 预签名 URL 禁止落日志/审计/缓存（只记录 bucket + object_key）
+# =====================================================================
+
+version: 1
+source: "系统关键约束第 7 条（Bucket 规划）、第 9 条（SSE-S3）；设计文档 9.4.1 / 9.4.2 节"
+engine: "MinIO（纠删码模式，S3 兼容 API）"
+sse: "SSE-S3（服务端加密，7 个 Bucket 全部启用；密钥由 MINIO_KMS_SECRET_KEY 提供）"
+public_access: "全部 Bucket 私有（匿名访问禁止）；仅通过预签名 URL 或服务端代理访问"
+
+presign_policy:
+  upload_expires_in_seconds: 3600
+  download_expires_in_seconds: 900
+  upload_source: "系统关键约束第 7 条（上传有效期 1 小时）"
+  download_source: "系统关键约束第 7 条（下载有效期 15 分钟）"
+  range_download: true
+  range_note: "支持 HTTP Range 分片下载（前端 seek / 大文件续传）；服务端必须返回 Accept-Ranges: bytes 与 206 Partial Content"
+  multipart:
+    enabled: true
+    part_count_threshold: 2
+    note: "part_count > 1 时返回分片预签名 parts[]（OTA 版本包由 ota-service 契约规定）"
+    part_size_bytes: null
+    part_size_status: pending_confirmation
+  url_logging: forbidden
+  url_logging_note: "预签名 URL 含签名查询串，禁止写入日志/审计/Trace（只记 bucket + object_key）"
+  binding:
+    bound_to: "单一对象键（不绑定 IP，便于车端网络切换）"
+    max_urls_per_request: 1
+  upload_integrity:
+    stage: "complete/notify 阶段服务端校验（minio.stat_object 取实际 size；MD5/SHA-256 与上报值比对）"
+    on_mismatch: "code=6001（OTA 包）/ 复用 6001（data-collector 文件，见其 pending #5），对象按失败处置（不通知下游）"
+  download_authorization:
+    rule: "签发前必须校验调用者对目标车辆的 RBAC 数据权限；越权返回 1002（禁止先给 URL 后校验）"
+
+object_key_rules:
+  generated_by: "服务端（服务端持有 bucket/key 模板，客户端禁止提供路径）"
+  forbidden: ["..", "//", "\\", "绝对路径", "客户端指定 bucket"]
+  validation: "complete/notify 阶段必须校验 object_key 前缀 ∈ 允许前缀集合，否则返回 1002"
+  allowed_characters: "^[A-Za-z0-9._/-]+$（键内禁止空格、中文、控制字符）"
+
+buckets:
+  # ---------------------------------------------------------------- 1
+  - name: hunter-raw-data
+    purpose: "传感器原始数据（点云 / 图像）"
+    lifecycle:
+      mode: expire
+      expire_days: 30
+      prefix: null
+    sse: sse-s3
+    writers: [data-collector]
+    readers: [data-analytics]
+    object_key_conventions:
+      - pattern: "{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}"
+        style: bucket_included
+        example: "hunter-raw-data/HUNTER-001/2024-08-19/point_cloud/1724035200_12580.pcd"
+        declared_in: "contracts/openapi/data-collector.yaml#x-hunter-file-upload-flow.naming（5.5 节命名规范；date 为 UTC，data_type ∈ {point_cloud, camera_image, rosbag, video, other}）"
+    notes: "data_type → Bucket 映射见 data-collector x-hunter-file-upload-flow.bucket_mapping；整桶 30 天过期，事件相关原始数据需在 30 天内转存 hunter-rosbag/events/"
+
+  # ---------------------------------------------------------------- 2
+  - name: hunter-rosbag
+    purpose: "ROS Bag 文件（常规 + 事件）"
+    lifecycle:
+      mode: mixed
+      rules:
+        - {prefix: "regular/", expire_days: 30}
+        - {prefix: "events/", expire_days: null, note: "事件数据永久保留（无过期规则）"}
+    sse: sse-s3
+    writers: [data-collector, scene-service]
+    readers: [data-analytics]
+    object_key_conventions:
+      - pattern: "{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}"
+        style: bucket_included
+        example: "hunter-rosbag/HUNTER-001/2024-08-19/rosbag/1724035200_12580.bag"
+        declared_in: "contracts/openapi/data-collector.yaml#x-hunter-file-upload-flow.naming（data_type=rosbag）"
+      - pattern: "events/{...}"
+        style: bucket_excluded
+        status: pending_confirmation
+        declared_in: "未在任何服务契约中定义（仅 init-buckets.sh 约定 events/ 前缀永久保留）→ 见 pending #2"
+    notes: "⚠ 既有冲突：5.5 命名规范不含 regular/ 段，而生命周期规则只对 regular/ 前缀生效 → 按当前命名上传的常规 rosbag 不匹配任何过期规则（永久占用）；事件数据必须落 events/ 才能避免 30 天误删。定稿前禁止实现（见 pending #2）"
+
+  # ---------------------------------------------------------------- 3
+  - name: hunter-video
+    purpose: "远程操控录像（含 sidecar JSON 归档元信息）"
+    lifecycle:
+      mode: expire
+      expire_days: 90
+      prefix: null
+    sse: sse-s3
+    writers: [remote-control, data-collector]
+    readers: [remote-control]
+    object_key_conventions:
+      - pattern: "remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.mp4"
+        style: bucket_excluded
+        declared_in: "contracts/openapi/remote-control.yaml#x-hunter-history-archive.object_key_pattern.video"
+      - pattern: "remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.json"
+        style: bucket_excluded
+        declared_in: "contracts/openapi/remote-control.yaml#x-hunter-history-archive.object_key_pattern.sidecar"
+    access:
+      upload: "SRS 录制产物由服务端直传；预签名上传仅用于异常人工补录（3600s）"
+      download: "预签名 900s + HTTP Range（前端 seek）；过期对象返回 3001"
+    notes: "录像与 sidecar 必须同目录同名（除扩展名），历史查询靠前缀 + Last-Modified 粗筛（rc:history 契约）"
+
+  # ---------------------------------------------------------------- 4
+  - name: hunter-ota-packages
+    purpose: "OTA 升级包（按车型/版本分层存储，永久保留）"
+    lifecycle:
+      mode: permanent
+      expire_days: null
+    sse: sse-s3
+    writers: [ota-service]
+    readers: [ota-service, api-gateway]
+    object_key_conventions:
+      - pattern: "hunter-edge/ota/{model}/{version_name}/{version_code}/package.tar.gz"
+        style: bucket_excluded
+        example: "hunter-edge/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz"
+        declared_in: "contracts/openapi/ota-service.yaml#x-hunter-version-upload-flow.object_key_pattern"
+    access:
+      upload: "预签名直传 3600s（part_count>1 时分片 + 断点续传）"
+      download: "发布校验通过后签发 900s 预签名（支持 Range）；不落库（package_url 落库的是对象地址）"
+    integrity:
+      md5: "package_md5（与对象实际值比对，不匹配 6001）"
+      sha256: "package_sha256（不匹配 6001）"
+      signature: "RSA-2048（RSASSA-PKCS1-v1_5 + SHA-256，验签失败 6002）"
+      monotonic: "version_code 相对同车型已发布最大值单调递增（回退 6003）"
+    notes: "升级门禁「存储空间 ≥2GB」指车端本地磁盘（系统约束第 14 条），与对象存储容量无关"
+
+  # ---------------------------------------------------------------- 5
+  - name: hunter-reports
+    purpose: "分析报告产物（HTML / PDF / JSON）与 sidecar 元信息"
+    lifecycle:
+      mode: permanent
+      expire_days: null
+    sse: sse-s3
+    writers: [data-analytics]
+    readers: [data-analytics]
+    object_key_conventions:
+      - pattern: "hunter-reports/{report_type}/{yyyy-mm-dd}/{report_id}.{html|pdf|json}"
+        style: bucket_included
+        declared_in: "contracts/openapi/data-analytics.yaml#x-hunter-report-storage.object_layout.artifact"
+      - pattern: "hunter-reports/{report_type}/{yyyy-mm-dd}/{report_id}.meta.json"
+        style: bucket_included
+        declared_in: "contracts/openapi/data-analytics.yaml#x-hunter-report-storage.object_layout.metadata（sidecar，ReportMeta 全字段）"
+      - pattern: "hunter-reports/eval/perception/latest.json"
+        style: bucket_included
+        declared_in: "contracts/openapi/data-analytics.yaml#x-hunter-report-storage.object_layout.eval_documents.perception_eval"
+      - pattern: "hunter-reports/eval/control/latest.json"
+        style: bucket_included
+        declared_in: "contracts/openapi/data-analytics.yaml#x-hunter-report-storage.object_layout.eval_documents.control_eval"
+      - pattern: "hunter-reports/coverage/latest.json"
+        style: bucket_included
+        declared_in: "contracts/openapi/data-analytics.yaml#x-hunter-report-storage.object_layout.eval_documents.scene_coverage"
+      - pattern: "hunter-reports/corner_cases/latest.json"
+        style: bucket_included
+        declared_in: "contracts/openapi/data-analytics.yaml#x-hunter-report-storage.object_layout.eval_documents.corner_cases"
+    access:
+      upload: "服务端直传（离线作业），预签名上传仅异常补录（3600s）"
+      download: "预签名 900s + Range；报告元信息以 sidecar 前缀列举（无 DB 表，total 为列举计数）"
+    notes: "元信息（ReportMeta）以 sidecar JSON 与产物同前缀存储；报告/评估结果表在 contracts/database 不存在 → 本契约不新增表（data-analytics pending #2）"
+
+  # ---------------------------------------------------------------- 6
+  - name: hunter-logs
+    purpose: "系统日志归档（结构化 JSON 审计日志）"
+    lifecycle:
+      mode: expire
+      expire_days: 30
+      prefix: null
+    sse: sse-s3
+    writers: [api-gateway, scene-service, data-collector, data-analytics, ota-service, remote-control]
+    readers: [data-analytics]
+    object_key_conventions:
+      - pattern: "{service}/{yyyy}/{mm}/{dd}/{hour}.jsonl.gz"
+        style: bucket_excluded
+        declared_in: "契约推导（审计日志按服务/日期归档）"
+        status: pending_confirmation
+    notes: "⚠ 日志归档必须复用 logging.py 的脱敏处理器，禁止写入密码/Token/私钥/预签名 URL；保留 30 天"
+
+  # ---------------------------------------------------------------- 7
+  - name: hunter-scene-assets
+    purpose: "场景资源（地图 / 模型 / OpenSCENARIO 导出产物）"
+    lifecycle:
+      mode: permanent
+      expire_days: null
+    sse: sse-s3
+    writers: [scene-service]
+    readers: [scene-service, data-analytics]
+    object_key_conventions:
+      - pattern: "scenarios/scene-{scene_id}-{version}.{ext}"
+        style: bucket_excluded
+        declared_in: "contracts/openapi/scene-service.yaml#x-hunter-openscenario-export（object_prefix + naming）"
+    access:
+      upload: "服务端生成导出产物直传；预签名上传仅异常补录（3600s）"
+      download: "预签名 900s + Range（scene-service 契约 presign_expires_in_seconds=900）"
+
+# =====================================================================
+# 交叉校验（scripts/verify_data_layer.py / common/python/tests/test_storage_contracts.py）
+#   1) 7 个 Bucket 名称 = infra/docker/minio/init-buckets.sh 与
+#      infra/k8s/jobs/minio-init-job.yaml 中 create_bucket 的实参集合（名称不可更改）
+#   2) 生命周期天数 = 上述两脚本的 add_expiry 实参（raw-data 30 / rosbag regular 30 /
+#      video 90 / logs 30；其余永久 = 无 add_expiry 调用）
+#   3) 预签名 TTL 3600 / 900 = 各服务契约 presign 声明（data-collector / ota-service /
+#      data-analytics / scene-service / remote-control）
+#   4) 各服务声明使用的 Bucket ∈ 本文件 buckets[].name，且声明方 ∈ writers ∪ readers
+# =====================================================================
+cross_check:
+  infra_scripts:
+    - infra/docker/minio/init-buckets.sh
+    - infra/k8s/jobs/minio-init-job.yaml
+  runtime_config:
+    - .env.example
+    - common/python/hunter_common/config.py
+    - infra/k8s/base/01-configmap-common.yaml
+  service_contracts:
+    - contracts/openapi/scene-service.yaml
+    - contracts/openapi/data-collector.yaml
+    - contracts/openapi/data-analytics.yaml
+    - contracts/openapi/ota-service.yaml
+    - contracts/openapi/remote-control.yaml
+
+x-hunter-pending-confirmation:
+  # 结构对齐各服务 OpenAPI 既有约定：{id, question, impact, contract_decision}（禁止自行发明键名）
+  items:
+    - id: 1
+      question: "对象键风格不统一（是否包含 Bucket 名）：data-collector 与 data-analytics 的对象键含 bucket 前缀（hunter-raw-data/HUNTER-001/...、hunter-reports/...）；ota-service / remote-control / scene-service 的对象键不含 bucket（hunter-edge/ota/...、remote-control/...、scenarios/...）"
+      impact: "阻塞（blocking）：六服务 key 模板无法统一校验与复用，预签名签名串风格不一致（前端/车端需按服务分别拼接）"
+      contract_decision: "统一为「不含 bucket」或「含 bucket」其一（推荐不含，bucket 由预签名请求的 bucket 字段承载）；统一前实现必须按各服务既有契约执行，禁止跨服务复用同一 key 模板"
+    - id: 2
+      question: "hunter-rosbag 前缀语义与 5.5 命名规范冲突：init-buckets.sh 仅对 regular/ 前缀配 30 天过期、events/ 永久；但命名规范（data-collector x-hunter-file-upload-flow.naming = {bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}）不含 regular/ 段，events/ 下的对象键结构在全部服务契约中也未定义"
+      impact: "阻塞（blocking）：按当前命名上传的常规 rosbag 不匹配任何过期规则（永久占用存储，成本与容量风险）；若为凑前缀把事件数据放 regular/ 则 30 天后被误删（丢失事故证据）"
+      contract_decision: "二选一：(a) 命名规范增加 regular/ 段并回填 data-collector 契约（推荐，与既有生命周期规则一致）；(b) 生命周期规则改为按 bucket 内全部对象过期（放弃 events/ 永久语义）。同时确认事件 rosbag 对象键模板并回填 data-collector（事件上传）与 data-analytics（事件取证读取）契约"
+    - id: 3
+      question: "hunter-logs 对象键模板为契约推导（{service}/{yyyy}/{mm}/{dd}/{hour}.jsonl.gz 在设计文档中未明确；hunter-reports 键模板已由 data-analytics x-hunter-report-storage.object_layout 明确）"
+      impact: "非阻塞：日志归档粒度/压缩策略待定，影响归档体积与检索方式（无需 DB 变更）"
+      contract_decision: "确认日志归档粒度（按小时还是按天）与是否压缩（.jsonl.gz）；确认后同步落地写入方配置"
+    - id: 4
+      question: "hunter-logs 归档写入方归属未确认（本契约 writers 列 6 个微服务，即各服务审计日志直连 MinIO 落桶）"
+      impact: "非阻塞：若改为统一日志采集侧车（Fluent Bit/Loki）落桶，需移出服务 writers 并同步各服务契约 data_protection.audit.sink"
+      contract_decision: "确认归档方式（各服务直连 MinIO 还是侧车采集），并据此调整 writers 与各服务契约"
+    - id: 5
+      question: "分片上传 part_size_bytes 与单对象大小上限未定（presign_policy.multipart.part_size_bytes = null；5.5 节提到「校验身份与配额」但未给出配额阈值，仅明确车端上传限速 10 Mbps）"
+      impact: "阻塞（blocking）：data-collector 与 ota-service 的 complete 阶段无法实现配额/分片校验（禁止硬编码阈值）"
+      contract_decision: "确认分片大小（建议 5MiB 起，S3 最小分片限制）、单对象上限与单车配额；据此回填本契约并在 data-collector / ota-service 契约补齐校验规则"
+    - id: 6
+      question: "MinIO 配置项缺失：common/python/hunter_common/config.py 仅有 minio_endpoint / minio_access_key / minio_secret_key / minio_secure，而 scene-service 契约声明 MINIO_BUCKET_SCENE_ASSETS、data-collector 契约声明 PRESIGNED_UPLOAD_EXPIRE_SECONDS / PRESIGNED_DOWNLOAD_EXPIRE_SECONDS，均未在共享配置与 .env.example 落地"
+      impact: "阻塞（blocking）：预签名 TTL 与 Bucket 名若无共享配置来源，实现侧只能硬编码（违反配置管理约束第 16 条）"
+      contract_decision: "确认配置项命名（建议 MINIO_BUCKET_* 与 PRESIGNED_UPLOAD_EXPIRE_SECONDS=3600 / PRESIGNED_DOWNLOAD_EXPIRE_SECONDS=900）并同步 .env.example / ConfigMap / Secret（密钥仅 Secret）"
+    - id: 7
+      question: "共享库缺少 MinIO 客户端封装（common/python/hunter_common/ 下无 storage/minio 模块，仅有 redis.py / kafka / database）"
+      impact: "非阻塞：各服务各自封装会造成预签名 TTL、SSE、对象键校验逻辑分叉（安全与一致性风险）"
+      contract_decision: "确认封装位置与接口（建议 hunter_common/storage.py：异步 minio 客户端单例、presign_put / presign_get / stat_object / ensure_bucket，预签名 TTL 从配置读取）——Step 2 落地"
+
+

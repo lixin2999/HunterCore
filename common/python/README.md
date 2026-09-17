@@ -63,6 +63,21 @@ manager.init()          # 引擎/会话工厂（幂等）
 受控词表（`hunter_common.database.enums`）与 DDL 的 `CHECK` 约束、Kafka 消息 schema 的 `enum`
 三者由测试与 `scripts/verify_data_layer.py` 强制一致，业务代码禁止硬编码字面量。
 
+## 契约一致性测试（仓库根目录执行）
+
+```bash
+pytest common/python/tests/test_kafka_contracts.py -q     # Kafka Topic / 消费者组 / 11 个消息 Schema
+pytest common/python/tests/test_storage_contracts.py -q   # Redis Key / MinIO Bucket ↔ 服务声明 ↔ 初始化脚本
+python scripts/verify_data_layer.py                       # 26 项数据层契约校验（含校验 9 Redis / 校验 10 MinIO）
+```
+
+存储契约同为单一事实来源：`contracts/database/redis-keys.yaml`（Redis Key 类型/TTL/读写方）与
+`contracts/database/object-storage.yaml`（Bucket 生命周期/SSE-S3/预签名有效期），各服务契约的
+`x-hunter-service.redis_keys` / `minio_buckets` 仅是声明，MinIO 初始化脚本
+（`infra/docker/minio/init-buckets.sh`、`infra/k8s/jobs/minio-init-job.yaml`）为运行侧落地。
+共享库当前**仅提供 Redis 封装**，MinIO 客户端封装待随存储层实现落地（见 `object-storage.yaml`
+pending #7，以及 15 项待确认项 / 8 项阻塞）。
+
 ## 约束
 
 - 所有异常必须继承 `HunterBaseException`，错误码使用 `ErrorCode` 预定义值，禁止新增/更改含义
