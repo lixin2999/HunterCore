@@ -1,0 +1,2356 @@
+openapi: 3.0.3
+
+info:
+  title: HunterEdge - ota-service
+  version: 0.1.0
+  description: |
+    OTA 管理服务 REST 契约（网关前缀 `/api/v1/ota` → ota-service:8084）。
+
+    模块职责（不可自行新增或合并模块）：版本仓库管理、升级任务调度、灰度发布
+    （5% → 20% → 50% → 100%，每批观察 24h，成功率 ≥ 95%）、升级监控、A/B 分区回滚。
+
+    ## 契约边界
+    - **端点清单来源**：设计文档 OTA 模块节（§12.5）**未随仓库提供** → 本清单由
+      「附录 D 接口级限流端点 `POST /api/v1/ota/versions` + 第 9 章
+      `ota_versions` / `ota_tasks` / `ota_records` 三表能力 + OTA 流程（灰度批次 / 升级门禁 /
+      A/B 分区回滚） + 本仓库统一运维探针」推导。逐条依据与风险见 `x-hunter-endpoints`
+      与 `x-hunter-pending-confirmation`（确认 12.5 节原文后回填再实现）。
+    - **数据层**：仅读写 `ota_svc` schema 三表；不跨服务直接访问其他 schema
+      （车辆状态经 Redis `vehicle:status:{vehicle_id}` 读模型，权威值仍属 vehicle-service）。
+    - **Kafka**：消费 `hunter.*.ota_status`（消费组 `ota-service-ota-status`）；
+      生产 `hunter.{vehicle_id}.ota_notify`（升级通知）。不新增 Topic。
+    - **安全**：SHA-256 完整性校验 + RSA-2048 数字验签 + TLS 1.3 + `version_code` 单调递增（防回滚）
+      + A/B 分区回滚 + 发布/回滚操作审计，见 `x-hunter-ota-security`。
+    - **统一响应**：`{code, message, data, request_id, timestamp}`（不可更改，错误码取附录 A）。
+
+    ## 状态机（不可更改）
+    - 车端升级（`ota_records.status/phase`、Kafka `ota_status`）：
+      `IDLE → PENDING → DOWNLOAD → INSTALL → TEST → SUCCESS`；
+      `TEST` 自检失败 → `ROLLBACK → ROLLED_BACK`（或 `FAILED`）
+    - 升级任务（`ota_tasks.status`）：
+      `created → pending_approval → running → paused → succeeded / failed / canceled`
+    - 版本（`ota_versions.status`）：`draft → published → deprecated / disabled`
+  contact:
+    name: HunterEdge Platform Team
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.hunter-edge.example.com
+    description: 经 API 网关（8080）统一入口；网关按前缀 /api/v1/ota 转发至 ota-service:8084
+  - url: http://ota-service:8084
+    description: 集群内直连（mTLS；仅联调与内部调用使用）
+
+tags:
+  - name: versions
+    description: OTA 版本仓库（创建 + 预签名上传 / 发布校验验签 / 废弃停用）
+  - name: tasks
+    description: 升级任务与灰度发布（创建 / 启动 / 暂停 / 恢复 / 取消 / A/B 回滚）
+  - name: records
+    description: 单车升级执行记录（升级监控 / 车辆升级历史时间线）
+  - name: ops
+    description: 运维探针（x-internal，安全域外）
+
+# 默认全局鉴权：所有业务端点需 JWT（网关校验后转发）；ops 端点用 `security: []` 显式退出
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/ota/versions:
+    get:
+      tags: [versions]
+      summary: 查询 OTA 版本仓库列表（分页）
+      description: |
+        版本仓库列表，默认排序 `release_time DESC NULLS LAST, version_code DESC`
+        （与索引 `idx_ota_versions_status_release_time` 对齐）；`total` 为 DB `COUNT(*)`，
+        满足 API P95 ≤ 200ms。
+
+        `package_download_url` 为服务端即时签发的 **15 分钟**预签名地址（不落库），
+        `package_url` 为落库的对象地址（MinIO `hunter-ota-packages`，永久保留）。
+      operationId: listOtaVersions
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: 按版本状态过滤（draft / published / deprecated / disabled）
+          schema: { $ref: "#/components/schemas/OtaVersionStatus" }
+        - name: release_type
+          in: query
+          required: false
+          description: 按发布类型过滤（⚠ 取值域待核对，见 x-hunter-pending-confirmation）
+          schema: { $ref: "#/components/schemas/OtaReleaseType" }
+        - name: version_code
+          in: query
+          required: false
+          description: 精确查询版本编码（单调递增整数；车端防回滚比对依据）
+          schema: { type: integer, minimum: 1 }
+        - name: applicable_model
+          in: query
+          required: false
+          description: 适用车型过滤（GIN 索引包含匹配，如 HUNTER_SE）
+          schema: { type: string, pattern: "^[A-Za-z0-9_]{1,32}$" }
+        - name: version_name
+          in: query
+          required: false
+          description: 版本名模糊匹配（ILIKE %value%）
+          schema: { type: string, maxLength: 64 }
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 版本仓库列表
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaVersionListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    post:
+      tags: [versions]
+      summary: 创建 OTA 版本（草稿）+ 申请升级包上传预签名地址
+      description: |
+        版本仓库入库第 1 步（两步式，与 5.5 节「预签名直传 + 完整性校验」一致）：
+
+        1. 校验 `version_code` / `version_name` 唯一性（`uq_ota_versions_version_code` /
+           `uq_ota_versions_version_name`，冲突返回 3002）；校验 `version_code` 相对**同车型已发布最大
+           version_code** 单调递增（回退提交返回 6003，防回滚）；
+        2. 服务端生成 `object_key`（客户端禁止指定，见 `x-hunter-version-upload-flow.object_key_pattern`）；
+        3. 返回 **1 小时**（3600s）预签名上传地址（`part_count > 1` 时返回分片上传 `parts[]`）；
+        4. 入库 `ota_versions`，`status=draft`、`release_time=null`；`package_*` / `signature` 先按请求值落库，
+           **发布（publish）时由服务端重新流式校验/验签**，任一不匹配置回失败并返回 6001/6002。
+
+        - 限流（附录 D）：单用户 **5 QPS**（升级包上传入口），超限返回 HTTP 429 + `Retry-After`
+        - 审计：创建动作写结构化审计日志（user_id / version_code / object_key / trace_id），
+          日志脱敏（禁止输出 `MINIO_SECRET_KEY`、签名私钥）
+      operationId: createOtaVersion
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaVersionCreateRequest" }
+      responses:
+        "200":
+          description: 版本草稿已创建并返回预签名上传地址（1 小时）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaVersionCreateResponse" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/versions/{version_id}:
+    get:
+      tags: [versions]
+      summary: 查询 OTA 版本详情
+      description: |
+        返回 `ota_versions` 单行完整信息 + 即时签发的 15 分钟下载预签名地址 +
+        该版本的关联任务计数（`task_count`：以该版本为目标的任务数，用于删除/废弃前的引用评估）。
+      operationId: getOtaVersion
+      parameters:
+        - $ref: "#/components/parameters/VersionIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 版本详情
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaVersionDetailResponse" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/versions/{version_id}/publish:
+    post:
+      tags: [versions]
+      summary: 发布 OTA 版本（SHA-256 校验 + RSA-2048 验签 + version_code 单调性门禁）
+      description: |
+        版本仓库第 2 步，也是**唯一的发布门禁**（`ota_versions` 表注释：发布前必须完成
+        SHA-256 校验 + RSA-2048 验签 + version_code 单调性检查）：
+
+        1. 从 MinIO `hunter-ota-packages` 读取对象做**单次流式校验**（包大小 / MD5 / SHA-256
+           与入库值比对；不匹配 → 6001，响应 `data` 回带 `expected` / `actual`）；
+        2. RSA-2048 数字验签（`RSASSA-PKCS1-v1_5 + SHA-256`，base64 签名；公钥来自环境变量
+           `OTA_SIGNATURE_PUBLIC_KEY`，私钥仅存于发布方 CI/KMS → 失败返回 6002）；
+        3. `version_code` 单调递增门禁：必须大于**同 `applicable_models` 范围已发布版本的最大
+           `version_code`**，否则返回 6003（防回滚）；
+        4. 全部通过后 `draft → published` 并写入 `release_time`；非 `draft` 状态重复发布 → 3003。
+
+        审计：发布动作写结构化审计日志（user_id / version_id / version_code / package_sha256 /
+        校验结论 / trace_id），日志脱敏（禁止输出签名私钥与 MinIO 密钥）。
+
+        ⚠ 性能例外：本端点为**长耗时操作**（GB 级对象流式哈希 + 验签，天然超过「API P95 ≤ 200ms」
+        通用指标），契约将其登记为性能例外（见 `x-hunter-service.performance.exceptions`），
+        网关侧转发超时需 ≥ 300s（网关超时配置为待确认项 `#9`）。
+      operationId: publishOtaVersion
+      parameters:
+        - $ref: "#/components/parameters/VersionIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaVersionPublishRequest" }
+      responses:
+        "200":
+          description: 发布成功（含五项校验结论，全部为 true）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaVersionPublishResponse" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/versions/{version_id}/deprecate:
+    post:
+      tags: [versions]
+      summary: 废弃 / 停用版本（published → deprecated / disabled）
+      description: |
+        版本退役：`deprecated`（已废弃，历史任务可用但不再新建任务）与
+        `disabled`（已停用，禁止作为新任务目标版本）；`disabled` 会让
+        `POST /api/v1/ota/tasks` 与 `POST /tasks/{task_id}/start` 返回 3003。
+
+        - 已发布版本**不可删除**（DDL：`ota_tasks.target_version_id` 为 `ON DELETE RESTRICT`），
+          故本服务无 DELETE 端点：退役只能走本端点（版本仓库永久保留，OTA 安全要求可追溯）
+        - 若存在 `running` / `paused` 任务引用该版本，返回 3003（先处置任务再退役）
+        - 审计：退役动作记录 user_id / version_id / 目标状态 / reason / trace_id
+      operationId: deprecateOtaVersion
+      parameters:
+        - $ref: "#/components/parameters/VersionIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaVersionDeprecateRequest" }
+      responses:
+        "200":
+          description: 版本状态已变更
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaVersionDetailResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/tasks:
+    get:
+      tags: [tasks]
+      summary: 查询升级任务列表（分页）
+      description: |
+        任务列表，默认排序 `create_time DESC`（索引 `idx_ota_tasks_status_create_time`）。
+        `target_vehicles` 为 `TEXT[]`，列表响应仅返回**计数** `vehicle_count`
+        （避免大数组拖慢响应，P95 ≤ 200ms）；车辆名单走 `GET /api/v1/ota/tasks/{task_id}`。
+      operationId: listOtaTasks
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: 按任务状态过滤（created / pending_approval / running / paused / succeeded / failed / canceled）
+          schema: { $ref: "#/components/schemas/OtaTaskStatus" }
+        - name: target_version_id
+          in: query
+          required: false
+          description: 按目标版本过滤（索引 idx_ota_tasks_target_version_id）
+          schema: { type: string, format: uuid }
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 按目标车辆过滤（GIN 索引 idx_ota_tasks_target_vehicles 包含匹配）
+          schema: { $ref: "#/components/schemas/VehicleId" }
+        - name: creator
+          in: query
+          required: false
+          description: 按创建人（user_id）过滤
+          schema: { type: string, format: uuid }
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 任务列表
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaTaskListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    post:
+      tags: [tasks]
+      summary: 创建升级任务（灰度批次规划，不下发）
+      description: |
+        创建任务并冻结灰度策略（默认 5% → 20% → 50% → 100%，每批观察 24h、成功率门禁 ≥ 95%，
+        `x-hunter-canary-rollout`）：`status=created`，**不向车辆下发任何通知**，
+        下发动作统一由 `POST /tasks/{task_id}/start` 触发。
+
+        校验规则（错误码）：
+        - `target_version_id` 不存在 → 3001；状态为 `draft` / `disabled` → 3003（必须先发布；`deprecated` 允许仅用于历史补升，⚠ 待确认）
+        - `target_vehicles` 为空 → 2002；重复车辆去重后入库；上限见 `OTA_TASK_MAX_TARGET_VEHICLES`
+        - `upgrade_strategy` 若显式给出，必须**逐字段等于**规范灰度序列（比例 5/20/50/100、观察 24h、门禁 0.95），
+          否则 → 2001（灰度流程不可更改）
+        - `preconditions` 不得弱于平台门禁（`OTA_PRECONDITION_MIN_SOC` / `OTA_PRECONDITION_REQUIRE_PARKED` /
+          `OTA_PRECONDITION_MIN_STORAGE_MB`，默认 2048 = 2GB），放宽 → 2001
+        - `schedule.mode=scheduled` 时 `start_time` 必填且 > 当前时间，否则 → 2002 / 2001
+        - 车辆存在性与在线状态**不在创建时校验**（避免长事务）：`start` 时逐车门禁校验，
+          离线 → 4001、升级中/其他任务占用 → 4002
+      operationId: createOtaTask
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaTaskCreateRequest" }
+      responses:
+        "200":
+          description: 任务已创建（status=created）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaTaskResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/tasks/{task_id}:
+    get:
+      tags: [tasks]
+      summary: 查询升级任务详情（含灰度进度、批次统计与推进判定）
+      description: |
+        任务详情 = `ota_tasks` 全字段 + 目标版本快照 + 冻结的 `upgrade_strategy`
+        + 实时灰度视图 `rollout`：
+
+        - `batches[]`：四批计划与实测（`target_count` / `success_count` / `failed_count` /
+          `rolled_back_count` / `success_rate` / `status` ∈ pending / in_progress / observing / passed / halted）
+        - `current_batch`：当前批次序号（1..4，对应 5% / 20% / 50% / 100%）
+        - `observe_until`：当前批次观察窗口结束时间（`observe_hours = 24`）
+        - `next_action`：`advance`（可推进下一批）/ `observing`（观察中）/ `halt`（成功率 < 95%，需人工介入）
+        - `halt_reason`：`halt` 时的原因（如 `success_rate_below_threshold: 0.9234 < 0.95`）
+
+        `rollout` 数据来源：`ota_records` 聚合 + Redis `ota:progress:{task_id}` 热点视图
+        （任务结束后 Redis key 保留 1 天，随后以 `ota_tasks.progress` JSONB 快照回落）。
+      operationId: getOtaTask
+      parameters:
+        - $ref: "#/components/parameters/TaskIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 任务详情
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaTaskDetailResponse" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/tasks/{task_id}/start:
+    post:
+      tags: [tasks]
+      summary: 启动任务（首轮门禁校验 + 下发第 1 批 5% 升级通知）
+      description: |
+        状态流转 `created | pending_approval | paused → running`：
+
+        1. 目标版本必须为 `published`，否则 3003；任务状态禁止启动时 3003（幂等：重复调用不重复下发）
+        2. 第 1 批（5%）车辆**逐台**校验升级门禁：
+           `battery_soc ≥ OTA_PRECONDITION_MIN_SOC`（默认 50%）、车辆静止且 P 档
+           （`OTA_PRECONDITION_REQUIRE_PARKED`）、网络稳定（遥测最后上报间隔 ≤
+           `OTA_OFFLINE_THRESHOLD_SECONDS`）、存储空间 ≥ `OTA_PRECONDITION_MIN_STORAGE_MB`（默认 2048MB = 2GB）。
+           不满足时：离线 → 4001；升级中/被其他任务占用 → 4002；门禁条件不足 → 6003
+           （`data.precondition_failures[]` 逐车给出 `failed_conditions` 与实测值）
+        3. 每台合格车辆：`ota_records` 插入（`status=PENDING`、`phase=IDLE`、`progress=0`、
+           `from_version` 取车辆当前版本）+ 生产 `hunter.{vehicle_id}.ota_notify`（key=vehicle_id、acks=all）
+           + 初始化 Redis `ota:progress:{task_id}`
+        4. 单台门禁失败**不阻断**同批其余车辆（批次内独立）；若整批门禁全失败 → 任务转 `failed` 并产生告警
+        5. `schedule.mode=immediate` 由本端点直接下发；`scheduled` 由服务内调度器到点执行同一逻辑
+
+        - 后续批次（20% → 50% → 100%）由服务内灰度调度器在满足「观察 24h **且** 成功率 ≥ 95%」后
+          自动推进（禁止人工跳过批次，见 `x-hunter-canary-rollout`）
+        - 限流：网关按用户维度限流（默认 100 QPS，见 `x-hunter-rate-limits`）
+        - 审计：记录 user_id / task_id / batch_no / 放行清单 / 拦截清单 / trace_id
+      operationId: startOtaTask
+      parameters:
+        - $ref: "#/components/parameters/TaskIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaTaskStartRequest" }
+      responses:
+        "200":
+          description: 启动动作已受理（含批次放行/拦截统计）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaTaskActionResponse" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/tasks/{task_id}/pause:
+    post:
+      tags: [tasks]
+      summary: 暂停升级任务（冻结批次推进，不影响已下发车辆）
+      description: |
+        `running → paused`：
+        - 暂停后灰度调度器**不再推进下一批次**，也不再下发新车辆的升级通知
+        - 已下发通知的车辆**继续升级**（车端本地状态机不受影响），平台继续消费其
+          `hunter.*.ota_status` 并落库 `ota_records`
+        - Redis `ota:progress:{task_id}` 与观察窗口计时保留；`observe_until` 不因暂停顺延（⚠ 待确认，见 x-hunter-pending-confirmation #6）
+        - 非 `running` 状态调用 → 3003；审计：记录 user_id / task_id / batch_no / reason / trace_id
+      operationId: pauseOtaTask
+      parameters:
+        - $ref: "#/components/parameters/TaskIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaTaskPauseRequest" }
+      responses:
+        "200":
+          description: 任务已暂停
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaTaskActionResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/tasks/{task_id}/resume:
+    post:
+      tags: [tasks]
+      summary: 恢复升级任务（重新评估批次推进条件）
+      description: |
+        `paused → running`，恢复时**重新评估**当前批次：
+
+        - 当前批次仍在 24h 观察窗口内 → 恢复为 `observing`，等待窗口结束
+        - 观察窗口已结束且成功率 ≥ `OTA_CANARY_MIN_SUCCESS_RATE`（默认 0.95）→ 立即推进下一批
+        - 成功率 < 阈值 → **拒绝恢复**并返回 3003（`data.halt_reason` 给出实测成功率），
+          人工只能选择 `rollback`（回滚）或 `cancel`（终止），符合「任何一批成功率 < 95%
+          立即暂停 + 告警 + 人工介入」
+        - 恢复只通知 `ota_records` 中**尚未下发**（`status=PENDING` 且未收到 `ota_status`）的车辆，
+          已进入 `DOWNLOAD`/`INSTALL`/`TEST`/`SUCCESS` 的车辆不会二次通知（幂等）
+        - 非 `paused` 状态调用 → 3003
+      operationId: resumeOtaTask
+      parameters:
+        - $ref: "#/components/parameters/TaskIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaTaskStartRequest" }
+      responses:
+        "200":
+          description: 任务已恢复
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaTaskActionResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/tasks/{task_id}/cancel:
+    post:
+      tags: [tasks]
+      summary: 终止升级任务（不再推进任何批次）
+      description: |
+        `created | pending_approval | running | paused → canceled`（终态）：
+
+        - 终止后调度器不再推进批次、不再下发任何 `ota_notify`；`ota_tasks.progress` 冻结快照
+        - 已下发通知的车辆**不做强制中断**（车端处于 INSTALL 阶段时中断刷写有变砖风险）：
+          平台继续消费 `ota_status` 落库 `ota_records`，直至车辆到达终态（SUCCESS / ROLLED_BACK / FAILED）
+        - 若需让已升级成功的车辆回退，使用 `POST /tasks/{task_id}/rollback`
+        - 终态任务（succeeded / failed / canceled）重复终止 → 3003
+        - Redis `ota:progress:{task_id}` 不主动删除，按契约 TTL（任务结束后 1 天）自然过期
+        - 审计：记录 user_id / task_id / canceled_batch_no / 已下发车辆数 / reason / trace_id
+      operationId: cancelOtaTask
+      parameters:
+        - $ref: "#/components/parameters/TaskIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaTaskCancelRequest" }
+      responses:
+        "200":
+          description: 任务已终止
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaTaskActionResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/tasks/{task_id}/rollback:
+    post:
+      tags: [tasks]
+      summary: 触发 A/B 分区回滚（人工兜底，按车辆）
+      description: |
+        回滚语义分两类，**不可混淆**：
+
+        1. **车端自动回滚**（主路径，平台不参与）：车端 `TEST` 自检失败 →
+           `ROLLBACK → ROLLED_BACK / FAILED`，平台仅消费 `ota_status` 落库 `ota_records`
+           （`error_code` = 6001/6002/6003）。本端点**不用于**此类场景（车端已自行切回原分区）。
+        2. **平台人工回滚**（本端点）：对**已升级成功**（`ota_records.status=SUCCESS`）的车辆，
+           下发 A/B 分区回退指令至 `hunter.{vehicle_id}.command`
+           （`command_type="ota_rollback"`，`params={task_id, target, reason}`），
+           车端切回上一分区并重启应用；成功后回报 `ota_status=ROLLED_BACK`
+           → 平台把 `ota_records.status` 更新为 `ROLLED_BACK`（`error_code=null`）。
+
+        校验与门禁：
+        - 仅 `SUCCESS` 记录可回滚；`PENDING/DOWNLOAD/INSTALL/TEST` → 3003（升级中禁止回滚）；
+          `ROLLED_BACK` / `FAILED` → 3003（幂等拒绝，已回滚）
+        - 回滚门禁：车辆静止 + P 档 + 网络稳定（回退不刷写镜像，故不要求电量 ≥ 50%）。
+          离线 → 4001；升级中/被其他任务占用 → 4002；静止/网络不满足 → 6003
+        - 不传 `vehicle_ids` = 回滚该任务**全部**可回滚车辆；单车失败不影响其余车辆，
+          响应 `data.rollback_results[]` 逐车给出受理结论与拒绝原因
+        - 限流：网关按用户维度限流（见 `x-hunter-rate-limits`）；审计：记录 user_id / task_id /
+          车辆清单 / command_id 清单 / reason / trace_id
+      operationId: rollbackOtaTask
+      parameters:
+        - $ref: "#/components/parameters/TaskIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaTaskRollbackRequest" }
+      responses:
+        "200":
+          description: 回滚指令受理结果（逐车）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaTaskRollbackResponse" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/tasks/{task_id}/records:
+    get:
+      tags: [records]
+      summary: 查询任务下车辆升级记录（升级监控明细）
+      description: |
+        任务级升级监控：`ota_records` 按 `vehicle_id` / `status` 过滤，默认排序
+        `start_time DESC NULLS LAST, record_id DESC`（命中唯一索引 `uq_ota_records_task_vehicle`
+        `(task_id, vehicle_id)`；进行中记录命中部分索引 `idx_ota_records_inflight`）。
+
+        - `phase` = 当前执行阶段（车端 9 态：IDLE…SUCCESS/ROLLBACK/ROLLED_BACK/FAILED）
+        - `start_time` = 记录创建时间（DDL `DEFAULT now()`）；`end_time` 在到达终态
+          （`SUCCESS` / `ROLLED_BACK` / `FAILED`）时写入
+        - `duration_seconds` 为服务端派生字段（`end_time - start_time`，未结束为 null），
+          便于前端直接渲染耗时列（不在客户端做时间运算）
+        - 前端用于批次内车辆进度表与失败原因（`error_code` / `error_message`）
+      operationId: listOtaTaskRecords
+      parameters:
+        - $ref: "#/components/parameters/TaskIdPath"
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 按车辆过滤（命中 (task_id, vehicle_id) 索引）
+          schema: { $ref: "#/components/schemas/VehicleId" }
+        - name: status
+          in: query
+          required: false
+          description: 按升级状态过滤（车端 9 态状态机取值）
+          schema: { $ref: "#/components/schemas/OtaUpgradeStatus" }
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 升级记录列表
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaRecordListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/vehicles/{vehicle_id}/records:
+    get:
+      tags: [records]
+      summary: 查询单车 OTA 升级历史（时间线）
+      description: |
+        单车升级历史时间线（车辆详情页 / 回滚前评估「上一位版本」）。
+
+        - 默认排序 `start_time DESC NULLS LAST, record_id DESC`（索引
+          `idx_ota_records_vehicle_start_time` `(vehicle_id, start_time DESC)`）
+        - **只读**：车辆当前版本的权威值属 vehicle-service（`vehicles.software_version`），
+          本端点不做版本推断回写，避免跨服务双写不一致
+      operationId: listVehicleOtaRecords
+      parameters:
+        - $ref: "#/components/parameters/VehicleIdPath"
+        - name: status
+          in: query
+          required: false
+          description: 按升级状态过滤
+          schema: { $ref: "#/components/schemas/OtaUpgradeStatus" }
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 单车升级历史
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaRecordListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /healthz:
+    get:
+      tags: [ops]
+      summary: 存活探针（K8s startupProbe / livenessProbe）
+      operationId: healthz
+      x-internal: true
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 进程存活（统一响应格式）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseHealthy" }
+
+  /readyz:
+    get:
+      tags: [ops]
+      summary: 就绪探针（K8s readinessProbe，含 PostgreSQL / Redis / MinIO 连通性）
+      description: |
+        每项探测内置 2s 超时（依赖挂起时快速失败，避免 probe 超时误判）。
+        依赖不可用时返回 HTTP 503 + `code=5001`，`data` 给出各依赖探测明细。
+        Kafka 连通性在消费者/生产者启动阶段检查，不纳入探针（避免探针阻塞滚动更新）；
+        MinIO（bucket `hunter-ota-packages`）是升级包存储的**关键依赖**，纳入本次探测。
+      operationId: readyz
+      x-internal: true
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 全部依赖就绪
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseReady" }
+        "503":
+          description: 存在未就绪依赖（code=5001，data 为探测明细）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiResponseError" }
+
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus 指标暴露（文本格式）
+      operationId: metrics
+      x-internal: true
+      security: []
+      responses:
+        "200":
+          description: Prometheus exposition 文本（OTA 指标：任务数 / 批次成功率 / 状态上报处理延迟）
+          content:
+            text/plain:
+              schema:
+                type: string
+                description: Prometheus exposition format（# HELP / # TYPE / metric 行）
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        控制台用户 JWT Access Token（2 小时），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
+        载荷结构（3.2.2 节）：`sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` /
+        `iss="hunter-platform"` / `jti`。服务侧按 RBAC 资源域 `ota` 复核：
+        `read`（版本/任务/记录查询）、`create`（创建版本与任务）、`execute`（启动/暂停/恢复/终止/回滚/退役）。
+        校验失败映射：Token 缺失/无效 → 1001；Token 过期 → 1003；权限不足 → 1002。
+      # 未声明 mutualTLS：OTA 下发链路（ota_notify / command）由车端 Kafka SASL_SSL 承接，
+      # 车端不直连本服务 REST（见 x-hunter-kafka / x-hunter-pending-confirmation #8）
+
+  headers:
+    RequestId:
+      description: 链路追踪 ID（网关透传上游 X-Request-ID，未提供则生成 UUID）
+      schema: { type: string, format: uuid }
+    RetryAfter:
+      description: 限流重试等待秒数（HTTP 429 必需，附录 D 限流约束）
+      schema: { type: integer, minimum: 1 }
+
+  parameters:
+    TraceRequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: 客户端可选传入链路追踪 ID；未提供时由网关/服务生成 UUID
+      schema: { type: string, format: uuid }
+    PageQuery:
+      name: page
+      in: query
+      required: false
+      description: 页码（≥1，与 BaseRepository.paginate 一致）
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSizeQuery:
+      name: page_size
+      in: query
+      required: false
+      description: 每页条数（上限 200，与 BaseRepository.MAX_PAGE_SIZE 一致）
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    VersionIdPath:
+      name: version_id
+      in: path
+      required: true
+      description: 版本 ID（ota_svc.ota_versions.version_id，UUID）
+      schema: { type: string, format: uuid }
+    TaskIdPath:
+      name: task_id
+      in: path
+      required: true
+      description: 任务 ID（ota_svc.ota_tasks.task_id，UUID = Kafka ota_notify/ota_status 的 task_id）
+      schema: { type: string, format: uuid }
+    VehicleIdPath:
+      name: vehicle_id
+      in: path
+      required: true
+      description: 车辆标识（= 设备证书 CommonName = Kafka 消息 key，如 HUNTER-001）
+      schema: { $ref: "#/components/schemas/VehicleId" }
+
+  responses:
+    Unauthenticated:
+      description: 1001 / 1003 未认证（Token 缺失、无效或已过期）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 1001
+            message: 未认证
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    Forbidden:
+      description: 1002 无权限（角色权限不足，如无 ota:execute 权限）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 1002
+            message: 无权限
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    InvalidParameter:
+      description: |
+        2001 / 2002 / 6001 / 6002 / 6003（参数错误 / 必填缺失 / OTA 包校验失败 /
+        签名验证失败 / OTA 前置条件不满足）。HTTP 状态统一 422（`HTTP_STATUS_BY_CODE`）。
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          examples:
+            invalid:
+              value:
+                code: 2001
+                message: 参数错误
+                data: null
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+            checksum_failed:
+              value:
+                code: 6001
+                message: OTA 包校验失败
+                data: { field: package_sha256, expected: "e3b0c442...", actual: "d41d8cd9..." }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+            signature_failed:
+              value:
+                code: 6002
+                message: OTA 签名验证失败
+                data: { algorithm: RSASSA-PKCS1-v1_5_SHA256, key_id: "ota-signing-2026" }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+            precondition_failed:
+              value:
+                code: 6003
+                message: OTA 前置条件不满足
+                data:
+                  failed_conditions: [battery_soc, storage]
+                  precondition_failures:
+                    - vehicle_id: HUNTER-003
+                      failed_conditions: [battery_soc]
+                      actual: { battery_soc: 32, storage_free_mb: 5120 }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+    ResourceNotFound:
+      description: 3001 资源不存在（version_id / task_id 不存在）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 3001
+            message: 资源不存在
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    Conflict:
+      description: |
+        3002 / 3003 / 4001 / 4002（资源已存在 / 资源状态冲突 / 车辆不在线 / 车辆忙）。
+        HTTP 状态统一 409（`HTTP_STATUS_BY_CODE`）；`data` 给出冲突字段或拒绝原因。
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          examples:
+            already_exists:
+              value:
+                code: 3002
+                message: 资源已存在
+                data: { field: version_code, value: 10200 }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+            state_conflict:
+              value:
+                code: 3003
+                message: 资源状态冲突
+                data: { current_status: draft, allowed_status: [published] }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+            vehicle_offline:
+              value:
+                code: 4001
+                message: 车辆不在线
+                data: { vehicle_ids: [HUNTER-007] }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+            vehicle_busy:
+              value:
+                code: 4002
+                message: 车辆忙
+                data: { vehicle_ids: [HUNTER-002], current_status: upgrading }
+                request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+                timestamp: 1724035200
+    TooManyRequests:
+      description: |
+        HTTP 429 限流（附录 D）。⚠ 附录 A 无限流专用错误码，响应体 `code` 统一复用 5001（禁止新增），
+        客户端应以 HTTP 状态码 429 与 `Retry-After` 为准。
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 5001
+            message: 服务不可用
+            data: { scope: user, limit_per_second: 5, api: "POST /api/v1/ota/versions" }
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    ServiceUnavailable:
+      description: 5001 服务不可用（PostgreSQL / Redis / MinIO 依赖不可用或未就绪）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 5001
+            message: 服务不可用
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+    InternalError:
+      description: 5000 服务器内部错误（未预期异常；响应体不含堆栈与敏感信息）
+      headers:
+        X-Request-ID: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponseError" }
+          example:
+            code: 5000
+            message: 服务器内部错误
+            data: null
+            request_id: 6f1c2a48-3e2f-4c1b-9d3a-1f7b0c9e5a10
+            timestamp: 1724035200
+
+  schemas:
+    # ---------- 统一响应与公共类型 ----------
+    ApiResponse:
+      type: object
+      description: 统一 API 响应格式（所有服务必须遵守，字段不可更改）
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code:
+          type: integer
+          description: 0=成功；非 0=预定义错误码（附录 A）
+          example: 0
+        message:
+          type: string
+          example: success
+        data:
+          nullable: true
+          description: 业务数据（结构随端点而定；无数据时为 null）
+        request_id:
+          type: string
+          format: uuid
+          description: 请求 ID（等于链路 trace_id）
+        timestamp:
+          type: integer
+          description: 服务端响应时间（Unix epoch 秒）
+          example: 1724035200
+
+    ErrorCode:
+      type: integer
+      description: 预定义错误码（附录 A，禁止新增或更改含义）
+      enum: [0, 1001, 1002, 1003, 2001, 2002, 3001, 3002, 3003, 4001, 4002, 5000, 5001,
+             6001, 6002, 6003, 7001, 7002]
+
+    ApiResponseError:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [code]
+          properties:
+            code: { $ref: "#/components/schemas/ErrorCode" }
+            data:
+              nullable: true
+              description: |
+                错误上下文（如 6001 的 expected/actual、6003 的 precondition_failures[]、
+                3003 的 current_status）；一般错误为 null
+
+    ApiResponseEmpty:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              nullable: true
+              description: 恒为 null（无返回数据的成功响应）
+
+    ApiResponseHealthy:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/HealthStatus" }
+
+    ApiResponseReady:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/ReadyChecks" }
+
+    HealthStatus:
+      type: object
+      description: 存活探针响应体
+      required: [status, service]
+      properties:
+        status: { type: string, enum: [ok] }
+        service: { type: string, example: ota-service }
+        version: { type: string, description: 服务版本（构建时注入）, example: "0.1.0" }
+      example: { status: ok, service: ota-service, version: "0.1.0" }
+
+    ReadyChecks:
+      type: object
+      description: 就绪探针明细（任一 false → HTTP 503 + code=5001）
+      required: [database, redis, minio]
+      properties:
+        database:
+          type: boolean
+          description: PostgreSQL 连通性（ota_svc 三表读写依赖）
+        redis:
+          type: boolean
+          description: Redis 连通性（ota:progress:{task_id} 进度与限流依赖）
+        minio:
+          type: boolean
+          description: MinIO 连通性（bucket hunter-ota-packages 可访问性）
+      example: { database: true, redis: true, minio: true }
+
+    VehicleId:
+      type: string
+      description: 车辆标识（= 设备证书 CommonName = Kafka 消息 key）
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+      maxLength: 64
+      example: HUNTER-001
+
+    # ---------- 枚举（取值域严格对齐 DDL 03_ota.sql 与车端状态机，禁止新增） ----------
+    OtaVersionStatus:
+      type: string
+      description: 版本状态（DDL CHECK 约束，不可更改）
+      enum: [draft, published, deprecated, disabled]
+
+    OtaReleaseType:
+      type: string
+      description: |
+        版本发布类型。⚠ 取值域待核对（DDL 注释「正式/灰度/补丁」，设计文档未提供枚举），
+        故本契约**不设 enum**，实现与前端禁止硬编码分支（见 x-hunter-pending-confirmation #2）。
+      maxLength: 32
+      example: formal
+
+    OtaTaskStatus:
+      type: string
+      description: 升级任务状态（DDL CHECK 约束，不可更改）
+      enum: [created, pending_approval, running, paused, succeeded, failed, canceled]
+
+    OtaUpgradeStatus:
+      type: string
+      description: |
+        车端升级状态/阶段（车端状态机，不可更改）：
+        `IDLE → PENDING → DOWNLOAD → INSTALL → TEST → SUCCESS`；
+        `TEST` 自检失败 → `ROLLBACK → ROLLED_BACK`（或 `FAILED`）。
+        与 Kafka `ota_status.status/phase`、`ota_records.status/phase` 同域。
+      enum: [IDLE, PENDING, DOWNLOAD, INSTALL, TEST, SUCCESS, ROLLBACK, ROLLED_BACK, FAILED]
+
+    OtaBatchStatus:
+      type: string
+      description: 灰度高批次状态（平台派生，非 DDL 列）
+      enum: [pending, in_progress, observing, passed, halted]
+
+    OtaNextAction:
+      type: string
+      description: 批次推进判定（服务端派生，供前端展示与人工决策）
+      enum: [advance, observing, halt]
+
+    OtaTaskAction:
+      type: string
+      description: 任务动作类型（用于动作结果回执）
+      enum: [start, pause, resume, cancel]
+
+    OtaRollbackTarget:
+      type: string
+      description: |
+        回滚目标（当前仅支持 A/B 分区回退到上一分区）。
+        回退到更早的历史版本受「version_code 单调递增」防回滚约束，必须走正式版本发布流程，
+        因此不在此枚举内（见 x-hunter-pending-confirmation #5）。
+      enum: [previous_slot]
+
+    OtaPreconditionName:
+      type: string
+      description: 升级门禁项名称（与 Kafka ota_notify.preconditions 字段对齐）
+      enum: [battery_soc, vehicle_parked, network_stable, storage]
+
+    # ---------- 版本仓库 ----------
+    OtaVersionItem:
+      type: object
+      description: |
+        `ota_svc.ota_versions` 单行（字段与 DDL 一一对应）+ 服务端即时签发的下载地址。
+        ⚠ 该表**无 create_time/update_time 列**（DDL 03_ota.sql），故响应不返回创建时间；
+        列表排序以 `release_time DESC NULLS LAST, version_code DESC` 为准。
+      required: [version_id, version_name, version_code, release_type, package_url, package_size,
+                 package_md5, package_sha256, signature, changelog, applicable_models, status]
+      properties:
+        version_id: { type: string, format: uuid }
+        version_name: { type: string, maxLength: 64, example: V1.2.0 }
+        version_code:
+          type: integer
+          minimum: 1
+          description: 单调递增编码（防回滚；车端拒绝 <= 当前版本号的包）
+          example: 10200
+        release_type: { $ref: "#/components/schemas/OtaReleaseType" }
+        package_url:
+          type: string
+          description: 落库对象地址（MinIO bucket hunter-ota-packages，永久保留）
+          example: "s3://hunter-ota-packages/hunter-edge/ota/HUNTER_SE/V1.2.0/package.tar.gz"
+        package_size: { type: integer, format: int64, minimum: 1, description: 字节数 }
+        package_md5: { type: string, pattern: "^[0-9a-f]{32}$" }
+        package_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        signature: { type: string, description: RSA-2048 签名（base64） }
+        changelog: { type: object, additionalProperties: true, description: 变更说明（JSONB） }
+        applicable_models:
+          type: array
+          items: { type: string }
+          minItems: 1
+          example: [HUNTER_SE]
+        status: { $ref: "#/components/schemas/OtaVersionStatus" }
+        release_time:
+          type: number
+          nullable: true
+          description: 发布时间（Unix epoch 秒；draft 为 null）
+        package_download_url:
+          type: string
+          nullable: true
+          description: 服务端即时签发的下载预签名地址（有效期 15 分钟，支持 Range 分片下载）
+
+    OtaVersionDetail:
+      allOf:
+        - $ref: "#/components/schemas/OtaVersionItem"
+        - type: object
+          required: [task_count]
+          properties:
+            task_count:
+              type: integer
+              minimum: 0
+              description: 以该版本为目标版本的升级任务数（退役/删除前引用评估）
+
+    OtaVersionList:
+      type: object
+      description: 版本分页数据
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/OtaVersionItem" }
+        total: { type: integer, minimum: 0, description: 满足条件的总记录数（DB COUNT(*)） }
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200 }
+
+    OtaVersionListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaVersionList" }
+
+    OtaVersionResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaVersionItem" }
+
+    OtaVersionDetailResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaVersionDetail" }
+
+    OtaVersionCreateRequest:
+      type: object
+      description: |
+        创建版本草稿 + 申请上传预签名地址。`package_url` / `object_key` **由服务端生成**，
+        客户端不得指定（防越权写入其他对象路径）。
+      required: [version_name, version_code, release_type, package_size, package_md5,
+                 package_sha256, signature, applicable_models]
+      properties:
+        version_name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: 版本展示名（唯一；冲突 → 3002）
+          example: V1.2.0
+        version_code:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: 单调递增编码（唯一；必须大于同车型已发布最大编码，否则 → 6003）
+          example: 10200
+        release_type: { $ref: "#/components/schemas/OtaReleaseType" }
+        package_size: { type: integer, format: int64, minimum: 1, description: 升级包字节数 }
+        package_md5: { type: string, pattern: "^[0-9a-f]{32}$" }
+        package_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: 小写十六进制 SHA-256（发布时服务端会对 MinIO 对象重新流式计算比对）
+        signature:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: RSA-2048 签名（base64，`RSASSA-PKCS1-v1_5 + SHA-256`，由发布方私钥离线生成）
+        changelog:
+          type: object
+          additionalProperties: true
+          description: 变更说明（JSONB，默认 {}）
+          example: { features: ["感知模型升级至 v2.1"], fixes: ["修复远程操控时延抖动"] }
+        applicable_models:
+          type: array
+          items: { type: string, pattern: "^[A-Za-z0-9_]{1,32}$" }
+          minItems: 1
+          description: 适用车型（默认 [HUNTER_SE]）
+          example: [HUNTER_SE]
+        part_count:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 1
+          description: |
+            客户端期望的分片数（> 1 时返回 parts[] 分片预签名地址，支持断点续传）。
+            ⚠ MinIO 分片大小与 S3 UploadId 复用策略待确认（见 x-hunter-pending-confirmation #4）
+
+    OtaVersionUploadPart:
+      type: object
+      description: 分片上传预签名地址（当日志/断点续传用）
+      required: [part_number, upload_url]
+      properties:
+        part_number: { type: integer, minimum: 1, maximum: 10000 }
+        upload_url: { type: string, description: 预签名 PUT 地址（有效期同 expires_in） }
+
+    OtaVersionUploadInfo:
+      type: object
+      description: 上传预签名信息（有效期 3600s = 1 小时，与 5.5 节上传约束一致）
+      required: [object_key, upload_url, expires_in, part_count]
+      properties:
+        object_key:
+          type: string
+          description: 服务端生成的对象键（bucket hunter-ota-packages）
+          example: hunter-edge/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz
+        upload_url: { type: string, description: 单分片预签名 PUT 地址（part_count=1 时直接使用） }
+        expires_in: { type: integer, enum: [3600], description: 有效期秒数（固定 1 小时，不可更改） }
+        part_count: { type: integer, minimum: 1 }
+        parts:
+          type: array
+          nullable: true
+          description: part_count > 1 时返回的分片地址清单
+          items: { $ref: "#/components/schemas/OtaVersionUploadPart" }
+
+    OtaVersionCreateData:
+      type: object
+      description: 创建结果（草稿版本 + 上传信息）
+      required: [version, upload]
+      properties:
+        version: { $ref: "#/components/schemas/OtaVersionItem" }
+        upload: { $ref: "#/components/schemas/OtaVersionUploadInfo" }
+
+    OtaVersionCreateResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaVersionCreateData" }
+
+    OtaVersionPublishRequest:
+      type: object
+      description: 发布请求（可省略请求体；仅提供审计备注）
+      properties:
+        note:
+          type: string
+          maxLength: 512
+          description: 发布备注（写入审计日志，禁止含密钥/证书内容）
+
+    OtaVersionPublishChecks:
+      type: object
+      description: 发布五项校验结论（全部 true 才会置 published；任一 false 直接报错，无部分成功）
+      required: [package_size_verified, md5_verified, sha256_verified, signature_verified,
+                 version_code_monotonic]
+      properties:
+        package_size_verified: { type: boolean, description: MinIO 对象实际字节数与 package_size 一致 }
+        md5_verified: { type: boolean, description: 流式 MD5 与 package_md5 一致（不一致 → 6001） }
+        sha256_verified: { type: boolean, description: 流式 SHA-256 与 package_sha256 一致（不一致 → 6001） }
+        signature_verified: { type: boolean, description: RSA-2048 验签通过（失败 → 6002） }
+        version_code_monotonic: { type: boolean, description: 大于同车型已发布最大 version_code（失败 → 6003） }
+
+    OtaVersionPublishData:
+      type: object
+      required: [version_id, version_code, status, release_time, checks]
+      properties:
+        version_id: { type: string, format: uuid }
+        version_code: { type: integer, minimum: 1 }
+        status: { $ref: "#/components/schemas/OtaVersionStatus" }
+        release_time: { type: number, description: 本次发布时间（Unix epoch 秒） }
+        checks: { $ref: "#/components/schemas/OtaVersionPublishChecks" }
+
+    OtaVersionPublishResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaVersionPublishData" }
+
+    OtaVersionDeprecateRequest:
+      type: object
+      required: [status, reason]
+      properties:
+        status:
+          type: string
+          description: 目标状态（仅允许 deprecated / disabled；published 之外的当前状态 → 3003）
+          enum: [deprecated, disabled]
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: 退役原因（审计留痕，必填）
+
+    # ---------- 升级任务：灰度策略 / 调度 / 门禁 ----------
+    OtaCanaryBatch:
+      type: object
+      description: |
+        单个灰度批次（比例与门禁**不可更改**：5% → 20% → 50% → 100%，每批观察 24h，
+        成功率门禁 ≥ 95%）。
+      required: [batch_no, percent, observe_hours, success_rate_threshold]
+      properties:
+        batch_no: { type: integer, minimum: 1, maximum: 4, description: 批次序号（1 基） }
+        percent: { type: number, enum: [5, 20, 50, 100], description: 本批覆盖目标车辆比例（%） }
+        observe_hours:
+          type: integer
+          enum: [24]
+          description: 本批观察时长（小时，固定 24，进入下一批前必须满足；环境变量 OTA_CANARY_OBSERVE_HOURS）
+        success_rate_threshold:
+          type: number
+          enum: [0.95]
+          description: 本批成功率门禁（阈值来源：设计文档 OTA 灰度流程；环境变量 OTA_CANARY_MIN_SUCCESS_RATE）
+
+    OtaUpgradeStrategy:
+      type: object
+      description: |
+        灰度发布策略（写入 `ota_tasks.upgrade_strategy` JSONB）。
+        **规范序列**：4 批 5/20/50/100 + 观察 24h + 门禁 0.95；创建请求如显式给出，
+        必须逐字段等于该规范值，否则 → 2001（灰度流程不可更改）。
+      required: [batches, stage_gate]
+      properties:
+        batches:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items: { $ref: "#/components/schemas/OtaCanaryBatch" }
+        stage_gate:
+          type: boolean
+          enum: [true]
+          description: 是否严格按批次串行推进（固定 true：任何一批成功率 < 95% 立即暂停 + 告警 + 人工介入）
+
+    OtaTaskSchedule:
+      type: object
+      description: 调度窗口（写入 `ota_tasks.schedule` JSONB）
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          description: 调度模式（immediate=创建后由 start 立即下发；scheduled=到 start_time 由服务内调度器下发）
+          enum: [immediate, scheduled]
+        start_time:
+          type: number
+          nullable: true
+          description: 计划开始时间（Unix epoch 秒；mode=scheduled 时必填且 > 当前时间）
+        window_end:
+          type: number
+          nullable: true
+          description: 计划结束时间（超时未下发完的车辆自动跳过；可选）
+
+    OtaTaskPreconditions:
+      type: object
+      description: |
+        升级门禁（写入 `ota_tasks.preconditions` JSONB，并随 ota_notify 下发给车端二次校验）。
+        默认值对齐系统约束「电量 ≥ 50% / 车辆静止(P 档) / 网络稳定 / 存储 ≥ 2GB」；
+        请求值**不得弱于**平台门禁（放宽 → 2001）。
+      required: [soc_min, must_be_parked, network_stable, min_storage_mb]
+      properties:
+        soc_min:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 50
+          description: 最低电量百分比（环境变量 OTA_PRECONDITION_MIN_SOC）
+        must_be_parked:
+          type: boolean
+          default: true
+          description: 必须静止（P 档）（环境变量 OTA_PRECONDITION_REQUIRE_PARKED）
+        network_stable:
+          type: boolean
+          default: true
+          description: 网络稳定（遥测最后上报间隔 ≤ OTA_OFFLINE_THRESHOLD_SECONDS）
+        min_storage_mb:
+          type: integer
+          minimum: 0
+          default: 2048
+          description: 最小可用存储 MB（环境变量 OTA_PRECONDITION_MIN_STORAGE_MB）
+      example: { soc_min: 50, must_be_parked: true, network_stable: true, min_storage_mb: 2048 }
+
+    OtaTaskCreateRequest:
+      type: object
+      required: [task_name, target_version_id, target_vehicles]
+      properties:
+        task_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: 任务名称
+        target_version_id:
+          type: string
+          format: uuid
+          description: 目标版本（必须为 published；draft/disabled → 3003，不存在 → 3001）
+        target_vehicles:
+          type: array
+          items: { $ref: "#/components/schemas/VehicleId" }
+          minItems: 1
+          maxItems: 1000
+          description: |
+            目标车辆清单（去重后入库；上限默认 1000，环境变量 OTA_TASK_MAX_TARGET_VEHICLES）。
+            车辆存在性/在线状态在 start 时逐台校验（离线 → 4001，忙 → 4002）。
+        upgrade_strategy:
+          allOf: [{ $ref: "#/components/schemas/OtaUpgradeStrategy" }]
+          description: 可选；省略时服务端写入规范灰度序列（推荐省略）
+        schedule:
+          $ref: "#/components/schemas/OtaTaskSchedule"
+        preconditions:
+          $ref: "#/components/schemas/OtaTaskPreconditions"
+      example:
+        task_name: "V1.2.0 灰度升级（首批 5%）"
+        target_version_id: 3f2b1a09-1c2d-4e5f-8a9b-0c1d2e3f4a5b
+        target_vehicles: [HUNTER-001, HUNTER-002, HUNTER-003]
+        schedule: { mode: immediate }
+
+    OtaTaskProgress:
+      type: object
+      description: |
+        任务聚合进度（写入 `ota_tasks.progress` JSONB，并同步缓存 `ota:progress:{task_id}`）。
+        计数按 `ota_records` 当前状态派生，唯一索引 `uq_ota_records_task_vehicle` 保证一台车一条记录。
+      required: [total, pending, in_progress, succeeded, failed, rolled_back]
+      properties:
+        total: { type: integer, minimum: 0, description: 目标车辆总数 }
+        pending: { type: integer, minimum: 0, description: 未开始/等待门禁 }
+        in_progress: { type: integer, minimum: 0, description: 处于 PENDING/DOWNLOAD/INSTALL/TEST }
+        succeeded: { type: integer, minimum: 0, description: 到达 SUCCESS }
+        failed: { type: integer, minimum: 0, description: 到达 FAILED }
+        rolled_back: { type: integer, minimum: 0, description: 到达 ROLLED_BACK }
+        success_rate:
+          type: number
+          nullable: true
+          description: 已完成车辆中的成功率（服务端派生，分母为 succeeded+failed+rolled_back；无完成车辆时为 null）
+        current_batch: { type: integer, minimum: 0, maximum: 4, description: 当前批次序号（0=尚未开始） }
+
+    OtaTaskItem:
+      type: object
+      description: |
+        `ota_svc.ota_tasks` 单行（字段与 DDL 一一对应）。
+        `target_vehicles` 为该表 TEXT[] 列原样返回，列表接口可按 need_vehicles 省略以控制响应体积。
+      required: [task_id, task_name, target_version_id, status, progress, creator, create_time]
+      properties:
+        task_id: { type: string, format: uuid }
+        task_name: { type: string, maxLength: 128 }
+        target_version_id: { type: string, format: uuid }
+        target_vehicles:
+          type: array
+          nullable: true
+          items: { $ref: "#/components/schemas/VehicleId" }
+          description: 目标车辆清单（列表接口在 need_vehicles=false 时为 null）
+        vehicle_count: { type: integer, minimum: 0, description: 目标车辆数（= array_length(target_vehicles,1)） }
+        upgrade_strategy: { $ref: "#/components/schemas/OtaUpgradeStrategy" }
+        schedule: { $ref: "#/components/schemas/OtaTaskSchedule" }
+        preconditions: { $ref: "#/components/schemas/OtaTaskPreconditions" }
+        status: { $ref: "#/components/schemas/OtaTaskStatus" }
+        progress: { $ref: "#/components/schemas/OtaTaskProgress" }
+        creator:
+          type: string
+          format: uuid
+          description: 创建人 user_id（DDL NOT NULL；网关注入 JWT 主体 sub，服务端不接收客户端传入）
+        create_time: { type: number, description: 创建时间（Unix epoch 秒） }
+
+    OtaBatchProgress:
+      type: object
+      description: 单批次进度视图（服务端按 ota_records 与 upgrade_strategy 派生，不落库）
+      required: [batch_no, percent, status, target_count, success_count, failed_count,
+                 rolled_back_count, in_progress_count]
+      properties:
+        batch_no: { type: integer, minimum: 1, maximum: 4 }
+        percent: { type: number, enum: [5, 20, 50, 100] }
+        status: { $ref: "#/components/schemas/OtaBatchStatus" }
+        target_count: { type: integer, minimum: 0, description: 本批分配车辆数 }
+        success_count: { type: integer, minimum: 0 }
+        failed_count: { type: integer, minimum: 0 }
+        rolled_back_count: { type: integer, minimum: 0 }
+        in_progress_count: { type: integer, minimum: 0 }
+        success_rate: { type: number, nullable: true, description: 本批成功率（门禁 ≥ 0.95） }
+        observe_until:
+          type: number
+          nullable: true
+          description: 本批观察截止时间（Unix epoch 秒 = 本批全部完成时间 + 24h）
+        started_at: { type: number, nullable: true }
+        finished_at: { type: number, nullable: true }
+
+    OtaRolloutView:
+      type: object
+      description: 灰度推进视图（任务详情内返回，供前端展示「推进/观察/暂停」决策建议）
+      required: [current_batch, total_batches, next_action, batches]
+      properties:
+        current_batch: { type: integer, minimum: 0, maximum: 4 }
+        total_batches: { type: integer, enum: [4] }
+        observe_until: { type: number, nullable: true, description: 当前批次观察截止时间 }
+        next_action: { $ref: "#/components/schemas/OtaNextAction" }
+        halt_reason:
+          type: string
+          nullable: true
+          description: 暂停原因（next_action=halt 时给出，如 success_rate 0.93 < 0.95）
+        batches:
+          type: array
+          items: { $ref: "#/components/schemas/OtaBatchProgress" }
+
+    # ---------- 升级任务：动作请求与回执 ----------
+    OtaTaskStartRequest:
+      type: object
+      description: 启动/恢复请求体（可省略；仅承载审计备注）
+      properties:
+        note:
+          type: string
+          maxLength: 512
+          description: 操作备注（写入审计日志，禁止含密钥/证书内容）
+        batch_no:
+          type: integer
+          minimum: 1
+          maximum: 4
+          nullable: true
+          description: |
+            ⚠ 一般省略。仅当任务处于 paused 且人工确认推进时可选填目标批次号；
+            填写的批次号必须等于「当前批次 + 1」，否则 → 3003（禁止跳批，见 x-hunter-pending-confirmation #3）
+
+    OtaTaskPauseRequest:
+      type: object
+      description: 暂停请求体（可省略）
+      properties:
+        reason:
+          type: string
+          maxLength: 512
+          description: 暂停原因（如「成功率异常，人工介入排查」）
+
+    OtaTaskCancelRequest:
+      type: object
+      description: 终止请求体（可省略）
+      properties:
+        reason:
+          type: string
+          maxLength: 512
+          description: 终止原因（审计留痕）
+
+    OtaPreconditionFailure:
+      type: object
+      description: 单车门禁失败明细（错误码 6003 的 `data.precondition_failures[]`）
+      required: [vehicle_id, failed_conditions]
+      properties:
+        vehicle_id: { $ref: "#/components/schemas/VehicleId" }
+        failed_conditions:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/OtaPreconditionName" }
+          description: 未通过的门禁项（1=电量, 2=静止/档位, 3=网络, 4=存储）
+        actual:
+          type: object
+          additionalProperties: true
+          description: 实测值（battery_soc / gear / last_seen_seconds / free_storage_mb）
+          example: { battery_soc: 42, gear: "D", last_seen_seconds: 3, free_storage_mb: 8192 }
+
+    OtaTaskActionData:
+      type: object
+      description: 任务动作回执（start / pause / resume / cancel 共用）
+      required: [task_id, action, status, released_count, blocked_count, executed_at]
+      properties:
+        task_id: { type: string, format: uuid }
+        action: { $ref: "#/components/schemas/OtaTaskAction" }
+        status:
+          allOf: [{ $ref: "#/components/schemas/OtaTaskStatus" }]
+          description: 动作执行后的任务状态
+        batch_no:
+          type: integer
+          nullable: true
+          description: 本次动作涉及的批次号（pause/cancel 可能为 null）
+        released_vehicles:
+          type: array
+          items: { $ref: "#/components/schemas/VehicleId" }
+          description: 本次放行（已下发 ota_notify）的车辆清单
+        blocked_vehicles:
+          type: array
+          items: { $ref: "#/components/schemas/OtaPreconditionFailure" }
+          description: 本次因门禁/状态被拦截的车辆清单（单车失败不阻断同批其余车辆）
+        released_count: { type: integer, minimum: 0 }
+        blocked_count: { type: integer, minimum: 0 }
+        executed_at: { type: number, description: 动作执行时间（Unix epoch 秒） }
+        operator_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: 操作人 user_id（网关注入 JWT 主体）
+        reason:
+          type: string
+          nullable: true
+          description: 动作原因（pause/cancel 回显请求值）
+
+    OtaTaskActionResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaTaskActionData" }
+
+    # ---------- 升级任务：人工回滚 ----------
+    OtaTaskRollbackRequest:
+      type: object
+      required: [reason]
+      properties:
+        vehicle_ids:
+          type: array
+          nullable: true
+          items: { $ref: "#/components/schemas/VehicleId" }
+          minItems: 1
+          description: 待回滚车辆子集；省略 = 该任务下**全部** `ota_records.status=SUCCESS` 的车辆
+        target:
+          allOf: [{ $ref: "#/components/schemas/OtaRollbackTarget" }]
+          default: previous_slot
+          description: 回滚目标（当前仅支持 A/B 分区回退到上一分区）
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: 回滚原因（审计留痕，必填；同时随 command params 下发车端）
+      example:
+        vehicle_ids: [HUNTER-001, HUNTER-002]
+        target: previous_slot
+        reason: "灰度观察期内发现定位漂移，回滚上一分区"
+
+    OtaTaskRollbackResultItem:
+      type: object
+      description: 单车回滚受理结论（逐车独立，单车失败不影响其余车辆）
+      required: [vehicle_id, accepted]
+      properties:
+        vehicle_id: { $ref: "#/components/schemas/VehicleId" }
+        accepted: { type: boolean, description: true=已下发 ota_rollback 指令；false=被拒绝 }
+        command_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: 指令 ID（accepted=true；用于与 `command_result` 关联追踪）
+        topic:
+          type: string
+          nullable: true
+          description: 指令下发 Topic（accepted=true 时固定 hunter.{vehicle_id}.command）
+        reason:
+          type: string
+          nullable: true
+          description: 拒绝原因（accepted=false，如 离线 / 状态不允许 / 无 SUCCESS 记录）
+        current_status:
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/OtaUpgradeStatus" }]
+          description: 拒绝时车辆的 `ota_records.status`
+
+    OtaTaskRollbackData:
+      type: object
+      required: [task_id, requested_count, accepted_count, rejected_count, results]
+      properties:
+        task_id: { type: string, format: uuid }
+        target: { $ref: "#/components/schemas/OtaRollbackTarget" }
+        requested_count: { type: integer, minimum: 0, description: 本次请求回滚车辆数 }
+        accepted_count: { type: integer, minimum: 0, description: 成功下发指令车辆数 }
+        rejected_count: { type: integer, minimum: 0, description: 被拒绝车辆数（门禁/状态/离线） }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/OtaTaskRollbackResultItem" }
+        executed_at: { type: number, description: 动作执行时间（Unix epoch 秒） }
+        operator_id: { type: string, format: uuid, nullable: true }
+
+    OtaTaskRollbackResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaTaskRollbackData" }
+
+    # ---------- 升级任务：查询响应 ----------
+    OtaTaskDetail:
+      allOf:
+        - $ref: "#/components/schemas/OtaTaskItem"
+        - type: object
+          required: [target_version, rollout]
+          properties:
+            target_version:
+              allOf: [{ $ref: "#/components/schemas/OtaVersionItem" }]
+              description: 内联目标版本（前端一次请求即可渲染任务全貌）
+            rollout: { $ref: "#/components/schemas/OtaRolloutView" }
+
+    OtaTaskList:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/OtaTaskItem" }
+        total: { type: integer, minimum: 0 }
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200 }
+
+    OtaTaskListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaTaskList" }
+
+    OtaTaskResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaTaskItem" }
+
+    OtaTaskDetailResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaTaskDetail" }
+
+    # ---------- 车辆升级记录（ota_records） ----------
+    OtaRecordItem:
+      type: object
+      description: |
+        `ota_svc.ota_records` 单行（字段与 DDL 一一对应）。
+        唯一索引 `uq_ota_records_task_vehicle` 保证同一任务下每车仅一条记录；
+        `start_time` 为记录创建时间（DDL `DEFAULT now()`，**不是**首次 DOWNLOAD 时间）。
+      required: [record_id, task_id, vehicle_id, to_version, status, phase, progress, start_time]
+      properties:
+        record_id: { type: integer, format: int64, description: BIGSERIAL 主键 }
+        task_id: { type: string, format: uuid }
+        vehicle_id: { $ref: "#/components/schemas/VehicleId" }
+        from_version: { type: string, nullable: true, description: 升级前版本（下发时取车辆当前版本；未知为 null） }
+        to_version: { type: string, description: 目标版本名（= ota_versions.version_name；DDL NOT NULL） }
+        status: { $ref: "#/components/schemas/OtaUpgradeStatus" }
+        phase: { $ref: "#/components/schemas/OtaUpgradeStatus" }
+        progress: { type: integer, minimum: 0, maximum: 100, description: 车端上报百分比 }
+        error_code:
+          type: string
+          nullable: true
+          maxLength: 64
+          description: |
+            车端/平台错误码（DDL 为 TEXT，以兼容车端自定义码）：'6001' 校验失败 / '6002' 验签失败 /
+            '6003' 门禁不满足 / '7002' 类似平台码；与 Kafka `ota_status.error_code`（string）同域
+        error_message:
+          type: string
+          nullable: true
+          description: 失败原因（车端上报 ≤512 字符，Kafka 契约约束；禁止含密钥/证书内容）
+        start_time: { type: number, description: 记录创建时间（Unix epoch 秒） }
+        end_time: { type: number, nullable: true, description: 到达终态时间（SUCCESS/ROLLED_BACK/FAILED） }
+        duration_seconds:
+          type: number
+          nullable: true
+          description: 服务端派生 = end_time - start_time（未结束为 null，客户端不做时间运算）
+
+    OtaRecordList:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/OtaRecordItem" }
+        total: { type: integer, minimum: 0 }
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 200 }
+        summary:
+          nullable: true
+          description: 任务级聚合摘要（仅 /tasks/{task_id}/records 返回，便于前端渲染批次卡片）
+          allOf: [{ $ref: "#/components/schemas/OtaTaskProgress" }]
+
+    OtaRecordListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/OtaRecordList" }
+
+# ---------- 以下是本契约的机器可读扩展（x-hunter-*），供实现/测试/运维核对 ----------
+
+x-hunter-service:
+  name: ota-service
+  module: "OTA 管理（版本仓库管理 / 升级任务调度 / 灰度发布 / 升级监控 / A/B 分区回滚）"
+  port: 8084
+  gateway_prefix: /api/v1/ota
+  db_schema: ota_svc
+  db_tables: [ota_versions, ota_tasks, ota_records]
+  db_access:
+    - table: ota_versions
+      access: write+read+update
+      pattern: "create 插入 draft（release_time=null）→ publish 校验通过后更新为 published + release_time；deprecate 更新 status；**不提供 DELETE**（ON DELETE RESTRICT + 需可追溯）"
+    - table: ota_tasks
+      access: write+read+update
+      pattern: "create 插入（upgrade_strategy / schedule / preconditions JSONB）→ start/pause/resume/cancel 推状态 + progress JSONB 快照；批次推进以 SELECT ... FOR UPDATE 行锁串行化"
+    - table: ota_records
+      access: write+read+update
+      pattern: "start/resume 按车辆批量插入（status=PENDING、phase=IDLE、progress=0）；消费 ota_status 按唯一索引 uq_ota_records_task_vehicle 更新 status/phase/progress/error_*；rollback 置 ROLLED_BACK"
+  db_cross_service_policy: "禁止跨服务直连其他 schema；车辆在线 / 电量 / 档位仅读 Redis 读模型 vehicle:status:{vehicle_id}（权威值属 vehicle-service）"
+  minio_buckets: [hunter-ota-packages]
+  minio_bucket_lifecycle:
+    hunter-ota-packages: "永久保留（OTA 版本可追溯）；SSE-S3 服务端加密；上传预签名 1 小时 / 下载预签名 15 分钟 + Range 分片"
+  redis_keys:
+    - pattern: "ota:progress:{task_id}"
+      type: "Hash"
+      ttl_seconds: 86400
+      usage: "任务进度热点视图（任务结束后保留 1 天，随后回落 ota_tasks.progress JSONB 快照）"
+    - pattern: "vehicle:status:{vehicle_id}"
+      type: "Hash"
+      ttl_seconds: null
+      usage: "只读：升级门禁判定（battery_soc 电量 / vehicle_state 是否 P 档静止 / 在线）"
+    - pattern: "vehicle:online:set"
+      type: "Set"
+      ttl_seconds: null
+      usage: "只读：目标车辆在线数量统计（start 前可行性预检）"
+    - pattern: "rate_limit:{ip}:{api}"
+      type: "String"
+      ttl_seconds: 60
+      usage: "接口限流计数（窗口 1 分钟；与附录 D 阈值配合）"
+  dependencies:
+    postgresql: "ota_svc 三表（唯一索引 uq_ota_versions_version_code / uq_ota_versions_version_name / uq_ota_records_task_vehicle；部分索引 idx_ota_records_inflight；车辆维度索引 idx_ota_records_vehicle_start_time）"
+    redis: "只写 ota:progress:{task_id}、只读 vehicle:status:{vehicle_id} / vehicle:online:set（不新增 Redis 键模式）"
+    minio: "hunter-ota-packages（永久保留；SSE-S3）"
+    kafka: "见 x-hunter-kafka"
+    services: "无同步 REST 依赖：目标车辆清单由调用方传入，车辆可用性经 Redis 读模型判定（vehicle-service 归属未在模块表定义 → 见 x-hunter-pending-confirmation #18）"
+  config_source: "pydantic-settings（环境变量 / K8s ConfigMap ota-service-config + hunter-common-config + Secret hunter-app-secrets）"
+  required_env:
+    - SERVICE_NAME
+    - API_PORT
+    - DB_POOL_SIZE
+    - DB_MAX_OVERFLOW
+    - MINIO_BUCKET_OTA_PACKAGES
+    - PRESIGNED_UPLOAD_EXPIRE_SECONDS
+    - PRESIGNED_DOWNLOAD_EXPIRE_SECONDS
+    - OTA_CANARY_STAGES
+    - OTA_CANARY_OBSERVE_HOURS
+    - OTA_CANARY_MIN_SUCCESS_RATE
+    - OTA_PRECONDITION_MIN_SOC
+    - OTA_PRECONDITION_REQUIRE_PARKED
+    - OTA_PRECONDITION_MIN_STORAGE_MB
+    - OTA_OFFLINE_THRESHOLD_SECONDS
+    - OTA_OFFLINE_FALLBACK_ENABLED
+    - OTA_PACKAGE_VERIFY_SHA256
+    - OTA_PACKAGE_VERIFY_SIGNATURE
+    - OTA_ROLLOUT_TICK_SECONDS
+    - OTA_TASK_MAX_TARGET_VEHICLES
+    - KAFKA_BOOTSTRAP_SERVERS
+    - KAFKA_SECURITY_PROTOCOL
+    - KAFKA_SASL_MECHANISM
+    - POSTGRES_HOST
+    - POSTGRES_PORT
+    - POSTGRES_USER
+    - POSTGRES_DB
+    - REDIS_HOST
+    - REDIS_PORT
+    - MINIO_ENDPOINT
+    - OTA_SIGNATURE_PUBLIC_KEY
+    - POSTGRES_PASSWORD
+    - REDIS_PASSWORD
+    - MINIO_ACCESS_KEY
+    - MINIO_SECRET_KEY
+    - KAFKA_SASL_USERNAME
+    - KAFKA_SASL_PASSWORD
+  env_derived:
+    - name: KAFKA_BOOTSTRAP_SERVERS
+      from: "hunter-common-config（共享 ConfigMap）"
+    - name: KAFKA_SECURITY_PROTOCOL
+      from: "hunter-common-config（共享 ConfigMap；SASL_SSL 强制，禁止 PLAINTEXT）"
+    - name: KAFKA_SASL_MECHANISM
+      from: "hunter-common-config（共享 ConfigMap；SCRAM-SHA-512）"
+    - name: POSTGRES_HOST
+      from: "hunter-common-config（共享 ConfigMap）"
+    - name: POSTGRES_PORT
+      from: "hunter-common-config（共享 ConfigMap）"
+    - name: POSTGRES_USER
+      from: "hunter-common-config（共享 ConfigMap）"
+    - name: POSTGRES_DB
+      from: "hunter-common-config（共享 ConfigMap）"
+    - name: REDIS_HOST
+      from: "hunter-common-config（共享 ConfigMap）"
+    - name: REDIS_PORT
+      from: "hunter-common-config（共享 ConfigMap）"
+    - name: MINIO_ENDPOINT
+      from: "hunter-common-config（共享 ConfigMap）"
+    - name: OTA_SIGNATURE_PUBLIC_KEY
+      from: "hunter-app-secrets（Secret；RSA-2048 验签公钥 PEM，非敏感但统一由 Secret 注入）"
+    - name: POSTGRES_PASSWORD
+      from: "hunter-app-secrets（Secret）"
+    - name: REDIS_PASSWORD
+      from: "hunter-app-secrets（Secret）"
+    - name: MINIO_ACCESS_KEY
+      from: "hunter-app-secrets（Secret）"
+    - name: MINIO_SECRET_KEY
+      from: "hunter-app-secrets（Secret）"
+    - name: KAFKA_SASL_USERNAME
+      from: "hunter-app-secrets（Secret）"
+    - name: KAFKA_SASL_PASSWORD
+      from: "hunter-app-secrets（Secret）"
+  env_defaults:
+    OTA_PACKAGE_VERIFY_SHA256: true
+    OTA_PACKAGE_VERIFY_SIGNATURE: true
+    OTA_PRECONDITION_MIN_SOC: 50
+    OTA_PRECONDITION_REQUIRE_PARKED: true
+    OTA_PRECONDITION_MIN_STORAGE_MB: 2048
+    OTA_OFFLINE_THRESHOLD_SECONDS: 10
+    OTA_CANARY_STAGES: "5,20,50,100"
+    OTA_CANARY_OBSERVE_HOURS: 24
+    OTA_CANARY_MIN_SUCCESS_RATE: 0.95
+    OTA_ROLLOUT_TICK_SECONDS: 60
+    OTA_TASK_MAX_TARGET_VEHICLES: 1000
+    OTA_OFFLINE_FALLBACK_ENABLED: false
+    PRESIGNED_UPLOAD_EXPIRE_SECONDS: 3600
+    PRESIGNED_DOWNLOAD_EXPIRE_SECONDS: 900
+  env_notes:
+    - env: OTA_SIGNATURE_PUBLIC_KEY
+      note: "RSA-2048 验签公钥（PEM；由 hunter-app-secrets 注入）；私钥仅存发布方 CI/KMS，禁止入库/入日志（与 offline 签名私钥分离）"
+    - env: OTA_PRECONDITION_MIN_STORAGE_MB
+      note: "单位 MB，与 ota_tasks.preconditions.min_storage_mb / Kafka ota_notify.preconditions.min_storage_mb 字段单位一致（避免换算错误）；2048 = 2GB（设计文档升级门禁）"
+    - env: OTA_PRECONDITION_MIN_SOC
+      note: "电量门禁 ≥50%（设计文档升级门禁，不可放宽）；低于该值车辆计入 start 响应的 blocked[]"
+    - env: OTA_PRECONDITION_REQUIRE_PARKED
+      note: "静止（P 档）门禁；判定依据 vehicle:status:{vehicle_id} 读模型，缺数据时按 OTA_OFFLINE_FALLBACK_ENABLED 处理"
+    - env: OTA_CANARY_STAGES
+      note: "灰度批次定义，取值必须为 5,20,50,100（设计文档灰度流程不可更改）；仅允许整体停用灰度（置 100）作为紧急通道，见 x-hunter-pending-confirmation #16"
+    - env: OTA_CANARY_OBSERVE_HOURS
+      note: "每批观察 24h（可调但不得放宽下限；<24h 观察会削弱灰度门禁有效性）"
+    - env: OTA_CANARY_MIN_SUCCESS_RATE
+      note: "每批成功率门禁 0.95；不得放宽下限（<95% 必须暂停 + 告警 + 人工介入）"
+    - env: OTA_TASK_MAX_TARGET_VEHICLES
+      note: "单任务目标车辆上限（防误操作全量下发；超限 2001）"
+    - env: OTA_OFFLINE_THRESHOLD_SECONDS
+      note: "网络稳定判定：遥测最后上报间隔 ≤ 该值（默认 10s，与 communication_loss 事件阈值同源）"
+    - env: OTA_OFFLINE_FALLBACK_ENABLED
+      note: "⚠ 门禁读模型（vehicle:status:{vehicle_id} / vehicle:online:set）缺失时的策略：默认 **false = 缺数据即拒绝**（计入 start 响应 blocked[] 并给 reason），与 K8s 生产 ConfigMap 一致；仅 DEBUG 联调可显式置 true，见 x-hunter-pending-confirmation #19"
+    - env: OTA_PACKAGE_VERIFY_SHA256
+      note: "完整性校验开关，默认 true；生产禁止置 false（仅 DEBUG 联调可关），见 x-hunter-pending-confirmation #17"
+    - env: OTA_PACKAGE_VERIFY_SIGNATURE
+      note: "RSA-2048 验签开关，默认 true；生产禁止置 false，见 x-hunter-pending-confirmation #17"
+    - env: OTA_ROLLOUT_TICK_SECONDS
+      note: "灰度调度器扫描周期（观察窗口到期判定 + 批次推进）"
+  forbidden_hardcode: "URL / 密钥 / 端口 / 阈值 / 频率一律走环境变量或 ConfigMap，禁止硬编码（规则 16）"
+  performance:
+    targets:
+      api_response_p95_ms: 200
+      telemetry_ingest_latency_s: 1
+      alert_trigger_latency_s: 2
+      availability: "99.9%"
+    note: "OTA 域无视频/指令时延指标；ota_notify 端到端下发时延目标 P95 ≤ 5s（观察项，见 x-hunter-pending-confirmation #7）"
+    exceptions:
+      - endpoint: "POST /api/v1/ota/versions/{version_id}/publish"
+        reason: "GB 级升级包单次流式 MD5/SHA-256 + RSA-2048 验签，耗时随包体线性增长"
+        gateway_timeout_seconds: ">= 300"
+        mitigation: "异步任务化列为备选方案（见 x-hunter-pending-confirmation #9），当前契约保持同步语义 + 长度例外登记"
+  observability:
+    metrics:
+      - ota_versions_total{status}
+      - ota_tasks_total{status}
+      - ota_records_total{status}
+      - ota_package_verify_failures_total{reason}
+      - ota_canary_success_rate{task_id,batch_no}
+      - ota_rollback_total{trigger}
+    logs: "structlog JSON，必含 trace_id / service / user_id（如适用）/ task_id / vehicle_id（如适用）"
+    audit: "发布 / 退役 / 任务创建 / 启动 / 暂停 / 恢复 / 终止 / 回滚 全量审计（见 x-hunter-ota-security.audit）"
+
+x-hunter-endpoints:
+  note: |
+    契约定义顺序 = 实现顺序（契约先行）。每条端点均标注来源依据；`derived` 表示
+    设计文档 §12.5 未提供，由「附录 D + 第 9 章三表能力 + OTA 流程 + 本仓库统一探针」推导。
+  items:
+    - { operationId: listOtaVersions,        method: GET,  path: "/api/v1/ota/versions",                     rbac: "ota:read",    source: derived }
+    - { operationId: createOtaVersion,       method: POST, path: "/api/v1/ota/versions",                     rbac: "ota:create",  source: "附录 D 明列（POST /api/v1/ota/versions）", rate_limit: "5 QPS/用户" }
+    - { operationId: getOtaVersion,          method: GET,  path: "/api/v1/ota/versions/{version_id}",       rbac: "ota:read",    source: derived }
+    - { operationId: publishOtaVersion,      method: POST, path: "/api/v1/ota/versions/{version_id}/publish",   rbac: "ota:execute", source: derived, note: "性能例外；网关超时 ≥300s" }
+    - { operationId: deprecateOtaVersion,    method: POST, path: "/api/v1/ota/versions/{version_id}/deprecate", rbac: "ota:execute", source: derived }
+    - { operationId: listOtaTasks,           method: GET,  path: "/api/v1/ota/tasks",                       rbac: "ota:read",    source: derived }
+    - { operationId: createOtaTask,          method: POST, path: "/api/v1/ota/tasks",                       rbac: "ota:create",  source: derived }
+    - { operationId: getOtaTask,             method: GET,  path: "/api/v1/ota/tasks/{task_id}",             rbac: "ota:read",    source: derived }
+    - { operationId: startOtaTask,           method: POST, path: "/api/v1/ota/tasks/{task_id}/start",       rbac: "ota:execute", source: derived }
+    - { operationId: pauseOtaTask,           method: POST, path: "/api/v1/ota/tasks/{task_id}/pause",       rbac: "ota:execute", source: derived }
+    - { operationId: resumeOtaTask,          method: POST, path: "/api/v1/ota/tasks/{task_id}/resume",      rbac: "ota:execute", source: derived }
+    - { operationId: cancelOtaTask,          method: POST, path: "/api/v1/ota/tasks/{task_id}/cancel",      rbac: "ota:execute", source: derived }
+    - { operationId: rollbackOtaTask,        method: POST, path: "/api/v1/ota/tasks/{task_id}/rollback",    rbac: "ota:execute", source: derived }
+    - { operationId: listOtaTaskRecords,     method: GET,  path: "/api/v1/ota/tasks/{task_id}/records",     rbac: "ota:read",    source: derived }
+    - { operationId: listVehicleOtaRecords,  method: GET,  path: "/api/v1/ota/vehicles/{vehicle_id}/records", rbac: "ota:read",  source: derived }
+    - { operationId: healthz,                method: GET,  path: "/healthz",  rbac: none, source: "本仓库统一探针", security: [] }
+    - { operationId: readyz,                 method: GET,  path: "/readyz",   rbac: none, source: "本仓库统一探针", security: [] }
+    - { operationId: metrics,                method: GET,  path: "/metrics",  rbac: none, source: "Prometheus 抓取", security: [] }
+  forbidden:
+    - "禁止新增端点而不先更新本契约（规则 7）"
+    - "DELETE /api/v1/ota/versions/{id}：DDL 为 ON DELETE RESTRICT 且 OTA 要求可追溯 → 明确不提供，退役走 deprecate"
+
+x-hunter-rate-limits:
+  note: "阈值来源：附录 D（不可更改）。429 响应体 code 复用 5001（附录 A 无限流专用码，禁止新增）。"
+  global:
+    - { scope: global,  limit: 10000, unit: QPS, applies_to: "网关全局限流" }
+    - { scope: user,    limit: 100,   unit: QPS, applies_to: "单用户（JWT sub）" }
+    - { scope: ip,      limit: 200,   unit: QPS, applies_to: "单 IP" }
+  endpoint_overrides:
+    - { endpoint: "POST /api/v1/ota/versions", scope: user, limit: 5, unit: QPS, source: "附录 D 明列" }
+  recommended:
+    - endpoint: "POST /api/v1/ota/versions/{version_id}/publish"
+      scope: user
+      limit: 2
+      unit: QPS
+      source: "非附录 D 规定值，仅为实现建议（长耗时端点，防并发 IO 打满）；⚠ 见 x-hunter-pending-confirmation #10"
+  kafka_side_limits:
+    - { scope: "单车遥测上报", limit: 100, unit: "msg/s", note: "车端约束，非本服务" }
+    - { scope: "文件上传", limit: 10, unit: Mbps, note: "车端约束，非本服务" }
+  client_guidance: "以 HTTP 429 + Retry-After 为准；退避重试（指数退避，最大 3 次）"
+
+x-hunter-kafka:
+  source_of_truth: "contracts/kafka/topics.yaml + contracts/kafka/consumer-groups.yaml + contracts/kafka/schemas/*.json（本服务不新增 Topic / 不修改配置）"
+  consumes:
+    - topic_pattern: "hunter.*.ota_status"
+      subscribe_mode: regex_pattern
+      declared_in: "consumer-groups.yaml → group_id: ota-service-ota-status"
+      partitions: 3
+      key: vehicle_id
+      acks_producer_side: all
+      retention: "30 天"
+      schema: schemas/ota_status.schema.json
+      idempotency_key: "(task_id, vehicle_id, status)"
+      processing:
+        - "按 (task_id, vehicle_id) 定位 ota_records（唯一索引 uq_ota_records_task_vehicle），推进 status/phase/progress"
+        - "终态（SUCCESS / ROLLED_BACK / FAILED）时写 end_time；error_code / error_message 原样落库（DDL 为 TEXT，与 schema 的 string 一致，无需转换）"
+        - "同步 Redis ota:progress:{task_id} 与 ota_tasks.progress 快照"
+        - "批次成功率 = 本批 SUCCESS / 本批总数；< OTA_CANARY_MIN_SUCCESS_RATE（0.95）→ 任务置 paused + 告警（alert_event）"
+        - "消息键不含车辆版本权威值：不写 vehicle_svc 数据（跨服务禁止双写）"
+      offset_commit: "手动提交（业务处理成功后提交，at-least-once + 幂等）"
+      dlq: "处理失败进死信队列：`{original_topic}.dlq`（`hunter_common.kafka.consumer` 统一派生，保留原 topic/partition/offset 头）；⚠ 该派生 Topic 尚未登记于 contracts/kafka/topics.yaml → 见 x-hunter-pending-confirmation #11"
+      offset_reset_policy: "earliest（消费组首次启动不丢历史状态上报）"
+      notes: "consumer-groups.yaml 中该消费组 produces 声明为 []（消费链路无再生产）；本服务对外的 ota_notify / command 由独立生产者发送，非消费组输出"
+  produces:
+    - topic: "hunter.{vehicle_id}.ota_notify"
+      declared_in: "topics.yaml → producer: ota-service"
+      partitions: 3
+      partition_key: vehicle_id
+      acks: all
+      schema: schemas/ota_notify.schema.json
+      trigger: "POST /tasks/{task_id}/start 及灰度调度器放行每一批（逐车一条）"
+      payload_note: "package_url 使用**发送时刻**签发的 1 小时预签名地址（X-Amz-Expires=3600）；禁止下发长期凭证或密钥"
+      schema_requires: [vehicle_id, timestamp, task_id, version_name, version_code, package_url,
+                        package_size, package_md5, package_sha256, signature]
+    - topic: "hunter.{vehicle_id}.command"
+      declared_in: "topics.yaml → producer: [api-gateway, ota-service, remote-control]"
+      partitions: 3
+      partition_key: vehicle_id
+      acks: all
+      schema: schemas/command.schema.json
+      command_type: ota_rollback
+      params: "{task_id, target, reason}"
+      trigger: "POST /tasks/{task_id}/rollback（人工兜底 A/B 分区回退）"
+      result_tracking: "指令结果经 hunter.{vehicle_id}.command_result 回报；本服务**不消费**该 Topic（消费声明未登记于 consumer-groups.yaml）→ 回滚结果以 ota_status（ROLLED_BACK/FAILED）+ ota_records 终态为准，见 x-hunter-pending-confirmation #12"
+    - topic: "hunter.broadcast.command"
+      declared_in: "topics.yaml → producer: [api-gateway, ota-service]（该字段为**设计预期生产者登记**，非实现现状）"
+      partitions: 3
+      acks: all
+      schema: schemas/command.schema.json
+      status: "⚠ 本服务使用场景（如全车队暂停升级）设计文档未定义 → 见 x-hunter-pending-confirmation #12；未确认前**不生产**该 Topic（全车队操作逐车经 ota_notify 完成；api-gateway 契约亦声明不生产任何 Topic）"
+  security: "车端连接强制 SASL_SSL + SCRAM-SHA-512（禁止 PLAINTEXT）；消息 key = vehicle_id 保证单车辆有序"
+  forbidden: "禁止新增 Topic、禁止修改分区/acks/retention、禁止以 PLAINTEXT 连接任何环境"
+
+x-hunter-version-upload-flow:
+  note: "两步式：先建草稿拿预签名地址（不经过服务端，避免 GB 级包体打满 API 网关），再直传 MinIO，最后发布校验。"
+  steps:
+    - step: 1
+      action: "POST /api/v1/ota/versions"
+      detail: "提交元数据（version_name / version_code / release_type / package_size / package_md5 / package_sha256 / signature / changelog / applicable_models）"
+      server_side: "唯一性校验 + version_code 单调性预校验 + 生成 object_key + 落库 status=draft + 签发 1 小时上传预签名地址"
+    - step: 2
+      action: "客户端 PUT 直传 MinIO（bucket hunter-ota-packages）"
+      detail: "part_count=1 用 upload_url；>1 用 parts[] 分片并支持断点续传"
+      ttl_seconds: 3600
+    - step: 3
+      action: "POST /api/v1/ota/versions/{version_id}/publish"
+      server_side:
+        - "读取 MinIO 对象做**单次流式** MD5 + SHA-256 + 长度校验（不整包入内存）→ 不匹配 6001"
+        - "RSA-2048 验签（RSASSA-PKCS1-v1_5 + SHA-256；公钥 OTA_SIGNATURE_PUBLIC_KEY）→ 失败 6002"
+        - "version_code 单调递增门禁（同 applicable_models 范围已发布最大值）→ 失败 6003"
+        - "全部通过：draft → published + 写 release_time"
+    - step: 4
+      action: "GET /api/v1/ota/versions/{version_id} 或列表"
+      detail: "返回即时签发的 15 分钟下载预签名地址 package_download_url（支持 Range 分片下载）"
+  object_key_pattern: "hunter-edge/ota/{model}/{version_name}/{version_code}/package.tar.gz（例：hunter-edge/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz）"
+  presign_policy:
+    upload_expires_seconds: 3600
+    download_expires_seconds: 900
+    range_download: true
+  integrity_rules:
+    - "package_md5 / package_sha256 一律小写十六进制（DDL CHAR(32) / CHAR(64)）"
+    - "禁止以 MinIO multipart 的 ETag 直接充当 SHA-256（多分片 ETag 非内容哈希）"
+    - "签名私钥仅存发布方 CI/KMS；平台仅存公钥；日志禁止输出密钥与私钥"
+  pending:
+    - "分片上传的 UploadId 复用/分片大小/断点续传语义（见 x-hunter-pending-confirmation #4）"
+    - "升级包大小上限未定义（建议 GB 级：500MB~4GB），需确认（见 x-hunter-pending-confirmation #13）"
+
+x-hunter-canary-rollout:
+  source: "系统约束：灰度第 1 批 5% → 观察 24h → 成功率 ≥95% → 第 2 批 20% → … → 第 4 批 100%；任一批成功率 <95% 立即暂停 + 告警 + 人工介入（阈值与流程不可更改）"
+  batches:
+    - { batch_no: 1, percent: 5,   observe_hours: 24, success_rate_threshold: 0.95 }
+    - { batch_no: 2, percent: 20,  observe_hours: 24, success_rate_threshold: 0.95 }
+    - { batch_no: 3, percent: 50,  observe_hours: 24, success_rate_threshold: 0.95 }
+    - { batch_no: 4, percent: 100, observe_hours: 24, success_rate_threshold: 0.95 }
+  gates:
+    observe_hours_env: OTA_CANARY_OBSERVE_HOURS
+    success_rate_threshold_env: OTA_CANARY_MIN_SUCCESS_RATE
+    success_rate_formula: "本批 SUCCESS / (本批 SUCCESS + FAILED + ROLLED_BACK)"
+    insufficient_data: "本批暂无终态记录时 success_rate=null、next_action=observing（不误判为通过，也不误判为失败）"
+    rounding: "小规模车队（< 20 台）按 ceil(percent × total) 取整且至少 1 台，末批补足剩余车辆（⚠ 待确认，见 x-hunter-pending-confirmation #14）"
+    batch_advance: "仅当「观察窗口已结束」且「成功率 ≥ 阈值」同时满足才推进；禁止人工跳批（见 x-hunter-pending-confirmation #3）"
+  scheduler:
+    tick_seconds_env: OTA_ROLLOUT_TICK_SECONDS
+    concurrency_control: "以 PostgreSQL 行锁（SELECT ... FOR UPDATE on ota_tasks）+ 状态机校验保证单任务只被推进一次；**不新增 Redis key**（Redis key 命名受契约约束）"
+    actions_per_tick: "推进批次 / 到期置 succeeded / 成功率不达标置 paused + 发 alert_event"
+  state_machine:
+    - { from: created,          to: running,   trigger: "POST /tasks/{task_id}/start（首批 5% 放行）" }
+    - { from: pending_approval, to: running,   trigger: "POST /tasks/{task_id}/start（审批通过后）" }
+    - { from: running,          to: paused,    trigger: "批次成功率 < 阈值（自动）或 POST /tasks/{task_id}/pause（人工）" }
+    - { from: paused,           to: running,   trigger: "POST /tasks/{task_id}/resume（重新评估：达标即推进，未达标则拒绝并返回 3003）" }
+    - { from: running,          to: succeeded, trigger: "第 4 批（100%）全部到达终态且无 FAILED/ROLLED_BACK 阻断" }
+    - { from: running,          to: failed,    trigger: "整批门禁全失败或不可恢复错误" }
+    - { from: "created|pending_approval|running|paused", to: canceled, trigger: "POST /tasks/{task_id}/cancel" }
+  halt_behavior:
+    - "任务置 paused（不推进下一批，不再下发新车辆）"
+    - "产生 alert_event 告警（级别 critical，供告警处理链路推送值班）"
+    - "已下发车辆不被强制中断（车端本地状态机继续），平台继续消费 ota_status 落库"
+    - "人工可选：resume（若已达标）/ rollback（A/B 回退）/ cancel（终止）"
+  idempotency:
+    - "重复 start / resume：仅对 ota_records.status=PENDING 且未收到过 ota_status 的车辆下发 ota_notify"
+    - "已进入 DOWNLOAD/INSTALL/TEST/SUCCESS 的车辆不二次通知"
+    - "同一任务同一车辆仅一条 ota_records（唯一索引 uq_ota_records_task_vehicle）"
+  observability:
+    - "ota_canary_success_rate{task_id,batch_no} 指标 + /metrics 暴露"
+    - "任务详情 /tasks/{task_id} 返回 rollout.next_action / halt_reason，前端展示人工决策建议"
+
+x-hunter-ota-security:
+  source: "系统约束第 9 条（安全机制全部实现，不可省略）+ OTA 安全（SHA-256 + RSA-2048 + 版本单调 + A/B 分区）"
+  package_verification:
+    order: ["package_size（字节数）", "package_md5（流式）", "package_sha256（流式）", "RSA-2048 验签", "version_code 单调递增"]
+    signature_scheme: "RSASSA-PKCS1-v1_5 + SHA-256，签名 base64；公钥 OTA_SIGNATURE_PUBLIC_KEY；私钥仅发布方 CI/KMS"
+    error_mapping:
+      - { failure: "包大小不一致", code: 6001 }
+      - { failure: "MD5 / SHA-256 不匹配", code: 6001 }
+      - { failure: "签名验签失败", code: 6002 }
+      - { failure: "version_code 非单调（回退）", code: 6003 }
+      - { failure: "门禁不满足（SOC/静止/网络/存储）", code: 6003 }
+    client_side: "车端下载后必须**再次**完成 SHA-256 校验 + 验签 + 版本单调检查（ota_notify.schema.json 描述），失败即回报 ota_status=FAILED（6001/6002）"
+  rollback_protection:
+    - "version_code 单调递增（平台发布门禁 + 车端校验双保险）"
+    - "A/B 分区：刷写非活动分区，TEST 自检失败回退原分区（车端自动）；平台人工回滚仅对 SUCCESS 记录下发 ota_rollback 指令"
+  authorization:
+    authn: "JWT Access Token（2h）+ Refresh Token（7d），网关校验后注入 X-User-Id / X-Roles / X-Trace-Id"
+    rbac_resource: "ota"
+    actions: ["read（查询版本/任务/记录）", "create（创建版本/任务）", "execute（发布/退役/启动/暂停/恢复/终止/回滚）"]
+    error_mapping: "Token 缺失/无效 → 1001；Token 过期 → 1003；权限不足 → 1002"
+    data_scope: "按车辆/项目数据权限过滤（用户仅可操作授权车辆的目标清单）"
+  transport:
+    vehicle_kafka: "SASL_SSL + SCRAM-SHA-512（禁止 PLAINTEXT）"
+    rest: "HTTPS TLS 1.3（网关入口）"
+    internal: "服务间 mTLS"
+  data_protection:
+    - "MinIO SSE-S3（hunter-ota-packages 永久保留）"
+    - "数据库 TDE"
+    - "日志脱敏：禁止输出 password / token / 私钥 / MINIO_SECRET_KEY / 预签名 URL 全量查询串（仅记录对象键）"
+    - "ORM 参数化查询（禁字符串拼接 SQL）；请求体 Pydantic v2 强校验（防注入/越权字段）"
+  audit:
+    sink: "结构化 JSON 审计日志（hunter-logs 30 天）"
+    events:
+      - { operation: "POST /versions",            fields: [user_id, version_name, version_code, object_key, trace_id] }
+      - { operation: "POST /versions/{id}/publish", fields: [user_id, version_id, version_code, package_sha256, checks, trace_id] }
+      - { operation: "POST /versions/{id}/deprecate", fields: [user_id, version_id, status, reason, trace_id] }
+      - { operation: "POST /tasks",              fields: [user_id, task_id, target_version_id, vehicle_count, trace_id] }
+      - { operation: "POST /tasks/{id}/start",   fields: [user_id, task_id, batch_no, released, blocked, trace_id] }
+      - { operation: "POST /tasks/{id}/pause|resume|cancel", fields: [user_id, task_id, batch_no, reason, status, trace_id] }
+      - { operation: "POST /tasks/{id}/rollback", fields: [user_id, task_id, vehicles, command_ids, reason, trace_id] }
+    retention: "审计日志不可篡改（只追加）；⚠ 保留期与 hunter-logs 30 天生命周期存在冲突（合规建议 ≥ 1 年）→ 见 x-hunter-pending-confirmation #15"
+  forbidden:
+    - "禁止跳过 SHA-256 / 验签 / 版本单调任一门禁"
+    - "禁止将签名私钥、MinIO 密钥、JWT 写入代码/日志/数据库"
+    - "禁止向车端下发长期有效凭证（仅 1 小时预签名地址）"
+    - "禁止放宽 gate 校验绕过灰度成功率门禁"
+
+x-hunter-error-status-map:
+  source: "设计文档 附录 A 错误码 + common/python/hunter_common/exceptions.py ErrorCode"
+  note: "⚠ 设计文档未定义错误码→HTTP 状态映射；此处与 services/ota-service/app/core/error_handlers.py 的 HTTP_STATUS_BY_CODE 对齐；响应体始终为统一格式（code 字段为准）"
+  map:
+    1001: 401
+    1002: 403
+    1003: 401
+    2001: 422
+    2002: 422
+    3001: 404
+    3002: 409
+    3003: 409
+    4001: 409
+    4002: 409
+    5000: 500
+    5001: 503
+    6001: 422
+    6002: 422
+    6003: 422
+    7001: 409
+    7002: 502
+
+x-hunter-pending-confirmation:
+  source: "本契约编写过程中发现的、设计文档未明确的决策点；确认后回填契约再实现代码"
+  note: |
+    以下条目**必须在实现前人工确认**（或确认「按契约默认执行」）。凡涉及字段名/错误码/Topic 名/阈值/状态名
+    的核对，均不得在实现中擅自发明（规则 7），未确认前实现必须按 `contract_decision` 当前取值执行。
+    确认后回填本文档与相关契约（openapi / kafka / database）。
+  items:
+    - id: 1
+      question: "设计文档 §12.5（OTA 模块）原文未随仓库提供，无法逐条比对端点/字段/批次规则"
+      contract_decision: "按模块职责表、网关路由表、附录 D 限流、附录 A 错误码、第 8/9 章 Kafka 与 DDL、第 14/15 章状态机与安全约束，推导 15 个业务端点（+3 个运维端点 /healthz /readyz /metrics）与全部请求/响应字段（见 x-hunter-endpoints.items 及各 operation 的推导说明）"
+      impact: "Step 3/4（schemas / routers）实现范围；若 §12.5 原文与推导存在差异（路径、字段名、批次取整、状态名）需回改契约 + schema + migration"
+    - id: 2
+      question: "release_type 取值域（DDL 注释仅写「正式/灰度/补丁」，未给英文枚举）"
+      contract_decision: "契约**不设 enum**（x-hunter-enum-reconciliation 已标注「待核对」），服务端存库即透传、不做取值白名单校验；前端不得硬编码分支"
+      impact: "前端筛选/选项无法固定；若需强校验须确认英文枚举（formal / grayscale / patch）后补 enum 并同步 DDL 注释、Pydantic 模型与前端选项"
+    - id: 3
+      question: "任务 paused → resume 时是否允许人工指定批次推进（跳批）"
+      contract_decision: "禁止跳批：resume 时 batch_no 仅允许「当前批次 +1」（或省略=自动推进），其余值 → 3003；推进仍需满足「观察窗口已结束 + 成功率 ≥ 门禁」"
+      impact: "灰度流程被强制串行化（4 批全走完）；若业务需紧急跳批，须明确审批人 + 告警策略后修改契约（涉及 resume 语义与前端表单）"
+    - id: 4
+      question: "分片上传语义（S3 UploadId 复用、分片大小、断点续传是否由服务端代理）"
+      contract_decision: "两步式预签名直传：part_count=1 用单次 PUT upload_url；part_count>1 由 create 返回 parts[]（每片一个预签名 URL），客户端自行分片并断点续传，服务端不代理 GB 级流量"
+      impact: "Step 3 上传流程实现与前端上传组件；服务端无法感知上传进度（仅靠 publish 阶段校验），如需进度需 MinIO 事件回调（未登记）"
+    - id: 5
+      question: "回滚目标是否允许指定历史版本（非 A/B 非活动分区）"
+      contract_decision: "仅支持 previous_slot（A/B 分区上一分区）；不提供「回滚到任意历史 version_code」，避免与 version_code 单调递增防回滚约束冲突"
+      impact: "跨版本回退须发布一个 version_code 更高的「回退版本」承载旧镜像（见 GET /versions/{id} 的 rollback_target 字段语义）"
+    - id: 6
+      question: "任务暂停后 24h 观察窗口（observe_until）是否顺延"
+      contract_decision: "不顺延：暂停不改变已记录的 observe_until；resume 后若窗口已过则立即按成功率判定推进/拒绝"
+      impact: "批次推进时机与成功率统计窗口口径；若改为顺延会影响 progress JSONB 字段含义与前端展示"
+    - id: 7
+      question: "hunter.{vehicle_id}.ota_notify 的端到端下发时延目标（设计文档性能指标表未含 OTA 项）"
+      contract_decision: "暂定 P95 ≤ 5s（契约登记为观察项，非验收硬指标）；其余性能指标沿用 P95 ≤ 200ms / 可用性 ≥ 99.9%"
+      impact: "监控指标与验收口径；确认后需写入设计文档性能表并加 Prometheus 观测项"
+    - id: 8
+      question: "车端是否允许直连管理面 REST（本契约假设车端仅走 Kafka）"
+      contract_decision: "车端仅通过 Kafka（ota_notify / ota_status / command）+ MinIO 预签名地址交互，不访问 /api/v1/ota/** REST；管理面仅面向控制台用户（JWT + RBAC）"
+      impact: "网关路由与证书边界（车端 X.509 + Kafka SASL_SSL）；若车端需 REST 拉取版本清单，须新增端点为车端设备认证并回改契约"
+    - id: 9
+      question: "POST /versions/{id}/publish 为长耗时同步端点（GB 级流式 MD5/SHA-256 + RSA-2048 验签），网关转发超时是否 ≥300s"
+      contract_decision: "保持同步语义（200 返回五项校验结论）并在 x-hunter-service.performance.exceptions 登记为性能例外（不受 P95 ≤ 200ms 约束）；网关侧超时须 ≥300s"
+      impact: "网关超时/连接复用配置与前端加载体验；若要求 publish 也满足 P95 ≤ 200ms，须改为 202 + 异步任务 + 轮询端点（属端点新增，需先改契约）"
+    - id: 10
+      question: "publish 端点限流建议值（附录 D 未登记该端点）"
+      contract_decision: "建议单用户 2 QPS（非附录 D 规定值，实现侧建议配置，见 x-hunter-service.rate_limits.recommended）"
+      impact: "仅影响并发发布保护强度，不影响契约结构与业务语义"
+    - id: 11
+      question: "消费失败死信队列（DLQ）Topic 未在 contracts/kafka/topics.yaml 登记"
+      contract_decision: "按 hunter_common.kafka.consumer 统一约定派生 `{original_topic}.dlq`（保留原 topic/partition/offset 头），**不新增 Topic 名**；topics.yaml 是否登记派生 DLQ 由契约维护方决定"
+      impact: "DLQ 投递能力已可落地（实现不阻塞）；若要求 DLQ Topic 显式登记（分区/保留期），需更新 contracts/kafka/topics.yaml 后再实现投递策略细化"
+    - id: 12
+      question: "hunter.{vehicle_id}.command_result 是否登记为 ota-service 消费；hunter.broadcast.command 的 OTA 使用场景（如全车队暂停升级）设计文档未定义"
+      contract_decision: "本服务**不消费** command_result（回滚结果以 ota_status + ota_records 终态为准）；broadcast.command **不生产**（未确认前禁用，避免对全车队下发未定义语义指令）"
+      impact: "回滚指令的执行确认依赖车端 ota_status 上报（若车端只回 command_result 则回滚链路无闭环）；全车队操作只能逐车经 ota_notify 完成，如需广播须先更新 topics.yaml/consumer-groups.yaml"
+    - id: 13
+      question: "升级包大小上限（影响上传/校验耗时与存储规划）"
+      contract_decision: "契约未设硬上限（package_size 仅要求 > 0 且与 MinIO 对象长度一致）；服务端按流式校验不落内存，理论无包体上限"
+      impact: "前端上传提示与超时设置；若需硬上限（建议 500MB~4GB）须在 Pydantic 模型加校验并在前端同步提示，同时确认网关/客户端超时"
+    - id: 14
+      question: "小规模车队批次取整规则（5% 向上取整、至少 1 台、末批补足）"
+      contract_decision: "按 ceil(percent × total) 取整、每批至少 1 台、末批（100%）补足全部剩余车辆（见 x-hunter-canary-rollout.rounding）"
+      impact: "批次车辆分配与成功率分母（分母=本批已下发车辆数）；若确认其他规则（如向下取整）会改变小车队推进节奏"
+    - id: 15
+      question: "审计日志保留期（合规建议 ≥1 年）与 hunter-logs Bucket 30 天生命周期的冲突"
+      contract_decision: "审计日志写入结构化 JSON 日志（落 hunter-logs，30 天自动删除）；⚠ 不满足 1 年可追溯建议，需人工确认是否独立保留策略或落库审计表"
+      impact: "OTA 发布/回滚/回退的可追溯性合规；若需 ≥1 年，须新增审计表（DDL 契约变更）或独立 Bucket/前缀策略"
+    - id: 16
+      question: "是否允许停用灰度直接全量（OTA_CANARY_STAGES 置 100）作为紧急通道"
+      contract_decision: "契约保留 4 批灰度（5/20/50/100）为唯一标准流程；OTA_CANARY_STAGES 可调但不提供「跳过前 3 批」的 API 语义，紧急全量由运维改环境变量实现（需留审计）"
+      impact: "紧急修复发布时长（标准流程 ≥72h）；若业务需 API 级紧急全量，须新增审批 + 强制告警，属契约变更"
+    - id: 17
+      question: "OTA_PACKAGE_VERIFY_SHA256 / OTA_PACKAGE_VERIFY_SIGNATURE 安全开关是否允许关闭"
+      contract_decision: "默认 true 且**生产禁止置 false**（仅 DEBUG 联调可关）；契约门禁（6001/6002）语义不因开关改变，开关仅用于联调替身"
+      impact: "安全基线（完整性 + 签名不可绕过）；若关闭将直接违反设计文档 OTA 安全要求，需书面决策并留审计"
+    - id: 18
+      question: "目标车辆清单的存在性/在线性校验依赖：vehicle-service 未在模块表（6 个微服务）中定义，但网关路由表含 /api/v1/vehicle/**，且 infra/k8s/services/data-analytics.yaml 已预留 VEHICLE_SERVICE_BASE_URL(:8086)"
+      contract_decision: "本服务**不调用** vehicle-service REST（该服务当前无 contracts 契约，依赖它会把未定义接口引入实现）：create 仅做 vehicle_id 格式与数量校验；start 的可用性判定读 Redis 读模型 vehicle:status:{vehicle_id} / vehicle:online:set"
+      impact: "无法识别不存在的 vehicle_id（仅能判「不在线」→ 计入 blocked）；若后续 vehicle-service 契约落地，可新增可选内部校验（mTLS + VEHICLE_SERVICE_BASE_URL），并回改本契约与 K8s ConfigMap"
+    - id: 19
+      question: "OTA_OFFLINE_FALLBACK_ENABLED：Redis 中无某车辆 vehicle:status 读模型数据时，是否放行升级"
+      contract_decision: "契约默认 **false = 缺门禁数据即拒绝**（计入 blocked[] 并给 reason，安全默认值，与 K8s 生产 ConfigMap 一致）；仅 DEBUG 联调可显式置 true，生产禁止"
+      impact: "升级门禁严格性（false 更安全但可能因读模型缺失导致大量 blocked）；对齐 data-collector 写读模型的时效性后确认，若确认放行需补审计字段"

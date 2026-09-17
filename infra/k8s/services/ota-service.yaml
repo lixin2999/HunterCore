@@ -23,11 +23,19 @@ data:
   OTA_CANARY_MIN_SUCCESS_RATE: "0.95"
   # 升级前置条件（升级门禁：电量 ≥50%、车辆静止(P档)、网络稳定、存储 ≥2GB）
   OTA_PRECONDITION_MIN_SOC: "50"
-  OTA_PRECONDITION_MIN_STORAGE_GB: "2"
+  OTA_PRECONDITION_MIN_STORAGE_MB: "2048"   # 单位 MB（与 Kafka ota_notify.preconditions.min_storage_mb 一致，禁止换算歧义）
   OTA_PRECONDITION_REQUIRE_PARKED: "true"
   # 包校验（OTA 安全：SHA-256 完整性校验 + RSA-2048 签名验签 + 版本号单调递增）
   OTA_PACKAGE_VERIFY_SHA256: "true"
   OTA_PACKAGE_VERIFY_SIGNATURE: "true"
+  # 预签名时效（上传 1 小时 / 下载 15 分钟 + Range 分片）
+  PRESIGNED_UPLOAD_EXPIRE_SECONDS: "3600"
+  PRESIGNED_DOWNLOAD_EXPIRE_SECONDS: "900"
+  # 灰度调度与网络判定（观察窗口到期扫描周期；遥测中断阈值同源 communication_loss）
+  OTA_ROLLOUT_TICK_SECONDS: "60"
+  OTA_OFFLINE_THRESHOLD_SECONDS: "10"
+  OTA_OFFLINE_FALLBACK_ENABLED: "false"     # 生产：门禁读模型缺失即拒绝（联调可置 true）
+  OTA_TASK_MAX_TARGET_VEHICLES: "1000"
 ---
 apiVersion: apps/v1
 kind: Deployment

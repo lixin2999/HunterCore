@@ -228,7 +228,8 @@ REST 接口契约集中在 `contracts/openapi/`，遵循「先契约、后实现
 | `scene-service.yaml` | 场景库 CRUD（10 端点，12.2 节）+ 4.2.1 分类体系 / 4.2.2 配置结构 / 4.3 导出 / 4.4 下发 / 4.5 实车提取扩展字段 | ✅ |
 | `data-collector.yaml` | 数据采集（7 端点：遥测查询 / 事件查询与确认 / 文件清单与预签名上传）+ 5.3.3 遥测结构 / 5.4 预处理 / 5.5 上传流程扩展字段 | ✅ |
 | `data-analytics.yaml` | 数据分析（8 端点：报告列表/详情/生成、看板、感知与控制评估、场景覆盖率、Corner Case）+ 6.2 实时作业 / 6.3 离线作业 / 6.4 挖掘 / 6.5 报告扩展字段 | ✅ |
-| `ota-service.yaml` / `remote-control.yaml` | 各业务服务资源端点 | 待开发 |
+| `ota-service.yaml` | OTA 管理（15 端点：版本仓库 CRUD/发布/废弃、升级任务 CRUD/start|pause|resume|cancel|rollback、升级记录）+ 8/9 章 DDL 与 Kafka 对齐 + 版本上传两步式 / 灰度批次 / 发布校验扩展字段 | ✅ |
+| `remote-control.yaml` | 远程操控资源端点 | 待开发 |
 
 ```bash
 # 契约校验（29 项，无需运行服务）
@@ -260,12 +261,20 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
   MFA / 限流错误码复用、服务发现机制与配置键名、熔断阈值；场景服务侧见其契约 `x-hunter-pending-confirmation`（12 项）；
   数据采集侧见其契约 `x-hunter-pending-confirmation`（12 项：端点清单来源 / 文件元信息缺表 / sensor_file 字段 / Carla Topic 归属等）；
   数据分析侧见其契约 `x-hunter-pending-confirmation`（12 项：报告元信息缺表 / 报告异步语义 / TTC 等级冲突 /
-  alert_event 消费方落位 / 消费组契约修正等）
+  alert_event 消费方落位 / 消费组契约修正等）；
+  OTA 管理侧见其契约 `x-hunter-pending-confirmation`（19 项：12.5 节原文缺失 / `release_type` 取值域 / 跳批策略 /
+  publish 网关超时与异步化 / DLQ Topic 登记 / command_result 与 broadcast 归属 / 审计保留期等）
 - **数据分析服务**：`data-analytics.yaml` 的 8 个业务端点与设计文档 12.4 节逐条对齐（不可增删）；
   定位为「读模型 + 编排」——实时由 5 个 Flink 作业（6.2 节）、离线由 7 个 Spark 作业（6.3/6.4/6.5 节）承担，
   REST 只读预计算结果（P95 ≤ 200ms），报告生成为异步（202 + 轮询）；14 项实时阈值（3.0 m/s² / 0.5s / 0.8 rad/s /
   1.1 倍 / SOC 20%+10% / TTC 1.5s / 断联 10s 等）全部环境变量化并在 K8s ConfigMap 注入，与受控词表 `EVENT_LEVEL_BY_TYPE`
   机器可检一致；`alert_event.schema.json` 补全后 `topics.yaml` 已无 `schema: null`（Kafka 契约 11 个 Schema 全部落地）
+- **OTA 管理服务**：`ota-service.yaml` 的 15 个业务端点由「8 章升级流程 + 9 章 ota_* 三表列能力 + 附录 D 限流端点」
+  推导（12.5 节未随仓库提供，推导依据在 `x-hunter-endpoints.items` 逐条登记）；版本上传为**两步式**
+  （建草稿 → 1 小时预签名直传 → `publish` 单次流式校验 MD5/SHA-256/RSA-2048/版本单调递增，错误码 6001/6002/6003）；
+  灰度 4 批 `5%→20%→50%→100%`、每批观察 24h、成功率 ≥0.95（`OTA_CANARY_MIN_SUCCESS_RATE`）才推进，否则暂停 + 告警；
+  Kafka 消费 `hunter.*.ota_status`（消费组 `ota-service-ota-status`，DLQ `{topic}.dlq`），生产 `ota_notify`（逐车 1 小时预签名）
+  与 `command`（仅 `ota_rollback`）；最小权限仅写 `ota_svc` schema（禁止 DELETE），`publish` 作为唯一性能例外已登记
 
 ## 验证命令清单
 

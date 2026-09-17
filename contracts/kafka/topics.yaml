@@ -160,6 +160,9 @@ vehicle_topics:
     schema: schemas/remote_control.schema.json
     description: "远程操控指令（20Hz/50ms 间隔，>500ms 未收到则车端自动减速停车）"
 
+  # ⚠ producer 为「设计预期生产者登记」：api-gateway 契约声明不生产任何 Topic、
+  #   ota-service 契约将广播场景列为待确认（x-hunter-pending-confirmation #12）→ 实现侧暂不生产该 Topic，
+  #   先由逐车 hunter.{vehicle_id}.command / ota_notify 承接；启用广播须先同步两份 OpenAPI 契约
   - name: "hunter.broadcast.command"
     direction: platform_to_all_vehicles
     partitions: 3

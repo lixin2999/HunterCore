@@ -10,7 +10,7 @@
 | scene-service.yaml | scene-service | `/api/v1/scene` | ✅ 已定义（10 个业务端点 + 4.2.1/4.2.2 数据结构 + 4.4/4.5 流程扩展字段） |
 | data-collector.yaml | data-collector | `/api/v1/data` | ✅ 已定义（7 个业务端点 + 5.3.3 遥测结构 + 5.4 预处理 / 5.5 上传流程扩展字段） |
 | data-analytics.yaml | data-analytics | `/api/v1/analytics` | ✅ 已定义（8 个业务端点 + 6.2 实时作业 / 6.3 离线作业 / 6.4 Corner Case / 6.5 报告模板扩展字段） |
-| ota-service.yaml | ota-service | `/api/v1/ota` | 待开发 |
+| ota-service.yaml | ota-service | `/api/v1/ota` | ✅ 已定义（15 个业务端点 + 8/9 章 DDL 与 Kafka 对齐 + 版本上传 / 发布校验 / 灰度批次 / 回滚扩展字段；12.5 节原文缺失 → 推导清单） |
 | remote-control.yaml | remote-control | `/api/v1/remote`、`/ws/remote/**` | 待开发 |
 
 ## 统一约定（所有服务强制）
@@ -113,6 +113,39 @@
   12.4 节缺规划质量/数据质量端点、看板入库延迟来源、查询跨度上限、消费组契约修正 ——
   全量见契约 `x-hunter-pending-confirmation`（12 项）
 
+## OTA 管理契约要点（ota-service.yaml）
+
+- **业务端点**（15 个，推导清单 —— 设计文档 §12.5 原文未随仓库提供）：
+  版本仓库 `GET /api/v1/ota/versions`、`POST /api/v1/ota/versions`、`GET /api/v1/ota/versions/{version_id}`、
+  `POST /api/v1/ota/versions/{version_id}/publish`、`POST /api/v1/ota/versions/{version_id}/deprecate`；
+  升级任务 `GET /api/v1/ota/tasks`、`POST /api/v1/ota/tasks`、`GET /api/v1/ota/tasks/{task_id}`、
+  `POST /api/v1/ota/tasks/{task_id}/start|pause|resume|cancel|rollback`；升级记录
+  `GET /api/v1/ota/tasks/{task_id}/records`、`GET /api/v1/ota/vehicles/{vehicle_id}/records`
+  （推导依据逐条登记在 `x-hunter-endpoints.items`）
+- **版本上传两步式（`x-hunter-version-upload-flow`）**：建草稿（`draft`）→ 服务端签发 1 小时上传预签名地址 → 客户端直传
+  MinIO `hunter-ota-packages` → `publish` 由服务端**单次流式**校验；对象键
+  `hunter-edge/ota/{model}/{version_name}/{version_code}/package.tar.gz`（服务端生成，禁止客户端指定）
+- **发布门禁（唯一）**：`publish` 依次校验 包长/MD5/SHA-256（→ 6001）→ RSA-2048 验签 `RSASSA-PKCS1-v1_5 + SHA-256`
+  （→ 6002）→ `version_code` 同 `applicable_models` 范围单调递增（→ 6003），全部通过才 `draft → published` + 写 `release_time`；
+  该项为**长耗时操作**，已在 `x-hunter-service.performance.exceptions` 登记为性能例外（网关超时 ≥300s，见 pending #9）
+- **灰度发布（`x-hunter-canary-rollout`）**：4 批 `5% → 20% → 50% → 100%`，每批观察 24h，成功率 ≥0.95 才推进
+  （`SUCCESS / (SUCCESS + FAILED + ROLLED_BACK)`）；< 0.95 立即 `paused` + 告警 `alert_event`（人工只能 rollback / cancel）；
+  批次推进用 PG 行锁串行化，禁止跳批（pending #3）
+- **任务状态机**：`draft → pending_approval → running/observing → paused → completed/rolled_back/cancelled`；
+  升级门禁 `电量 ≥50% / 静止(P 档) / 网络稳定 / 存储 ≥2GB`（不满足车辆计入 `blocked[]` 并给出 `reason`）
+- **回滚**：平台侧仅按记录（`ota_records`）下发 `ota_rollback` 指令（A/B 分区 + 车端自检失败自动回退兜底），
+  只允许 `previous_slot`（不支持任意历史版本，pending #5）
+- **Kafka**：消费 `hunter.*.ota_status`（消费组 `ota-service-ota-status`，正则订阅、手动提交、DLQ `{topic}.dlq`）；
+  生产 `hunter.{vehicle_id}.ota_notify`（逐车下发，1 小时预签名 URL）与 `hunter.{vehicle_id}.command`（`ota_rollback`）；
+  不消费 `command_result`、不生产 `broadcast.command`（pending #12）；车端连接强制 SASL_SSL + SCRAM-SHA-512
+- **数据访问边界**：写 `ota_svc.ota_versions / ota_tasks / ota_records`（禁止 DELETE）；不跨 schema；不新增 Redis 键模式
+  （写 `ota:progress:{task_id}`，只读 `vehicle:status:{vehicle_id}` / `vehicle:online:set`）
+- **⚠ 待核对项**（全量 19 项见契约 `x-hunter-pending-confirmation`）：§12.5 原文缺失、
+  `release_type` 取值域、跳批策略、分片上传语义、回滚目标、观察窗口顺延、`ota_notify` 时延目标、车端是否直连 REST、
+  publish 网关超时与异步化、publish 限流建议值、DLQ Topic 登记、`command_result` / `broadcast` 归属、
+  升级包大小上限、小车队批次取整、审计保留期、灰度停用通道、安全开关、vehicle-service 依赖、门禁数据缺失放行 ——
+  全量见契约 `x-hunter-pending-confirmation`（19 项）
+
 ## 校验命令
 
 ```bash
@@ -127,6 +160,9 @@ cd services/data-collector && pytest app/tests/test_data_collector_contract.py -
 
 # 数据分析契约 ↔ 设计文档 6 章/12.4 节 ↔ DDL ↔ Kafka 契约（含 alert_event Schema）↔ K8s 清单（32 项）
 cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q
+
+# OTA 管理契约 ↔ 设计文档 8/9/12.5 节 ↔ DDL（ota_* 三表）↔ Kafka 契约（ota_notify/ota_status）↔ K8s 清单
+# （契约测试随 ota-service 实现步骤落地）
 ```
 
 > 命名约定：各服务契约测试文件使用唯一文件名（如 `test_scene_contract.py`），
