@@ -59,7 +59,8 @@ HunterCore/
 ├── common/
 │   ├── python/hunter_common/  # Python 共享库（配置/日志/异常/响应/Kafka/DB/Redis）
 │   └── typescript/            # TypeScript 共享类型（后续层级初始化）
-├── frontend/                  # Vue 3 管理后台（后续层级初始化）
+├── frontend/                  # Vue 3 管理后台（Vite + TS + Element Plus + Pinia + ECharts + Three.js）
+│   └── src/                   # api（按模块）/ types（契约类型）/ stores / router / views / utils / components
 ├── infra/
 │   ├── k8s/                   # K8s 清单：6 微服务 Deployment/Service/ConfigMap、中间件 StatefulSet/PVC、初始化 Job、Ingress
 │   ├── docker/                # 本地开发：postgres/kafka/minio 初始化脚本
@@ -109,7 +110,7 @@ services/{service-name}/
 
 - Docker Desktop（含 Docker Compose v2）
 - Python 3.11+
-- （可选）Node.js 20+（前端，后续层级初始化）
+- Node.js 20.19+（前端 `frontend/`）
 
 ### 1. 启动本地基础设施
 
@@ -156,7 +157,7 @@ ruff check common services                        # Lint
 2. 安装共享库 `hunter_common`（editable），并执行数据库迁移：`alembic -c common/python/alembic.ini upgrade head`（建 schema/表/hypertable）
 3. 启动业务微服务（依赖基础设施）：scene-service → data-collector → data-analytics → ota-service → remote-control
 4. 启动 api-gateway（依赖上述服务就绪后统一对外路由，8080）
-5. 前端 dev server（Vite，5173，后续层级初始化）
+5. 前端 dev server：`cd frontend && npm install && npm run dev`（Vite 5173，代理 `/api` 与 `/ws` → 网关 8080；详见 `frontend/README.md`）
 
 ## Kubernetes 部署与监控（L1）
 
@@ -300,6 +301,31 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
   Kafka 仅消费 `hunter.*.command_result`（消费组 `remote-control-command-result`），`contracts/kafka/` 相关条目
   均已登记、本契约零改动；媒体面 SRTP/UDP 不经网关，须在 K8s 单独暴露 UDP
 
+## 前端管理后台（L4）
+
+`frontend/` 为 Vue 3 + TypeScript 管理后台，**只经 api-gateway(8080)** 访问后端（REST `/api/v1/**` + WS `/ws/remote/**`），
+媒体面 WebRTC/SRTP 不经网关；页面模块与 OpenAPI 契约一一对应：
+
+| 页面模块 | 路由 | 主要契约端点 |
+|----------|------|--------------|
+| 运营看板 | `/dashboard` | `GET /analytics/dashboard`（车队/管道/算法/事件四维，含降级标记）、`GET /remote/vehicles` |
+| 场景库 | `/scenes`、`/scenes/:scene_id` | `/api/v1/scene`（列表/创建/更新/复制/发布/删除/模板/导出/下发 Carla 仿真）+ Three.js 3D 预览 |
+| 数据分析 | `/analytics` | `perception/eval`、`control/eval`（阈值判定）、`scene/coverage`（热力图）、`corner-cases`、`reports*`（异步生成 + 轮询） |
+| OTA 管理 | `/ota/versions`、`/ota/tasks`、`/ota/tasks/:task_id` | `/api/v1/ota/versions*`（本地算 MD5/SHA-256 → 分片上传 → 服务端 6001/6002 校验）、`tasks*`（4 批灰度 5/20/50/100 + 门禁放行/阻塞明细 + A/B 回滚） |
+| 远程操控 | `/remote/console`、`/remote/history` | `/api/v1/remote/*` + WS `control`（20Hz）/`signal`（WebRTC 中继）；原生 WebRTC 视频 + 急停 + 链路统计 + 录像回放 |
+| 事件与文件 | `/data` | `/api/v1/data/events*`（确认留痕）、`files*`（预签名下载/游标分页） |
+
+要点：
+
+- **契约类型直用**：`src/types/**` 字段名与 `contracts/openapi/*.yaml` 完全一致（`snake_case`），不做驼峰转换，降低字段错配风险
+- **统一响应处理**：`api/request.ts` 解析 `ApiResponse`，`code≠0` 抛业务异常；`1003` 单飞刷新后重放，`1001` 清理会话并广播失效事件
+- **限流友好**：轮询间隔全部来自环境变量（遥测 ≥ 2000ms，符合附录 D 20 QPS），页面隐藏暂停、请求未完成跳过本轮
+- **远程操控安全约束**：控制 20Hz 固定节拍、速度以会话响应 `max_speed_mps` 限幅（默认 2.0 m/s）、心跳 10s、
+  `estop` 立即下发、离开页面自动结束会话、终态关闭码（1008/4001/4003/4010）不重连
+- **RBAC 一致性**：`v-permission` 指令与路由 `meta.permission` 使用的权限编码均取自各服务契约 RBAC 说明
+  （`scene:read|create|update|delete|execute`、`data:read`、`analytics:read|execute`、`ota:read|create|execute`、`remote:read|create|execute`），前端仅做展示控制，鉴权以后端为准
+- **已知折衷**：Token 存 `localStorage`（无 HttpOnly Cookie 端点契约）；`OtaReleaseType` 未定义 enum（pending #2）、`RC_MAX_STEER_RAD`（pending #18）、WS JWT 传送方式（pending #20，现用子协议 `hunter-jwt`）
+
 ## 验证命令清单
 
 | 验证点 | 命令 |
@@ -325,6 +351,9 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 | 指标端点 | `curl http://localhost:<port>/metrics`（Prometheus 文本格式，含 `hunter_` 前缀指标） |
 | K8s/监控清单静态校验 | `python scripts/verify_infra.py`（68 个文档：API 版本/命名空间/探针/资源/敏感字段/端口/契约） |
 | 容器镜像构建 | `docker build -f services/<service>/Dockerfile -t hunter/<service>:0.1.0 .` |
+| 前端类型检查 | `cd frontend && npm run type-check`（vue-tsc 严格模式，0 error） |
+| 前端生产构建 | `cd frontend && npm run build`（type-check + vite build，产物 `frontend/dist/`） |
+| 前端本地联调 | `cd frontend && npm run dev` → `http://localhost:5173`（代理 `/api`、`/ws` 到网关 8080） |
 | 监控栈部署 | `kubectl apply -k infra/monitoring` + `kubectl apply -f infra/monitoring/exporters/exporters.yaml` |
 
 ## 开发约束（摘要）
@@ -339,7 +368,8 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 
 ## 文档
 
-- `docs/`：设计文档索引与开发文档
+- `docs/`：设计文档索引与开发文档（含 `frontend-portal.md`：前端模块设计、鉴权与权限、远程操控实现要点、回归清单）
+- `frontend/README.md`：前端快速开始、环境变量、页面与契约端点映射、待确认项
 - `contracts/`：接口契约（数据库 DDL/ER/受控词表 + Redis Key / MinIO 对象存储契约、Kafka Topic 清单/消费者组/11 个消息 JSON Schema 已完成；OpenAPI 已完成 api-gateway / scene-service / data-collector / data-analytics / ota-service / remote-control，六个服务契约齐备）
 - `release.md`：版本变更记录
 

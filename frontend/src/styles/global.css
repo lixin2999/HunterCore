@@ -1,0 +1,117 @@
+/**
+ * HunterEdge 前端全局样式
+ * 仅存放布局级样式与主题变量；组件私有样式写在各自 SFC 的 <style scoped> 中。
+ */
+
+:root {
+  /* 事件等级配色（设计文档 5.8 节：info 蓝 / warning 黄 / critical 红） */
+  --hunter-level-info: #409eff;
+  --hunter-level-warning: #e6a23c;
+  --hunter-level-critical: #f56c6c;
+  /* 远程操控安全提示色 */
+  --hunter-safety: #f56c6c;
+  --hunter-ok: #67c23a;
+  /* 布局尺寸 */
+  --hunter-header-height: 56px;
+  --hunter-sidebar-width: 216px;
+  --hunter-sidebar-collapsed-width: 64px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+  font-size: 14px;
+  color: #303133;
+  background-color: #f5f7fa;
+}
+
+/* 业务通用：卡片间距 / 页面容器 */
+.page-container {
+  padding: 16px;
+}
+
+.page-card {
+  margin-bottom: 16px;
+}
+
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.filter-bar .el-input,
+.filter-bar .el-select {
+  width: 200px;
+}
+
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.text-muted {
+  color: #909399;
+}
+
+.text-critical {
+  color: var(--hunter-level-critical);
+}
+
+.text-warning {
+  color: var(--hunter-level-warning);
+}
+
+.mono {
+  font-family: 'JetBrains Mono', Consolas, Monaco, monospace;
+  font-size: 12px;
+}
+
+/* 状态灯 */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+}
+
+/* 图表容器统一高度 */
+.chart-block {
+  width: 100%;
+  height: 320px;
+}
+
+.chart-block--sm {
+  height: 240px;
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c0c4cc;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}

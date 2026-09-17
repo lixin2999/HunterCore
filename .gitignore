@@ -54,6 +54,7 @@ pnpm-debug.log*
 .eslintcache
 *.tsbuildinfo
 .vite/
+frontend/.npm-cache
 
 # ===== Flink / Spark：Java 构建与本地产物 =====
 target/
