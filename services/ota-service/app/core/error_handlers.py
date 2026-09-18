@@ -23,10 +23,10 @@ HTTP_STATUS_BY_CODE: dict[int, int] = {
 }
 
 
-def _unified_json(code: int, message: str) -> JSONResponse:
+def _unified_json(code: int, message: str, *, data: object | None = None) -> JSONResponse:
     """按错误码映射 HTTP 状态，响应体为统一格式（request_id 复用链路 trace_id）。"""
     status = HTTP_STATUS_BY_CODE.get(code, 500)
-    payload = error_response(code, message, request_id=get_trace_id() or None)
+    payload = error_response(code, message, data=data, request_id=get_trace_id() or None)
     return JSONResponse(status_code=status, content=payload.model_dump())
 
 
@@ -68,7 +68,9 @@ def register_exception_handlers(app: FastAPI) -> None:
             message=exc.message,
             path=request.url.path,
         )
-        return _unified_json(exc.code, exc.message)
+        # data 承载错误上下文（契约 ApiResponseError：6001 expected/actual、
+        # 6003 precondition_failures[]、3003 current_status 等），一般错误为 None
+        return _unified_json(exc.code, exc.message, data=exc.details or None)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_handler(

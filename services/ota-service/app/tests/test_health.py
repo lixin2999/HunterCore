@@ -17,13 +17,15 @@ def _client() -> AsyncClient:
 
 @pytest.mark.asyncio
 async def test_healthz_ok() -> None:
-    """/healthz 返回统一响应格式且 code=0。"""
+    """/healthz 返回统一响应格式且 code=0（data = HealthStatus 三字段）。"""
     async with _client() as client:
         resp = await client.get("/healthz")
     assert resp.status_code == 200
     body = resp.json()
     assert body["code"] == 0
     assert set(body.keys()) == {"code", "message", "data", "request_id", "timestamp"}
+    assert body["data"]["status"] == "ok"
+    assert body["data"]["service"] == "ota-service"
 
 
 @pytest.mark.asyncio
@@ -54,3 +56,33 @@ async def test_metrics_endpoint_prometheus_format() -> None:
     assert resp.status_code == 200
     assert "hunter_http_requests_total" in resp.text
     assert 'service="ota-service"' in resp.text
+
+
+@pytest.mark.asyncio
+async def test_readyz_contract_ready_checks(client: AsyncClient) -> None:
+    """就绪探针（契约 ReadyChecks）：data 必含 database/redis/minio，全部 true → 200。"""
+    resp = await client.get("/readyz")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert body["data"] == {"database": True, "redis": True, "minio": True}
+
+
+@pytest.mark.asyncio
+async def test_readyz_503_when_dependency_down(ota_env: object) -> None:
+    """MinIO 未就绪 → HTTP 503 + code=5001 + data.minio=false（契约 /readyz 503 响应）。"""
+    from app.main import app as asgi_app
+
+    asgi_app.state.storage = None  # 模拟 MinIO 探测失败（storage 未装配）
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=asgi_app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as http:
+            resp = await http.get("/readyz")
+    finally:
+        asgi_app.state.storage = ota_env.storage  # type: ignore[attr-defined]
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["code"] == 5001
+    assert body["data"]["minio"] is False

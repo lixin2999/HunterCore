@@ -138,3 +138,7 @@ infra/k8s/**/02-secret.yaml
 *.jks
 ca.crt
 
+
+# ===== 本地文档（开发规则：docs/ 开发文档与 release.md 只更新、不追踪） =====
+docs/
+release.md
