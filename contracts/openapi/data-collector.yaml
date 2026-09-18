@@ -88,6 +88,10 @@ paths:
         嵌套结构与 5.3.3 节遥测消息完全一致（chassis / localization / perception / planning /
         control / system），由扁平列重组，映射见 `x-hunter-telemetry-query-contract`。
 
+        时间跨度上限：`TELEMETRY_QUERY_MAX_RANGE_HOURS`（环境变量，默认 24h，待确认项 7）。
+        超限时服务端截断 `end_time` 并返回 `206 Partial Content`（截断为服务端行为、
+        非错误），响应头 `X-Truncated-Range: seconds=<被截去的秒数>`。
+
         限流：附录 D `GET /data/telemetry` 单用户 20 QPS（超限 HTTP 429 + `code=5001` + `Retry-After`）。
       operationId: queryTelemetry
       parameters:
@@ -110,6 +114,19 @@ paths:
           description: 遥测数据（分页）
           headers:
             X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TelemetryQueryResponse" }
+        "206":
+          description: 时间区间超上限被截断（`end_time` 截至跨度上限；截断非错误）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+            X-Truncated-Range:
+              description: 被截去的时间跨度秒数（格式 `seconds=<n>`，n ≥ 1）
+              schema:
+                type: string
+                pattern: "^seconds=[0-9]+$"
+              example: seconds=3600
           content:
             application/json:
               schema: { $ref: "#/components/schemas/TelemetryQueryResponse" }

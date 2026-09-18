@@ -28,9 +28,22 @@ import yaml
 from hunter_common.database.enums import EVENT_LEVEL_BY_TYPE, EventLevel, EventType
 from hunter_common.database.repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from hunter_common.exceptions import ErrorCode
+from pydantic import BaseModel
 
 from app.core.error_handlers import HTTP_STATUS_BY_CODE
 from app.main import app
+from app.schemas.events import EventItem, EventListData
+from app.schemas.files import (
+    CompletedPart,
+    FileCompleteData,
+    FileCompleteRequest,
+    FileListData,
+    FileObjectItem,
+    FilePresignData,
+    FilePresignPart,
+    FilePresignRequest,
+)
+from app.schemas.telemetry import TelemetryQueryData, TelemetrySample
 
 ROOT = Path(__file__).resolve().parents[4]
 CONTRACT_PATH = ROOT / "contracts" / "openapi" / "data-collector.yaml"
@@ -694,4 +707,236 @@ def test_pending_confirmation_items_are_structured(contract: dict[str, Any]) -> 
     )
     for keyword in ("端点", "元信息入库", "sensor_file", "Carla", "6001"):
         assert keyword in text, f"关键待确认项缺失: {keyword}"
+
+
+# =====================================================================
+# 六、生成的 OpenAPI ↔ 契约 diff（实现即契约证据）
+# =====================================================================
+#: FastAPI 内置组件（422 校验错误体），不属于业务契约
+_FASTAPI_BUILTIN_SCHEMAS = {"HTTPValidationError", "ValidationError"}
+#: 契约 paths 中由共享库运维端点提供、不进入 FastAPI openapi 文档的路径。
+#: /metrics 由 hunter_common.metrics 注册（test_ops_endpoints_match_implementation 已覆盖其存在性）。
+_OPS_ONLY_CONTRACT_PATHS = {"/metrics"}
+
+
+def _effective_properties(
+    schema: dict[str, Any], components: dict[str, Any], depth: int = 0
+) -> set[str]:
+    """展开 OpenAPI schema 的 $ref / allOf，返回合并后的属性名集合。
+
+    契约响应模型用 allOf 组合（如 ApiResponse + data 实体），实现侧为等价的
+    内联展开，因此 diff 必须基于"有效属性集"而非原始结构。required 语义差异
+    （实现侧 code/message/data 提供默认值）由统一响应格式测试单独覆盖。
+    """
+    if depth > 8:  # 防御循环引用
+        return set()
+    if "$ref" in schema:
+        target = components.get(schema["$ref"].rsplit("/", 1)[-1], {})
+        return _effective_properties(target, components, depth + 1)
+    props: set[str] = set()
+    for sub in schema.get("allOf", []):
+        props |= _effective_properties(sub, components, depth + 1)
+    props |= set((schema.get("properties") or {}).keys())
+    return props
+
+
+def test_generated_openapi_paths_equal_contract(contract: dict[str, Any]) -> None:
+    """实现注册的业务端点（方法+路径）必须与契约 paths 完全一致（双向 diff 为空）。"""
+    generated = {
+        path: frozenset(method for method in ops if method in HTTP_METHODS)
+        for path, ops in app.openapi()["paths"].items()
+    }
+    expected = {
+        path: frozenset(method for method in ops if method in HTTP_METHODS)
+        for path, ops in contract["paths"].items()
+        if path not in _OPS_ONLY_CONTRACT_PATHS
+    }
+    assert generated == expected, (
+        f"路径漂移: 仅契约有={sorted(set(expected) - set(generated))} "
+        f"仅实现有={sorted(set(generated) - set(expected))}"
+    )
+
+
+def test_generated_schemas_share_names_with_contract(contract: dict[str, Any]) -> None:
+    """生成文档中的业务 Schema 必须与契约同名（禁止实现私增/改名）。"""
+    generated = set(app.openapi()["components"]["schemas"]) - _FASTAPI_BUILTIN_SCHEMAS
+    contract_names = set(contract["components"]["schemas"])
+    assert generated <= contract_names, f"实现私增 Schema: {sorted(generated - contract_names)}"
+    # 契约中的请求/数据实体 Schema 必须全部在实现文档中同名可见（防契约漂移为内部模型）
+    entity_pattern = re.compile(r"(Request|Data|Item|Sample|Part)$")
+    for name in sorted(contract_names):
+        if entity_pattern.search(name):
+            assert name in generated, f"契约实体 Schema 未在实现中暴露: {name}"
+
+
+def test_same_named_schemas_effective_fields_match_contract(contract: dict[str, Any]) -> None:
+    """同名 Schema 的有效属性集必须一致（契约 allOf 组合 ↔ 实现内联展开）。"""
+    generated = app.openapi()["components"]["schemas"]
+    contract_schemas = contract["components"]["schemas"]
+    shared = (set(generated) & set(contract_schemas)) - _FASTAPI_BUILTIN_SCHEMAS
+    for name in sorted(shared):
+        expected = _effective_properties(contract_schemas[name], contract_schemas)
+        actual = set((generated[name].get("properties") or {}).keys())
+        assert actual == expected, (
+            f"Schema {name} 属性漂移: 仅契约有={sorted(expected - actual)} "
+            f"仅实现有={sorted(actual - expected)}"
+        )
+
+
+def test_enum_schemas_match_contract_vocabulary(contract: dict[str, Any]) -> None:
+    """枚举 Schema（事件类型/等级、Bucket、数据类型、上传方式）成员必须与契约一致。
+
+    ErrorCode 不经 response_model 进入实现文档（由 test_error_codes_are_predefined
+    基于 hunter_common 错误码表覆盖），故此处仅校验文档内可见枚举。
+    """
+    generated = app.openapi()["components"]["schemas"]
+    contract_schemas = contract["components"]["schemas"]
+    checked = 0
+    for name, contract_schema in contract_schemas.items():
+        expected = contract_schema.get("enum")
+        if expected is None or name == "ErrorCode":  # ErrorCode 见 test_error_codes_are_predefined
+            continue
+        generated_schema = generated.get(name)
+        assert generated_schema is not None, f"枚举 Schema 未在实现中暴露: {name}"
+        assert sorted(generated_schema.get("enum", [])) == sorted(expected), f"枚举成员漂移: {name}"
+        checked += 1
+    assert checked >= 4, f"契约枚举覆盖不足: 仅校验 {checked} 个"
+
+
+def test_telemetry_206_declared_on_both_sides(contract: dict[str, Any]) -> None:
+    """206 截断语义必须双侧声明：契约 queryTelemetry ↔ 实现路由装饰器（待确认项 7）。"""
+    contract_responses = contract["paths"]["/api/v1/data/telemetry"]["get"]["responses"]
+    assert "206" in contract_responses, "契约 queryTelemetry 缺少 206 截断响应声明"
+    truncated_header = contract_responses["206"]["headers"]["X-Truncated-Range"]
+    assert truncated_header["schema"]["pattern"] == "^seconds=[0-9]+$"
+    generated_responses = app.openapi()["paths"]["/api/v1/data/telemetry"]["get"]["responses"]
+    assert "206" in generated_responses, "实现 query_telemetry 未声明 206 响应"
+
+
+# =====================================================================
+# 七、契约示例 ↔ 实现模型（example-based 反序列化验证）
+# =====================================================================
+#: 契约 Schema → 实现模型：契约最小合法实例必须被同名实现模型接受
+_MODEL_BY_SCHEMA: dict[str, type[BaseModel]] = {
+    "FilePresignRequest": FilePresignRequest,
+    "FileCompleteRequest": FileCompleteRequest,
+    "TelemetrySample": TelemetrySample,
+    "TelemetryQueryData": TelemetryQueryData,
+    "EventItem": EventItem,
+    "EventListData": EventListData,
+    "FilePresignData": FilePresignData,
+    "FileCompleteData": FileCompleteData,
+    "FileListData": FileListData,
+    "FileObjectItem": FileObjectItem,
+    "FilePresignPart": FilePresignPart,
+    "CompletedPart": CompletedPart,
+}
+#: pattern / 语义字段的合成值特例（契约 example 缺失时使用）
+_EXAMPLE_OVERRIDES: dict[str, Any] = {
+    "md5": "a" * 32,
+    "sha256": "a" * 64,
+    "vehicle_id": "HUNTER-001",
+    "time": 1724035200.123,  # 遥测采集时间（设计文档 5.3.3 示例）
+    "timestamp": 1724035200.123,
+    "etag": "d41d8cd98f00b204e9800998ecf8427e",
+}
+
+
+def _resolve_ref(schema: dict[str, Any], components: dict[str, Any]) -> dict[str, Any]:
+    """解引用一层组件引用（契约内枚举/嵌套实体均为组件级引用）。"""
+    if "$ref" not in schema:
+        return schema
+    target = components.get(schema["$ref"].rsplit("/", 1)[-1])
+    assert target is not None, f"契约 $ref 无法解析: {schema['$ref']}"
+    return target
+
+
+def _synthetic_value(field: str, prop: dict[str, Any], components: dict[str, Any]) -> Any:
+    """为契约属性合成最小合法值：example 优先，其次枚举首成员/pattern/类型推断。"""
+    if "example" in prop:
+        return prop["example"]
+    if field in _EXAMPLE_OVERRIDES:
+        return _EXAMPLE_OVERRIDES[field]
+    prop = _resolve_ref(prop, components)  # $ref 枚举（bucket/data_type/event_type 等）
+    if "example" in prop:
+        return prop["example"]
+    if "enum" in prop:
+        return prop["enum"][0]
+    value_type = prop.get("type")
+    if value_type == "integer":
+        return 1
+    if value_type == "number":
+        return 1.0
+    if value_type == "boolean":
+        return True
+    if value_type == "array":
+        items = _resolve_ref(prop.get("items", {}), components)
+        return [_synthetic_value(field, items, components)]
+    if value_type == "object" and (prop.get("properties") or {}):
+        return _minimal_instance_from(prop, components)  # 嵌套实体（items[] 元素）递归构造
+    if value_type == "object":
+        return {}
+    return "hunter-edge-contract"  # string 兜底
+
+
+def _minimal_instance_from(
+    schema: dict[str, Any],
+    components: dict[str, Any],
+    model: type[BaseModel] | None = None,
+) -> dict[str, Any]:
+    """基于契约 Schema 合成最小合法实例（仅必填字段）。
+
+    允许实现响应模型比契约更完整（服务端总回填，如 FileCompleteData.data_type
+    契约可选、实现必填）：叠加实现必填字段参与合成，但取值仍由契约属性/example
+    驱动；契约必填字段在实现侧被收紧为必填属正常（实现是契约的合法超集）。
+    """
+    properties = schema.get("properties") or {}
+    required: set[str] = set(schema.get("required", []))
+    if model is not None:
+        required |= {name for name, info in model.model_fields.items() if info.is_required()}
+    return {
+        field: _synthetic_value(field, properties.get(field) or {}, components)
+        for field in required
+    }
+
+
+def _minimal_instance(schema_name: str, components: dict[str, Any]) -> dict[str, Any]:
+    """从契约 Schema 生成最小合法实例（叠加同名实现模型的必填字段）。"""
+    return _minimal_instance_from(
+        _resolve_ref({"$ref": f"#/components/schemas/{schema_name}"}, components),
+        components,
+        _MODEL_BY_SCHEMA[schema_name],
+    )
+
+
+def _assert_payload_subset(actual: Any, expected: Any, path: str) -> None:
+    """递归断言合成 payload 是实现实例 dump 的子集（实现可额外填充默认字段如 None）。"""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        for key, sub in expected.items():
+            assert key in actual, f"{path}.{key} 缺失"
+            _assert_payload_subset(actual[key], sub, f"{path}.{key}")
+    elif isinstance(expected, list) and isinstance(actual, list):
+        assert len(actual) == len(expected), f"{path} 长度漂移: {len(actual)} != {len(expected)}"
+        for index, sub in enumerate(expected):
+            _assert_payload_subset(actual[index], sub, f"{path}[{index}]")
+    else:
+        assert actual == expected, f"{path} 取值漂移: {actual!r} != {expected!r}"
+
+
+@pytest.mark.parametrize("schema_name", sorted(_MODEL_BY_SCHEMA))
+def test_contract_schemas_validate_against_implementation_models(
+    contract: dict[str, Any], schema_name: str
+) -> None:
+    """契约 Schema 的最小合法实例必须被同名实现模型接受且逐字段保值（防字段漂移）。"""
+    components = contract["components"]["schemas"]
+    payload = _minimal_instance(schema_name, components)
+    instance = _MODEL_BY_SCHEMA[schema_name].model_validate(payload)
+    dumped = instance.model_dump()  # 嵌套实体转 dict（StrEnum == str 成立）
+    _assert_payload_subset(dumped, payload, schema_name)
+
+
+def test_ready_checks_example_matches_readiness_contract(contract: dict[str, Any]) -> None:
+    """契约 ReadyChecks 顶层示例（就绪检查项）必须与 /readyz 响应 data 键一致。"""
+    example = contract["components"]["schemas"]["ReadyChecks"]["example"]
+    assert set(example) == {"database", "redis"}, f"就绪检查项漂移: {sorted(example)}"
 

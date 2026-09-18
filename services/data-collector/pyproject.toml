@@ -7,6 +7,7 @@ dependencies = [
     "fastapi>=0.100,<1.0",
     "uvicorn[standard]>=0.23",
     "prometheus-client>=0.20,<1",
+    "boto3>=1.28,<2",
 ]
 
 # 注意：hunter_common 由仓库统一安装（先执行 pip install -e "common/python"），

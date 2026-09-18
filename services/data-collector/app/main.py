@@ -6,6 +6,7 @@
 - 全链路 trace_id（X-Request-ID）中间件
 - /healthz 存活探针、/readyz 就绪探针（DB/Redis 连通性）
 - /metrics Prometheus 指标端点（供 infra/monitoring 抓取）
+- 业务路由：/api/v1/data/**（telemetry / events / files，契约 data-collector.yaml）
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from hunter_common.database import DatabaseSessionManager
+from hunter_common.kafka.producer import KafkaProducerManager
 from hunter_common.logging import (
     configure_logging,
     get_logger,
@@ -28,14 +30,29 @@ from hunter_common.redis import RedisManager
 
 from app.config import settings
 from app.core.error_handlers import register_exception_handlers
+from app.producers.sensor_file import SensorFileProducer
+from app.repositories.events import EventRepository
+from app.repositories.storage import MinioStorage, get_storage
+from app.repositories.telemetry import TelemetryRepository
+from app.routers import events, files, telemetry
 from app.routers.health import router as health_router
+from app.services.events import EventService
+from app.services.files import FileService
+from app.services.telemetry import TelemetryService
 
 logger = get_logger("app.main")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """应用生命周期：初始化日志/DB/Redis 管理器（惰性连接，不阻塞启动）。"""
+    """应用生命周期：初始化日志/DB/Redis/MinIO 与业务服务（惰性连接，不阻塞启动）。
+
+    app.state 装配清单（路由经 Depends 从 state 取服务，测试可整体替换）：
+    - db / redis：hunter_common 管理器（连接池惰性建立）；
+    - storage：MinioStorage（boto3 同步客户端，调用经 to_thread 包装；
+      botocore 连接池自管理，无显式 close，退出时交由 GC 回收）；
+    - telemetry_service / event_service / file_service：业务服务（构造注入仓储与依赖）。
+    """
     configure_logging(
         settings.service_name,
         settings.log_level,
@@ -45,10 +62,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db.init()
     app.state.redis = RedisManager(settings)
     app.state.redis.init()
+    # Kafka 生产者单例（幂等；Producer 构造为懒连接，不阻塞启动）
+    KafkaProducerManager.initialize(settings)
+
+    storage: MinioStorage = await get_storage()
+    app.state.storage = storage
+    app.state.telemetry_service = TelemetryService(TelemetryRepository(app.state.db))
+    app.state.event_service = EventService(EventRepository(app.state.db), storage)
+    app.state.file_service = FileService(storage, SensorFileProducer())
     logger.info("service_started", service=settings.service_name, port=settings.api_port)
     yield
     await app.state.redis.close()
     await app.state.db.close()
+    try:
+        await KafkaProducerManager.instance().close()
+    except RuntimeError:
+        pass  # 未初始化（测试场景）则跳过 flush
     logger.info("service_stopped", service=settings.service_name)
 
 
@@ -91,6 +120,9 @@ async def trace_id_middleware(request: Request, call_next) -> Response:
 
 
 app.include_router(health_router)
+app.include_router(telemetry.router)
+app.include_router(events.router)
+app.include_router(files.router)
 register_metrics(app, settings.service_name, version="0.1.0")
 register_exception_handlers(app)
 
