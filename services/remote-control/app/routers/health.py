@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -22,7 +23,7 @@ async def healthz() -> dict[str, object]:
     return success_response(data={"status": "ok"}).model_dump()
 
 
-async def _bounded_probe(name: str, coro: object) -> bool:
+async def _bounded_probe(name: str, coro: Awaitable[object]) -> bool:
     """带超时的单项探测：超时/异常一律视为未就绪（禁止探测挂起请求）。"""
     try:
         return bool(await asyncio.wait_for(coro, timeout=_PROBE_TIMEOUT_S))

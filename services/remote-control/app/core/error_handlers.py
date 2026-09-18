@@ -1,6 +1,8 @@
 """全局异常处理器：任何异常均返回统一响应格式（code 必须为预定义错误码）。"""
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -50,7 +52,7 @@ def _unified_http_json(
     message: str,
     *,
     status_code: int,
-    headers: dict[str, str] | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> JSONResponse:
     """HTTP 层异常响应：保留原始 HTTP 状态码与响应头（如 429 的 Retry-After）。"""
     payload = error_response(code, message, request_id=get_trace_id() or None)
