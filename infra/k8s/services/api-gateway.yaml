@@ -21,6 +21,27 @@ data:
   RATE_LIMIT_IP_QPS: "200"
   # 网关路由表前缀（与设计文档一致，禁止自行更改）
   GATEWAY_ROUTE_PREFIXES: "/api/v1/scene,/api/v1/data,/api/v1/analytics,/api/v1/ota,/api/v1/remote,/api/v1/vehicle,/api/v1/user"
+  # ---------- 转发目标（x-hunter-gateway-routes；集群内经 Service DNS） ----------
+  SCENE_SERVICE_URL: "http://scene-service:8081"
+  DATA_COLLECTOR_SERVICE_URL: "http://data-collector:8082"
+  DATA_ANALYTICS_SERVICE_URL: "http://data-analytics:8083"
+  OTA_SERVICE_URL: "http://ota-service:8084"
+  REMOTE_CONTROL_SERVICE_URL: "http://remote-control:8085"
+  # vehicle-service / user-service 归属待确认（契约 pending_confirmation）：
+  # 不配置 URL → 对应前缀返回 503 + code=5001，禁止伪造转发
+  # ---------- 转发超时与熔断（契约 circuit_breaker 默认策略；阈值待人工确认） ----------
+  PROXY_CONNECT_TIMEOUT_SECONDS: "5"
+  PROXY_TIMEOUT_SECONDS: "30"
+  PROXY_MAX_CONNECTIONS: "100"
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: "5"
+  CIRCUIT_BREAKER_TIMEOUT_RATE: "0.5"
+  CIRCUIT_BREAKER_OPEN_SECONDS: "30"
+  # ---------- 登录防护（设计文档 14.5 节；阈值待人工确认） ----------
+  LOGIN_RATE_LIMIT_PER_IP: "30"
+  LOGIN_MAX_FAILURES: "5"
+  LOGIN_LOCK_WINDOW_SECONDS: "900"
+  JWT_ISSUER: "hunter-platform"
+  TRUST_FORWARDED_FOR: "true"   # Ingress 覆盖 X-Forwarded-For；直连部署改 false
 ---
 apiVersion: apps/v1
 kind: Deployment

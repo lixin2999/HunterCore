@@ -267,7 +267,8 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
   （12.2 节未随仓库提供，推导依据在 `x-hunter-endpoints.derivation` 逐条登记）；遥测查询响应与 5.3.3 节消息结构逐字段一致
   （`x-hunter-telemetry-query-contract` 给出扁平列映射）；文件上传 6 步流程 + 命名规范 + 校验失败复用 6001（`x-hunter-file-upload-flow`）；
   Kafka 消费 4 个车端 Topic（`data-collector-*` 消费组）、生产 4 个内部 Topic（含本次补全的 `sensor_file.schema.json`）
-- **⚠ 待确认**（契约内标 `pending_confirmation`）：认证端点路径与载荷、`/api/v1/vehicle|user` 归属服务（模块表仅 6 个微服务）、
+- **⚠ 待确认**（契约内标 `pending_confirmation`）：~~认证端点路径与载荷~~（**已实现**：网关自持
+  login/refresh/logout/me，MFA 待数据库契约扩展；详见 `docs/api-gateway.md`）、`/api/v1/vehicle|user` 归属服务（模块表仅 6 个微服务，未配置 URL → 503）、
   MFA / 限流错误码复用、服务发现机制与配置键名、熔断阈值；场景服务侧见其契约 `x-hunter-pending-confirmation`（12 项）；
   数据采集侧见其契约 `x-hunter-pending-confirmation`（12 项：端点清单来源 / 文件元信息缺表 / sensor_file 字段 / Carla Topic 归属等）；
   数据分析侧见其契约 `x-hunter-pending-confirmation`（12 项：报告元信息缺表 / 报告异步语义 / TTC 等级冲突 /
@@ -366,6 +367,7 @@ python scripts/verify_test_layer.py
 | 数据层契约校验 | `python scripts/verify_data_layer.py`（DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema + Redis Key + MinIO，26 项） |
 | 存储契约单元测试 | `pytest common/python/tests/test_storage_contracts.py -q`（Redis Key / MinIO Bucket ↔ 服务声明 ↔ 初始化脚本，9 项） |
 | 接口契约校验 | `pytest services/api-gateway/app/tests/test_openapi_contract.py -q`（OpenAPI ↔ 实现 ↔ K8s 清单，29 项） |
+| 网关认证/限流/转发测试 | `pytest services/api-gateway -q`（登录/刷新轮换防重放/注销幂等/会话强依赖/限流维度/代理转发与熔断，66 项） |
 | 场景契约校验 | `cd services/scene-service && pytest app/tests/test_scene_contract.py -q`（契约 ↔ 设计文档 4 章/12.2 节 ↔ DDL ↔ Kafka ↔ K8s，29 项） |
 | 数据采集契约校验 | `cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q`（契约 ↔ 设计文档 5 章 ↔ DDL ↔ Kafka ↔ K8s，30 项） |
 | 数据分析契约校验 | `cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q`（契约 ↔ 设计文档 6 章/12.4 节 ↔ DDL ↔ Kafka ↔ K8s，32 项） |
