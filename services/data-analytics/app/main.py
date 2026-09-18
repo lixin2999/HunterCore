@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +28,9 @@ from hunter_common.metrics import register_metrics
 from hunter_common.redis import RedisManager
 
 from app.config import settings
+from app.core import dependencies
 from app.core.error_handlers import register_exception_handlers
+from app.routers import corner_cases, coverage, dashboard, evaluation, reports
 from app.routers.health import router as health_router
 
 logger = get_logger("app.main")
@@ -47,6 +50,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.redis.init()
     logger.info("service_started", service=settings.service_name, port=settings.api_port)
     yield
+    # 关闭请求期惰性创建的下游资源（httpx 客户端 / asyncpg 池 / MinIO 客户端）
+    closables: list[Any] = getattr(app.state, dependencies.KEY_CLOSABLES, [])
+    for closable in closables:
+        try:
+            await closable.close()
+        except Exception:  # noqa: BLE001 - 单个资源释放失败不得阻断其余资源关闭（已记 warning）
+            logger.warning("closable_release_failed", type=type(closable).__name__)
+    storage = getattr(app.state, dependencies.KEY_STORAGE, None)
+    if storage is not None:
+        await storage.close()
     await app.state.redis.close()
     await app.state.db.close()
     logger.info("service_stopped", service=settings.service_name)
@@ -91,6 +104,11 @@ async def trace_id_middleware(request: Request, call_next) -> Response:
 
 
 app.include_router(health_router)
+app.include_router(reports.router)
+app.include_router(dashboard.router)
+app.include_router(evaluation.router)
+app.include_router(coverage.router)
+app.include_router(corner_cases.router)
 register_metrics(app, settings.service_name, version="0.1.0")
 register_exception_handlers(app)
 
