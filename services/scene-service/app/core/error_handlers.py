@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from hunter_common.exceptions import ErrorCode, HunterBaseException
 from hunter_common.logging import get_logger, get_trace_id
 from hunter_common.responses import error_response
+from sqlalchemy.exc import InterfaceError, OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 logger = get_logger("app.core.error_handlers")
@@ -58,7 +59,7 @@ def _unified_http_json(
 
 
 def register_exception_handlers(app: FastAPI) -> None:
-    """注册全局异常处理：业务异常 / 参数校验异常 / 未预期异常 / HTTP 层异常（404/405）。"""
+    """注册全局异常处理：业务异常 / 参数校验异常 / 依赖不可用 / 未预期异常 / HTTP 层异常。"""
 
     @app.exception_handler(HunterBaseException)
     async def _hunter_handler(request: Request, exc: HunterBaseException) -> JSONResponse:
@@ -69,6 +70,21 @@ def register_exception_handlers(app: FastAPI) -> None:
             path=request.url.path,
         )
         return _unified_json(exc.code, exc.message)
+
+    async def _dependency_unavailable_handler(request: Request, exc: Exception) -> JSONResponse:
+        """依赖不可用（数据库连接拒绝/超时、连接层异常）→ 503 + code=5001。
+
+        契约 5001 覆盖「PostgreSQL / Redis / MinIO / Carla 管理 API 不可达」；
+        asyncpg/SQLAlchemy 在部分版本会把连接失败直接抛为 ``OSError``（如
+        ``ConnectionRefusedError``），故在此统一收敛，避免退化为 5000。
+        """
+        logger.error(
+            "dependency_unavailable", error=type(exc).__name__, path=request.url.path
+        )
+        return _unified_json(ErrorCode.SERVICE_UNAVAILABLE, "服务不可用")
+
+    for exc_type in (OperationalError, InterfaceError, ConnectionError, OSError):
+        app.add_exception_handler(exc_type, _dependency_unavailable_handler)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_handler(

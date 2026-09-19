@@ -7,6 +7,8 @@ dependencies = [
     "fastapi>=0.100,<1.0",
     "uvicorn[standard]>=0.23",
     "prometheus-client>=0.20,<1",
+    "boto3>=1.28,<2",          # MinIO（S3 协议）：场景导出产物上传 + 15 分钟预签名下载
+    "httpx>=0.27,<1",          # Carla 管理 API 调用（4.4 节下发流程，超时/重试）
 ]
 
 # 注意：hunter_common 由仓库统一安装（先执行 pip install -e "common/python"），

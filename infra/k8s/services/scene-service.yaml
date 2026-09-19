@@ -17,6 +17,41 @@ data:
   DB_MAX_OVERFLOW: "5"
   # 场景资源 Bucket（hunter-scene-assets，生命周期永久）
   MINIO_BUCKET_SCENE_ASSETS: "hunter-scene-assets"
+  MINIO_REGION: "us-east-1"
+  # 导出（4.3 节；命名与预签名时效由契约固定，禁止改动）
+  SCENE_EXPORT_OBJECT_PREFIX: "scenarios/"
+  SCENE_EXPORT_PRESIGN_EXPIRE_SECONDS: "900"
+  SCENE_EXPORT_MAX_SCENES: "50"
+  # Carla 管理 API（4.4 节；地址按环境注入，⚠ 键名/子路径见契约待确认 #9）
+  # CARLA_MANAGEMENT_ENDPOINT 由环境 overlay（hunter-common-config / Secret）注入，禁止在此硬编码
+  CARLA_INSTANCE_CREATE_PATH: "/api/v1/instances"
+  CARLA_INSTANCE_QUERY_PATH: "/api/v1/instances"
+  CARLA_SCENARIO_SUBMIT_PATH: "/api/v1/instances/{sim_instance_id}/scenario"
+  CARLA_REQUEST_TIMEOUT_SECONDS: "5"
+  CARLA_REQUEST_MAX_RETRIES: "1"
+  # 场景约束与缓存（SCENE_DETAIL_CACHE_TTL_SECONDS 与 Redis Key 契约同源 = 3600）
+  SCENE_DURATION_MAX_SECONDS: "600"
+  SCENE_PARAM_OVERRIDE_ALLOWED_PATHS: "ego_vehicle,weather,duration,actors,events,success_criteria"
+  SCENE_PARAM_OVERRIDE_FORBIDDEN_PATHS: "map"
+  SCENE_DETAIL_CACHE_TTL_SECONDS: "3600"
+  SCENE_DUPLICATE_NAME_SUFFIX: "-copy"
+  SCENE_DUPLICATE_MAX_ATTEMPTS: "100"
+  SCENE_DEFAULT_VERSION: "1.0.0"
+  # RBAC（资源域 scene：create/read/update/delete/execute）
+  SCENE_READ_ROLES: "admin,analyst,operator"
+  SCENE_WRITE_ROLES: "admin,operator"
+  SCENE_EXECUTE_ROLES: "admin,operator"
+  SCENE_SCOPE_BY_CREATOR: "false"
+  SCENE_SCOPE_EXEMPT_ROLES: "admin"
+  # 实车场景自动提取（4.5 节）
+  ANALYTICS_RESULT_TOPIC: "analytics_result"
+  SCENE_EXTRACTION_GROUP_ID: "scene-service-analytics-result"
+  SCENE_EXTRACTION_CONSUMER_ENABLED: "true"
+  KAFKA_EXTRACTION_POLL_TIMEOUT_SECONDS: "1"
+  SCENE_EXTRACTION_CREATOR_ID: "00000000-0000-0000-0000-000000000000"  # ⚠ 系统账号 uuid 待确认
+  SCENE_EXTRACTION_DEFAULT_EGO_MODEL: "HUNTER_SE"
+  SCENE_EXTRACTION_MIN_SAFE_DISTANCE: "1"
+  SCENE_EXTRACTION_MAX_SPEED_DEVIATION: "1"
 ---
 apiVersion: apps/v1
 kind: Deployment

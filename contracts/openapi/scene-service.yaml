@@ -1200,7 +1200,41 @@ x-hunter-service:
     - REDIS_URL
     - MINIO_ENDPOINT
     - MINIO_BUCKET_SCENE_ASSETS
-    - CARLA_MANAGEMENT_ENDPOINT   # ⚠ 键名待确认（禁止在代码中硬编码 Carla 地址）
+    # ---------- MinIO / 导出（4.3 节） ----------
+    - MINIO_REGION
+    - SCENE_EXPORT_OBJECT_PREFIX            # 契约 x-hunter-export.object_prefix（scenarios/）
+    - SCENE_EXPORT_PRESIGN_EXPIRE_SECONDS   # 契约固定 900（15 分钟下载预签名）
+    - SCENE_EXPORT_MAX_SCENES               # 契约 SceneExportRequest.scene_ids maxItems = 50
+    # ---------- Carla 管理 API（4.4 节；⚠ 键名与子路径待确认 #9） ----------
+    - CARLA_MANAGEMENT_ENDPOINT             # ⚠ 键名待确认（禁止在代码中硬编码 Carla 地址）
+    - CARLA_INSTANCE_CREATE_PATH            # ② 创建仿真实例路径（默认 /api/v1/instances）
+    - CARLA_INSTANCE_QUERY_PATH             # 并行实例查询路径（默认 /api/v1/instances）
+    - CARLA_SCENARIO_SUBMIT_PATH            # ③④ 下发场景配置路径（含 {sim_instance_id}）
+    - CARLA_REQUEST_TIMEOUT_SECONDS
+    - CARLA_REQUEST_MAX_RETRIES
+    # ---------- 场景约束与缓存（4.2 节 + Redis Key 契约） ----------
+    - SCENE_DURATION_MAX_SECONDS            # ⚠ 上限设计文档未定义（待确认 #9）
+    - SCENE_PARAM_OVERRIDE_ALLOWED_PATHS    # 参数覆盖白名单顶层路径
+    - SCENE_PARAM_OVERRIDE_FORBIDDEN_PATHS  # 参数覆盖禁止路径（含 map）
+    - SCENE_DETAIL_CACHE_TTL_SECONDS        # cache:scene:{scene_id} TTL（契约 3600）
+    - SCENE_DUPLICATE_NAME_SUFFIX
+    - SCENE_DUPLICATE_MAX_ATTEMPTS
+    - SCENE_DEFAULT_VERSION
+    # ---------- RBAC（资源域 scene：create/read/update/delete/execute） ----------
+    - SCENE_READ_ROLES
+    - SCENE_WRITE_ROLES
+    - SCENE_EXECUTE_ROLES
+    - SCENE_SCOPE_BY_CREATOR                # 数据权限隔离开关（默认关闭）
+    - SCENE_SCOPE_EXEMPT_ROLES
+    # ---------- 实车场景自动提取（4.5 节） ----------
+    - ANALYTICS_RESULT_TOPIC
+    - SCENE_EXTRACTION_GROUP_ID
+    - SCENE_EXTRACTION_CONSUMER_ENABLED
+    - KAFKA_EXTRACTION_POLL_TIMEOUT_SECONDS
+    - SCENE_EXTRACTION_CREATOR_ID           # ⚠ 自动提取无人类操作者，系统 uuid 待确认
+    - SCENE_EXTRACTION_DEFAULT_EGO_MODEL
+    - SCENE_EXTRACTION_MIN_SAFE_DISTANCE
+    - SCENE_EXTRACTION_MAX_SPEED_DEVIATION
   performance:
     api_p95_ms: 200             # 13.2 节：API 响应 P95 ≤ 200ms
     list_default_page_size: 20
@@ -1437,7 +1471,7 @@ x-hunter-pending-confirmation:
       impact: "网关/服务错误处理"
     - id: 9
       question: "Carla 管理 API 地址与配置键名、仿真并发上限、场景时长上限"
-      contract_decision: "键名暂定 CARLA_MANAGEMENT_ENDPOINT，值域与上限均需环境变量化"
+      contract_decision: "键名暂定 CARLA_MANAGEMENT_ENDPOINT，值域与上限均需环境变量化；实现侧以 CARLA_INSTANCE_CREATE_PATH / CARLA_INSTANCE_QUERY_PATH（默认 /api/v1/instances）与 CARLA_SCENARIO_SUBMIT_PATH（默认 /api/v1/instances/{sim_instance_id}/scenario）及 SCENE_DURATION_MAX_SECONDS（默认 600s）落地，人工确认后仅调整配置不改代码"
       impact: "Step 3 服务层实现与 K8s ConfigMap"
     - id: 10
       question: "实车场景提取触发源：analytics_result 还是 event_raw"

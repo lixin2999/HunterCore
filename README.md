@@ -235,7 +235,7 @@ REST 接口契约集中在 `contracts/openapi/`，遵循「先契约、后实现
 | 契约 | 覆盖范围 | 状态 |
 |------|----------|------|
 | `api-gateway.yaml` | 统一认证（登录 / 刷新 / 登录态查询 / 注销）+ 运维探针（`/healthz`、`/readyz`、`/metrics`）+ 路由表 / 五级限流 / WebSocket / 审计日志 / 错误码映射扩展字段 | ✅ |
-| `scene-service.yaml` | 场景库 CRUD（10 端点，12.2 节）+ 4.2.1 分类体系 / 4.2.2 配置结构 / 4.3 导出 / 4.4 下发 / 4.5 实车提取扩展字段 | ✅ |
+| `scene-service.yaml` | 场景库 CRUD（10 端点，12.2 节）+ 4.2.1 分类体系 / 4.2.2 配置结构 / 4.3 导出 / 4.4 下发 / 4.5 实车提取扩展字段 | ✅ 契约 + 实现（服务端口 8081；100 项测试） |
 | `data-collector.yaml` | 数据采集（7 端点：遥测查询 / 事件查询与确认 / 文件清单与预签名上传）+ 5.3.3 遥测结构 / 5.4 预处理 / 5.5 上传流程扩展字段 | ✅ |
 | `data-analytics.yaml` | 数据分析（8 端点：报告列表/详情/生成、看板、感知与控制评估、场景覆盖率、Corner Case）+ 6.2 实时作业 / 6.3 离线作业 / 6.4 挖掘 / 6.5 报告扩展字段 | ✅ |
 | `ota-service.yaml` | OTA 管理（15 端点：版本仓库 CRUD/发布/废弃、升级任务 CRUD/start|pause|resume|cancel|rollback、升级记录）+ 8/9 章 DDL 与 Kafka 对齐 + 版本上传两步式 / 灰度批次 / 发布校验扩展字段 | ✅ |
@@ -263,6 +263,11 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 - **场景服务**：`scene-service.yaml` 与设计文档 12.2 节逐条对齐（不得增删端点）；4.2.2 场景配置结构拆为 `SceneMeta`（→ `scenes` 列）
   + `SceneConfig`（→ `config_json`），映射关系由 `x-hunter-scene-config-contract` 声明；Kafka 仅消费 `analytics_result`
   （`analytics_result.schema.json` 已按 4.5 节补全：触发事件 + 前后各 10 秒截取窗口）
+  - **实现（L3 Step 2）**：10 个端点全部落地（`app/routers/{scenes,templates,export,simulation}.py`），
+    4.2.1 分类体系驱动 17 个内置模板，4.3 节导出 Carla XML / OpenSCENARIO 1.2 至 `hunter-scene-assets`+900s 预签名，
+    4.4 节下发走环境变量化的 Carla 管理 API 客户端（超时/重试 → 5001），4.5 节由 `analytics_result` 消费者自动建
+    `real_vehicle_replay` 草稿场景（幂等键 `(vehicle_id, window_start)`，异常进 `analytics_result.dlq`）；
+    状态机与错误码严格按契约（重名 3002、状态冲突 3003、软删除过滤、`cache:scene:{scene_id}` 写后失效）
 - **数据采集服务**：`data-collector.yaml` 的 7 个业务端点由「附录 D 限流端点 + 5.5 上传流程 + events 表列能力」推导
   （12.2 节未随仓库提供，推导依据在 `x-hunter-endpoints.derivation` 逐条登记）；遥测查询响应与 5.3.3 节消息结构逐字段一致
   （`x-hunter-telemetry-query-contract` 给出扁平列映射）；文件上传 6 步流程 + 命名规范 + 校验失败复用 6001（`x-hunter-file-upload-flow`）；
@@ -369,6 +374,7 @@ python scripts/verify_test_layer.py
 | 接口契约校验 | `pytest services/api-gateway/app/tests/test_openapi_contract.py -q`（OpenAPI ↔ 实现 ↔ K8s 清单，29 项） |
 | 网关认证/限流/转发测试 | `pytest services/api-gateway -q`（登录/刷新轮换防重放/注销幂等/会话强依赖/限流维度/代理转发与熔断，66 项） |
 | 场景契约校验 | `cd services/scene-service && pytest app/tests/test_scene_contract.py -q`（契约 ↔ 设计文档 4 章/12.2 节 ↔ DDL ↔ Kafka ↔ K8s，29 项） |
+| 场景服务实现测试 | `cd services/scene-service && pytest -q`（端点/服务层/消费者/健康探针 100 项；含错误码 1001/1002/2001/2002/3001/3002/3003/5001 分支） |
 | 数据采集契约校验 | `cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q`（契约 ↔ 设计文档 5 章 ↔ DDL ↔ Kafka ↔ K8s，30 项） |
 | 数据分析契约校验 | `cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q`（契约 ↔ 设计文档 6 章/12.4 节 ↔ DDL ↔ Kafka ↔ K8s，32 项） |
 | 远程操控契约校验 | `cd services/remote-control && pytest app/tests/test_remote_control_contract.py -q`（契约 ↔ 设计文档 15 条安全约束/12.6 节推导 ↔ Kafka ↔ MinIO 归档 ↔ K8s，契约测试随实现步骤落地） |
