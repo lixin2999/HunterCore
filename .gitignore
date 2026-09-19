@@ -126,6 +126,21 @@ Icon?
 # ===== 本地文档（按开发规则：每次只更新不提交） =====
 docs/
 release.md
+# ===== 单机部署包（infra/deploy）：模板与 SQL 产物入库；真实密钥/证书/数据禁止入库 =====
+infra/deploy/.env
+infra/deploy/.env.bak*
+infra/deploy/certs/*
+!infra/deploy/certs/README.md
+infra/deploy/data/
+infra/deploy/backups/
+*.pem
+*.crt
+*.cer
+*.keystore
+*.truststore
+*.p12
+*.pfx
+
 
 # ===== K8s 敏感配置（仅提交 *.example.yaml 模板，禁止提交真实密钥/证书） =====
 infra/k8s/**/02-secret.yaml

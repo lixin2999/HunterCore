@@ -1,0 +1,28 @@
+{
+  "data-root": "/var/lib/docker",
+  "storage-driver": "overlay2",
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "iptables": true,
+  "live-restore": true,
+  "no-new-privileges": true,
+  "userland-proxy": false,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "5",
+    "labels": "com.docker.compose.project,com.docker.compose.service,com.docker.compose.container-number"
+  },
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 65536,
+      "Soft": 65536
+    }
+  },
+  "max-concurrent-downloads": 6,
+  "max-concurrent-uploads": 6,
+  "registry-mirrors": [],
+  "features": {
+    "buildkit": true
+  }
+}
