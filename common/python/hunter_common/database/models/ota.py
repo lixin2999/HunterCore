@@ -23,7 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from hunter_common.database.base import Base, StrEnumType, uuid_primary_key_column
 from hunter_common.database.enums import OtaStatus, OtaTaskStatus, OtaVersionStatus
@@ -75,6 +75,15 @@ class OtaVersion(Base):
     )
     release_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # 关系契约：contracts/database/orm-mapping.md 第 2 节
+    # DDL FK = ON DELETE RESTRICT（已发布版本不可删）→ 禁止 delete-orphan，
+    # passive_deletes 让 ORM 不尝试把 ota_tasks.target_version_id 置空（NOT NULL）
+    tasks: Mapped[list[OtaTask]] = relationship(
+        back_populates="version",
+        passive_deletes=True,
+        lazy="raise_on_sql",
+    )
+
 
 class OtaTask(Base):
     """OTA 升级任务（ota_svc.ota_tasks）；灰度任一批次成功率 < 95% 时暂停并告警。"""
@@ -116,6 +125,15 @@ class OtaTask(Base):
     creator: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
     create_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    # creator 为逻辑外键 → user_svc.users.user_id（跨服务不建 relationship，走 REST）
+    version: Mapped[OtaVersion] = relationship(back_populates="tasks", lazy="selectin")
+    records: Mapped[list[OtaRecord]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",  # DDL FK ON DELETE CASCADE
+        passive_deletes=True,
+        lazy="raise_on_sql",  # 记录量级大：必须显式 selectinload，禁止隐式加载
     )
 
 
@@ -172,6 +190,9 @@ class OtaRecord(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # vehicle_id 为逻辑外键 → vehicle_svc.vehicles（跨服务不建 relationship，走 REST）
+    task: Mapped[OtaTask] = relationship(back_populates="records", lazy="selectin")
 
 
 __all__ = ["OtaRecord", "OtaTask", "OtaVersion"]

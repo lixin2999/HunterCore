@@ -74,6 +74,9 @@ class Event(Base):
     acknowledged_by: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
     acknowledge_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # 无 relationship：``vehicle_id`` / ``acknowledged_by`` 均为逻辑外键，
+    # 跨服务补全一律走 REST（contracts/database/orm-mapping.md 第 2.1 节）
+
 
 class VehicleTelemetry(Base):
     """车辆遥测时序（data_collector.vehicle_telemetry，hypertable，保留 90 天）。
@@ -153,6 +156,9 @@ class VehicleTelemetry(Base):
     cpu_temp: Mapped[float | None] = mapped_column(Double)
     network_rssi: Mapped[int | None] = mapped_column(Integer)
     network_latency_ms: Mapped[float | None] = mapped_column(Double)
+
+    # 无 relationship：时序表不建外键（避免写入放大），``vehicle_id`` 为逻辑外键，
+    # 跨服务补全一律走 REST（contracts/database/orm-mapping.md 第 2.1 节）
 
 
 __all__ = ["Event", "VehicleTelemetry"]

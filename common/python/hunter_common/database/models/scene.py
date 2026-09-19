@@ -80,5 +80,8 @@ class Scene(Base, UpdateTimeMixin, SoftDeleteMixin):
         StrEnumType(SceneStatus), nullable=False, server_default=text("'draft'")
     )
 
+    # 无 relationship：``creator`` 为逻辑外键 → user_svc.users.user_id，
+    # 跨服务补全一律走 REST（contracts/database/orm-mapping.md 第 2.1 节）
+
 
 __all__ = ["Scene"]

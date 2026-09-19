@@ -1,7 +1,8 @@
 """ORM 模型：车辆主数据（vehicle_svc）+ 用户与 RBAC（user_svc）。
 
 对应契约：contracts/database/ddl/01_core.sql（字段名/类型/约束不可更改）。
-跨 schema 引用（如 scenes.creator → users.user_id）为逻辑外键，不建物理外键（服务解耦）。
+关系契约：contracts/database/orm-mapping.md 第 2 节（每条关系必须显式 lazy 策略，异步安全）。
+跨 schema 引用（如 scenes.creator → users.user_id）为逻辑外键，不建物理外键与 relationship（服务解耦）。
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from hunter_common.database.base import Base, StrEnumType, uuid_primary_key_column
 from hunter_common.database.enums import (
@@ -70,6 +71,9 @@ class Vehicle(Base):
     device_cert_sn: Mapped[str | None] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
 
+    # 无 relationship：events / vehicle_telemetry / algorithm_metrics / ota_records 的 vehicle_id
+    # 均为**跨 schema 逻辑外键**，跨服务补全一律走 REST（contracts/database/orm-mapping.md 第 2.1 节）
+
 
 class User(Base):
     """平台用户（user_svc.users）；``password_hash`` 为 bcrypt 哈希，禁止明文/日志输出。"""
@@ -102,6 +106,22 @@ class User(Base):
     )
     last_login_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # 关系契约：contracts/database/orm-mapping.md 第 2 节（lazy 策略不可改为隐式加载）
+    user_roles: Mapped[list[UserRole]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        # 删除用户时交由 DB `ON DELETE CASCADE` 处理，避免 ORM 逐行 DELETE（N 次往返）
+        passive_deletes=True,
+        lazy="raise_on_sql",
+    )
+    roles: Mapped[list[Role]] = relationship(
+        secondary=f"{USER_SCHEMA}.user_roles",
+        viewonly=True,  # 写入走关联对象 UserRole（避免与 user_roles 双写冲突）
+        order_by="Role.role_code",
+        lazy="selectin",  # 鉴权热路径：一条 IN 查询批量预取，异步安全
+        overlaps="user_roles",
+    )
+
 
 class Role(Base):
     """角色（user_svc.roles）；``role_code`` 为对外稳定标识，业务判断禁止使用 role_id。"""
@@ -122,6 +142,32 @@ class Role(Base):
     )
     create_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    user_roles: Mapped[list[UserRole]] = relationship(
+        back_populates="role",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="raise_on_sql",
+    )
+    users: Mapped[list[User]] = relationship(
+        secondary=f"{USER_SCHEMA}.user_roles",
+        viewonly=True,
+        lazy="selectin",
+        overlaps="user_roles",
+    )
+    role_permissions: Mapped[list[RolePermission]] = relationship(
+        back_populates="role",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="raise_on_sql",
+    )
+    permissions: Mapped[list[Permission]] = relationship(
+        secondary=f"{USER_SCHEMA}.role_permissions",
+        viewonly=True,
+        order_by="Permission.permission_code",
+        lazy="selectin",
+        overlaps="role_permissions",
     )
 
 
@@ -145,6 +191,19 @@ class Permission(Base):
     description: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    role_permissions: Mapped[list[RolePermission]] = relationship(
+        back_populates="permission",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="raise_on_sql",
+    )
+    roles: Mapped[list[Role]] = relationship(
+        secondary=f"{USER_SCHEMA}.role_permissions",
+        viewonly=True,
+        lazy="selectin",
+        overlaps="role_permissions",
     )
 
 
@@ -172,6 +231,10 @@ class UserRole(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    # 多对一：单对象按需显式加载（raise_on_sql 禁止隐式 IO，异步安全）
+    user: Mapped[User] = relationship(back_populates="user_roles", lazy="raise_on_sql")
+    role: Mapped[Role] = relationship(back_populates="user_roles", lazy="raise_on_sql")
+
 
 class RolePermission(Base):
     """角色-权限关联（user_svc.role_permissions，复合主键，级联删除）。"""
@@ -195,6 +258,13 @@ class RolePermission(Base):
     )
     create_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    role: Mapped[Role] = relationship(
+        back_populates="role_permissions", lazy="raise_on_sql"
+    )
+    permission: Mapped[Permission] = relationship(
+        back_populates="role_permissions", lazy="raise_on_sql"
     )
 
 

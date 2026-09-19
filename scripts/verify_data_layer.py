@@ -15,6 +15,10 @@
  10. 对象存储契约（contracts/database/object-storage.yaml）↔ docker 与 K8s MinIO 初始化脚本
      ↔ 各服务 x-hunter-service.minio_buckets / minio_bucket_lifecycle / 预签名 TTL（三方一致）
 
+  11. 模型 ↔ Repository 一一对应（hunter_common.database.repositories.REPOSITORY_BY_MODEL ↔ ALL_MODELS）
+  12. relationship 异步安全 lazy 策略（契约 orm-mapping.md 第 1 节白名单，禁止隐式 lazy="select"）
+  13. ORM 映射与 Repository 契约文档（contracts/database/orm-mapping.md）↔ 实现同步
+
 用法：python scripts/verify_data_layer.py
 退出码：0 全部通过；1 存在失败项
 """
@@ -38,6 +42,19 @@ COMPOSE_TOPICS_SCRIPT = ROOT / "infra" / "docker" / "kafka" / "create-topics.sh"
 K8S_TOPICS_JOB = ROOT / "infra" / "k8s" / "jobs" / "kafka-init-job.yaml"
 ALEMBIC_INI = ROOT / "common" / "python" / "alembic.ini"
 SERVICE_CONTRACT_DIR = ROOT / "contracts" / "openapi"
+ORM_MAPPING_CONTRACT = DB_CONTRACT_DIR / "orm-mapping.md"
+#: 契约关系表/Repository 表所在区块标记（避免误匹配其他表格）
+RELATION_TABLE_START = "<!-- relationship-table:start -->"
+RELATION_TABLE_END = "<!-- relationship-table:end -->"
+REPOSITORY_TABLE_START = "<!-- repository-table:start -->"
+REPOSITORY_TABLE_END = "<!-- repository-table:end -->"
+#: 关系行：`Class.attr` 位于首列
+RELATION_ROW_RE = re.compile(r"^\|\s*`([A-Za-z_]\w*)\.([a-z_]\w*)`\s*\|", re.MULTILINE)
+#: Repository 行：`XxxRepository` | `Model`
+REPOSITORY_ROW_RE = re.compile(r"^\|\s*`(\w+Repository)`\s*\|\s*`(\w+)`\s*\|", re.MULTILINE)
+#: 异步安全 lazy 策略白名单（contracts/database/orm-mapping.md 第 1 节）
+ASYNC_SAFE_LAZY = frozenset({"selectin", "raise_on_sql"})
+
 REDIS_CONTRACT = DB_CONTRACT_DIR / "redis-keys.yaml"
 OBJECT_STORAGE_CONTRACT = DB_CONTRACT_DIR / "object-storage.yaml"
 MINIO_DOCKER_INIT = ROOT / "infra" / "docker" / "minio" / "init-buckets.sh"
@@ -298,7 +315,7 @@ def check_contract_files() -> None:
             ok(f"DDL 契约存在: contracts/database/ddl/{name}")
         else:
             fail(f"缺失 DDL 契约: contracts/database/ddl/{name}")
-    for name in ("README.md", "er.md", "enums.md"):
+    for name in ("README.md", "er.md", "enums.md", "orm-mapping.md"):
         path = DB_CONTRACT_DIR / name
         if path.is_file():
             ok(f"数据库契约文档存在: contracts/database/{name}")
@@ -520,6 +537,85 @@ def check_alembic_offline_sql() -> None:
     ):
         if keyword not in sql:
             fail(f"迁移 SQL 缺少: {keyword}")
+
+
+def check_orm_repository_layer() -> None:
+    """校验 11/12/13：模型 ↔ Repository 一一对应、relationship 异步安全、契约文档同步。"""
+    import hunter_common.database.models  # noqa: F401  (register models)
+    from hunter_common.database.base import Base
+    from hunter_common.database.models import ALL_MODELS
+    from hunter_common.database.repositories import REPOSITORY_BY_MODEL
+    from hunter_common.database.repository import BaseRepository
+
+    # ---- 校验 11：模型 ↔ Repository 一一对应 ----
+    model_set = set(ALL_MODELS)
+    registry = dict(REPOSITORY_BY_MODEL)
+    if model_set != set(registry):
+        missing = sorted(model.__name__ for model in model_set - set(registry))
+        extra = sorted(model.__name__ for model in set(registry) - model_set)
+        fail(f"模型 ↔ Repository 未一一对应（缺 {missing}，多 {extra}）")
+    else:
+        mismatched = [
+            repository.__name__
+            for model, repository in registry.items()
+            if repository.model is not model or not issubclass(repository, BaseRepository)
+        ]
+        if mismatched:
+            fail(f"Repository.model 未绑定到对应模型或未继承 BaseRepository: {mismatched}")
+        else:
+            ok(f"模型 ↔ Repository 一一对应（{len(model_set)} 个模型 / Repository）")
+
+    # ---- 校验 12：relationship 异步安全 lazy 策略 ----
+    relations = {
+        f"{mapper.class_.__name__}.{prop.key}": prop
+        for mapper in Base.registry.mappers
+        for prop in mapper.relationships
+    }
+    unsafe = {
+        name: prop.lazy for name, prop in relations.items() if prop.lazy not in ASYNC_SAFE_LAZY
+    }
+    if unsafe:
+        fail(f"relationship 使用非异步安全 lazy 策略（应取 {sorted(ASYNC_SAFE_LAZY)}）: {unsafe}")
+    else:
+        ok(f"relationship 全部显式声明异步安全 lazy 策略（{len(relations)} 条）")
+
+    # ---- 校验 13：契约文档 orm-mapping.md ↔ 实现同步 ----
+    if not ORM_MAPPING_CONTRACT.is_file():
+        fail("缺失契约: contracts/database/orm-mapping.md")
+        return
+    text = ORM_MAPPING_CONTRACT.read_text(encoding="utf-8")
+    if not all(
+        marker in text
+        for marker in (
+            RELATION_TABLE_START,
+            RELATION_TABLE_END,
+            REPOSITORY_TABLE_START,
+            REPOSITORY_TABLE_END,
+        )
+    ):
+        fail("orm-mapping.md 缺少关系表/Repository 表区块标记")
+        return
+
+    relation_block = text.split(RELATION_TABLE_START, 1)[1].split(RELATION_TABLE_END, 1)[0]
+    declared_relations = {f"{cls}.{attr}" for cls, attr in RELATION_ROW_RE.findall(relation_block)}
+    if declared_relations != set(relations):
+        fail(
+            "orm-mapping.md 关系表与实现不一致"
+            f"（文档多 {sorted(declared_relations - set(relations))}，"
+            f"实现多 {sorted(set(relations) - declared_relations)}）"
+        )
+    else:
+        ok(f"orm-mapping.md 关系表与实现一致（{len(declared_relations)} 条 relationship）")
+
+    repository_block = text.split(REPOSITORY_TABLE_START, 1)[1].split(REPOSITORY_TABLE_END, 1)[0]
+    declared_repos = dict(REPOSITORY_ROW_RE.findall(repository_block))
+    implemented = {
+        repository.__name__: model.__name__ for model, repository in registry.items()
+    }
+    if declared_repos != implemented:
+        fail(f"orm-mapping.md Repository 表与实现不一致：文档 {declared_repos} vs 实现 {implemented}")
+    else:
+        ok(f"orm-mapping.md Repository 表与实现一致（{len(declared_repos)} 个 Repository）")
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -1008,6 +1104,7 @@ def main() -> int:
     check_enum_contract(ddl)
     check_hypertable_contract()
     check_alembic_offline_sql()
+    check_orm_repository_layer()
     check_kafka_topics()
     check_json_schemas()
     check_consumer_groups()

@@ -20,6 +20,7 @@
 | `ddl/04_events.sql` | `events`（18 种事件类型 + 3 级事件等级） | data_collector |
 | `ddl/05_timeseries.sql` | `vehicle_telemetry`、`algorithm_metrics`（hypertable：按天分块 + 90 天保留） | data_collector / data_analytics |
 | `er.md` | ER 关系说明、跨 schema 访问例外、字段类型约定、与设计文档的差异清单 | — |
+| `orm-mapping.md` | ORM 关系映射契约（16 条 relationship + lazy 策略白名单）与 Repository 契约（13 个 Repository + 方法清单） | — |
 | `enums.md` | 受控词表（车辆状态 / 事件类型与等级 / OTA 状态机 / 权限资源域），与 ORM `StrEnum` 一一对应 | — |
 | `redis-keys.yaml` | Redis Key 契约：系统约束第 8 条 7 个 Key + `rc:lock:{vehicle_id}` 实现派生键、命名规则、字段结构、TTL、读写方、跨服务引用 | — |
 | `object-storage.yaml` | MinIO 契约：7 个 Bucket（生命周期 / SSE-S3 / 读写方 / 对象键约定）、预签名策略（上传 3600s、下载 900s、Range、分片）、对象键规则 | — |
@@ -40,11 +41,15 @@ alembic downgrade -1                                     # 回滚（含 drop sch
 ## 存储契约校验方式
 
 ```bash
-# 26 项数据层契约校验（含校验 9 Redis Key、校验 10 对象存储；无需数据库/集群）
+# 26 项数据层契约校验（含校验 9 Redis Key、校验 10 对象存储、校验 11-13 ORM 关系与 Repository）
 python scripts/verify_data_layer.py
 
 # 存储契约单元测试（Redis Key / MinIO Bucket ↔ 服务声明 ↔ MinIO 初始化脚本）
 pytest common/python/tests/test_storage_contracts.py -q
+
+# ORM 关系契约与 Repository 层单元测试
+pytest common/python/tests/test_orm_relationships.py -q
+pytest common/python/tests/test_repositories.py -q
 ```
 
 两份存储契约含 `x-hunter-pending-confirmation` 待确认项（`redis-keys.yaml` 8 项、`object-storage.yaml` 7 项，
@@ -56,11 +61,16 @@ pytest common/python/tests/test_storage_contracts.py -q
 - `vehicle_telemetry` / `algorithm_metrics`：`chunk_time_interval = 1 day`，保留 90 天
 - 受控词表（车辆状态 8 态、事件类型 18 种、事件等级 3 级、OTA 状态机 9 态、算法模块 3 种）必须与
   `hunter_common/database/enums.py` 完全一致，禁止在业务代码中硬编码字符串
+- ORM relationship 必须显式声明异步安全 lazy 策略（`selectin` / `raise_on_sql`，见 `orm-mapping.md` 第 1 节），
+  禁止隐式 `lazy="select"`；跨 schema 逻辑外键**不建** relationship（走 REST 补全）
+- 每个 ORM 模型对应**恰好一个** Repository（`hunter_common/database/repositories/`），
+  映射登记在 `REPOSITORY_BY_MODEL`；Repository 只 `flush` 不 `commit`（事务边界归调用方）
 - Redis Key 命名模式以 `redis-keys.yaml` 为准（`session:` / `vehicle:status:` / `vehicle:online:set` /
   `rate_limit:` / `ota:progress:` / `rc:session:` / `cache:scene:` / `rc:lock:`），禁止新增命名空间
 - MinIO Bucket 名称、生命周期、SSE 策略以 `object-storage.yaml` 为准；预签名有效期固定
   「上传 3600s / 下载 900s」，禁止按接口随意调整；对象键一律由服务端生成
-- 所有结构变更必须同时更新：DDL → ORM 模型 → Alembic migration（upgrade + downgrade）→ 本文件清单；
+- 所有结构变更必须同时更新：DDL → ORM 模型 → Repository → Alembic migration（upgrade + downgrade）→
+  `orm-mapping.md`（关系与 Repository 契约）→ 本文件清单；
   Redis / MinIO 契约变更必须同步各服务 OpenAPI 的 `x-hunter-service` 声明与
   `infra/docker/minio/init-buckets.sh`、`infra/k8s/jobs/minio-init-job.yaml`
 

@@ -9,7 +9,7 @@
 | `exceptions` | `HunterBaseException` 基类 + 预定义错误码（1001–7002）异常体系 + `ErrorCode` 枚举 |
 | `responses` | 统一响应模型 `ApiResponse[T]`（code/message/data/request_id/timestamp）+ `success_response`/`error_response` |
 | `kafka` | confluent-kafka 2.x 异步封装（**契约驱动**）：`KafkaProducerManager`（单例；按契约 acks 投递、key=vehicle_id 强制、重试+指数退避、网络中断落盘缓冲 1GB 并可重投）/ `KafkaConsumerManager`（手动提交 offset、契约 Schema 校验→DLQ、handler 重试→DLQ、幂等守卫、消费积压指标）；子模块 `contracts`（topics.yaml/consumer-groups.yaml/schemas 运行时加载）/ `messages`（编解码+key 规则）/ `buffer`（磁盘缓冲）/ `idempotency`（幂等守卫）/ `metrics`（`hunter_kafka_*` 指标） |
-| `database` | SQLAlchemy 2.0 数据访问层包：`DatabaseSessionManager`（asyncpg 异步引擎 + 会话，连接池 CPU×2+1）· `Base`/`StrEnumType`/混入类 · `enums`（车辆状态/事件类型/OTA 状态机等受控词表）· `BaseRepository`（CRUD + 分页 + 软删除 + 批量写入）· `models`（13 张表 ORM）· `migrations`（Alembic） |
+| `database` | SQLAlchemy 2.0 数据访问层包：`DatabaseSessionManager`（asyncpg 异步引擎 + 会话，连接池 CPU×2+1）· `Base`/`StrEnumType`/混入类 · `enums`（车辆状态/事件类型/OTA 状态机等受控词表）· `BaseRepository`（CRUD + 分页 + 软删除 + 批量写入 + 条件查询）· `models`（13 张表 ORM，含 16 条 relationship 与异步安全 lazy 策略）· `repositories`（13 个模型级 Repository，映射登记 `REPOSITORY_BY_MODEL`）· `migrations`（Alembic） |
 | `redis` | redis-py 异步客户端封装（单例、限流计数 `incr_with_expire`、分布式锁） |
 
 ## 使用示例
@@ -26,38 +26,47 @@ logger = get_logger(__name__)
 
 ### 数据访问层（ORM + Repository）
 
+契约：`contracts/database/ddl/*.sql`（结构）+ `contracts/database/orm-mapping.md`（关系与 Repository 契约）。
+
 ```python
+from datetime import UTC, datetime
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from hunter_common.database import BaseRepository, DatabaseSessionManager
-from hunter_common.database.enums import SceneStatus
+from hunter_common.database import (
+    REPOSITORY_BY_MODEL,
+    DatabaseSessionManager,
+    SceneRepository,
+    VehicleRepository,
+    VehicleTelemetryRepository,
+)
+from hunter_common.database.enums import SceneStatus, VehicleStatus
 from hunter_common.database.models import Scene
-
-
-class SceneRepository(BaseRepository[Scene]):
-    """业务 Repository 只需声明 model（可选默认排序）。"""
-
-    model = Scene
-    default_order_by = ("-create_time",)
-
-
-async def demo(db: AsyncSession) -> None:
-    repo = SceneRepository(db)
-    # 分页 + 过滤（非法列名抛 2001；page_size 上限 200）
-    page = await repo.paginate(page=1, page_size=20, filters={"status": SceneStatus.DRAFT})
-    # 主键查询（缺失抛 3001）；软删除对 Scene 生效，deleted_at 非空记录默认被过滤
-    scene = await repo.get_or_raise(page.items[0].scene_id)
-    await repo.soft_delete(scene)     # 写 deleted_at
-    # 高吞吐批量写入（时序/事件），重复键幂等跳过
-    await repo.bulk_create_ignore_conflicts(
-        [{"scene_name": "s1", "scene_type": "urban", "creator": scene.creator}],
-        conflict_columns=["scene_name"],
-    )
-
 
 manager = DatabaseSessionManager(HunterBaseConfig())
 manager.init()          # 引擎/会话工厂（幂等）
 # FastAPI: db: AsyncSession = Depends(manager.get_session)
+
+
+async def demo(db: AsyncSession) -> None:
+    scenes = SceneRepository(db)
+    # 分页 + 过滤（非法列名抛 2001；page_size 上限 200）；Scene 默认排序 create_time DESC
+    page = await scenes.paginate(page=1, page_size=20, filters={"status": SceneStatus.DRAFT})
+    # 主键查询（缺失抛 3001）；软删除对 Scene 生效，deleted_at 非空记录默认被过滤
+    scene = await scenes.get_or_raise(page.items[0].scene_id)
+    assert await scenes.get_by_scene_name("crossing-01") is not None   # 部分唯一索引
+    await scenes.soft_delete(scene)                                    # 只写 deleted_at
+
+    # 车辆状态 + 最近在线（默认排序 last_online_time DESC，对齐 idx_vehicles_status_last_online）
+    await VehicleRepository(db).update_status("HUNTER-001", VehicleStatus.AUTO_DRIVING)
+
+    # 遥测批量写入：executemany + ON CONFLICT (time, vehicle_id) DO NOTHING（≥10000 点/秒、幂等）
+    await VehicleTelemetryRepository(db).insert_points(
+        [{"time": datetime.now(UTC), "vehicle_id": "HUNTER-001", "velocity": 1.52}]
+    )
+
+    # 模型 ↔ Repository 一一对应（13 个模型，契约校验依赖此注册表）
+    assert REPOSITORY_BY_MODEL[Scene] is SceneRepository
 ```
 
 受控词表（`hunter_common.database.enums`）与 DDL 的 `CHECK` 约束、Kafka 消息 schema 的 `enum`

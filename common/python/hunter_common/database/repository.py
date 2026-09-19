@@ -7,6 +7,8 @@
 - 分页：``page ≥ 1``、``1 ≤ page_size ≤ MAX_PAGE_SIZE``（保护 P95 ≤ 200ms）
 - 批量写入：``bulk_create`` / ``bulk_create_ignore_conflicts`` 走 executemany 与
   ``ON CONFLICT DO NOTHING``（时序写入 ≥ 10000 点/秒、消费幂等）
+- 条件查询：``find_one`` / ``find_all`` 接受 ORM 列表达式（唯一索引 / 复合主键查询），
+  ``delete_where`` 提供条件删除（关联表解绑等）
 """
 from __future__ import annotations
 
@@ -245,6 +247,19 @@ class BaseRepository(Generic[ModelT]):
         await self.session.execute(stmt)
         await self.session.flush()
 
+    async def delete_where(self, *conditions: ColumnElement[bool]) -> int:
+        """按条件物理删除，返回删除行数（用于关联表解绑等场景）。
+
+        Raises:
+            InvalidParameterError: 未提供条件（防止误删整表）。
+        """
+        if not conditions:
+            raise InvalidParameterError("delete_where 必须提供至少一个条件")
+        stmt = delete(self.model).where(*conditions)
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return int(getattr(result, "rowcount", 0) or 0)
+
     # ---------- 读操作 ----------
 
     async def get(
@@ -268,6 +283,42 @@ class BaseRepository(Generic[ModelT]):
                 details={"model": self.model.__name__, self.pk_name: str(pk_value)}
             )
         return instance
+
+    async def find_one(
+        self, *conditions: ColumnElement[bool], include_deleted: bool = False
+    ) -> ModelT | None:
+        """按自定义条件查询单条记录（条件为 ORM 列表达式，一律参数绑定）。
+
+        用于按唯一索引/复合主键查询（如 ``User.username == name``）；
+        模型具备 ``deleted_at`` 时自动附加软删除过滤。
+        """
+        stmt = select(self.model).where(
+            *self.build_conditions(None, include_deleted=include_deleted), *conditions
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
+
+    async def find_all(
+        self,
+        *conditions: ColumnElement[bool],
+        order_by: Sequence[str] | None = None,
+        limit: int | None = None,
+        include_deleted: bool = False,
+    ) -> list[ModelT]:
+        """按自定义条件查询列表（可选排序；limit 上限 MAX_PAGE_SIZE）。"""
+        stmt = select(self.model).where(
+            *self.build_conditions(None, include_deleted=include_deleted), *conditions
+        )
+        stmt = self.apply_order(stmt, order_by)
+        if limit is not None:
+            if not 1 <= limit <= MAX_PAGE_SIZE:
+                raise InvalidParameterError(
+                    f"limit 必须在 1..{MAX_PAGE_SIZE} 之间",
+                    details={"limit": limit, "max": MAX_PAGE_SIZE},
+                )
+            stmt = stmt.limit(limit)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
 
     async def list(
         self,

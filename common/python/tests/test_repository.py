@@ -26,9 +26,10 @@ from hunter_common.exceptions import (
 class StubResult:
     """模拟 SQLAlchemy Result：支持 scalars()/all()/first()/scalar_one()。"""
 
-    def __init__(self, rows: list[Any] | None = None, scalar: Any = None) -> None:
+    def __init__(self, rows: list[Any] | None = None, scalar: Any = None, rowcount: int = 0) -> None:
         self._rows = list(rows or [])
         self._scalar = scalar
+        self.rowcount = rowcount
 
     def scalars(self) -> StubResult:
         return self
@@ -326,5 +327,87 @@ def test_page_result_pages_calculation() -> None:
     assert PageResult(items=[], total=21, page=2, page_size=20).has_next is False
     assert PageResult(items=[], total=41, page=2, page_size=20).has_next is True
     assert PageResult(items=[], total=5, page=1, page_size=0).pages == 0
+
+
+# ---------- find_one / find_all / delete_where（Repository 契约 3.1） ----------
+
+
+async def test_find_one_applies_soft_delete_filter_and_condition() -> None:
+    repo, stub = scene_repo()
+    stub.queue(StubResult([Scene(scene_name="crossing", scene_type="urban", creator=uuid4())]))
+
+    scene = await repo.find_one(Scene.scene_name == "crossing")
+
+    assert scene is not None
+    sql = compiled(stub.executed[0][0])
+    assert "scene_svc.scenes.deleted_at IS NULL" in sql
+    assert "scene_svc.scenes.scene_name = " in sql
+
+
+async def test_find_one_can_include_deleted_explicitly() -> None:
+    repo, stub = scene_repo()
+    stub.queue(StubResult([]))
+
+    assert await repo.find_one(include_deleted=True) is None
+    assert "deleted_at IS NULL" not in compiled(stub.executed[0][0])
+
+
+async def test_find_all_applies_order_by_and_limit() -> None:
+    repo, stub = scene_repo()
+    stub.queue(StubResult([Scene(scene_name="s1", scene_type="urban", creator=uuid4())]))
+
+    rows = await repo.find_all(Scene.scene_type == "urban", order_by=("-update_time",), limit=5)
+
+    assert len(rows) == 1
+    sql = compiled(stub.executed[0][0], literal=True)
+    assert "scene_svc.scenes.scene_type = 'urban'" in sql
+    assert "ORDER BY scene_svc.scenes.update_time DESC" in sql
+    assert "LIMIT 5" in sql
+
+
+async def test_find_all_falls_back_to_default_order() -> None:
+    repo, stub = scene_repo()
+    stub.queue(StubResult([]))
+
+    await repo.find_all()
+
+    assert "ORDER BY scene_svc.scenes.create_time DESC" in compiled(stub.executed[0][0])
+
+
+async def test_find_all_rejects_limit_above_page_size_cap() -> None:
+    repo, _ = scene_repo()
+    with pytest.raises(InvalidParameterError) as excinfo:
+        await repo.find_all(limit=MAX_PAGE_SIZE + 1)
+    assert excinfo.value.code == ErrorCode.INVALID_PARAM
+
+
+async def test_find_all_rejects_unknown_order_field() -> None:
+    """排序字段非法（疑似注入）必须拒绝为 2001。"""
+    repo, _ = scene_repo()
+    with pytest.raises(InvalidParameterError) as excinfo:
+        await repo.find_all(order_by=("scene_name; DROP TABLE scene_svc.scenes --",))
+    assert excinfo.value.code == ErrorCode.INVALID_PARAM
+
+
+async def test_delete_where_returns_rowcount_and_flushes() -> None:
+    repo, stub = scene_repo()
+    stub.queue(StubResult(rowcount=2))
+
+    deleted = await repo.delete_where(Scene.scene_id == uuid4())
+
+    assert deleted == 2
+    assert stub.flushed == 1
+    assert compiled(stub.executed[0][0]).startswith("DELETE FROM scene_svc.scenes")
+
+
+async def test_delete_where_requires_condition() -> None:
+    repo, stub = scene_repo()
+
+    with pytest.raises(InvalidParameterError) as excinfo:
+        await repo.delete_where()
+
+    assert excinfo.value.code == ErrorCode.INVALID_PARAM
+    assert stub.executed == [], "无条件删除必须被拒绝，禁止误删整表"
+
 
 

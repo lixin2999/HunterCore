@@ -58,5 +58,8 @@ class AlgorithmMetric(Base):
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
 
+    # 无 relationship：hypertable 不建外键（避免写入放大），``vehicle_id`` 为逻辑外键，
+    # 跨服务补全一律走 REST（contracts/database/orm-mapping.md 第 2.1 节）
+
 
 __all__ = ["AlgorithmMetric"]
