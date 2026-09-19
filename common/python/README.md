@@ -26,22 +26,24 @@ logger = get_logger(__name__)
 
 ### 数据访问层（ORM + Repository）
 
-契约：`contracts/database/ddl/*.sql`（结构）+ `contracts/database/orm-mapping.md`（关系与 Repository 契约）。
+契约：`contracts/database/ddl/*.sql`（结构）+ `contracts/database/orm-mapping.md`（关系、Repository 方法、排序与事务语义）。
 
 ```python
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from hunter_common.database import (
     REPOSITORY_BY_MODEL,
     DatabaseSessionManager,
+    OtaTaskRepository,
     SceneRepository,
     VehicleRepository,
     VehicleTelemetryRepository,
 )
 from hunter_common.database.enums import SceneStatus, VehicleStatus
-from hunter_common.database.models import Scene
+from hunter_common.database.models import OtaTask, Scene
 
 manager = DatabaseSessionManager(HunterBaseConfig())
 manager.init()          # 引擎/会话工厂（幂等）
@@ -57,17 +59,36 @@ async def demo(db: AsyncSession) -> None:
     assert await scenes.get_by_scene_name("crossing-01") is not None   # 部分唯一索引
     await scenes.soft_delete(scene)                                    # 只写 deleted_at
 
-    # 车辆状态 + 最近在线（默认排序 last_online_time DESC，对齐 idx_vehicles_status_last_online）
+    # 车辆状态 + 最近在线：单条 UPDATE ... RETURNING（原子、1 次往返）
+    # 默认排序 last_online_time DESC NULLS LAST（对齐 idx_vehicles_status_last_online，避免 Sort）
     await VehicleRepository(db).update_status("HUNTER-001", VehicleStatus.AUTO_DRIVING)
 
     # 遥测批量写入：executemany + ON CONFLICT (time, vehicle_id) DO NOTHING（≥10000 点/秒、幂等）
+    # 返回值 = 提交（attempted）行数（被跳过的重复点仍计入：异步驱动无精确 executemany rowcount）
     await VehicleTelemetryRepository(db).insert_points(
         [{"time": datetime.now(UTC), "vehicle_id": "HUNTER-001", "velocity": 1.52}]
+    )
+
+    # raise_on_sql 关系必须显式加载（禁止隐式 IO）：options= 透传到语句
+    tasks = await OtaTaskRepository(db).find_all(
+        options=(selectinload(OtaTask.records),), limit=20
     )
 
     # 模型 ↔ Repository 一一对应（13 个模型，契约校验依赖此注册表）
     assert REPOSITORY_BY_MODEL[Scene] is SceneRepository
 ```
+
+**使用要点（与契约 orm-mapping 第 3 节一致）**
+
+| 主题 | 规则 |
+|------|------|
+| 事务边界 | Repository 只 `flush`，不 commit/rollback；`create` / `update` / 批量分片用 SAVEPOINT，冲突只回滚该 SAVEPOINT（外事务与已写分片保留） |
+| 错误码 | 唯一冲突 → 3002、缺失 → 3001、非法字段/列名/参数 → 2001；`details` 仅含模型名 / SQLSTATE / 约束名（不含行值） |
+| 排序 spec | `-col` = DESC、`-col:nl` = DESC NULLS LAST（可空列必写）、`col:nf` = NULLS FIRST |
+| 读取上限 | 默认 `limit ≤ 200`；`vehicle_telemetry` / `algorithm_metrics` 放宽到 `MAX_SERIES_POINTS = 10000`（须给时间窗）；`paginate.page_size` 恒 ≤ 200 |
+| 复合主键 | `VehicleTelemetry` / `AlgorithmMetric` 禁用基类 `get` / `get_or_raise` / `hard_delete`（抛 `NotImplementedError`），改用 `get_point` / `list_series` 等专属方法 |
+| 幂等写入 | `insert_points` / `insert_metrics` / `insert_events` 走 `ON CONFLICT DO NOTHING`（消费重放安全） |
+| 物理清理 | `purge_before` 按 `ctid` 分批删除（短事务）；90 天保留仍由 TimescaleDB 保留策略负责 |
 
 受控词表（`hunter_common.database.enums`）与 DDL 的 `CHECK` 约束、Kafka 消息 schema 的 `enum`
 三者由测试与 `scripts/verify_data_layer.py` 强制一致，业务代码禁止硬编码字面量。
@@ -77,7 +98,8 @@ async def demo(db: AsyncSession) -> None:
 ```bash
 pytest common/python/tests/test_kafka_contracts.py -q     # Kafka Topic / 消费者组 / 11 个消息 Schema
 pytest common/python/tests/test_storage_contracts.py -q   # Redis Key / MinIO Bucket ↔ 服务声明 ↔ 初始化脚本
-python scripts/verify_data_layer.py                       # 26 项数据层契约校验（含校验 9 Redis / 校验 10 MinIO）
+pytest common/python/tests/test_orm_relationships.py -q   # ORM 关系 + Repository 专属方法双向契约
+python scripts/verify_data_layer.py                       # 32 项数据层契约校验（含校验 9 Redis / 10 MinIO / 13b 专属方法）
 ```
 
 ## Kafka 契约驱动生产/消费（用法）

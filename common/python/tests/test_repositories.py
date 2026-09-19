@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import TracebackType
 from typing import Any
 from uuid import uuid4
 
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import selectinload
 
 from hunter_common.database import REPOSITORY_BY_MODEL
 from hunter_common.database.enums import (
@@ -29,6 +31,7 @@ from hunter_common.database.models import (
     AlgorithmMetric,
     Event,
     OtaRecord,
+    OtaTask,
     OtaVersion,
     Permission,
     Role,
@@ -90,6 +93,27 @@ class StubResult:
         return self._scalar
 
 
+class StubSavepoint:
+    """模拟 ``AsyncSession.begin_nested()``（SAVEPOINT）：块内异常只回滚该 SAVEPOINT。"""
+
+    def __init__(self, session: StubSession) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> StubSession:
+        self._session.savepoints += 1
+        return self._session
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        if exc_type is not None:
+            self._session.savepoint_rollbacks += 1
+        return False
+
+
 class StubSession:
     """记录 execute/add/flush 调用的最小 AsyncSession 替身。"""
 
@@ -97,17 +121,30 @@ class StubSession:
         self.executed: list[tuple[Any, Any]] = []
         self.added: list[Any] = []
         self.flushed = 0
-        self._queue: list[StubResult] = []
+        self.savepoints = 0
+        self.savepoint_rollbacks = 0
+        self.expunged: list[Any] = []
+        self._queue: list[StubResult | Exception] = []
 
-    def queue(self, *results: StubResult) -> None:
+    def queue(self, *results: StubResult | Exception) -> None:
+        """排队下一次 execute 的返回值；元素为异常时该次 execute 直接抛出。"""
         self._queue.extend(results)
 
     async def execute(self, statement: Any, params: Any = None) -> StubResult:
         self.executed.append((statement, params))
-        return self._queue.pop(0) if self._queue else StubResult()
+        item: StubResult | Exception = self._queue.pop(0) if self._queue else StubResult()
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     def add(self, instance: Any) -> None:
         self.added.append(instance)
+
+    def begin_nested(self) -> StubSavepoint:
+        return StubSavepoint(self)
+
+    def expunge(self, instance: Any) -> None:
+        self.expunged.append(instance)
 
     async def flush(self) -> None:
         self.flushed += 1
@@ -189,7 +226,8 @@ async def test_vehicle_list_by_status_uses_default_ordering_and_limit() -> None:
 
     sql = compiled(stub.executed[0][0], literal=True)
     assert "vehicle_svc.vehicles.status = 'auto_driving'" in sql
-    assert "ORDER BY vehicle_svc.vehicles.last_online_time DESC" in sql
+    assert "ORDER BY vehicle_svc.vehicles.last_online_time DESC NULLS LAST" in sql
+    assert "vehicle_svc.vehicles.vehicle_id ASC" in sql
     assert "LIMIT 50" in sql
 
 
@@ -200,6 +238,7 @@ async def test_vehicle_list_by_status_rejects_over_max_limit() -> None:
 
 
 async def test_vehicle_update_status_writes_status_and_last_online() -> None:
+    """单条 UPDATE ... RETURNING：原子更新、1 次往返（无"先查后写"竞态）。"""
     repo, stub = repo_pair(VehicleRepository)
     vehicle = Vehicle(vehicle_id="HUNTER-001", vehicle_name="一号车")
     seen = datetime(2026, 9, 19, 8, 0, tzinfo=UTC)
@@ -210,9 +249,23 @@ async def test_vehicle_update_status_writes_status_and_last_online() -> None:
     )
 
     assert updated is vehicle
-    assert vehicle.status is VehicleStatus.ONLINE_IDLE
-    assert vehicle.last_online_time == seen
-    assert stub.flushed == 1
+    assert len(stub.executed) == 1, "必须是单条 UPDATE ... RETURNING"
+    sql = compiled(stub.executed[0][0], literal=True)
+    assert sql.startswith("UPDATE vehicle_svc.vehicles SET status='online_idle'")
+    assert "last_online_time" in sql
+    assert "vehicle_svc.vehicles.vehicle_id = " in sql
+    assert "RETURNING" in sql
+    assert stub.flushed == 0, "Core UPDATE 不触发 ORM flush"
+
+
+async def test_vehicle_update_status_omits_last_online_when_not_provided() -> None:
+    repo, stub = repo_pair(VehicleRepository)
+    stub.queue(StubResult([]))
+
+    assert await repo.update_status("HUNTER-001", VehicleStatus.OFFLINE) is None
+
+    sql = compiled(stub.executed[0][0], literal=True)
+    assert "last_online_time" not in sql.split("WHERE")[0], "未提供时不得写入该列"
 
 
 async def test_vehicle_update_status_returns_none_for_missing_vehicle() -> None:
@@ -220,7 +273,7 @@ async def test_vehicle_update_status_returns_none_for_missing_vehicle() -> None:
     stub.queue(StubResult([]))
 
     assert await repo.update_status("HUNTER-404", VehicleStatus.OFFLINE) is None
-    assert stub.flushed == 0
+    assert len(stub.executed) == 1
 
 
 # ---------- UserRepository ----------
@@ -267,20 +320,24 @@ async def test_user_list_permission_codes_joins_full_rbac_chain() -> None:
 
 
 async def test_user_touch_last_login_sets_timestamp() -> None:
+    """单条 UPDATE + rowcount 判定（登录热路径 1 次往返）。"""
     repo, stub = repo_pair(UserRepository)
-    user = User(username="admin", password_hash="hash")
     at = datetime(2026, 9, 19, 9, 30, tzinfo=UTC)
-    stub.queue(StubResult([user]))
+    stub.queue(StubResult(rowcount=1))
 
     assert await repo.touch_last_login(user_id=uuid4(), at=at) is True
-    assert user.last_login_time == at
+
+    assert len(stub.executed) == 1
+    sql = compiled(stub.executed[0][0], literal=True)
+    assert sql.startswith("UPDATE user_svc.users SET last_login_time=")
 
 
 async def test_user_touch_last_login_returns_false_for_missing_user() -> None:
     repo, stub = repo_pair(UserRepository)
-    stub.queue(StubResult([]))
+    stub.queue(StubResult(rowcount=0))
 
     assert await repo.touch_last_login(user_id=uuid4()) is False
+    assert len(stub.executed) == 1
 
 
 # ---------- RoleRepository / PermissionRepository ----------
@@ -521,6 +578,22 @@ async def test_ota_version_max_version_code_returns_none_when_table_empty() -> N
     assert "WHERE" not in last_sql(stub)
 
 
+async def test_ota_version_default_order_matches_contract_nulls_last() -> None:
+    """契约 openapi/ota-service.yaml：``release_time DESC NULLS LAST, version_code DESC``。
+
+    若退化为 ``DESC``（= NULLS FIRST）会使未发布草稿排在最前，且失去
+    idx_ota_versions_status_release_time 的索引排序能力（P95 ≤ 200ms）。
+    """
+    repo, stub = repo_pair(OtaVersionRepository)
+    stub.queue(StubResult([]))
+
+    await repo.list(limit=20)
+
+    sql = compiled(stub.executed[0][0], literal=True)
+    assert "ORDER BY ota_svc.ota_versions.release_time DESC NULLS LAST" in sql
+    assert "ota_svc.ota_versions.version_code DESC" in sql
+
+
 # ---------- OtaTaskRepository ----------
 
 
@@ -574,7 +647,8 @@ async def test_ota_record_list_inflight_defaults_to_active_statuses() -> None:
     for terminal in ("'IDLE'", "'SUCCESS'", "'ROLLED_BACK'", "'FAILED'"):
         assert terminal not in sql, "终态不得进入进行中查询"
     assert "ORDER BY ota_svc.ota_records.status ASC" in sql
-    assert "ota_svc.ota_records.start_time DESC" in sql
+    assert "ota_svc.ota_records.start_time DESC NULLS LAST" in sql
+    assert "ota_svc.ota_records.record_id DESC" in sql
     assert "LIMIT 5" in sql
 
 
@@ -595,7 +669,8 @@ async def test_ota_record_list_by_vehicle_orders_by_start_time_desc() -> None:
 
     sql = compiled(stub.executed[0][0], literal=True)
     assert "ota_svc.ota_records.vehicle_id = " in sql
-    assert "ORDER BY ota_svc.ota_records.start_time DESC" in sql
+    assert "ORDER BY ota_svc.ota_records.start_time DESC NULLS LAST" in sql
+    assert "ota_svc.ota_records.record_id DESC" in sql, "次级键保证分页稳定（契约）"
     assert "LIMIT 3" in sql
 
 
@@ -671,45 +746,64 @@ async def test_event_list_unacknowledged_filters_flag_and_level() -> None:
     assert "LIMIT 20" in sql
 
 
-async def test_event_acknowledge_writes_three_columns() -> None:
+async def test_event_acknowledge_issues_single_conditional_update() -> None:
+    """原子确认：单条 UPDATE（WHERE 带 acknowledged IS FALSE），1 次往返。"""
     repo, stub = repo_pair(EventRepository)
-    event = Event(
-        vehicle_id="HUNTER-001",
-        event_type=EventType.EMERGENCY_STOP,
-        event_level=EventLevel.CRITICAL,
-        event_time=datetime(2026, 9, 19, tzinfo=UTC),
-    )
-    event.acknowledged = False
     user_id = uuid4()
     at = datetime(2026, 9, 19, 11, 0, tzinfo=UTC)
-    stub.queue(StubResult([event]))
+    stub.queue(StubResult(rowcount=1))
 
     assert await repo.acknowledge(1024, acknowledged_by=user_id, at=at) is True
-    assert event.acknowledged is True
-    assert event.acknowledged_by == user_id
-    assert event.acknowledge_time == at
+
+    assert len(stub.executed) == 1
+    sql = compiled(stub.executed[0][0], literal=True)
+    assert sql.startswith("UPDATE data_collector.events SET")
+    assert "data_collector.events.event_id = " in sql
+    assert "data_collector.events.acknowledged IS false" in sql
+    assert "acknowledged_by" in sql and "acknowledge_time" in sql
 
 
 async def test_event_acknowledge_is_idempotent_and_keeps_first_audit() -> None:
+    """已确认事件不覆盖首次审计：条件 UPDATE 未命中 → 轻量 EXISTS 判定存在性。"""
     repo, stub = repo_pair(EventRepository)
-    first_at = datetime(2026, 9, 19, 11, 0, tzinfo=UTC)
-    event = Event(event_time=datetime(2026, 9, 19, tzinfo=UTC))
-    event.acknowledged = True
-    event.acknowledge_time = first_at
-    event.acknowledged_by = uuid4()
-    stub.queue(StubResult([event]))
+    stub.queue(StubResult(rowcount=0), StubResult([1]))
 
     assert await repo.acknowledge(1024, acknowledged_by=uuid4()) is True
-    assert event.acknowledge_time == first_at
-    assert stub.flushed == 0, "已确认事件不得重复 UPDATE"
+
+    assert len(stub.executed) == 2
+    update_sql = compiled(stub.executed[0][0], literal=True)
+    assert "acknowledged IS false" in update_sql, "不满足首确认条件的行不会被 UPDATE"
+    exists_sql = compiled(stub.executed[1][0]).lower()
+    assert exists_sql.startswith("select") and "limit" in exists_sql
 
 
 async def test_event_acknowledge_returns_false_for_missing_event() -> None:
     repo, stub = repo_pair(EventRepository)
-    stub.queue(StubResult([]))
+    stub.queue(StubResult(rowcount=0), StubResult([]))
 
     assert await repo.acknowledge(404, acknowledged_by=uuid4()) is False
-    assert stub.flushed == 0
+    assert len(stub.executed) == 2
+
+
+async def test_event_insert_events_is_idempotent_on_unique_key() -> None:
+    """events 写入幂等：ON CONFLICT (vehicle_id, event_type, event_time) DO NOTHING。"""
+    repo, stub = repo_pair(EventRepository)
+    rows = [
+        {
+            "vehicle_id": "HUNTER-001",
+            "event_type": EventType.OVER_SPEED,
+            "event_level": EventLevel.CRITICAL,
+            "event_time": datetime(2026, 9, 19, 10, 0, tzinfo=UTC),
+            "data_json": {},
+        }
+    ]
+
+    assert await repo.insert_events(rows) == 1
+
+    sql = last_sql(stub)
+    assert "INSERT INTO data_collector.events" in sql
+    assert "ON CONFLICT (vehicle_id, event_type, event_time) DO NOTHING" in sql
+    assert stub.executed[0][1] == [dict(row) for row in rows], "executemany 传行参数（禁止拼接）"
 
 
 # ---------- VehicleTelemetryRepository ----------
@@ -727,7 +821,10 @@ async def test_telemetry_insert_points_uses_executemany_and_on_conflict() -> Non
     sql = last_sql(stub)
     assert "INSERT INTO data_collector.vehicle_telemetry" in sql
     assert "ON CONFLICT (time, vehicle_id) DO NOTHING" in sql
-    assert stub.executed[0][1] == rows, "批量写入必须一次 execute 传多行参数（executemany）"
+    assert stub.executed[0][1] == [dict(row) for row in rows], (
+        "批量写入必须一次 execute 传多行参数（executemany），且不与入参共享对象"
+    )
+    assert stub.savepoints == 1, "每个分片一个 SAVEPOINT"
 
 
 async def test_telemetry_insert_points_skips_empty_input() -> None:
@@ -782,15 +879,73 @@ async def test_telemetry_latest_point_orders_desc_and_returns_first() -> None:
     assert await repo.latest_point("HUNTER-404") is None
 
 
-async def test_telemetry_purge_before_deletes_older_points() -> None:
+async def test_telemetry_purge_before_deletes_in_batches() -> None:
+    """物理清理分批执行：每批一个短事务（避免长事务/WAL 膨胀），末批不足即停止。"""
     repo, stub = repo_pair(VehicleTelemetryRepository)
-    stub.queue(StubResult(rowcount=7))
+    stub.queue(StubResult(rowcount=5000), StubResult(rowcount=1200))
 
-    assert await repo.purge_before(datetime(2026, 6, 1, tzinfo=UTC)) == 7
+    removed = await repo.purge_before(datetime(2026, 6, 1, tzinfo=UTC), batch_size=5000)
 
-    sql = last_sql(stub)
-    assert sql.startswith("DELETE FROM data_collector.vehicle_telemetry")
-    assert "data_collector.vehicle_telemetry.time < " in sql
+    assert removed == 6200
+    assert len(stub.executed) == 2, "5000 满批后继续，第二批 1200 < 5000 即结束"
+    for stmt, _params in stub.executed:
+        sql = compiled(stmt, literal=True)
+        assert sql.startswith("DELETE FROM data_collector.vehicle_telemetry")
+        assert "ctid IN (SELECT ctid" in sql
+        assert "LIMIT 5000" in sql
+
+
+async def test_telemetry_purge_before_respects_max_rows() -> None:
+    repo, stub = repo_pair(VehicleTelemetryRepository)
+    stub.queue(StubResult(rowcount=100))
+
+    assert await repo.purge_before(
+        datetime(2026, 6, 1, tzinfo=UTC), batch_size=5000, max_rows=100
+    ) == 100
+    assert len(stub.executed) == 1
+    assert "LIMIT 100" in compiled(stub.executed[0][0], literal=True)
+
+
+async def test_telemetry_purge_before_rejects_bad_batch_params() -> None:
+    repo, _stub = repo_pair(VehicleTelemetryRepository)
+    with pytest.raises(InvalidParameterError):
+        await repo.purge_before(datetime(2026, 6, 1, tzinfo=UTC), batch_size=0)
+    with pytest.raises(InvalidParameterError):
+        await repo.purge_before(datetime(2026, 6, 1, tzinfo=UTC), max_rows=0)
+
+
+async def test_telemetry_series_read_allows_points_above_page_limit() -> None:
+    """时序序列读取上限放宽到 MAX_SERIES_POINTS（轨迹回放），但仍有硬上限。"""
+    repo, stub = repo_pair(VehicleTelemetryRepository)
+    stub.queue(StubResult([]))
+
+    await repo.list_points(
+        "HUNTER-001",
+        start_time=datetime(2026, 9, 19, tzinfo=UTC),
+        end_time=datetime(2026, 9, 20, tzinfo=UTC),
+        limit=2000,
+    )
+    assert "LIMIT 2000" in compiled(stub.executed[0][0], literal=True)
+
+    with pytest.raises(InvalidParameterError):
+        await repo.list_points("HUNTER-001", limit=10001)
+
+
+async def test_telemetry_repository_rejects_single_column_primary_key_semantics() -> None:
+    """复合主键保护：基类 get / get_or_raise / hard_delete 必须显式拒绝（防止跨车辆误命中）。"""
+    repo, stub = repo_pair(VehicleTelemetryRepository)
+    point = VehicleTelemetry(vehicle_id="HUNTER-001", time=datetime(2026, 9, 19, tzinfo=UTC))
+
+    assert repo.pk_names == ("time", "vehicle_id")
+    assert repo.is_composite_pk is True
+
+    with pytest.raises(NotImplementedError):
+        await repo.get(datetime(2026, 9, 19, tzinfo=UTC))
+    with pytest.raises(NotImplementedError):
+        await repo.get_or_raise(datetime(2026, 9, 19, tzinfo=UTC))
+    with pytest.raises(NotImplementedError):
+        await repo.hard_delete(point)
+    assert stub.executed == [], "被拒绝的操作不得发出任何 SQL"
 
 
 # ---------- AlgorithmMetricRepository ----------
@@ -859,6 +1014,63 @@ async def test_metric_latest_returns_newest_point_or_none() -> None:
         )
         is None
     )
+
+
+async def test_metric_series_read_allows_points_above_page_limit() -> None:
+    """指标趋势序列读取上限放宽到 MAX_SERIES_POINTS，超限仍抛 2001。"""
+    repo, stub = repo_pair(AlgorithmMetricRepository)
+    stub.queue(StubResult([]))
+
+    await repo.list_series(
+        "HUNTER-001",
+        start_time=datetime(2026, 9, 19, tzinfo=UTC),
+        end_time=datetime(2026, 9, 20, tzinfo=UTC),
+        limit=5000,
+    )
+    assert "LIMIT 5000" in compiled(stub.executed[0][0], literal=True)
+
+    with pytest.raises(InvalidParameterError):
+        await repo.list_series("HUNTER-001", limit=10001)
+
+
+async def test_metric_repository_rejects_single_column_primary_key_semantics() -> None:
+    repo, stub = repo_pair(AlgorithmMetricRepository)
+    metric = AlgorithmMetric(
+        vehicle_id="HUNTER-001", module=MetricModule.PERCEPTION, metric_name="fps"
+    )
+    assert repo.pk_names == ("time", "vehicle_id", "module", "metric_name")
+
+    with pytest.raises(NotImplementedError):
+        await repo.get(datetime(2026, 9, 19, tzinfo=UTC))
+    with pytest.raises(NotImplementedError):
+        await repo.hard_delete(metric)
+    assert stub.executed == []
+
+
+# ---------- 显式加载选项（raise_on_sql 关系）----------
+
+
+async def test_find_all_mounts_explicit_loader_options() -> None:
+    """契约 orm-mapping 第 1 节：``raise_on_sql`` 关系必须由调用方显式 selectinload。"""
+    repo, stub = repo_pair(OtaTaskRepository)
+    stub.queue(StubResult([]))
+
+    await repo.find_all(OtaTask.task_id == uuid4(), options=(selectinload(OtaTask.records),))
+
+    stmt = stub.executed[0][0]
+    paths = [str(getattr(option, "path", option)) for option in stmt._with_options]
+    assert any("OtaTask.records" in path for path in paths), f"loader options 未挂载: {paths}"
+
+
+async def test_paginate_passes_loader_options_through() -> None:
+    repo, stub = repo_pair(OtaTaskRepository)
+    stub.queue(StubResult(scalar=1), StubResult([]))
+
+    await repo.paginate(page=1, page_size=10, options=(selectinload(OtaTask.records),))
+
+    stmt = stub.executed[1][0]
+    paths = [str(getattr(option, "path", option)) for option in stmt._with_options]
+    assert any("OtaTask.records" in path for path in paths)
 
 
 

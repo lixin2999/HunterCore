@@ -20,7 +20,7 @@
 | `ddl/04_events.sql` | `events`（18 种事件类型 + 3 级事件等级） | data_collector |
 | `ddl/05_timeseries.sql` | `vehicle_telemetry`、`algorithm_metrics`（hypertable：按天分块 + 90 天保留） | data_collector / data_analytics |
 | `er.md` | ER 关系说明、跨 schema 访问例外、字段类型约定、与设计文档的差异清单 | — |
-| `orm-mapping.md` | ORM 关系映射契约（16 条 relationship + lazy 策略白名单）与 Repository 契约（13 个 Repository + 方法清单） | — |
+| `orm-mapping.md` | ORM 关系映射契约（16 条 relationship + lazy 策略白名单）、Repository 契约（13 个 Repository + 专属方法双向校验）、排序 spec 与默认排序、事务/错误码/读取上限/显式加载语义、服务层收敛路径 | — |
 | `enums.md` | 受控词表（车辆状态 / 事件类型与等级 / OTA 状态机 / 权限资源域），与 ORM `StrEnum` 一一对应 | — |
 | `redis-keys.yaml` | Redis Key 契约：系统约束第 8 条 7 个 Key + `rc:lock:{vehicle_id}` 实现派生键、命名规则、字段结构、TTL、读写方、跨服务引用 | — |
 | `object-storage.yaml` | MinIO 契约：7 个 Bucket（生命周期 / SSE-S3 / 读写方 / 对象键约定）、预签名策略（上传 3600s、下载 900s、Range、分片）、对象键规则 | — |
@@ -41,7 +41,7 @@ alembic downgrade -1                                     # 回滚（含 drop sch
 ## 存储契约校验方式
 
 ```bash
-# 26 项数据层契约校验（含校验 9 Redis Key、校验 10 对象存储、校验 11-13 ORM 关系与 Repository）
+# 32 项数据层契约校验（含校验 9 Redis Key、校验 10 对象存储、校验 11-13 ORM 关系 / Repository 注册表与专属方法双向一致）
 python scripts/verify_data_layer.py
 
 # 存储契约单元测试（Redis Key / MinIO Bucket ↔ 服务声明 ↔ MinIO 初始化脚本）
@@ -64,7 +64,11 @@ pytest common/python/tests/test_repositories.py -q
 - ORM relationship 必须显式声明异步安全 lazy 策略（`selectin` / `raise_on_sql`，见 `orm-mapping.md` 第 1 节），
   禁止隐式 `lazy="select"`；跨 schema 逻辑外键**不建** relationship（走 REST 补全）
 - 每个 ORM 模型对应**恰好一个** Repository（`hunter_common/database/repositories/`），
-  映射登记在 `REPOSITORY_BY_MODEL`；Repository 只 `flush` 不 `commit`（事务边界归调用方）
+  映射登记在 `REPOSITORY_BY_MODEL`；Repository 只 `flush` 不 `commit`（事务边界归调用方），
+  约束冲突用 SAVEPOINT 局部回滚；专属方法必须与 `orm-mapping.md` 第 3 节**双向**一致
+  （测试 + 校验 13b 强制）
+- 可空列排序必须显式声明空值位次（`-col:nl` = `DESC NULLS LAST`），与 DDL 索引一致；
+  时序复合主键表（`vehicle_telemetry` / `algorithm_metrics`）禁用基类 `get` / `hard_delete` 等单列主键语义
 - Redis Key 命名模式以 `redis-keys.yaml` 为准（`session:` / `vehicle:status:` / `vehicle:online:set` /
   `rate_limit:` / `ota:progress:` / `rc:session:` / `cache:scene:` / `rc:lock:`），禁止新增命名空间
 - MinIO Bucket 名称、生命周期、SSE 策略以 `object-storage.yaml` 为准；预签名有效期固定

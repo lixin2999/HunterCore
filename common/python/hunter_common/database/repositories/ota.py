@@ -1,10 +1,12 @@
 """OTA 数据访问层（ota_svc：ota_versions / ota_tasks / ota_records）。
 
-契约：contracts/database/ddl/03_ota.sql + orm-mapping.md 第 3 节。
+契约：contracts/database/ddl/03_ota.sql + orm-mapping.md 第 3 节 + openapi/ota-service.yaml（列表排序）。
 安全约束：
 - ``version_code`` 单调递增（防回滚）→ ``max_version_code`` 提供发布门禁基准；
 - 版本删除受 DDL FK ``ON DELETE RESTRICT`` 保护，本层不提供版本 delete 便捷方法；
 - 记录 ``status``/``phase`` 取值 = 车端 OTA 状态机 9 态（受控词表，禁止硬编码字面量）。
+排序约定（不可更改）：``release_time DESC NULLS LAST, version_code DESC``（版本列表）、
+``start_time DESC NULLS LAST, record_id DESC``（升级记录），与 OpenAPI 描述及 DDL 索引一致。
 """
 from __future__ import annotations
 
@@ -27,8 +29,9 @@ class OtaVersionRepository(BaseRepository[OtaVersion]):
     """OTA 版本仓库读写。"""
 
     model = OtaVersion
-    #: 版本列表默认排序（对齐 idx_ota_versions_status_release_time：release_time DESC NULLS LAST）
-    default_order_by = ("-release_time", "-version_code")
+    #: 版本列表默认排序（契约 openapi/ota-service.yaml：``release_time DESC NULLS LAST, version_code DESC``；
+    #: 对齐 idx_ota_versions_status_release_time，避免执行计划多出 Sort）
+    default_order_by = ("-release_time:nl", "-version_code")
 
     async def get_by_version_code(self, version_code: int) -> OtaVersion | None:
         """按版本编码查询（唯一索引 uq_ota_versions_version_code）。"""
@@ -83,8 +86,9 @@ class OtaRecordRepository(BaseRepository[OtaRecord]):
     """单车辆升级记录读写。"""
 
     model = OtaRecord
-    #: 记录列表默认排序（对齐 idx_ota_records_vehicle_start_time）
-    default_order_by = ("-start_time",)
+    #: 记录列表默认排序（契约 openapi/ota-service.yaml：``start_time DESC NULLS LAST, record_id DESC``；
+    #: 次级键 record_id 保证同 start_time 记录的分页稳定，避免翻页重复/漏行）
+    default_order_by = ("-start_time:nl", "-record_id")
 
     async def get_by_task_vehicle(self, task_id: UUID, vehicle_id: str) -> OtaRecord | None:
         """按 (task_id, vehicle_id) 查询（唯一索引 uq_ota_records_task_vehicle）。
@@ -101,7 +105,13 @@ class OtaRecordRepository(BaseRepository[OtaRecord]):
         statuses: Sequence[OtaStatus] | None = None,
         limit: int | None = None,
     ) -> list[OtaRecord]:
-        """查询进行中记录（默认 = OTA 状态机非终态，命中部分索引 idx_ota_records_inflight）。"""
+        """查询进行中记录（默认 = OTA 状态机非终态，命中部分索引 idx_ota_records_inflight）。
+
+        排序 ``status ASC, start_time DESC NULLS LAST, record_id DESC``：
+        部分索引 ``(status, start_time)`` 仅能在同向时复用索引顺序，
+        本方法以"最新批次优先"可读性为准（``start_time DESC`` 需 Incremental Sort），
+        代价被部分索引谓词（非终态）限制在小结果集内；次级键保证分页稳定。
+        """
         active = (
             list(statuses)
             if statuses is not None
@@ -109,8 +119,7 @@ class OtaRecordRepository(BaseRepository[OtaRecord]):
         )
         return await self.find_all(
             OtaRecord.status.in_(active),
-            # 与部分索引 (status, start_time) 列序一致，避免额外排序
-            order_by=("status", "-start_time"),
+            order_by=("status", "-start_time:nl", "-record_id"),
             limit=limit,
         )
 

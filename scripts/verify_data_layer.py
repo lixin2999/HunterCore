@@ -48,10 +48,19 @@ RELATION_TABLE_START = "<!-- relationship-table:start -->"
 RELATION_TABLE_END = "<!-- relationship-table:end -->"
 REPOSITORY_TABLE_START = "<!-- repository-table:start -->"
 REPOSITORY_TABLE_END = "<!-- repository-table:end -->"
+BASE_METHODS_TABLE_START = "<!-- base-methods-table:start -->"
+BASE_METHODS_TABLE_END = "<!-- base-methods-table:end -->"
 #: 关系行：`Class.attr` 位于首列
 RELATION_ROW_RE = re.compile(r"^\|\s*`([A-Za-z_]\w*)\.([a-z_]\w*)`\s*\|", re.MULTILINE)
 #: Repository 行：`XxxRepository` | `Model`
 REPOSITORY_ROW_RE = re.compile(r"^\|\s*`(\w+Repository)`\s*\|\s*`(\w+)`\s*\|", re.MULTILINE)
+#: Repository 行整行（含「专属方法」列）：| `XxxRepository` | `Model` | `module.py` | methods |
+REPOSITORY_METHOD_ROW_RE = re.compile(
+    r"^\|\s*`(\w+Repository)`\s*\|\s*`(\w+)`\s*\|\s*`[^`]+`\s*\|(.+?)\|\s*$", re.MULTILINE
+)
+#: 方法列中的标识符；DDL 索引名前缀需排除（见 INDEX_NAME_PREFIXES）
+METHOD_TOKEN_RE = re.compile(r"`([a-z_][a-z0-9_]*)`")
+INDEX_NAME_PREFIXES = ("uq_", "idx_", "pk_", "ck_", "fk_")
 #: 异步安全 lazy 策略白名单（contracts/database/orm-mapping.md 第 1 节）
 ASYNC_SAFE_LAZY = frozenset({"selectin", "raise_on_sql"})
 
@@ -591,9 +600,11 @@ def check_orm_repository_layer() -> None:
             RELATION_TABLE_END,
             REPOSITORY_TABLE_START,
             REPOSITORY_TABLE_END,
+            BASE_METHODS_TABLE_START,
+            BASE_METHODS_TABLE_END,
         )
     ):
-        fail("orm-mapping.md 缺少关系表/Repository 表区块标记")
+        fail("orm-mapping.md 缺少关系表/Repository 表/通用方法表区块标记")
         return
 
     relation_block = text.split(RELATION_TABLE_START, 1)[1].split(RELATION_TABLE_END, 1)[0]
@@ -616,6 +627,49 @@ def check_orm_repository_layer() -> None:
         fail(f"orm-mapping.md Repository 表与实现不一致：文档 {declared_repos} vs 实现 {implemented}")
     else:
         ok(f"orm-mapping.md Repository 表与实现一致（{len(declared_repos)} 个 Repository）")
+
+    # ---- 校验 13b：Repository「专属方法」列 ↔ 实现双向一致 ----
+    from inspect import iscoroutinefunction, isfunction
+
+    method_rows = REPOSITORY_METHOD_ROW_RE.findall(repository_block)
+    documented_by_model: dict[str, set[str]] = {}
+    for _name, model_name, methods_cell in method_rows:
+        tokens = {
+            token
+            for token in METHOD_TOKEN_RE.findall(methods_cell)
+            if not token.startswith(INDEX_NAME_PREFIXES)
+        }
+        documented_by_model[model_name] = tokens
+
+    if len(method_rows) != len(registry):
+        fail(f"orm-mapping.md Repository 行数 {len(method_rows)} != 注册表 {len(registry)}")
+    else:
+        problems: list[str] = []
+        for model, repository in registry.items():
+            documented = documented_by_model.get(model.__name__)
+            if documented is None:
+                problems.append(f"{model.__name__} 未登记专属方法列")
+                continue
+            implemented_methods = {
+                name
+                for name, value in vars(repository).items()
+                if not name.startswith("_") and (isfunction(value) or iscoroutinefunction(value))
+            }
+            if documented - implemented_methods:
+                problems.append(
+                    f"{repository.__name__} 契约声明但未实现 {sorted(documented - implemented_methods)}"
+                )
+            if implemented_methods - documented:
+                problems.append(
+                    f"{repository.__name__} 已实现但未登记契约 {sorted(implemented_methods - documented)}"
+                )
+        if problems:
+            fail("Repository 专属方法 ↔ 契约不一致：" + "；".join(problems))
+        else:
+            ok(
+                f"Repository 专属方法与契约双向一致（{len(method_rows)} 个 Repository / "
+                f"{sum(len(v) for v in documented_by_model.values())} 个专属方法）"
+            )
 
 
 def load_yaml(path: Path) -> dict[str, Any]:

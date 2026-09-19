@@ -4,6 +4,8 @@
 规则：
 - 每个模型恰好一个 Repository；只 ``flush`` 不 ``commit``（事务边界由调用方控制）；
 - 查询条件一律参数绑定（禁止字符串拼接 SQL）；按 DDL 唯一索引/索引组织专属查询方法；
+- 默认排序显式声明空值位次（``:nl`` = NULLS LAST）以对齐 DDL 索引
+  （``idx_vehicles_status_last_online`` 为 ``... DESC NULLS LAST``）；
 - RBAC 五表同属 user_svc（同一服务 schema），可内部 JOIN；跨服务引用（如 scenes.creator）禁止 JOIN。
 """
 from __future__ import annotations
@@ -12,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from hunter_common.database.enums import PermissionResource, RoleStatus, VehicleStatus
@@ -31,8 +33,8 @@ class VehicleRepository(BaseRepository[Vehicle]):
     """车辆台账读写（vehicle_svc.vehicles）。"""
 
     model = Vehicle
-    #: 在线看板与车辆列表默认排序（对齐 idx_vehicles_status_last_online）
-    default_order_by = ("-last_online_time", "vehicle_id")
+    #: 在线看板与车辆列表默认排序（对齐 idx_vehicles_status_last_online：``last_online_time DESC NULLS LAST``）
+    default_order_by = ("-last_online_time:nl", "vehicle_id")
 
     async def get_by_device_cert_sn(self, device_cert_sn: str) -> Vehicle | None:
         """按 X.509 设备证书序列号查询（部分唯一索引 uq_vehicles_device_cert_sn）。"""
@@ -51,14 +53,22 @@ class VehicleRepository(BaseRepository[Vehicle]):
         *,
         last_online_time: datetime | None = None,
     ) -> Vehicle | None:
-        """更新车辆状态，可选同步最近在线时间；车辆不存在返回 ``None``。"""
-        vehicle = await self.get(vehicle_id)
-        if vehicle is None:
-            return None
+        """更新车辆状态，可选同步最近在线时间；车辆不存在返回 ``None``。
+
+        实现：单条 ``UPDATE ... RETURNING``（原子更新 + 1 次往返，避免"先查后写"的竞态），
+        返回值经 ORM identity map 合并，调用方拿到的即最新实体。
+        """
         values: dict[str, Any] = {"status": status}
         if last_online_time is not None:
             values["last_online_time"] = last_online_time
-        return await self.update(vehicle, **values)
+        stmt = (
+            update(Vehicle)
+            .where(Vehicle.vehicle_id == vehicle_id)
+            .values(**values)
+            .returning(Vehicle)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
 
 
 class UserRepository(BaseRepository[User]):
@@ -103,12 +113,18 @@ class UserRepository(BaseRepository[User]):
         return list((await self.session.execute(stmt)).scalars().all())
 
     async def touch_last_login(self, user_id: UUID, *, at: datetime | None = None) -> bool:
-        """记录最近登录时间；用户不存在返回 ``False``。"""
-        user = await self.get(user_id)
-        if user is None:
-            return False
-        await self.update(user, last_login_time=at or datetime.now(UTC))
-        return True
+        """记录最近登录时间；用户不存在返回 ``False``。
+
+        实现：单条 ``UPDATE``（登录热路径 1 次往返，避免"先查后写"），
+        ``rowcount`` 判定用户是否存在。
+        """
+        stmt = (
+            update(User)
+            .where(User.user_id == user_id)
+            .values(last_login_time=at or datetime.now(UTC))
+        )
+        result = await self.session.execute(stmt)
+        return bool(int(getattr(result, "rowcount", 0) or 0))
 
 
 class RoleRepository(BaseRepository[Role]):

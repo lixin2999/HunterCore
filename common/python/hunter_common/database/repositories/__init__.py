@@ -2,7 +2,14 @@
 
 - 每个 ORM 模型恰好一个 Repository；``REPOSITORY_BY_MODEL`` 是映射的单一登记点
   （契约校验与依赖注入均以此为准，缺项/多项由测试与 ``scripts/verify_data_layer.py`` 拦截）；
-- 所有 Repository 继承 ``BaseRepository``，统一 CRUD / 分页 / 软删除 / 批量写入 / 条件查询语义。
+- 所有 Repository 继承 ``BaseRepository``，统一 CRUD / 分页 / 软删除 / 批量写入 / 条件查询语义；
+- 写入只 ``flush``（SAVEPOINT 局部回滚约束冲突），事务边界由调用方
+  （``DatabaseSessionManager.session()`` / ``Depends(get_session)``）控制；
+- 默认排序显式声明空值位次（``-col:nl`` = NULLS LAST），与 DDL 索引保持一致。
+
+⚠ 迁移状态（契约 orm-mapping.md 第 5 节）：本包为**唯一数据访问实现**，但各服务
+``services/*/app/repositories/*.py`` 仍存在同名同表的过渡实现；收敛顺序为
+scene-service → data-collector → api-gateway → ota-service，收敛前禁止在同一个模块内混用两套。
 """
 from __future__ import annotations
 

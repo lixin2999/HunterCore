@@ -64,7 +64,9 @@ from hunter_common.database.repositories import (
 from hunter_common.database.repository import (
     BULK_CHUNK_SIZE,
     DEFAULT_PAGE_SIZE,
+    DEFAULT_PURGE_BATCH_SIZE,
     MAX_PAGE_SIZE,
+    MAX_SERIES_POINTS,
     BaseRepository,
     PageResult,
 )
@@ -91,11 +93,13 @@ __all__ = [
     "CHUNK_TIME_INTERVAL",
     "COLLECTOR_SCHEMA",
     "DEFAULT_PAGE_SIZE",
+    "DEFAULT_PURGE_BATCH_SIZE",
     "EVENT_IDEMPOTENCY_COLUMNS",
     "EVENT_LEVEL_BY_TYPE",
     "GATEWAY_SCHEMA",
     "HYPERTABLES",
     "MAX_PAGE_SIZE",
+    "MAX_SERIES_POINTS",
     "METRIC_CONFLICT_COLUMNS",
     "OTA_ACTIVE_STATUSES",
     "OTA_SCHEMA",

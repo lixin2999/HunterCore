@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from inspect import iscoroutinefunction, isfunction
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,31 @@ ASYNC_SAFE_LAZY = frozenset({"selectin", "raise_on_sql"})
 
 RELATION_ROW_RE = re.compile(r"^\|\s*`([A-Za-z_]\w*)\.([a-z_]\w*)`\s*\|", re.MULTILINE)
 REPOSITORY_ROW_RE = re.compile(r"^\|\s*`(\w+Repository)`\s*\|\s*`(\w+)`\s*\|", re.MULTILINE)
+#: Repository 表「专属方法」列整行：| `XxxRepository` | `Model` | `module.py` | methods |
+REPOSITORY_METHOD_ROW_RE = re.compile(
+    r"^\|\s*`(\w+Repository)`\s*\|\s*`(\w+)`\s*\|\s*`[^`]+`\s*\|(.+?)\|\s*$", re.MULTILINE
+)
+#: 方法列中的标识符（DDL 索引名需排除，见 _INDEX_NAME_PREFIXES）
+_METHOD_TOKEN_RE = re.compile(r"`([a-z_][a-z0-9_]*)`")
+_INDEX_NAME_PREFIXES = ("uq_", "idx_", "pk_", "ck_", "fk_")
+
+
+def documented_methods(methods_cell: str) -> set[str]:
+    """从契约「专属方法」列解析方法名（过滤 `uq_*` / `idx_*` 等 DDL 索引名）。"""
+    return {
+        token
+        for token in _METHOD_TOKEN_RE.findall(methods_cell)
+        if not token.startswith(_INDEX_NAME_PREFIXES)
+    }
+
+
+def public_methods(repository: type[BaseRepository[Any]]) -> set[str]:
+    """Repository 类**自身定义**的公开方法（不含继承自 BaseRepository 的通用方法）。"""
+    return {
+        name
+        for name, value in vars(repository).items()
+        if not name.startswith("_") and (isfunction(value) or iscoroutinefunction(value))
+    }
 
 
 def relation_names() -> set[str]:
@@ -205,4 +231,45 @@ def test_repository_contract_table_matches_registry() -> None:
     assert {model for _name, model in rows} == {
         model.__name__ for model in REPOSITORY_BY_MODEL
     }
+
+
+def test_repository_methods_match_contract() -> None:
+    """契约「专属方法」列 ↔ 实现**双向**一致（新增/删除/改名专属方法必须先改契约）。"""
+    text = CONTRACT.read_text(encoding="utf-8")
+    block = text[
+        text.index("<!-- repository-table:start -->") : text.index("<!-- repository-table:end -->")
+    ]
+    rows = REPOSITORY_METHOD_ROW_RE.findall(block)
+    assert len(rows) == len(REPOSITORY_BY_MODEL), "契约 Repository 行数与注册表不一致"
+    documented_by_model = {model: documented_methods(cell) for _name, model, cell in rows}
+
+    for model, repository in REPOSITORY_BY_MODEL.items():
+        documented = documented_by_model[model.__name__]
+        implemented = public_methods(repository)
+        assert not (documented - implemented), (
+            f"{repository.__name__} 契约声明但未实现: {sorted(documented - implemented)}"
+        )
+        assert not (implemented - documented), (
+            f"{repository.__name__} 已实现但未登记契约: {sorted(implemented - documented)}"
+        )
+
+
+def test_base_repository_common_methods_match_contract() -> None:
+    """契约 3.1 通用方法表 ⊆ ``BaseRepository`` 实现（方法名不可臆造）。"""
+    text = CONTRACT.read_text(encoding="utf-8")
+    block = text[
+        text.index("<!-- base-methods-table:start -->") : text.index(
+            "<!-- base-methods-table:end -->"
+        )
+    ]
+    documented: set[str] = set()
+    for row in block.splitlines():
+        cells = row.split("|")
+        if len(cells) < 3 or not cells[1].strip().startswith("`"):
+            continue
+        documented |= documented_methods(cells[1])
+
+    assert documented, "契约 3.1 通用方法表解析为空"
+    missing = sorted(name for name in documented if not hasattr(BaseRepository, name))
+    assert missing == [], f"契约 3.1 声明但 BaseRepository 未实现: {missing}"
 

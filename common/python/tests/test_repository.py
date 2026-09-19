@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from types import TracebackType
 from typing import Any
 from uuid import uuid4
 
@@ -44,6 +45,31 @@ class StubResult:
         return self._scalar
 
 
+class StubSavepoint:
+    """模拟 ``AsyncSession.begin_nested()`` 返回的 SAVEPOINT 上下文。
+
+    语义与 SQLAlchemy 一致：块内异常只回滚 SAVEPOINT（``savepoint_rollbacks`` +1），
+    异常继续向上抛出，外层事务不受影响。
+    """
+
+    def __init__(self, session: StubSession) -> None:
+        self._session = session
+
+    async def __aenter__(self) -> StubSession:
+        self._session.savepoints += 1
+        return self._session
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        if exc_type is not None:
+            self._session.savepoint_rollbacks += 1
+        return False
+
+
 class StubSession:
     """记录 execute/add/flush 调用的最小 AsyncSession 替身。"""
 
@@ -52,19 +78,32 @@ class StubSession:
         self.added: list[Any] = []
         self.flushed = 0
         self.rolled_back = 0
+        self.savepoints = 0
+        self.savepoint_rollbacks = 0
+        self.expunged: list[Any] = []
         self.deleted: list[Any] = []
         self._queue: list[StubResult] = []
         self._flush_error = flush_error
 
-    def queue(self, *results: StubResult) -> None:
+    def queue(self, *results: StubResult | Exception) -> None:
+        """排队下一次 execute 的返回值；元素为异常时该次 execute 直接抛出。"""
         self._queue.extend(results)
 
     async def execute(self, statement: Any, params: Any = None) -> StubResult:
         self.executed.append((statement, params))
-        return self._queue.pop(0) if self._queue else StubResult()
+        item: StubResult | Exception = self._queue.pop(0) if self._queue else StubResult()
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     def add(self, instance: Any) -> None:
         self.added.append(instance)
+
+    def begin_nested(self) -> StubSavepoint:
+        return StubSavepoint(self)
+
+    def expunge(self, instance: Any) -> None:
+        self.expunged.append(instance)
 
     async def flush(self) -> None:
         self.flushed += 1
@@ -116,21 +155,42 @@ async def test_create_adds_instance_and_flushes() -> None:
 
 
 async def test_create_translates_unique_violation_to_3002() -> None:
-    orig = type("FakeOrig", (Exception,), {"pgcode": "23505"})("duplicate key value")
-    repo, _ = scene_repo(StubSession(flush_error=IntegrityError("insert", {}, orig)))
+    orig = type("FakeOrig", (Exception,), {"pgcode": "23505"})(
+        'duplicate key value violates unique constraint "uq_scenes_scene_name"'
+    )
+    repo, stub = scene_repo(StubSession(flush_error=IntegrityError("insert", {}, orig)))
     with pytest.raises(ResourceAlreadyExistsError) as excinfo:
         await repo.create(scene_name="dup", scene_type="urban", creator=uuid4())
     assert excinfo.value.code == ErrorCode.RESOURCE_ALREADY_EXISTS
+    # SAVEPOINT 局部回滚：外事务不被回滚、失败行被移出会话、约束名进入 details（不含行值）
+    assert stub.savepoint_rollbacks == 1
+    assert stub.rolled_back == 0, "禁止回滚调用方外事务（事务边界属调用方）"
+    assert len(stub.expunged) == 1
+    assert excinfo.value.details["constraint"] == "uq_scenes_scene_name"
+    assert "dup" not in str(excinfo.value.details), "details 禁止携带冲突行的键值"
 
 
 async def test_create_translates_check_violation_to_2001() -> None:
-    orig = type("FakeOrig", (Exception,), {"pgcode": "23514"})("check constraint violated")
+    orig = type("FakeOrig", (Exception,), {"pgcode": "23514"})(
+        'new row violates check constraint "scenes_status_check"'
+    )
     session = StubSession(flush_error=IntegrityError("insert", {}, orig))
     repo, stub = scene_repo(session)
     with pytest.raises(InvalidParameterError) as excinfo:
         await repo.create(scene_name="bad", scene_type="urban", creator=uuid4())
     assert excinfo.value.code == ErrorCode.INVALID_PARAM
-    assert stub.rolled_back == 1
+    assert stub.savepoint_rollbacks == 1
+    assert stub.rolled_back == 0
+    assert excinfo.value.details["constraint"] == "scenes_status_check"
+
+
+async def test_create_rejects_unknown_field_with_2001() -> None:
+    """契约 orm-mapping 3.1：非法字段必须为 2001（而非 SQLAlchemy TypeError → 5000）。"""
+    repo, stub = scene_repo()
+    with pytest.raises(InvalidParameterError) as excinfo:
+        await repo.create(scene_name="s", scene_type="urban", creator=uuid4(), bogus_field=1)
+    assert excinfo.value.code == ErrorCode.INVALID_PARAM
+    assert stub.added == [] and stub.flushed == 0, "非法入参不得进入会话"
 
 
 async def test_update_sets_allowed_columns_and_rejects_unknown() -> None:
@@ -171,7 +231,39 @@ async def test_bulk_create_uses_executemany_with_chunking() -> None:
     assert inserted == 5
     assert len(stub.executed) == 3, "应分 3 片写入（2+2+1）"
     assert all(len(params) <= 2 for _stmt, params in stub.executed)
+    assert stub.savepoints == 3, "每个分片一个 SAVEPOINT，限制失败影响范围"
     assert compiled(stub.executed[0][0]).startswith("INSERT INTO scene_svc.scenes")
+
+
+async def test_bulk_create_translates_chunk_violation_and_reports_savepoint() -> None:
+    """批量分片冲突 → 3002（与 create 一致），且只回滚该分片。"""
+    repo, stub = scene_repo()
+    stub.queue(
+        StubResult(),  # 第一片成功
+        IntegrityError(
+            "insert",
+            {},
+            type("FakeOrig", (Exception,), {"pgcode": "23505"})(
+                'duplicate key value violates unique constraint "uq_scenes_scene_name"'
+            ),
+        ),
+    )
+    with pytest.raises(ResourceAlreadyExistsError) as excinfo:
+        await repo.bulk_create(
+            [{"scene_name": f"s{i}", "scene_type": "urban", "creator": uuid4()} for i in range(3)],
+            chunk_size=2,
+        )
+    assert excinfo.value.code == ErrorCode.RESOURCE_ALREADY_EXISTS
+    assert stub.savepoint_rollbacks == 1
+    assert stub.rolled_back == 0
+
+
+async def test_bulk_create_rejects_unknown_row_field_with_2001() -> None:
+    repo, stub = scene_repo()
+    with pytest.raises(InvalidParameterError) as excinfo:
+        await repo.bulk_create([{"scene_name": "s", "bogus_field": 1}])
+    assert excinfo.value.code == ErrorCode.INVALID_PARAM
+    assert stub.executed == [], "非法行键不得发出 SQL"
 
 
 async def test_bulk_create_ignore_conflicts_uses_on_conflict_do_nothing() -> None:
@@ -179,6 +271,15 @@ async def test_bulk_create_ignore_conflicts_uses_on_conflict_do_nothing() -> Non
     rows = [{"scene_name": "s", "scene_type": "urban", "creator": uuid4()}]
     await repo.bulk_create_ignore_conflicts(rows, conflict_columns=["scene_name"])
     assert "ON CONFLICT (scene_name) DO NOTHING" in compiled(stub.executed[0][0])
+
+
+async def test_bulk_create_ignore_conflicts_returns_submitted_rows() -> None:
+    """返回值 = 提交（attempted）行数：被 DO NOTHING 跳过的行仍计入（异步驱动无精确 rowcount）。"""
+    repo, stub = scene_repo()
+    rows = [{"scene_name": f"s{i}", "scene_type": "urban", "creator": uuid4()} for i in range(3)]
+    stub.queue(StubResult(rowcount=1))  # 驱动只报告跳过后影响行数，返回值不依赖它
+
+    assert await repo.bulk_create_ignore_conflicts(rows, conflict_columns=["scene_name"]) == 3
 
 
 async def test_bulk_create_ignore_conflicts_rejects_bad_columns() -> None:
@@ -193,6 +294,41 @@ async def test_bulk_create_returns_zero_for_empty_rows() -> None:
     repo, stub = scene_repo()
     assert await repo.bulk_create([]) == 0
     assert stub.executed == []
+
+
+async def test_bulk_create_rejects_non_positive_chunk_size() -> None:
+    repo, _ = scene_repo()
+    with pytest.raises(InvalidParameterError):
+        await repo.bulk_create([{"scene_name": "s"}], chunk_size=0)
+
+
+# ---------- 排序 spec（空值位次）----------
+
+
+async def test_order_clause_supports_nulls_last_and_nulls_first() -> None:
+    """排序 spec ``:nl`` / ``:nf`` 必须落到 SQL 的 NULLS LAST / NULLS FIRST（对齐 DDL 索引）。"""
+    repo, _ = scene_repo()
+    assert str(repo.order_clause("-create_time:nl")).endswith("DESC NULLS LAST")
+    assert str(repo.order_clause("create_time:nl")).endswith("ASC NULLS LAST")
+    assert str(repo.order_clause("-create_time:nf")).endswith("DESC NULLS FIRST")
+    assert str(repo.order_clause("-create_time")).endswith("DESC")
+
+
+async def test_order_clause_rejects_unknown_null_position_and_column() -> None:
+    repo, _ = scene_repo()
+    with pytest.raises(InvalidParameterError):
+        repo.order_clause("-create_time:xx")
+    with pytest.raises(InvalidParameterError):
+        repo.order_clause("-not_a_column:nl")
+
+
+async def test_apply_order_renders_default_spec_with_nulls_last() -> None:
+    repo, stub = scene_repo()
+    stub.queue(StubResult([]))
+    await repo.list(order_by=("-create_time:nl", "scene_id"))
+    sql = compiled(stub.executed[0][0], literal=True)
+    assert "ORDER BY scene_svc.scenes.create_time DESC NULLS LAST" in sql
+    assert "scene_svc.scenes.scene_id ASC" in sql
 
 
 # ---------- 读操作 ----------

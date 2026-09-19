@@ -58,52 +58,122 @@ DDL 定义表结构，本文件定义「ORM 如何映射这些结构」「每个
 ## 3. Repository 契约（命名 / 归属 / 方法）
 
 **命名规范**：`<Entity>Repository`，与被映射的 ORM 类同名对应；一个模型**恰好**一个 Repository 类。
-**事务边界**：Repository 只 `flush`，**不在内部提交/回滚**（事务边界由调用方 / `DatabaseSessionManager.session()` 控制）。
-**错误码**：唯一冲突 → 3002、缺失 → 3001、非法列名/参数 → 2001（均由 `BaseRepository` 统一映射）。
-**查询安全**：`filters` 键必须是真实列名；条件一律参数绑定，禁止字符串拼接 SQL。
+**事务边界**：Repository 只 `flush`，**不在内部提交/回滚**（事务边界由调用方 / `DatabaseSessionManager.session()` 控制）；
+`create` / `update` / 批量写入的每个分片用 **SAVEPOINT**（`begin_nested`）包裹，约束冲突只回滚该 SAVEPOINT，
+外事务与已写入分片不受影响（调用方无需因为 3002/2001 丢弃整个事务）。
+**错误码**：唯一冲突 → 3002、缺失 → 3001、非法列名/字段/参数 → 2001（均由 `BaseRepository` 统一映射，
+且 `details` 只允许携带模型名 / SQLSTATE / 约束名，**禁止**携带驱动原始报错文本与行值）。
+**查询安全**：`filters` 键必须是真实列名；条件一律参数绑定，禁止字符串拼接 SQL；
+写路径（`create` / `bulk_create` / `bulk_create_ignore_conflicts`）同样做列名白名单校验。
+**方法级同步**：本表「专属方法」列与实现由 `tests/test_orm_relationships.py::test_repository_methods_match_contract`
+与 `scripts/verify_data_layer.py`（校验 13）双向强校验 —— 新增/删除/改名专属方法必须**先改本表**。
 
 <!-- repository-table:start -->
 | Repository | 模型 | 模块 | 专属方法（映射的契约索引） |
 |------------|------|------|---------------------------|
-| `VehicleRepository` | `Vehicle` | `repositories/core.py` | `get_by_device_cert_sn`（`uq_vehicles_device_cert_sn`）、`list_by_status`（`idx_vehicles_status_last_online`）、`update_status` |
-| `UserRepository` | `User` | `repositories/core.py` | `get_by_username`（`uq_users_username`）、`get_by_email`（`uq_users_email`，小写比较）、`list_role_codes` / `list_permission_codes`（RBAC 展开）、`touch_last_login` |
+| `VehicleRepository` | `Vehicle` | `repositories/core.py` | `get_by_device_cert_sn`（`uq_vehicles_device_cert_sn`）、`list_by_status`（`idx_vehicles_status_last_online`）、`update_status`（单条 `UPDATE ... RETURNING`，1 次往返） |
+| `UserRepository` | `User` | `repositories/core.py` | `get_by_username`（`uq_users_username`）、`get_by_email`（`uq_users_email`，小写比较）、`list_role_codes` / `list_permission_codes`（RBAC 展开）、`touch_last_login`（单条 UPDATE + rowcount 判定） |
 | `RoleRepository` | `Role` | `repositories/core.py` | `get_by_role_code`（`uq_roles_role_code`）、`list_enabled`（`roles.status`） |
 | `PermissionRepository` | `Permission` | `repositories/core.py` | `get_by_permission_code`（`uq_permissions_permission_code`）、`list_by_resource`（`idx_permissions_resource_action`） |
 | `UserRoleRepository` | `UserRole` | `repositories/core.py` | `get_pair`、`list_role_ids`（复合主键前缀）、`link`（幂等绑定）、`unlink` |
 | `RolePermissionRepository` | `RolePermission` | `repositories/core.py` | `get_pair`、`list_permission_ids`（复合主键前缀）、`link`（幂等绑定）、`unlink` |
 | `SceneRepository` | `Scene` | `repositories/scene.py` | `get_by_scene_name`（`uq_scenes_scene_name`，仅存活场景） |
-| `OtaVersionRepository` | `OtaVersion` | `repositories/ota.py` | `get_by_version_code`（`uq_ota_versions_version_code`）、`get_by_version_name`（`uq_ota_versions_version_name`）、`max_version_code`（`version_code` 单调递增基准） |
+| `OtaVersionRepository` | `OtaVersion` | `repositories/ota.py` | `get_by_version_code`（`uq_ota_versions_version_code`）、`get_by_version_name`（`uq_ota_versions_version_name`）、`max_version_code`（version_code 单调递增基准） |
 | `OtaTaskRepository` | `OtaTask` | `repositories/ota.py` | `list_by_status`（`idx_ota_tasks_status_create_time`）、`list_by_target_version`（`idx_ota_tasks_target_version_id`） |
 | `OtaRecordRepository` | `OtaRecord` | `repositories/ota.py` | `get_by_task_vehicle`（`uq_ota_records_task_vehicle`）、`list_inflight`（`idx_ota_records_inflight`）、`list_by_vehicle`（`idx_ota_records_vehicle_start_time`）、`status_counts`（灰度成功率分子/分母） |
-| `EventRepository` | `Event` | `repositories/collector.py` | `get_by_vehicle_type_time`（`uq_events_vehicle_type_time` 幂等）、`list_by_vehicle`（`idx_events_vehicle_time`）、`list_unacknowledged`（`idx_events_unacknowledged`）、`acknowledge` |
-| `VehicleTelemetryRepository` | `VehicleTelemetry` | `repositories/collector.py` | `insert_points`（`ON CONFLICT (time, vehicle_id) DO NOTHING`）、`get_point`、`list_points`（`idx_vehicle_telemetry_vehicle_time`）、`latest_point`、`purge_before` |
+| `EventRepository` | `Event` | `repositories/collector.py` | `get_by_vehicle_type_time`（`uq_events_vehicle_type_time` 幂等预检）、`insert_events`（批量幂等写入，同唯一键）、`list_by_vehicle`（`idx_events_vehicle_time`）、`list_unacknowledged`（`idx_events_unacknowledged`）、`acknowledge`（条件 `UPDATE`，原子且保留首次审计） |
+| `VehicleTelemetryRepository` | `VehicleTelemetry` | `repositories/collector.py` | `insert_points`（`ON CONFLICT (time, vehicle_id) DO NOTHING`）、`get_point`、`list_points`（`idx_vehicle_telemetry_vehicle_time`）、`latest_point`、`purge_before`（按 ctid 分批删除） |
 | `AlgorithmMetricRepository` | `AlgorithmMetric` | `repositories/analytics.py` | `insert_metrics`（`ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING`）、`list_series`（`idx_algorithm_metrics_module_metric_time`）、`latest` |
 <!-- repository-table:end -->
 
 ### 3.1 通用方法契约（`BaseRepository`，所有 Repository 共享）
 
+<!-- base-methods-table:start -->
 | 方法 | 语义 | 契约要点 |
 |------|------|---------|
-| `get` / `get_or_raise` | 主键查询 | 缺失：`get` 返回 None，`get_or_raise` 抛 3001 |
-| `find_one` / `find_all` | 自定义条件查询 | 条件为 ORM 列表达式（参数绑定）；自动附加软删除过滤 |
-| `list` / `paginate` | 列表 / 分页 | `page ≥ 1`、`1 ≤ page_size ≤ 200`（保护 P95 ≤ 200ms）；排序 `-` 前缀 = DESC |
+| `get` / `get_or_raise` | 主键查询 | 缺失：`get` 返回 None，`get_or_raise` 抛 3001；**复合主键模型抛 `NotImplementedError`** |
+| `find_one` / `find_all` | 自定义条件查询 | 条件为 ORM 列表达式（参数绑定）；自动附加软删除过滤；支持 `options=`；`limit ≤ max_query_limit` |
+| `list` / `paginate` | 列表 / 分页 | `page ≥ 1`、`1 ≤ page_size ≤ 200`（保护 P95 ≤ 200ms）；排序 spec 见 3.2 节 |
 | `count` / `exists` | 计数 / 存在性 | `exists` 走 `LIMIT 1`，比 `count` 轻 |
-| `create` / `update` | 单条写 | 仅 `flush`，不 commit；唯一冲突 → 3002、非法字段 → 2001 |
-| `bulk_create` | 批量插入 | executemany 分片（`BULK_CHUNK_SIZE`），时序写入 ≥ 10000 点/秒 |
-| `bulk_create_ignore_conflicts` | 幂等批量插入 | `ON CONFLICT (…) DO NOTHING`，消费重放/重复时间点跳过 |
-| `delete_where` / `hard_delete` | 条件删除 / 物理删除 | 仅用于关联表解绑与超期数据清理；`scenes` 一律走 `soft_delete` |
+| `create` / `update` | 单条写 | SAVEPOINT 内 `flush`，不 commit；唯一冲突 → 3002、非法字段 → 2001 |
+| `bulk_create` | 批量插入 | executemany 分片（`BULK_CHUNK_SIZE`），时序写入 ≥ 10000 点/秒；返回**提交行数** |
+| `bulk_create_ignore_conflicts` | 幂等批量插入 | `ON CONFLICT (…) DO NOTHING`，消费重放/重复时间点跳过；返回**提交（attempted）行数**（被跳过的重复行仍计入，异步驱动无法提供精确插入行数） |
+| `delete_where` / `hard_delete` | 条件删除 / 物理删除 | 仅用于关联表解绑与超期数据清理；`scenes` 一律走 `soft_delete`；**复合主键模型禁用 `hard_delete`** |
 | `soft_delete` | 软删除 | 仅 `deleted_at` 模型（当前仅 `Scene`）；其他模型抛 `NotImplementedError` |
+<!-- base-methods-table:end -->
 
-**默认排序**：`VehicleRepository` → `last_online_time DESC`（在线看板）、`SceneRepository` → `create_time DESC`、
-`OtaVersionRepository` → `release_time DESC`、`OtaRecordRepository` → `start_time DESC`、
-`EventRepository` → `event_time DESC`（均对齐 DDL 索引与契约列表排序约定）。
+### 3.2 排序 spec 与默认排序（空值位次必须显式声明）
 
-## 4. 校验方式
+排序 spec 由 `BaseRepository.order_clause` 解析，取值不可扩展：
+
+| spec | 生成 SQL | 适用场景 |
+|------|---------|---------|
+| `col` | `col ASC` | 非空列升序 |
+| `-col` | `col DESC` | 非空列降序 |
+| `col:nl` / `-col:nl` | `col ASC NULLS LAST` / `col DESC NULLS LAST` | **可空列**（对齐 DDL 索引 `... DESC NULLS LAST`） |
+| `col:nf` / `-col:nf` | `col ASC NULLS FIRST` / `col DESC NULLS FIRST` | 需显式把空值排前 |
+
+⚠ PostgreSQL 中 `DESC` 默认等价 `NULLS FIRST`：可空列若漏写 `:nl`，会同时造成
+**业务语义反转**（空值排最前，如未发布草稿排在版本列表首位）与**索引失效**（多出 `Sort` 节点，破坏 P95 ≤ 200ms）。
+
+**默认排序**（列表页第一排序键；次级键用于分页稳定）：
+
+| Repository | 默认排序 | 依据 |
+|------------|---------|------|
+| `VehicleRepository` | `last_online_time DESC NULLS LAST, vehicle_id ASC` | `idx_vehicles_status_last_online` |
+| `SceneRepository` | `create_time DESC, scene_id ASC` | `idx_scenes_status_type_create_time` |
+| `OtaVersionRepository` | `release_time DESC NULLS LAST, version_code DESC` | OpenAPI ota-service.yaml + `idx_ota_versions_status_release_time` |
+| `OtaTaskRepository` | `create_time DESC` | `idx_ota_tasks_status_create_time` |
+| `OtaRecordRepository` | `start_time DESC NULLS LAST, record_id DESC` | OpenAPI ota-service.yaml + `idx_ota_records_vehicle_start_time` |
+| `EventRepository` | `event_time DESC, event_id DESC` | `idx_events_vehicle_time` |
+| `VehicleTelemetryRepository` | `time DESC` | `idx_vehicle_telemetry_vehicle_time` |
+| `AlgorithmMetricRepository` | `time DESC` | `idx_algorithm_metrics_vehicle_time` |
+
+### 3.3 读取上限（`max_query_limit`）
+
+- 通用读方法默认 `limit ≤ 200`（`MAX_PAGE_SIZE`，对齐分页接口契约与 P95 ≤ 200ms）；
+- `VehicleTelemetryRepository` / `AlgorithmMetricRepository` 放宽到
+  `MAX_SERIES_POINTS = 10000`（轨迹回放 / 指标趋势序列），**调用方必须给出时间窗**
+  （`start_time` / `end_time`），否则单次拉取会拖垮 P95；
+- `paginate` 的 `page_size` 始终 ≤ 200（对外分页契约不因时序放宽而上浮）。
+
+### 3.4 显式加载策略（`options=`）
+
+契约第 1 节的 `raise_on_sql` 关系必须由调用方显式加载，因此 `get` / `get_or_raise` / `find_one` /
+`find_all` / `list` / `paginate` 均提供 `options: Sequence[ORMOption] | None`：
+
+```python
+tasks = await OtaTaskRepository(session).find_all(
+    OtaTask.status == OtaTaskStatus.RUNNING,
+    options=(selectinload(OtaTask.records),),
+)
+```
+
+## 4. 服务层 Repository 收敛路径（迁移契约）
+
+`common/python/hunter_common/database/repositories/` 是**唯一数据访问实现**的最终形态；
+迁移期各服务 `services/*/app/repositories/*.py` 仍存在**同名同表**的过渡实现（构造签名与事务粒度不同：
+服务层为 `db: DatabaseSessionManager` 且每个方法独立事务，共享层为 `session: AsyncSession` 且由调用方控制事务）。
+
+| 顺序 | 服务 | 过渡实现 | 收敛要求 |
+|------|------|---------|---------|
+| 1 | scene-service | `app/repositories/scenes.py::SceneRepository` | 改为注入共享 `SceneRepository`；软删除、白名单排序行为逐条回归 |
+| 2 | data-collector | `app/repositories/events.py::EventRepository`、`telemetry.py::TelemetryRepository` | 写路径改用 `insert_events` / `insert_points`；查询改用共享 Repository；保留契约行转换函数 |
+| 3 | api-gateway | `app/repositories/user_repository.py::UserRepository` | **鉴权链路**，须独立变更 + 全量回归；`touch_last_login` 采用共享实现 |
+| 4 | ota-service | `app/repositories/versions.py` 等 | `max_published_code` → 复用 `max_version_code(status=published)` |
+
+**迁移期纪律（不可违反）**：
+1. 同一个模块内**禁止同时导入**服务层与共享层的同名 Repository（避免隐式双写/双读）；
+2. 新代码一律使用共享层；服务层过渡实现只允许修 BUG，不再新增方法；
+3. 收敛完成的服务必须删除过渡实现（避免"两套事实来源"长期并存）。
+
+## 5. 校验方式
 
 ```bash
 # ORM 关系契约 + Repository 契约（无需数据库）
 pytest common/python/tests/test_orm_relationships.py -q
 pytest common/python/tests/test_repositories.py -q
+pytest common/python/tests/test_repository.py -q
 
 # 数据层契约校验（含校验 11 模型↔仓库、12 relationship 异步安全、13 本文件与实现同步）
 python scripts/verify_data_layer.py
