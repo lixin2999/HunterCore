@@ -67,7 +67,7 @@ from hunter_common.database.repositories.ota import (
 )
 from hunter_common.database.repositories.scene import SceneRepository
 from hunter_common.database.repository import BaseRepository
-from hunter_common.exceptions import InvalidParameterError
+from hunter_common.exceptions import ErrorCode, InvalidParameterError
 
 
 class StubResult:
@@ -94,13 +94,18 @@ class StubResult:
 
 
 class StubSavepoint:
-    """模拟 ``AsyncSession.begin_nested()``（SAVEPOINT）：块内异常只回滚该 SAVEPOINT。"""
+    """模拟 ``AsyncSession.begin_nested()``（SAVEPOINT）：记录调用顺序，不模拟事务语义。
+
+    ⚠ 真实 SAVEPOINT 语义（``begin_nested()`` 会先 flush 未决变更、回滚后会话是否可用）无法用桩件表达，
+    由 ``tests/integration/test_data_layer_transactions.py`` 在真实数据库上验证。
+    """
 
     def __init__(self, session: StubSession) -> None:
         self._session = session
 
     async def __aenter__(self) -> StubSession:
         self._session.savepoints += 1
+        self._session.events.append("savepoint")
         return self._session
 
     async def __aexit__(
@@ -115,7 +120,7 @@ class StubSavepoint:
 
 
 class StubSession:
-    """记录 execute/add/flush 调用的最小 AsyncSession 替身。"""
+    """记录 execute/add/flush 调用的最小 AsyncSession 替身（``events`` 记录调用顺序）。"""
 
     def __init__(self) -> None:
         self.executed: list[tuple[Any, Any]] = []
@@ -124,6 +129,8 @@ class StubSession:
         self.savepoints = 0
         self.savepoint_rollbacks = 0
         self.expunged: list[Any] = []
+        #: 调用顺序日志（savepoint / add / flush），用于断言写路径 SAVEPOINT 纪律
+        self.events: list[str] = []
         self._queue: list[StubResult | Exception] = []
 
     def queue(self, *results: StubResult | Exception) -> None:
@@ -139,15 +146,18 @@ class StubSession:
 
     def add(self, instance: Any) -> None:
         self.added.append(instance)
+        self.events.append("add")
 
     def begin_nested(self) -> StubSavepoint:
         return StubSavepoint(self)
 
     def expunge(self, instance: Any) -> None:
         self.expunged.append(instance)
+        self.events.append("expunge")
 
     async def flush(self) -> None:
         self.flushed += 1
+        self.events.append("flush")
 
     async def rollback(self) -> None:
         pass
@@ -880,7 +890,10 @@ async def test_telemetry_latest_point_orders_desc_and_returns_first() -> None:
 
 
 async def test_telemetry_purge_before_deletes_in_batches() -> None:
-    """物理清理分批执行：每批一个短事务（避免长事务/WAL 膨胀），末批不足即停止。"""
+    """物理清理按**语句**分批：每批一条 DELETE（行数受 batch_size 限制），末批不足即停止。
+
+    注意：事务边界仍归调用方（Repository 不 commit），大表清理须由调用方按批 commit。
+    """
     repo, stub = repo_pair(VehicleTelemetryRepository)
     stub.queue(StubResult(rowcount=5000), StubResult(rowcount=1200))
 
@@ -906,12 +919,42 @@ async def test_telemetry_purge_before_respects_max_rows() -> None:
     assert "LIMIT 100" in compiled(stub.executed[0][0], literal=True)
 
 
+async def test_telemetry_purge_before_respects_max_batches() -> None:
+    """批次数上限：防止无上限循环长时间占用连接（每批都满时按 max_batches 截断）。"""
+    repo, stub = repo_pair(VehicleTelemetryRepository)
+    stub.queue(StubResult(rowcount=100), StubResult(rowcount=100), StubResult(rowcount=100))
+
+    removed = await repo.purge_before(
+        datetime(2026, 6, 1, tzinfo=UTC), batch_size=100, max_batches=2
+    )
+
+    assert removed == 200
+    assert len(stub.executed) == 2, "达到 max_batches 即停止，不进入第 3 批"
+
+
 async def test_telemetry_purge_before_rejects_bad_batch_params() -> None:
     repo, _stub = repo_pair(VehicleTelemetryRepository)
     with pytest.raises(InvalidParameterError):
         await repo.purge_before(datetime(2026, 6, 1, tzinfo=UTC), batch_size=0)
     with pytest.raises(InvalidParameterError):
         await repo.purge_before(datetime(2026, 6, 1, tzinfo=UTC), max_rows=0)
+    with pytest.raises(InvalidParameterError):
+        await repo.purge_before(datetime(2026, 6, 1, tzinfo=UTC), max_batches=0)
+
+
+async def test_telemetry_list_points_requires_time_window() -> None:
+    """时序序列读取必须有界：无 start_time / end_time 抛 2001（禁止全量扫描 hypertable）。"""
+    repo, stub = repo_pair(VehicleTelemetryRepository)
+
+    with pytest.raises(InvalidParameterError) as excinfo:
+        await repo.list_points("HUNTER-001")
+
+    assert excinfo.value.code == ErrorCode.INVALID_PARAM
+    assert stub.executed == [], "无窗口请求不得发出 SQL"
+
+    stub.queue(StubResult([]))
+    await repo.list_points("HUNTER-001", end_time=datetime(2026, 9, 20, tzinfo=UTC))
+    assert "time <= " in compiled(stub.executed[0][0], literal=True)
 
 
 async def test_telemetry_series_read_allows_points_above_page_limit() -> None:
@@ -928,7 +971,12 @@ async def test_telemetry_series_read_allows_points_above_page_limit() -> None:
     assert "LIMIT 2000" in compiled(stub.executed[0][0], literal=True)
 
     with pytest.raises(InvalidParameterError):
-        await repo.list_points("HUNTER-001", limit=10001)
+        await repo.list_points(
+            "HUNTER-001",
+            start_time=datetime(2026, 9, 19, tzinfo=UTC),
+            end_time=datetime(2026, 9, 20, tzinfo=UTC),
+            limit=10001,
+        )
 
 
 async def test_telemetry_repository_rejects_single_column_primary_key_semantics() -> None:
@@ -1030,7 +1078,27 @@ async def test_metric_series_read_allows_points_above_page_limit() -> None:
     assert "LIMIT 5000" in compiled(stub.executed[0][0], literal=True)
 
     with pytest.raises(InvalidParameterError):
-        await repo.list_series("HUNTER-001", limit=10001)
+        await repo.list_series(
+            "HUNTER-001",
+            start_time=datetime(2026, 9, 19, tzinfo=UTC),
+            end_time=datetime(2026, 9, 20, tzinfo=UTC),
+            limit=10001,
+        )
+
+
+async def test_metric_list_series_requires_time_window() -> None:
+    """时序序列读取必须有界：指标趋势查询无时间窗抛 2001。"""
+    repo, stub = repo_pair(AlgorithmMetricRepository)
+
+    with pytest.raises(InvalidParameterError) as excinfo:
+        await repo.list_series("HUNTER-001", module=MetricModule.PERCEPTION)
+
+    assert excinfo.value.code == ErrorCode.INVALID_PARAM
+    assert stub.executed == [], "无窗口请求不得发出 SQL"
+
+    stub.queue(StubResult([]))
+    await repo.list_series("HUNTER-001", start_time=datetime(2026, 9, 19, tzinfo=UTC))
+    assert "time >= " in compiled(stub.executed[0][0], literal=True)
 
 
 async def test_metric_repository_rejects_single_column_primary_key_semantics() -> None:

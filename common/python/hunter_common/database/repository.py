@@ -1,8 +1,13 @@
 """通用 Repository 基类：CRUD + 分页查询 + 软删除 + 批量写入。
 
 设计要点（对齐开发规则与性能指标）：
-- 只负责数据访问，**不提交事务**（事务边界由调用方或 DatabaseSessionManager 控制）；
-  ``create`` / ``update`` 用 SAVEPOINT 局部回滚约束冲突，失败后会话仍可用（外事务不受影响）
+- 只负责数据访问，**不提交事务、也不 rollback**（事务边界由调用方或 DatabaseSessionManager 控制）
+- **写路径纪律（SAVEPOINT 顺序，不可违反）**：``create`` / ``update`` 的 ``add`` / ``setattr`` 必须位于
+  ``begin_nested()`` 之后 —— SQLAlchemy 进入 SAVEPOINT 时会先 ``flush()`` 未决变更
+  （``SessionTransaction._take_snapshot``），写在 SAVEPOINT 之前会让 INSERT/UPDATE 落到 SAVEPOINT **之外**，
+  冲突时**整个会话事务被回滚**（后续 commit 抛 ``PendingRollbackError``，调用方已写数据全部丢失）；
+  SAVEPOINT 回滚本身已把失败行移出会话，**禁止再调用 ``session.expunge()``**
+  （实例已不在会话中，会抛 ``InvalidRequestError``，把本应返回的 3002/2001 变成 5000）
 - 默认过滤软删除记录（模型继承 ``SoftDeleteMixin`` 时），``include_deleted=True`` 可显式包含
 - ``filters`` 的键必须是模型真实列名（非法键抛 2001 参数错误），值走参数绑定（禁止拼接 SQL）；
   写路径（``create`` / ``bulk_create`` / ``bulk_create_ignore_conflicts``）同样做列名白名单校验
@@ -28,14 +33,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar, cast
 
-from sqlalchemy import ColumnElement, Select, delete, func, insert, select
+from sqlalchemy import Column, ColumnElement, Select, Table, delete, func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.interfaces import ORMOption
+from sqlalchemy.sql.util import find_tables
 
 from hunter_common.database.base import Base, supports_soft_delete
 from hunter_common.exceptions import (
+    HunterBaseException,
     InvalidParameterError,
     ResourceAlreadyExistsError,
     ResourceNotFoundError,
@@ -43,16 +50,20 @@ from hunter_common.exceptions import (
 
 ModelT = TypeVar("ModelT", bound=Base)
 
-#: 分页大小上限（保护接口 P95 ≤ 200ms，防止一次拉取过多数据）
+#: 分页大小上限（阈值来源：系统关键约束第 10 条「API 接口响应 P95 ≤ 200ms」，防止一次拉取过多数据）
 MAX_PAGE_SIZE = 200
 #: 默认分页大小
 DEFAULT_PAGE_SIZE = 20
-#: 批量写入分片大小
+#: 批量写入分片大小（阈值来源：系统关键约束第 10 条「时序数据写入 ≥ 10000 点/秒」；单分片 1000 行减少往返）
 BULK_CHUNK_SIZE = 1000
-#: 时序序列读取上限（轨迹回放 / 指标趋势；仅时序 Repository 放宽 ``max_query_limit``）
+#: 时序序列读取上限（阈值来源：系统关键约束第 10 条「P95 ≤ 200ms」；
+#: 轨迹回放 / 指标趋势序列，仅时序 Repository 放宽 ``max_query_limit``，且必须有时间窗）
 MAX_SERIES_POINTS = 10000
-#: 物理清理默认批大小（``purge_before``：限制单事务规模，避免长事务与 WAL 放大）
+#: 物理清理默认批大小（``purge_before``；阈值来源：系统关键约束第 6 条「vehicle_telemetry 保留 90 天」）。
+#: ⚠ 仅限制**单条 DELETE 语句**的行数，不代表分批提交 —— 事务边界归调用方（Repository 不 commit）
 DEFAULT_PURGE_BATCH_SIZE = 5000
+#: ``purge_before`` 单次调用最多批次数（防止无上限循环长时间占用连接；调用方可显式调高）
+DEFAULT_PURGE_BATCH_LIMIT = 1000
 #: PostgreSQL 唯一约束冲突错误码（23505 unique_violation）
 _PG_UNIQUE_VIOLATION = "23505"
 #: 排序 spec 的空值位次后缀（与 DDL 索引 ``NULLS LAST`` 对齐）
@@ -122,8 +133,8 @@ class BaseRepository(Generic[ModelT]):
     # ---------- 内部工具 ----------
 
     @property
-    def table(self) -> Any:
-        return self.model.__table__
+    def table(self) -> Table:
+        return cast(Table, self.model.__table__)
 
     @property
     def pk_names(self) -> tuple[str, ...]:
@@ -139,7 +150,7 @@ class BaseRepository(Generic[ModelT]):
         return self.pk_names[0]
 
     @property
-    def pk_column(self) -> Any:
+    def pk_column(self) -> Column[Any]:
         return self.table.columns[self.pk_name]
 
     @property
@@ -152,7 +163,7 @@ class BaseRepository(Generic[ModelT]):
         """模型合法列名集合（按模型缓存；写路径白名单校验用）。"""
         return _column_names(self.model)
 
-    def column(self, name: str) -> Any:
+    def column(self, name: str) -> Column[Any]:
         """校验并返回列对象；非法列名抛 2001（防止任意属性访问与注入）。"""
         if name not in self.table.columns:
             raise InvalidParameterError(
@@ -160,6 +171,20 @@ class BaseRepository(Generic[ModelT]):
                 details={"model": self.model.__name__, "field": name},
             )
         return self.table.columns[name]
+
+    def require_time_window(
+        self, start: Any | None, end: Any | None, *, operation: str
+    ) -> None:
+        """时序序列读取必须给出时间窗（契约 orm-mapping 第 3.3 节）。
+
+        vehicle_telemetry / algorithm_metrics 是 hypertable，无窗口查询会退化为全量扫描
+        （单车辆历史可达百万行），直接违背 P95 ≤ 200ms（系统关键约束第 10 条）。
+        """
+        if start is None and end is None:
+            raise InvalidParameterError(
+                f"{operation} 必须提供 start_time 或 end_time（时序序列读取需有界，禁止全量扫描）",
+                details={"model": self.model.__name__, "operation": operation},
+            )
 
     def ensure_known_columns(self, names: Iterable[str]) -> None:
         """写路径列名白名单校验（非法列名抛 2001，替代 SQLAlchemy ``TypeError`` → 5000）。"""
@@ -250,7 +275,7 @@ class BaseRepository(Generic[ModelT]):
         return stmt.order_by(*(self.order_clause(spec) for spec in specs))
 
     @staticmethod
-    def translate_integrity_error(exc: IntegrityError, model_name: str) -> Exception:
+    def translate_integrity_error(exc: IntegrityError, model_name: str) -> HunterBaseException:
         """将 IntegrityError 翻译为平台预定义错误码异常（3002 唯一冲突 / 2001 约束失败）。
 
         安全：``details`` 只保留模型名、SQLSTATE 与**约束名**（标识符）。
@@ -284,18 +309,18 @@ class BaseRepository(Generic[ModelT]):
     async def create(self, **values: Any) -> ModelT:
         """新增记录（flush 但不 commit）；非法字段 → 2001、唯一键冲突 → 3002。
 
-        事务：flush 包在 SAVEPOINT（``begin_nested``）中 —— 约束冲突只回滚该 SAVEPOINT，
-        调用方的外事务与已 flush 的其他写入不受影响，失败后会话仍可继续使用；
-        失败行同时从会话中移除，避免调用方继续提交时重放同一冲突行。
+        事务：``add`` 与 ``flush`` 均在 SAVEPOINT（``begin_nested``）**内部** —— 见模块 docstring
+        「写路径纪律」：SAVEPOINT 之前的未决变更会被隐式 flush 到 SAVEPOINT 之外，使冲突回滚整个会话事务。
+        约束冲突只回滚该 SAVEPOINT（不侵占调用方事务边界）；失败行由 SAVEPOINT 回滚自动移出会话，
+        **不得再调用 ``session.expunge()``**（实测会抛 ``InvalidRequestError``，把 3002 变成 5000）。
         """
         self.ensure_known_columns(values)
         instance = self.model(**values)
-        self.session.add(instance)
         try:
             async with self.session.begin_nested():
+                self.session.add(instance)
                 await self.session.flush()
         except IntegrityError as exc:
-            self.session.expunge(instance)
             raise self.translate_integrity_error(exc, self.model.__name__) from exc
         return instance
 
@@ -369,13 +394,16 @@ class BaseRepository(Generic[ModelT]):
     async def update(self, instance: ModelT, **values: Any) -> ModelT:
         """按字段更新（非法字段 → 2001；flush 但不 commit；约束冲突 → 3002/2001）。
 
-        事务：与 ``create`` 一致，flush 包在 SAVEPOINT 中，冲突只回滚该 SAVEPOINT。
+        事务：与 :meth:`create` 一致，``setattr`` 与 ``flush`` 都在 SAVEPOINT **内部**
+        （先 ``setattr`` 会被 ``begin_nested()`` 的隐式 flush 提前发出 → SAVEPOINT 失效）。
+        冲突时只回滚该 SAVEPOINT，实例属性被还原/过期（调用方需按需重新加载），外事务保持可用。
         """
-        for name, value in values.items():
+        for name in values:
             self.column(name)
-            setattr(instance, name, value)
         try:
             async with self.session.begin_nested():
+                for name, value in values.items():
+                    setattr(instance, name, value)
                 await self.session.flush()
         except IntegrityError as exc:
             raise self.translate_integrity_error(exc, self.model.__name__) from exc
@@ -404,10 +432,17 @@ class BaseRepository(Generic[ModelT]):
         """按条件物理删除，返回删除行数（用于关联表解绑等场景）。
 
         Raises:
-            InvalidParameterError: 未提供条件（防止误删整表）。
+            InvalidParameterError: 未提供条件，或存在**不引用本模型表列**的条件
+                （防呆：拒绝 ``literal_column("1=1")`` 之类恒真条件从而误删整表）。
         """
         if not conditions:
             raise InvalidParameterError("delete_where 必须提供至少一个条件")
+        for condition in conditions:
+            if self.table not in find_tables(condition, check_columns=True):
+                raise InvalidParameterError(
+                    "delete_where 的每个条件都必须引用本模型表列（防止误删整表）",
+                    details={"model": self.model.__name__},
+                )
         stmt = delete(self.model).where(*conditions)
         result = await self.session.execute(stmt)
         await self.session.flush()
@@ -574,6 +609,7 @@ class BaseRepository(Generic[ModelT]):
 __all__ = [
     "BULK_CHUNK_SIZE",
     "DEFAULT_PAGE_SIZE",
+    "DEFAULT_PURGE_BATCH_LIMIT",
     "DEFAULT_PURGE_BATCH_SIZE",
     "MAX_PAGE_SIZE",
     "MAX_SERIES_POINTS",

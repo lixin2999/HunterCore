@@ -64,9 +64,9 @@ lint:
 unit:
   stage: unit
   script:
-    - pytest tests -m unit -q
-    # 共享库与各服务单元测试（不依赖容器）
-    - pytest common/python services -m "not integration and not e2e and not performance" -q
+    # 6 个服务共用顶层包名 app，必须分进程收集（见 scripts/run_unit_tests.py 说明）：
+    # 同进程收集 services 下多个目录会 ModuleNotFoundError / Plugin already registered
+    - python scripts/run_unit_tests.py
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

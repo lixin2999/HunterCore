@@ -59,8 +59,22 @@ DDL 定义表结构，本文件定义「ORM 如何映射这些结构」「每个
 
 **命名规范**：`<Entity>Repository`，与被映射的 ORM 类同名对应；一个模型**恰好**一个 Repository 类。
 **事务边界**：Repository 只 `flush`，**不在内部提交/回滚**（事务边界由调用方 / `DatabaseSessionManager.session()` 控制）；
-`create` / `update` / 批量写入的每个分片用 **SAVEPOINT**（`begin_nested`）包裹，约束冲突只回滚该 SAVEPOINT，
-外事务与已写入分片不受影响（调用方无需因为 3002/2001 丢弃整个事务）。
+`create` / `update` 与批量写入的每个分片用 **SAVEPOINT**（`begin_nested`）包裹，约束冲突只回滚该 SAVEPOINT，
+**调用方外事务与已写入分片不受影响**（捕获 3002/2001 后无需丢弃整个事务）。
+
+<!-- write-path-discipline:start -->
+**写路径纪律（SAVEPOINT 顺序；实现与测试强校验，不可违反）**：
+
+1. `create` / `update` 的 `add` / `setattr` **必须位于 `begin_nested()` 之后**：SQLAlchemy 进入
+   SAVEPOINT 时会先 `flush()` 未决变更（`SessionTransaction._take_snapshot`），写在 SAVEPOINT 之前的语句
+   会落到 SAVEPOINT **之外**，冲突时整个会话事务被回滚（后续 `commit()` 抛 `PendingRollbackError`，
+   调用方已写数据全部丢失）。
+2. 冲突后**禁止调用 `session.expunge()`**：SAVEPOINT 回滚已把失败行移出会话，再 `expunge` 会抛
+   `InvalidRequestError`，使本应返回的 3002/2001 退化为 5000。
+3. 同类纪律适用于批量路径：每个分片在 SAVEPOINT **内部**执行（`execute` 之前不得有未决 ORM 变更）。
+4. 校验手段：`common/python/tests/test_repository_transactions.py`（真实 Session，unit 阶段）+
+   `tests/integration/test_data_layer_transactions.py`（真实 PostgreSQL，integration 阶段）。
+<!-- write-path-discipline:end -->
 **错误码**：唯一冲突 → 3002、缺失 → 3001、非法列名/字段/参数 → 2001（均由 `BaseRepository` 统一映射，
 且 `details` 只允许携带模型名 / SQLSTATE / 约束名，**禁止**携带驱动原始报错文本与行值）。
 **查询安全**：`filters` 键必须是真实列名；条件一律参数绑定，禁止字符串拼接 SQL；
@@ -95,7 +109,7 @@ DDL 定义表结构，本文件定义「ORM 如何映射这些结构」「每个
 | `find_one` / `find_all` | 自定义条件查询 | 条件为 ORM 列表达式（参数绑定）；自动附加软删除过滤；支持 `options=`；`limit ≤ max_query_limit` |
 | `list` / `paginate` | 列表 / 分页 | `page ≥ 1`、`1 ≤ page_size ≤ 200`（保护 P95 ≤ 200ms）；排序 spec 见 3.2 节 |
 | `count` / `exists` | 计数 / 存在性 | `exists` 走 `LIMIT 1`，比 `count` 轻 |
-| `create` / `update` | 单条写 | SAVEPOINT 内 `flush`，不 commit；唯一冲突 → 3002、非法字段 → 2001 |
+| `create` / `update` | 单条写 | SAVEPOINT 内 `flush`，不 commit；唯一冲突 → 3002、非法字段 → 2001；`add` / `setattr` 必须在 SAVEPOINT 内（见本节「写路径纪律」） |
 | `bulk_create` | 批量插入 | executemany 分片（`BULK_CHUNK_SIZE`），时序写入 ≥ 10000 点/秒；返回**提交行数** |
 | `bulk_create_ignore_conflicts` | 幂等批量插入 | `ON CONFLICT (…) DO NOTHING`，消费重放/重复时间点跳过；返回**提交（attempted）行数**（被跳过的重复行仍计入，异步驱动无法提供精确插入行数） |
 | `delete_where` / `hard_delete` | 条件删除 / 物理删除 | 仅用于关联表解绑与超期数据清理；`scenes` 一律走 `soft_delete`；**复合主键模型禁用 `hard_delete`** |
@@ -129,13 +143,16 @@ DDL 定义表结构，本文件定义「ORM 如何映射这些结构」「每个
 | `VehicleTelemetryRepository` | `time DESC` | `idx_vehicle_telemetry_vehicle_time` |
 | `AlgorithmMetricRepository` | `time DESC` | `idx_algorithm_metrics_vehicle_time` |
 
-### 3.3 读取上限（`max_query_limit`）
+### 3.3 读取上限（`max_query_limit`）与序列读取窗口
 
+<!-- series-window-rule:start -->
 - 通用读方法默认 `limit ≤ 200`（`MAX_PAGE_SIZE`，对齐分页接口契约与 P95 ≤ 200ms）；
-- `VehicleTelemetryRepository` / `AlgorithmMetricRepository` 放宽到
-  `MAX_SERIES_POINTS = 10000`（轨迹回放 / 指标趋势序列），**调用方必须给出时间窗**
-  （`start_time` / `end_time`），否则单次拉取会拖垮 P95；
+- 时序序列读取（`VehicleTelemetryRepository.list_points` / `AlgorithmMetricRepository.list_series`）
+  放宽到 `MAX_SERIES_POINTS = 10000`，且**强制要求时间窗**：`start_time` / `end_time` 至少提供一个，
+  否则抛 **2001** —— 无窗口查询会全量扫描该车辆的 hypertable 历史（单车辆可达百万行），
+  直接违背 P95 ≤ 200ms；
 - `paginate` 的 `page_size` 始终 ≤ 200（对外分页契约不因时序放宽而上浮）。
+<!-- series-window-rule:end -->
 
 ### 3.4 显式加载策略（`options=`）
 
@@ -149,8 +166,27 @@ tasks = await OtaTaskRepository(session).find_all(
 )
 ```
 
-## 4. 服务层 Repository 收敛路径（迁移契约）
+### 3.5 服务 → 共享 Repository 白名单（跨服务边界）
 
+共享包 `hunter_common.database.repositories` 同时暴露 13 个模型的数据访问能力，因此**必须用白名单约束
+服务边界**（禁止跨服务直接访问其他服务的数据库 schema）。白名单由 `scripts/verify_data_layer.py`
+**校验 14** 强制：服务源码中出现未授权 Repository 导入即校验失败。
+
+<!-- service-repository-table:start -->
+| 服务 | 允许使用的共享 Repository | 说明 |
+|------|--------------------------|------|
+| `scene-service` | `SceneRepository` | `scene_svc.scenes`（软删除） |
+| `data-collector` | `EventRepository`、`VehicleTelemetryRepository` | `data_collector.events` / `vehicle_telemetry`（写路径幂等） |
+| `data-analytics` | `AlgorithmMetricRepository`、`EventRepository`、`VehicleTelemetryRepository` | 分析读取（时序 + 事件，只读） |
+| `ota-service` | `OtaVersionRepository`、`OtaTaskRepository`、`OtaRecordRepository` | `ota_svc` 三表（灰度成功率统计等） |
+| `api-gateway` | `UserRepository`、`RoleRepository`、`PermissionRepository`、`UserRoleRepository`、`RolePermissionRepository`、`VehicleRepository` | 鉴权链路（`user_svc` RBAC 五表）+ 车辆台账只读 |
+| `remote-control` | `VehicleRepository` | 车辆状态读取（状态写入走 REST 调 vehicle-service） |
+<!-- service-repository-table:end -->
+
+⚠ 未列入白名单的 schema（如车辆主数据写入、其他服务业务表）必须通过 REST API 访问
+（例：车辆信息 `/api/v1/vehicle/**`），不得直接使用其 Repository。
+
+## 4. 服务层 Repository 收敛路径（迁移契约）
 `common/python/hunter_common/database/repositories/` 是**唯一数据访问实现**的最终形态；
 迁移期各服务 `services/*/app/repositories/*.py` 仍存在**同名同表**的过渡实现（构造签名与事务粒度不同：
 服务层为 `db: DatabaseSessionManager` 且每个方法独立事务，共享层为 `session: AsyncSession` 且由调用方控制事务）。
@@ -174,8 +210,14 @@ tasks = await OtaTaskRepository(session).find_all(
 pytest common/python/tests/test_orm_relationships.py -q
 pytest common/python/tests/test_repositories.py -q
 pytest common/python/tests/test_repository.py -q
+# 写路径 SAVEPOINT 语义（真实 Session，sqlite+aiosqlite，无需容器）
+pytest common/python/tests/test_repository_transactions.py -q
 
-# 数据层契约校验（含校验 11 模型↔仓库、12 relationship 异步安全、13 本文件与实现同步）
+# 数据层契约校验（含校验 11 模型↔仓库、12 relationship 异步安全、13 本文件与实现同步、
+# 14 服务→Repository 白名单、15 写路径纪律与序列窗口规则声明）
 python scripts/verify_data_layer.py
+
+# 真实 PostgreSQL/TimescaleDB 事务语义（docker-compose 或 testcontainers，无 Docker 自动 skip）
+pytest tests/integration/test_data_layer_transactions.py -m integration -q
 ```
 

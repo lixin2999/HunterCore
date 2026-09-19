@@ -28,6 +28,9 @@ dependencies = [
 dev = [
     "pytest>=8.0,<9",
     "pytest-asyncio>=0.23,<1",
+    # 真实 Session 语义测试（tests/test_repository_transactions.py：SAVEPOINT/事务边界回归）
+    # 用 sqlite+aiosqlite 驱动，无需容器即可在单元阶段守护写路径纪律；仅测试依赖，运行时不使用
+    "aiosqlite>=0.19,<1",
     "ruff>=0.4,<1",
     "mypy>=1.8,<2",
 ]

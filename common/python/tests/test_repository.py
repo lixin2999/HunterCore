@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import literal_column
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 
@@ -48,8 +49,9 @@ class StubResult:
 class StubSavepoint:
     """模拟 ``AsyncSession.begin_nested()`` 返回的 SAVEPOINT 上下文。
 
-    语义与 SQLAlchemy 一致：块内异常只回滚 SAVEPOINT（``savepoint_rollbacks`` +1），
-    异常继续向上抛出，外层事务不受影响。
+    ⚠ 仅用于校验**调用顺序**与 SQL 形状：真正的 SAVEPOINT 事务语义（``begin_nested()`` 会先
+    ``flush()`` 未决变更、回滚后会话是否可用）由 SQLAlchemy 自身决定，不能用桩件代替
+    —— 见 ``tests/integration/test_data_layer_transactions.py``（真实数据库，``integration`` 标记）。
     """
 
     def __init__(self, session: StubSession) -> None:
@@ -57,6 +59,7 @@ class StubSavepoint:
 
     async def __aenter__(self) -> StubSession:
         self._session.savepoints += 1
+        self._session.events.append("savepoint")
         return self._session
 
     async def __aexit__(
@@ -71,7 +74,7 @@ class StubSavepoint:
 
 
 class StubSession:
-    """记录 execute/add/flush 调用的最小 AsyncSession 替身。"""
+    """记录 execute/add/flush 调用的最小 AsyncSession 替身（``events`` 记录调用顺序）。"""
 
     def __init__(self, *, flush_error: Exception | None = None) -> None:
         self.executed: list[tuple[Any, Any]] = []
@@ -82,6 +85,8 @@ class StubSession:
         self.savepoint_rollbacks = 0
         self.expunged: list[Any] = []
         self.deleted: list[Any] = []
+        #: 调用顺序日志（savepoint / add / setattr / flush / expunge），用于断言写路径 SAVEPOINT 纪律
+        self.events: list[str] = []
         self._queue: list[StubResult] = []
         self._flush_error = flush_error
 
@@ -98,15 +103,18 @@ class StubSession:
 
     def add(self, instance: Any) -> None:
         self.added.append(instance)
+        self.events.append("add")
 
     def begin_nested(self) -> StubSavepoint:
         return StubSavepoint(self)
 
     def expunge(self, instance: Any) -> None:
         self.expunged.append(instance)
+        self.events.append("expunge")
 
     async def flush(self) -> None:
         self.flushed += 1
+        self.events.append("flush")
         if self._flush_error is not None:
             raise self._flush_error
 
@@ -143,15 +151,32 @@ def vehicle_repo(session: StubSession | None = None) -> tuple[VehicleRepository,
     return VehicleRepository(stub), stub  # type: ignore[arg-type]
 
 
+class SetattrSpy:
+    """记录属性写入顺序的替身：用于断言 ``update`` 的 ``setattr`` 发生在 SAVEPOINT 内。"""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__setattr__("_events", events)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self._events.append("setattr")
+        super().__setattr__(name, value)
+
+
 # ---------- 写操作 ----------
 
 
-async def test_create_adds_instance_and_flushes() -> None:
+async def test_create_adds_instance_inside_savepoint() -> None:
+    """写路径纪律：``add`` 必须发生在 SAVEPOINT **内部**。
+
+    依据：SQLAlchemy ``begin_nested()`` 会先 ``flush()`` 未决变更（``_take_snapshot``），
+    SAVEPOINT 之前的 ``add`` 会让 INSERT 落到 SAVEPOINT 之外，冲突回滚整个会话事务。
+    """
     repo, stub = scene_repo()
     scene = await repo.create(scene_name="crossing", scene_type="urban", creator=uuid4())
     assert isinstance(scene, Scene)
     assert stub.added == [scene]
     assert stub.flushed == 1
+    assert stub.events == ["savepoint", "add", "flush"]
 
 
 async def test_create_translates_unique_violation_to_3002() -> None:
@@ -162,10 +187,13 @@ async def test_create_translates_unique_violation_to_3002() -> None:
     with pytest.raises(ResourceAlreadyExistsError) as excinfo:
         await repo.create(scene_name="dup", scene_type="urban", creator=uuid4())
     assert excinfo.value.code == ErrorCode.RESOURCE_ALREADY_EXISTS
-    # SAVEPOINT 局部回滚：外事务不被回滚、失败行被移出会话、约束名进入 details（不含行值）
+    # SAVEPOINT 局部回滚：外事务不被回滚、失败行由 SAVEPOINT 回滚移出会话、约束名进入 details（不含行值）
     assert stub.savepoint_rollbacks == 1
     assert stub.rolled_back == 0, "禁止回滚调用方外事务（事务边界属调用方）"
-    assert len(stub.expunged) == 1
+    assert stub.expunged == [], (
+        "禁止 expunge：SAVEPOINT 回滚已把失败行移出会话，再 expunge 会抛 InvalidRequestError（3002 → 5000）"
+    )
+    assert stub.events[:2] == ["savepoint", "add"], "add 必须在 SAVEPOINT 内"
     assert excinfo.value.details["constraint"] == "uq_scenes_scene_name"
     assert "dup" not in str(excinfo.value.details), "details 禁止携带冲突行的键值"
 
@@ -181,6 +209,7 @@ async def test_create_translates_check_violation_to_2001() -> None:
     assert excinfo.value.code == ErrorCode.INVALID_PARAM
     assert stub.savepoint_rollbacks == 1
     assert stub.rolled_back == 0
+    assert stub.expunged == [], "同 create：失败行由 SAVEPOINT 回滚移出会话"
     assert excinfo.value.details["constraint"] == "scenes_status_check"
 
 
@@ -201,6 +230,17 @@ async def test_update_sets_allowed_columns_and_rejects_unknown() -> None:
     assert stub.flushed == 1
     with pytest.raises(InvalidParameterError):
         await repo.update(scene, not_a_column=1)
+
+
+async def test_update_writes_attributes_inside_savepoint() -> None:
+    """写路径纪律：``setattr`` 必须在 SAVEPOINT 内（先 setattr 会被隐式 flush 提前发出 UPDATE）。"""
+    repo, stub = scene_repo()
+    spy = SetattrSpy(stub.events)
+
+    await repo.update(spy, scene_name="renamed")  # type: ignore[arg-type]
+
+    assert stub.events == ["savepoint", "setattr", "flush"]
+    assert spy.scene_name == "renamed"
 
 
 async def test_soft_delete_sets_timestamp_and_requires_capability() -> None:
@@ -300,6 +340,34 @@ async def test_bulk_create_rejects_non_positive_chunk_size() -> None:
     repo, _ = scene_repo()
     with pytest.raises(InvalidParameterError):
         await repo.bulk_create([{"scene_name": "s"}], chunk_size=0)
+
+
+# ---------- 条件删除（防误删整表）----------
+
+
+async def test_delete_where_rejects_condition_without_model_columns() -> None:
+    """防呆：不引用本模型表列的恒真条件（如 ``literal_column("1=1")``）必须拒绝。"""
+    repo, stub = scene_repo()
+    with pytest.raises(InvalidParameterError) as excinfo:
+        await repo.delete_where(literal_column("1=1"))
+    assert excinfo.value.code == ErrorCode.INVALID_PARAM
+    assert stub.executed == [], "被拒绝的条件不得发出 SQL"
+
+
+async def test_delete_where_accepts_model_conditions_and_returns_rowcount() -> None:
+    repo, stub = scene_repo()
+    stub.queue(StubResult(rowcount=1))
+
+    removed = await repo.delete_where(Scene.scene_id == uuid4())
+
+    assert removed == 1
+    assert compiled(stub.executed[0][0]).startswith("DELETE FROM scene_svc.scenes")
+
+
+async def test_delete_where_requires_at_least_one_condition() -> None:
+    repo, _ = scene_repo()
+    with pytest.raises(InvalidParameterError):
+        await repo.delete_where()
 
 
 # ---------- 排序 spec（空值位次）----------

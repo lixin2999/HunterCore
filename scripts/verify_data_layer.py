@@ -18,6 +18,8 @@
   11. 模型 ↔ Repository 一一对应（hunter_common.database.repositories.REPOSITORY_BY_MODEL ↔ ALL_MODELS）
   12. relationship 异步安全 lazy 策略（契约 orm-mapping.md 第 1 节白名单，禁止隐式 lazy="select"）
   13. ORM 映射与 Repository 契约文档（contracts/database/orm-mapping.md）↔ 实现同步
+  14. 服务 → 共享 Repository 白名单（orm-mapping.md 第 3.5 节；禁止跨服务直查其他服务 schema）
+  15. 写路径纪律与序列读取窗口规则在契约中显式声明（SAVEPOINT 顺序 / 禁止 expunge / 时序必须有窗口）
 
 用法：python scripts/verify_data_layer.py
 退出码：0 全部通过；1 存在失败项
@@ -50,6 +52,27 @@ REPOSITORY_TABLE_START = "<!-- repository-table:start -->"
 REPOSITORY_TABLE_END = "<!-- repository-table:end -->"
 BASE_METHODS_TABLE_START = "<!-- base-methods-table:start -->"
 BASE_METHODS_TABLE_END = "<!-- base-methods-table:end -->"
+#: 服务 → Repository 白名单区块标记（orm-mapping.md 第 3.5 节，禁止跨服务直查其他服务 schema）
+SERVICE_REPOSITORY_TABLE_START = "<!-- service-repository-table:start -->"
+SERVICE_REPOSITORY_TABLE_END = "<!-- service-repository-table:end -->"
+#: 写路径纪律区块标记（SAVEPOINT 顺序 + 禁止 expunge）
+WRITE_PATH_DISCIPLINE_START = "<!-- write-path-discipline:start -->"
+WRITE_PATH_DISCIPLINE_END = "<!-- write-path-discipline:end -->"
+#: 时序读取窗口规则区块标记
+SERIES_WINDOW_RULE_START = "<!-- series-window-rule:start -->"
+SERIES_WINDOW_RULE_END = "<!-- series-window-rule:end -->"
+#: 共享 Repository 导入语句（from hunter_common.database[.repositories...] import ...）
+SHARED_REPOSITORY_IMPORT_RE = re.compile(
+    r"from\s+hunter_common\.database[\w.]*\s+import\s+([^#\n]+)"
+)
+#: Repository 类名（大驼峰 + Repository 后缀）
+REPOSITORY_CLASS_RE = re.compile(r"\b([A-Z]\w*Repository)\b")
+#: 服务 → Repository 白名单行：| `scene-service` | `SceneRepository`、`UserRepository` | 说明 |
+SERVICE_REPOSITORY_ROW_RE = re.compile(r"^\|\s*`([\w-]+)`\s*\|\s*([^|]+)\|", re.MULTILINE)
+#: 写路径纪律/窗口规则必须出现的关键锚点（契约不得静默丢失这些约束）
+WRITE_PATH_ANCHORS = ("begin_nested", "expunge", "SAVEPOINT")
+SERIES_WINDOW_ANCHORS = ("start_time", "end_time", "2001")
+SERVICES_DIR = ROOT / "services"
 #: 关系行：`Class.attr` 位于首列
 RELATION_ROW_RE = re.compile(r"^\|\s*`([A-Za-z_]\w*)\.([a-z_]\w*)`\s*\|", re.MULTILINE)
 #: Repository 行：`XxxRepository` | `Model`
@@ -677,6 +700,93 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
+def marked_block(text: str, start: str, end: str) -> str | None:
+    """截取 ``<!-- xxx:start -->`` 与 ``<!-- xxx:end -->`` 之间的区块（缺失返回 None）。"""
+    if start not in text or end not in text:
+        return None
+    return text.split(start, 1)[1].split(end, 1)[0]
+
+
+def parse_service_repository_allowlist() -> dict[str, set[str]]:
+    """解析 orm-mapping.md 第 3.5 节的服务 → 共享 Repository 白名单。"""
+    text = ORM_MAPPING_CONTRACT.read_text(encoding="utf-8")
+    block = marked_block(text, SERVICE_REPOSITORY_TABLE_START, SERVICE_REPOSITORY_TABLE_END)
+    if block is None:
+        return {}
+    allowlist: dict[str, set[str]] = {}
+    for service, names in SERVICE_REPOSITORY_ROW_RE.findall(block):
+        if service in {"服务", "service"}:
+            continue
+        allowlist[service] = set(REPOSITORY_CLASS_RE.findall(names))
+    return allowlist
+
+
+def collect_service_repository_usage() -> dict[str, set[str]]:
+    """扫描各服务源码，收集从 ``hunter_common.database`` 导入的 Repository 类名。"""
+    usage: dict[str, set[str]] = {}
+    for service_dir in sorted(path for path in SERVICES_DIR.iterdir() if path.is_dir()):
+        used: set[str] = set()
+        for source_path in service_dir.rglob("*.py"):
+            source = source_path.read_text(encoding="utf-8")
+            for match in SHARED_REPOSITORY_IMPORT_RE.finditer(source):
+                chunk = match.group(1)
+                if chunk.strip().startswith("("):
+                    end = source.find(")", match.end())
+                    chunk = source[match.end() : end] if end != -1 else chunk
+                used.update(REPOSITORY_CLASS_RE.findall(chunk))
+        usage[service_dir.name] = used
+    return usage
+
+
+def check_service_repository_boundaries() -> None:
+    """校验 14：服务 → 共享 Repository 白名单（防跨服务直查其他服务 schema）。"""
+    allowlist = parse_service_repository_allowlist()
+    if not allowlist:
+        fail("orm-mapping.md 缺少「服务 → Repository 白名单」表（第 3.5 节区块标记缺失）")
+        return
+
+    problems: list[str] = []
+    usage = collect_service_repository_usage()
+    for service, used in sorted(usage.items()):
+        allowed = allowlist.get(service)
+        if allowed is None:
+            problems.append(f"{service} 未登记白名单")
+            continue
+        unauthorized = used - allowed
+        if unauthorized:
+            problems.append(f"{service} 使用了未授权 Repository {sorted(unauthorized)}")
+
+    if problems:
+        fail("服务 → Repository 边界越界：" + "；".join(problems))
+    else:
+        ok(
+            f"服务 → Repository 白名单一致（{len(usage)} 个服务，越界 0 处；"
+            f"当前共享层实际被引用 {sum(len(v) for v in usage.values())} 处）"
+        )
+
+
+def check_write_path_and_window_contract() -> None:
+    """校验 15：写路径纪律与序列读取窗口规则必须在契约中显式声明（防文档静默丢失约束）。"""
+    text = ORM_MAPPING_CONTRACT.read_text(encoding="utf-8")
+    problems: list[str] = []
+    for name, start, end, anchors in (
+        ("写路径纪律", WRITE_PATH_DISCIPLINE_START, WRITE_PATH_DISCIPLINE_END, WRITE_PATH_ANCHORS),
+        ("序列读取窗口", SERIES_WINDOW_RULE_START, SERIES_WINDOW_RULE_END, SERIES_WINDOW_ANCHORS),
+    ):
+        block = marked_block(text, start, end)
+        if block is None:
+            problems.append(f"{name} 区块标记缺失")
+            continue
+        missing = [anchor for anchor in anchors if anchor not in block]
+        if missing:
+            problems.append(f"{name} 区块缺少关键锚点 {missing}")
+
+    if problems:
+        fail("契约声明不完整：" + "；".join(problems))
+    else:
+        ok("写路径纪律（SAVEPOINT 顺序 / 禁止 expunge）与序列读取窗口规则均已在契约显式声明")
+
+
 def parse_create_topic_calls(text: str) -> dict[str, tuple[int, int]]:
     """解析 ``create_topic "<name>" <partitions> <retention_ms>`` 调用（docker 脚本与 K8s Job 同格式）。"""
     pattern = re.compile(r'create_topic\s+"([\w.]+)"\s+(\d+)\s+(\d+)')
@@ -1159,6 +1269,8 @@ def main() -> int:
     check_hypertable_contract()
     check_alembic_offline_sql()
     check_orm_repository_layer()
+    check_service_repository_boundaries()
+    check_write_path_and_window_contract()
     check_kafka_topics()
     check_json_schemas()
     check_consumer_groups()

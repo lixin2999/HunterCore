@@ -4,7 +4,9 @@
 写入：批量 + ``ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING``（幂等），
 返回**提交（attempted）行数**（被跳过的重复点仍计入，异步驱动无法提供精确插入行数）；
 性能：批量写入 ≥ 10000 点/秒（executemany 分片），禁止逐条 INSERT + commit；
-读取：``max_query_limit`` 放宽到 ``MAX_SERIES_POINTS``（指标趋势序列），调用方必须给出时间窗；
+读取：``max_query_limit`` 放宽到 ``MAX_SERIES_POINTS``（指标趋势序列），
+且 ``list_series`` **强制要求时间窗**（``start_time`` / ``end_time`` 至少一个，否则 2001），
+禁止无界扫描 hypertable；
 保留策略（90 天）由 TimescaleDB ``add_retention_policy`` 负责，本层不提供物理删除。
 """
 from __future__ import annotations
@@ -51,10 +53,14 @@ class AlgorithmMetricRepository(BaseRepository[AlgorithmMetric]):
     ) -> list[AlgorithmMetric]:
         """按车辆（可选模块/指标名/时间窗）查询指标时序。
 
+        **必须给出时间窗**（``start_time`` 或 ``end_time`` 至少一个），否则抛 2001：
+        无窗口查询会全量扫描该车辆的指标历史（契约 orm-mapping 第 3.3 节，P95 ≤ 200ms）。
+
         命中 ``idx_algorithm_metrics_vehicle_time``（``vehicle_id, time DESC``，最早停）
         或 ``idx_algorithm_metrics_module_metric_time``（``module, metric_name, time DESC``，趋势图）；
         单车辆明细查询建议给出时间窗并显式传 ``vehicle_id``。
         """
+        self.require_time_window(start_time, end_time, operation="list_series")
         conditions: list[Any] = [AlgorithmMetric.vehicle_id == vehicle_id]
         if module is not None:
             conditions.append(AlgorithmMetric.module == module)

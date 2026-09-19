@@ -82,10 +82,10 @@ async def demo(db: AsyncSession) -> None:
 
 | 主题 | 规则 |
 |------|------|
-| 事务边界 | Repository 只 `flush`，不 commit/rollback；`create` / `update` / 批量分片用 SAVEPOINT，冲突只回滚该 SAVEPOINT（外事务与已写分片保留） |
+| 事务边界 | Repository 只 `flush`，不 commit/rollback；`create` / `update` / 批量分片用 SAVEPOINT，冲突只回滚该 SAVEPOINT（外事务与已写分片保留）。**写路径纪律**：`add` / `setattr` 必须在 `begin_nested()` 内（SAVEPOINT 之外的未决变更会被隐式 flush，冲突时回滚整个事务 → `PendingRollbackError`），冲突后禁止 `expunge`（会抛 `InvalidRequestError`，3002 → 5000） |
 | 错误码 | 唯一冲突 → 3002、缺失 → 3001、非法字段/列名/参数 → 2001；`details` 仅含模型名 / SQLSTATE / 约束名（不含行值） |
 | 排序 spec | `-col` = DESC、`-col:nl` = DESC NULLS LAST（可空列必写）、`col:nf` = NULLS FIRST |
-| 读取上限 | 默认 `limit ≤ 200`；`vehicle_telemetry` / `algorithm_metrics` 放宽到 `MAX_SERIES_POINTS = 10000`（须给时间窗）；`paginate.page_size` 恒 ≤ 200 |
+| 读取上限 | 默认 `limit ≤ 200`；`vehicle_telemetry` / `algorithm_metrics` 放宽到 `MAX_SERIES_POINTS = 10000`（`list_points` / `list_series` **强制要求时间窗**，否则 2001）；`paginate.page_size` 恒 ≤ 200 |
 | 复合主键 | `VehicleTelemetry` / `AlgorithmMetric` 禁用基类 `get` / `get_or_raise` / `hard_delete`（抛 `NotImplementedError`），改用 `get_point` / `list_series` 等专属方法 |
 | 幂等写入 | `insert_points` / `insert_metrics` / `insert_events` 走 `ON CONFLICT DO NOTHING`（消费重放安全） |
 | 物理清理 | `purge_before` 按 `ctid` 分批删除（短事务）；90 天保留仍由 TimescaleDB 保留策略负责 |

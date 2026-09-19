@@ -217,7 +217,7 @@ python scripts/verify_data_layer.py
 
 - **ORM 与 DDL 逐列一致**：列名、类型（TEXT/UUID/JSONB/TEXT[]/TIMESTAMPTZ/CHAR(n)…）、可空性、主键三方对齐，偏差会让校验脚本失败
 - **受控词表统一**：`hunter_common.database.enums` 的 `StrEnum` 是唯一来源，DB 侧用 `TEXT + CHECK`（便于扩展），`StrEnumType` 拒绝非法取值
-- **通用 Repository**：`BaseRepository`（CRUD + 分页 + 软删除 + `ON CONFLICT DO NOTHING` 批量写入），默认过滤软删除记录，非法字段抛 2001；写入用 SAVEPOINT 局部回滚（不侵占调用方事务边界）
+- **通用 Repository**：`BaseRepository`（CRUD + 分页 + 软删除 + `ON CONFLICT DO NOTHING` 批量写入），默认过滤软删除记录，非法字段抛 2001；写入用 SAVEPOINT 局部回滚（`add`/`setattr` 必须在 SAVEPOINT 内、冲突后禁止 `expunge`，见契约 §3 写路径纪律），不侵占调用方事务边界
 - **排序与索引对齐**：排序 spec 支持 `-col:nl`（`DESC NULLS LAST`），默认排序与 DDL 索引一致，避免 `Sort` 破坏 P95 ≤ 200ms
 - **复合主键保护**：时序表（`vehicle_telemetry` / `algorithm_metrics`）禁用基类 `get`/`hard_delete`，防止跨车辆误命中
 - **显式加载与读取上限**：读方法支持 `options=(selectinload(...),)`；分页 `page_size ≤ 200`，时序序列读取放宽到 `MAX_SERIES_POINTS = 10000`（须带时间窗）
@@ -389,7 +389,7 @@ python scripts/verify_test_layer.py
 | MinIO Bucket | 浏览器打开 `http://localhost:9001`（7 个 Bucket：hunter-raw-data / rosbag / video / ota-packages / reports / logs / scene-assets） |
 | Redis | `docker exec hunter-redis redis-cli ping` |
 | 共享库测试 | `pytest common/python/tests -q` |
-| 数据层契约校验 | `python scripts/verify_data_layer.py`（DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema + Redis Key + MinIO + Repository 专属方法双向一致，32 项） |
+| 数据层契约校验 | `python scripts/verify_data_layer.py`（DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema + Redis Key + MinIO + Repository 专属方法双向一致 + 服务→Repository 白名单 + 写路径纪律声明，34 项） |
 | 存储契约单元测试 | `pytest common/python/tests/test_storage_contracts.py -q`（Redis Key / MinIO Bucket ↔ 服务声明 ↔ 初始化脚本，9 项） |
 | 接口契约校验 | `pytest services/api-gateway/app/tests/test_openapi_contract.py -q`（OpenAPI ↔ 实现 ↔ K8s 清单，29 项） |
 | 网关认证/限流/转发测试 | `pytest services/api-gateway -q`（登录/刷新轮换防重放/注销幂等/会话强依赖/限流维度/代理转发与熔断，66 项） |

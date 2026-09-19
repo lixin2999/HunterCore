@@ -21,6 +21,7 @@ from sqlalchemy import Select, delete, literal_column, select, update
 from hunter_common.database.enums import EventLevel, EventType
 from hunter_common.database.models import Event, VehicleTelemetry
 from hunter_common.database.repository import (
+    DEFAULT_PURGE_BATCH_LIMIT,
     DEFAULT_PURGE_BATCH_SIZE,
     MAX_SERIES_POINTS,
     BaseRepository,
@@ -94,11 +95,14 @@ class EventRepository(BaseRepository[Event]):
     async def acknowledge(
         self, event_id: int, *, acknowledged_by: UUID, at: datetime | None = None
     ) -> bool:
-        """确认事件（单条条件 UPDATE：原子、1 次往返）；事件不存在返回 ``False``。
+        """确认事件（单条条件 UPDATE：原子、1 次往返）。
+
+        幂等语义：**事件存在即返回 ``True``（无论是否首次确认）**，仅当事件**不存在**返回 ``False``；
+        与旧实现（先 ``get`` 再 ``update``）语义一致，但消除了"先查后写"的 TOCTOU 与多余往返。
 
         - WHERE 带 ``acknowledged IS FALSE``：并发确认时不会互相覆盖，
-          「首次确认人与时间」始终保持（审计优先，与旧实现的语义一致）；
-        - 未命中时（已确认 / 不存在）再走一次轻量 EXISTS 查询区分"不存在"，返回 ``False``。
+          「首次确认人与时间」始终保持（审计优先）；
+        - 未命中时（已确认 / 不存在）再走一次轻量 EXISTS 查询，仅用于区分"不存在"（返回 ``False``）。
         """
         stmt = (
             update(Event)
@@ -153,7 +157,12 @@ class VehicleTelemetryRepository(BaseRepository[VehicleTelemetry]):
         end_time: datetime | None = None,
         limit: int | None = None,
     ) -> list[VehicleTelemetry]:
-        """车辆时间区间遥测（轨迹回放 / 指标计算，时间倒序）。"""
+        """车辆时间区间遥测（轨迹回放 / 指标计算，时间倒序）。
+
+        **必须给出时间窗**（``start_time`` 或 ``end_time`` 至少一个），否则抛 2001：
+        无窗口查询会全量扫描该车辆的 hypertable 历史（契约 orm-mapping 第 3.3 节，P95 ≤ 200ms）。
+        """
+        self.require_time_window(start_time, end_time, operation="list_points")
         conditions: list[Any] = [VehicleTelemetry.vehicle_id == vehicle_id]
         if start_time is not None:
             conditions.append(VehicleTelemetry.time >= start_time)
@@ -174,25 +183,36 @@ class VehicleTelemetryRepository(BaseRepository[VehicleTelemetry]):
         *,
         batch_size: int = DEFAULT_PURGE_BATCH_SIZE,
         max_rows: int | None = None,
+        max_batches: int = DEFAULT_PURGE_BATCH_LIMIT,
     ) -> int:
-        """分批删除 ``time < cutoff`` 的遥测点，返回删除行数。
+        """删除 ``time < cutoff`` 的遥测点，返回删除行数。
 
         ⚠ 90 天保留策略由 TimescaleDB ``add_retention_policy`` 以 chunk 级 drop 执行（契约），
         本方法仅用于测试数据清理与应急场景，禁止在生产定时任务中替代保留策略。
 
-        实现：``WHERE ctid IN (SELECT ctid ... LIMIT n)`` 分批 DELETE ——
-        每批一个短事务，避免单条大 DELETE 造成长事务锁等待、WAL 膨胀与 chunk 膨胀；
-        ``max_rows`` 可设总量上限（达到即提前返回）。
+        实现：``WHERE ctid IN (SELECT ctid ... LIMIT n)`` 按**语句**分批 ——
+        单条 DELETE 的行数受 ``batch_size`` 限制，避免一次性大 DELETE 造成 chunk 膨胀与锁放大；
+        但**事务边界仍归调用方**（Repository 不 commit）：所有批次默认落在调用方同一事务内，
+        大表清理时请由调用方按批 commit（或调大 ``batch_size``），否则仍是长事务。
+
+        Args:
+            cutoff: 删除早于该时间点的数据。
+            batch_size: 单条 DELETE 的行数上限（≥ 1）。
+            max_rows: 总量上限（达到即提前返回；None 表示不限）。
+            max_batches: 批次数上限（防止无上限循环长时间占用连接；默认
+                ``DEFAULT_PURGE_BATCH_LIMIT``，调用方可显式调高）。
 
         Raises:
-            InvalidParameterError: ``batch_size < 1`` 或 ``max_rows < 1``。
+            InvalidParameterError: ``batch_size`` / ``max_rows`` / ``max_batches`` 小于 1。
         """
         if batch_size < 1:
             raise InvalidParameterError("batch_size 必须 ≥ 1", details={"batch_size": batch_size})
         if max_rows is not None and max_rows < 1:
             raise InvalidParameterError("max_rows 必须 ≥ 1", details={"max_rows": max_rows})
+        if max_batches < 1:
+            raise InvalidParameterError("max_batches 必须 ≥ 1", details={"max_batches": max_batches})
         removed_total = 0
-        while True:
+        for _ in range(max_batches):
             remaining = None if max_rows is None else max_rows - removed_total
             if remaining is not None and remaining < 1:
                 break
