@@ -146,7 +146,7 @@ curl http://localhost:8081/healthz
 ### 4. 运行单元测试与静态检查
 
 ```bash
-pytest common/python/tests -q                     # 共享库测试
+pytest common/python/tests -q                     # 共享库测试（含 Kafka 契约/消息/缓冲/幂等/生产/消费）
 cd services/scene-service && pytest -q            # 服务测试（每个服务目录内执行）
 ruff check common services                        # Lint
 ```
@@ -227,6 +227,22 @@ python scripts/verify_data_layer.py
 - **三方一致**：MinIO 契约 ↔ `infra/docker/minio/init-buckets.sh` ↔ `infra/k8s/jobs/minio-init-job.yaml`（`create_bucket` 集合、`add_expiry` 天数、`encrypt_bucket` SSE-S3 覆盖 7 个 Bucket）；Redis 契约 ↔ 6 份服务契约（兼容「对象列表」与 `{read: [...]}` 两种既有声明形态）
 - **校验器条目**：`verify_data_layer.py` 校验 9（Redis Key）、校验 10（对象存储）；单测见 `common/python/tests/test_storage_contracts.py`
 - **⚠ 待确认项**（`x-hunter-pending-confirmation` 共 15 项 / 标阻塞 8 项）：Redis —— `vehicle:status:{vehicle_id}` 字段清单与写入方归属、`rc:lock:{vehicle_id}` 派生键登记、**网关登出 Token 黑名单键模式缺失（安全缺陷）**；对象存储 —— 对象键是否含 Bucket 名前缀、**`hunter-rosbag` `regular/` 前缀与 5.5 节命名规范冲突（现行命名 rosbag 不匹配任何过期规则 → 永久占用）**、分片上传 `part_size_bytes` 未定、MinIO 配置项未进入 `hunter_common.config`
+
+Kafka 契约驱动的生产/消费（共享库 `hunter_common.kafka`）要点：
+
+- **契约运行时加载**：`hunter_common.kafka.contracts` 读取 `topics.yaml` / `consumer-groups.yaml` / `schemas/*.schema.json`，
+  解析六种 Topic 写法（契约名 / 模板 `hunter.{vehicle_id}.telemetry` / 正则 `hunter.*.telemetry` / 具体实例 / 广播 / DLQ）；
+  契约目录定位顺序：显式 `KAFKA_CONTRACT_DIR` → 工作目录向上查找 → 包位置向上查找（**显式启用校验时契约缺失即 fail fast**，不静默降级）
+- **生产者**：按 Topic 契约 `acks` 选择底层 Producer 实例（telemetry=1 / health=0 / 其余=all）；
+  契约 `key=vehicle_id` 的 Topic 强制 key 与消息体一致；`retries=3` + 指数退避（仅可重试错误）；
+  网络中断且重试耗尽时落盘缓冲（上限 1GB，契约 `producer_defaults.local_disk_buffer_bytes`），`replay_buffered()` 重投
+- **消费者**：`schema_name="auto"` 时按消息实际 Topic 校验契约 Schema（非法消息直接进 DLQ，`reason=schema_invalid` 不重试）；
+  handler 失败指数退避重试，耗尽后转投 `{topic}.dlq` 并保留 `dlq.original.topic/partition/offset/reason/error` 头；
+  整批处理后手动提交 offset（at-least-once）；可注入 `IdempotencyGuard` 跳过重复消息；每批刷新 `hunter_kafka_consumer_lag`
+- **指标**（前缀 `hunter_kafka_`，随各服务 `/metrics` 暴露）：生产计数/时延/重试、缓冲水位/丢弃/重投、
+  消费计数（processed/skipped_duplicate/schema_invalid/handler_failed）、DLQ 计数、分区消费积压
+- **验证**：`pytest common/python/tests -q`（契约 round-trip、Mock Producer/Consumer 行为、缓冲崩溃恢复、幂等守卫）；
+  ⚠ 服务接入 `schema_name=SCHEMA_AUTO` 属显式选择，需先确认契约文件在容器内可读（K8s 挂载 ConfigMap），见 `release.md` 风险项
 
 ## 接口契约（OpenAPI）
 

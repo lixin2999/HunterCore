@@ -5,7 +5,7 @@
 - logging     structlog JSON 日志（trace_id / vehicle_id 上下文注入 + 敏感字段脱敏）
 - exceptions  HunterBaseException 与预定义错误码异常（1001-7002）
 - responses   统一 API 响应模型 ApiResponse[T]
-- kafka       confluent-kafka 异步生产者/消费者封装（SASL_SSL 支持）
+- kafka       confluent-kafka 异步生产者/消费者封装（契约驱动：契约 acks/重试/磁盘缓冲/手动提交/DLQ/Schema 校验）
 - database    SQLAlchemy 2.0 数据访问层包（session/base/enums/repository/models/migrations）
 - redis       redis-py 异步客户端封装
 - metrics     Prometheus 指标注册与 /metrics 端点（需显式导入 hunter_common.metrics）

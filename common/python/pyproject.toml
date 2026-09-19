@@ -19,6 +19,9 @@ dependencies = [
     "redis>=5.0.1,<6",
     "confluent-kafka>=2.3,<3",
     "prometheus-client>=0.20,<1",
+    # Kafka 契约运行时加载（hunter_common.kafka.contracts / messages）：topics.yaml 解析 + draft-07 校验
+    "jsonschema>=4.20,<5",
+    "PyYAML>=6.0,<7",
 ]
 
 [project.optional-dependencies]
@@ -27,8 +30,6 @@ dev = [
     "pytest-asyncio>=0.23,<1",
     "ruff>=0.4,<1",
     "mypy>=1.8,<2",
-    "jsonschema>=4.20,<5",
-    "PyYAML>=6.0,<7",
 ]
 
 [tool.setuptools.packages.find]
