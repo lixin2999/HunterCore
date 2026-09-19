@@ -16,7 +16,7 @@
 | `sql/init-data.sql` | `/opt/hunter-edge/sql/init-data.sql` | 初始数据：4 角色 + 16 权限点 + 角色权限矩阵 + 默认 admin + 测试车辆 |
 | `.env.example` | `/opt/hunter-edge/.env` | 环境变量模板（`cp` 后由 `scripts/gen-passwords.sh` 生成随机口令） |
 | `certs/` | `/opt/hunter-edge/certs/` | Kafka SASL_SSL 证书（`scripts/gen-kafka-certs.sh` 生成，**不入库**） |
-| `scripts/` | `/opt/hunter-edge/scripts/` | 运维脚本（口令/证书生成、DB 初始化、健康检查、巡检、备份、卸载） |
+| `scripts/` | `/opt/hunter-edge/scripts/` | 运维脚本（12 个：公共库、一键部署、口令/证书生成、DB/Kafka/MinIO 初始化、健康检查、巡检、备份、卸载、日志收集）—— 位于仓库根 `scripts/` |
 
 ## 契约来源（单一事实来源，禁止在本目录重复定义）
 
@@ -38,8 +38,17 @@ cat contracts/database/ddl/00_schemas.sql contracts/database/ddl/01_core.sql \
 cat contracts/database/ddl/05_timeseries.sql > infra/deploy/sql/timescaledb.sql
 ```
 
-## 批次说明（TBD）
+## 交付状态
 
-以下文件属部署包其余批次，尚未在本目录生成：`docker-compose.yml`、`config/srs.conf`、
-`config/flink-conf.yaml`、`scripts/*.sh`、`certs/README.md`。
-在 `docker-compose.yml` 就位前，第一至七章中的 `docker compose` 命令无法执行。
+| 本目录产物 | 状态 |
+|-----------|------|
+| `config/daemon.json`、`config/nginx.conf` | ✅ 已交付 |
+| `sql/schema.sql`、`sql/timescaledb.sql`、`sql/init-data.sql` | ✅ 已交付（生成产物） |
+| `.env.example` | ✅ 已交付（133 个变量，口令为 CHANGE_ME_*） |
+| `scripts/*.sh`（12 个：common/install/gen-passwords/gen-kafka-certs/init-db/init-kafka/init-minio/health-check/daily-check/backup/uninstall/collect-logs） | ✅ 已交付（位于仓库根 `scripts/`，部署时映射至 `/opt/hunter-edge/scripts/`，见下表） |
+| `docker-compose.yml`、`config/srs.conf`、`config/flink-conf.yaml`、`certs/README.md` | ⛔ **待交付**（后续批次） |
+
+> 在 `docker-compose.yml` 就位前，`install.sh` 的 step_6/7/11 会在 `require_compose_file` 处给出明确指引并退出；
+> step_1~5（系统初始化/目录/.env/证书）与各初始化脚本的静态校验可独立执行。
+> 脚本已通过 `bash -n` 与函数级自检；`shellcheck` 需在服务器执行（`sudo apt-get install -y shellcheck && shellcheck scripts/*.sh`）。
+

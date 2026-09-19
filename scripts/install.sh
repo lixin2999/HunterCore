@@ -802,13 +802,15 @@ step_4_gen_config() {
   example="${APP_DIR}/.env.example"
   if [ ! -f "$example" ] && [ -f "${APP_DIR}/infra/deploy/.env.example" ]; then
     install -m 0644 "${APP_DIR}/infra/deploy/.env.example" "$example"
+    hc_normalize_env_file "$example" || return 1
     log_success "已复制仓库模板：infra/deploy/.env.example → ${example}"
   fi
 
-  # 4.2 .env 生成（幂等：已存在则跳过口令生成）
+  # 4.2 .env 生成（幂等：已存在则跳过口令生成；CRLF 一律归一为 LF）
   if [ -f "$env_file" ]; then
     log_info ".env 已存在（${env_file}），跳过生成（幂等）"
     log_info "如需重新生成全部口令：bash ${GEN_PASSWORDS_SH} --force"
+    hc_normalize_env_file "$env_file" || return 1
   else
     if [ ! -f "$example" ]; then
       log_error "缺少 .env 模板：${example}"
@@ -816,6 +818,7 @@ step_4_gen_config() {
       return 1
     fi
     install -m 0600 "$example" "$env_file"
+    hc_normalize_env_file "$env_file" || return 1
     log_success "已从模板生成：${env_file}（权限 600）"
     if [ -f "$GEN_PASSWORDS_SH" ]; then
       local -a gp_args=()

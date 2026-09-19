@@ -253,8 +253,26 @@ confirm() {
 # ---------------------------------------------------------------------
 # 5. .env 读取与校验（所有脚本的配置唯一入口；禁止在业务代码硬编码阈值/地址）
 # ---------------------------------------------------------------------
+# hc_normalize_env_file <env_file>：把 CRLF 换行归一为 LF（幂等）
+#   背景：.env 若为 CRLF（Windows 编辑或直接从 Windows 工作区复制），sourcing 后变量值会带 \r，
+#         造成 "load_env 失败"、LOG_DIR 变成 "/var/log/hunter-edge\r" 等疑难故障，故在加载前自动修复。
+hc_normalize_env_file() {
+  local env_file="$1"
+  [ -f "$env_file" ] || return 0
+  if ! grep -qU $'\r' "$env_file" 2>/dev/null; then
+    return 0
+  fi
+  log_warn "检测到 CRLF 换行：${env_file}（Windows 编辑/复制所致），自动转换为 LF"
+  if ! sed -i 's/\r$//' "$env_file"; then
+    log_error "自动转换失败（文件只读？）：请执行 sed -i 's/\\r\$//' ${env_file} 后重试"
+    return 1
+  fi
+  log_success "已规范化为 LF：${env_file}"
+  return 0
+}
+
 # load_env [env_file]：加载 .env；优先级 参数 > HUNTER_ENV_FILE > ${APP_DIR}/.env。
-# 文件不存在即报错，避免带着空配置静默继续。
+# 文件不存在即报错，避免带着空配置静默继续；CRLF 自动归一为 LF。
 load_env() {
   local env_file="${1:-${HUNTER_ENV_FILE:-${APP_DIR}/.env}}"
   if [ ! -f "$env_file" ]; then
@@ -262,6 +280,7 @@ load_env() {
     log_error "请先执行：bash ${GEN_PASSWORDS_SH}"
     return 1
   fi
+  hc_normalize_env_file "$env_file" || return 1
   set -a
   # shellcheck source=/dev/null  # .env 由部署时生成（gen-passwords.sh），非仓库文件
   if ! . "$env_file"; then
@@ -270,8 +289,18 @@ load_env() {
     return 1
   fi
   set +a
+  # 运维级覆盖（HUNTER_*）优先级高于 .env 内的同名配置：便于在不改 .env 的情况下迁移日志/数据目录
+  if [ -n "${HUNTER_LOG_DIR:-}" ]; then
+    LOG_DIR="$HUNTER_LOG_DIR"
+  fi
+  if [ -n "${HUNTER_DATA_DIR:-}" ]; then
+    DATA_DIR="$HUNTER_DATA_DIR"
+  fi
+  if [ -n "${HUNTER_INSTALL_LOG:-}" ]; then
+    LOG_FILE="$HUNTER_INSTALL_LOG"
+  fi
   HUNTER_ENV_FILE="$env_file"
-  export HUNTER_ENV_FILE APP_DIR DATA_DIR
+  export HUNTER_ENV_FILE APP_DIR DATA_DIR LOG_DIR LOG_FILE
   log_info "已加载环境变量：${env_file}"
 }
 
@@ -506,7 +535,77 @@ flink_ui_url() {
 }
 
 # ---------------------------------------------------------------------
-# 9. 帮助信息（本文件为库文件，仅供 source；直接执行时打印说明）
+# 9. MinIO CLI（mc）与 Kafka 消费积压辅助
+#   minio/mc 是独立镜像（minio 服务镜像内不含 mc）：
+#     ① 若目标容器内有 mc（自定义镜像）→ 直接 docker exec；
+#     ② 否则以一次性容器执行，--network container:<minio> 复用其网络命名空间，
+#        因此不依赖 compose 网络命名（避免 project 前缀差异），127.0.0.1:9000 即 MinIO。
+# ---------------------------------------------------------------------
+MINIO_MC_IMAGE="${MINIO_MC_IMAGE:-minio/mc:RELEASE.2024-06-13T16-39-23Z}"  # 与仓库 docker-compose minio-init 同版本
+export MINIO_MC_IMAGE
+
+# minio_mc <args...>：执行 mc 子命令（自动注入 MC_HOST_local，需 MINIO_ROOT_USER/PASSWORD）
+minio_mc() {
+  local container="${MINIO_CONTAINER:-$C_MINIO}"
+  local port="${MINIO_API_PORT:-9000}"
+  local user="${MINIO_ROOT_USER:-}" password="${MINIO_ROOT_PASSWORD:-}"
+  local host_url
+  if [ -z "$user" ] || [ -z "$password" ]; then
+    log_error "MINIO_ROOT_USER / MINIO_ROOT_PASSWORD 未配置（请检查 .env）"
+    return 1
+  fi
+  host_url="http://${user}:${password}@127.0.0.1:${port}"
+  if docker exec "$container" sh -c 'command -v mc >/dev/null 2>&1' 2>/dev/null; then
+    docker exec -e "MC_HOST_local=${host_url}" "$container" mc "$@"
+    return $?
+  fi
+  docker run --rm \
+    --network "container:${container}" \
+    --entrypoint mc \
+    -e "MC_HOST_local=${host_url}" \
+    "$MINIO_MC_IMAGE" "$@"
+}
+
+# minio_bucket_count：当前 Bucket 数量（失败输出 -1）
+minio_bucket_count() {
+  local out
+  out="$(minio_mc ls local 2>/dev/null || true)"
+  if [ -z "$out" ]; then
+    printf '%s' "-1"
+    return 1
+  fi
+  printf '%s' "$(printf '%s\n' "$out" | grep -c '/$' || true)"
+}
+
+# kafka_consumer_lag <group_id>：该消费组所有分区 LAG 之和（消费组不存在输出 -1 并返回 1）
+kafka_consumer_lag() {
+  local group="${1:?kafka_consumer_lag 需要消费组名}"
+  local out total
+  out="$(kafka_tool_cli kafka-consumer-groups.sh --describe --group "$group" 2>/dev/null || true)"
+  if [ -z "$out" ] || printf '%s' "$out" | grep -q "does not exist"; then
+    printf '%s' "-1"
+    return 1
+  fi
+  total="$(printf '%s\n' "$out" | awk '
+    NR==1 { for (i = 1; i <= NF; i++) if ($i == "LAG") col = i; next }
+    col && $col ~ /^[0-9-]+$/ { sum += $col }
+    END { printf "%d", sum + 0 }')"
+  printf '%s' "${total:-0}"
+}
+
+# kafka_topic_count：Topic 总数（失败输出 -1）
+kafka_topic_count() {
+  local out
+  out="$(kafka_topics_cli --list 2>/dev/null || true)"
+  if [ -z "$out" ]; then
+    printf '%s' "-1"
+    return 1
+  fi
+  printf '%s' "$(printf '%s\n' "$out" | grep -cE '[^[:space:]]' || true)"
+}
+
+# ---------------------------------------------------------------------
+# 10. 帮助信息（本文件为库文件，仅供 source；直接执行时打印说明）
 # ---------------------------------------------------------------------
 common_help() {
   cat <<'EOF'
