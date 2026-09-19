@@ -122,6 +122,14 @@ KAFKA_DLQ_TOTAL = Counter(
     registry=REGISTRY,
 )
 
+KAFKA_DLQ_FAILED_TOTAL = Counter(
+    "hunter_kafka_dlq_failed_total",
+    "死信队列转投失败的消息数（DLQ 不可用/投递异常——消息随 offset 提交后仅存于日志，"
+    "需人工从日志溯源重放；审查 Y7）",
+    labelnames=("service", "group", "topic", "reason"),
+    registry=REGISTRY,
+)
+
 
 def record_produced(service: str, topic: str, status: str, duration_s: float) -> None:
     """记录一次生产结果（delivered / buffered / failed）。buffered/failed 也计入时延，便于定位链路劣化。"""
@@ -166,6 +174,11 @@ def record_consumed(service: str, group: str, topic: str, status: str, duration_
 def record_dlq(service: str, group: str, topic: str, reason: str) -> None:
     """记录一条转入死信队列的消息（reason ∈ schema_invalid / handler_error / decode_failed）。"""
     KAFKA_DLQ_TOTAL.labels(service, group, topic, reason).inc()
+
+
+def record_dlq_failed(service: str, group: str, topic: str, reason: str) -> None:
+    """记录一次 DLQ 转投失败（消息即将随 offset 提交而丢失，需告警 + 人工补救；审查 Y7）。"""
+    KAFKA_DLQ_FAILED_TOTAL.labels(service, group, topic, reason).inc()
 
 
 def set_consumer_lag(service: str, group: str, topic: str, partition: int, lag: int) -> None:

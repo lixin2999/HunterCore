@@ -46,6 +46,9 @@ class Settings(HunterBaseConfig):
     rc_stop_on_timeout_ms: int = 500       # 超时停车阈值（固定 500ms）
     rc_max_command_rate_hz: int = 25       # 单会话帧率上限（超出丢弃并计数，WS 通道使用）
     rc_session_lock_ttl_s: int = 30        # 会话互斥锁 TTL（契约固定 30s）
+    # 会话 Hash 硬 TTL（审查 R7 兜底；redis-keys pending #4 建议 6h）：
+    # 副本崩溃/未走 DELETE 时残留会话会永久占用车辆互斥位（后续接管恒 7001）
+    rc_session_ttl_s: int = 21600
 
     # ---------- 会话信令（Kafka command 通道；pending #17 取值域未定稿，经配置注入） ----------
     rc_command_session_start_type: str = "rc_session_start"
@@ -56,6 +59,8 @@ class Settings(HunterBaseConfig):
     rc_heartbeat_interval_s: int = 10      # 车辆侧心跳周期（固定 10s，不可放宽）
     rc_heartbeat_degraded_misses: int = 3  # 连续丢失 N 次 → degraded（pending #4 待定稿）
     rc_heartbeat_end_after_s: int = 60     # 无心跳持续 → 平台侧结束会话（pending #4 待定稿）
+    # 陈旧会话守护周期（审查 R7）：按 last_heartbeat_at 对账并强制结束失效会话
+    rc_session_reaper_interval_s: int = 30
 
     # ---------- 视频链路（VideoConfig 契约枚举：H.264 硬编 720p@30fps） ----------
     rc_video_width: int = 1280

@@ -178,6 +178,17 @@ def consumed_counter(status: str) -> float:
     )
 
 
+def dlq_failed_counter(reason: str = "handler_error") -> float:
+    """DLQ 转投失败计数器（审查 Y7：失败路径必须可告警）。"""
+    return sample(
+        "hunter_kafka_dlq_failed_total",
+        service=SERVICE,
+        group=GROUP_ID,
+        topic=CONSUMED_TOPIC,
+        reason=reason,
+    )
+
+
 def build_manager(
     contract: KafkaContract,
     batches: list[list[FakeMessage]],
@@ -186,6 +197,8 @@ def build_manager(
     schema_name: str | None = "telemetry",
     idempotency: IdempotencyGuard | None = None,
     idempotency_key: Any = None,
+    on_batch_end: Any = None,
+    dlq_enabled: bool = True,
     assignment: list[TopicPartition] | None = None,
     **config_overrides: Any,
 ) -> tuple[KafkaConsumerManager, FakeConsumer, FakeProducerManager]:
@@ -200,6 +213,8 @@ def build_manager(
         schema_name=schema_name,
         idempotency=idempotency,
         idempotency_key=idempotency_key,
+        on_batch_end=on_batch_end,
+        dlq_enabled=dlq_enabled,
         producer_manager=fake_producer,
         contract=contract,
         consumer=fake_consumer,
@@ -386,6 +401,46 @@ def test_unknown_schema_name_fails_fast(contract: KafkaContract) -> None:
         )
 
 
+async def test_dlq_failure_is_counted_when_dlq_disabled(contract: KafkaContract) -> None:
+    """审查 Y7 回归：DLQ 关闭（转投不可用）时必须上报 hunter_kafka_dlq_failed_total。
+
+    该路径下消息随 offset 提交而丢失 → 需可告警、可人工从日志溯源重放。
+    """
+    before = dlq_failed_counter("schema_invalid")
+    manager, fake_consumer, _ = build_manager(
+        contract, [[invalid_telemetry_message()]], dlq_enabled=False
+    )
+
+    async def handler(message: FakeMessage, value: Any) -> None:  # pragma: no cover - 不会执行
+        return None
+
+    with pytest.raises(StopConsume):
+        await manager.run(handler)
+
+    assert dlq_failed_counter("schema_invalid") - before == 1.0
+    assert fake_consumer.commit_calls == 1   # 行为保持：DLQ 关闭不阻断提交（数据仍需人工补救）
+
+
+async def test_dlq_failure_is_counted_when_producer_unavailable(
+    contract: KafkaContract,
+) -> None:
+    """生产者未初始化（无法转投）同样计数，且不掩盖原始业务异常。"""
+    before = dlq_failed_counter("handler_error")
+    manager, _, _ = build_manager(
+        contract, [[telemetry_message(contract)]], producer=None, kafka_consumer_max_attempts=1
+    )
+    manager._producer_manager = None
+    manager._resolve_producer = lambda: None  # type: ignore[method-assign]
+
+    async def handler(message: FakeMessage, value: Any) -> None:
+        raise ValueError("business failure")
+
+    with pytest.raises(StopConsume):
+        await manager.run(handler)
+
+    assert dlq_failed_counter("handler_error") - before == 1.0
+
+
 def test_schema_auto_requires_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     """auto 模式在契约不可用时必须 fail fast。"""
     monkeypatch.setattr(consumer_module, "get_contract", lambda **_kwargs: None)
@@ -397,6 +452,52 @@ def test_schema_auto_requires_contract(monkeypatch: pytest.MonkeyPatch) -> None:
             schema_name=SCHEMA_AUTO,
             consumer=FakeConsumer([]),
         )
+
+
+async def test_batch_end_hook_runs_before_commit(contract: KafkaContract) -> None:
+    """批次收尾钩子必须先于 commit 执行（保证批量写库不被提前提交 offset）。"""
+    order: list[str] = []
+
+    async def hook() -> None:
+        order.append("hook")
+
+    manager, fake_consumer, _ = build_manager(
+        contract, [[telemetry_message(contract)]], on_batch_end=hook
+    )
+    original_commit = fake_consumer.commit
+
+    def recording_commit(asynchronous: bool = False) -> None:
+        order.append("commit")
+        original_commit(asynchronous)
+
+    fake_consumer.commit = recording_commit  # type: ignore[method-assign]
+
+    async def handler(message: FakeMessage, value: Any) -> None:
+        return None
+
+    with pytest.raises(StopConsume):
+        await manager.run(handler)
+
+    assert order == ["hook", "commit"]
+
+
+async def test_batch_end_hook_failure_skips_commit(contract: KafkaContract) -> None:
+    """钩子失败（批量入库异常）→ 跳过本次提交，消息重投（at-least-once 不丢数据）。"""
+
+    async def failing_hook() -> None:
+        raise RuntimeError("batch flush failed")
+
+    manager, fake_consumer, _ = build_manager(
+        contract, [[telemetry_message(contract)]], on_batch_end=failing_hook
+    )
+
+    async def handler(message: FakeMessage, value: Any) -> None:
+        return None
+
+    with pytest.raises(StopConsume):
+        await manager.run(handler)
+
+    assert fake_consumer.commit_calls == 0
 
 
 async def test_decode_fallback_without_schema(contract: KafkaContract) -> None:

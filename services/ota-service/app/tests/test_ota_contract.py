@@ -360,7 +360,7 @@ def _ddl_columns_from_sql() -> dict[str, set[str]]:
     sql = DDL_PATH.read_text(encoding="utf-8")
     columns: dict[str, set[str]] = {}
     for match in re.finditer(
-        r"CREATE TABLE IF NOT EXISTS ota_svc\.(\w+)\s*\((.*?)\);", sql, re.S
+        r"CREATE TABLE IF NOT EXISTS ota_svc\.(\w+)\s*\((.*?)\);", sql, re.DOTALL
     ):
         table, body = match.group(1), match.group(2)
         cols: set[str] = set()

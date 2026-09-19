@@ -1,6 +1,7 @@
 """版本仓库端点测试（契约 ota-service.yaml versions 组；数据来自契约示例值）。"""
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import pytest
@@ -178,6 +179,39 @@ async def test_publish_success_returns_five_checks(
     assert data["status"] == "published"
     assert all(data["checks"].values()), data["checks"]
     assert data["release_time"] > 0
+
+
+async def test_publish_reports_verification_switches_honestly(
+    client: AsyncClient, ota_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """审查 Y3 回归：校验开关关闭时 checks 必须如实回报 False（禁止假声明）。
+
+    修复前无论是否真正执行校验，``sha256_verified`` / ``signature_verified`` 恒为 true，
+    前端与审计据此会误判"已验签"，掩盖高危配置（契约 pending：开关是否允许关闭）。
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "ota_package_verify_sha256", False)
+    monkeypatch.setattr(settings, "ota_package_verify_signature", False)
+
+    row = make_version(status="draft", name="V1.3.0", code=10300)
+    # 声明的 md5 与实际内容一致（通过 MD5 门禁），但 sha256 为错误值：
+    # 开关关闭时该差异被跳过 → 必须如实回报 sha256_verified=false（修复前为 true）
+    row.package_sha256 = hashlib.sha256(b"unrelated-content").hexdigest()
+    ota_env.versions.rows[row.version_id] = row
+    object_key = row.package_url.removeprefix("s3://").split("/", 1)[1]
+    ota_env.storage.put(object_key, PACKAGE_BYTES)
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/publish", headers=ADMIN_HEADERS
+    )
+
+    assert resp.status_code == 200
+    checks = resp.json()["data"]["checks"]
+    assert checks["sha256_verified"] is False
+    assert checks["signature_verified"] is False
+    # 未关闭的校验项仍如实为 true（size/MD5 恒校验）
+    assert checks["package_size_verified"] is True
+    assert checks["md5_verified"] is True
 
 
 async def test_publish_checksum_mismatch_returns_6001(

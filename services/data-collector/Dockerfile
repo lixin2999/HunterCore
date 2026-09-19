@@ -1,5 +1,6 @@
 # data-collector（多阶段构建；构建上下文为仓库根目录）
-# 构建：docker build -f services/data-collector/Dockerfile -t hunter/data-collector:0.1.0 .
+# 构建：docker build -f services/data-collector/Dockerfile -t hunter/data-collector:$VERSION .
+#       （$VERSION 与 K8s 清单的 {version} 占位符同源，由 scripts/render_k8s.py 注入）
 # 运行用户：distroless :nonroot（UID 65532），禁止 root 运行（安全机制约束）
 #
 # 阶段 1：builder —— python:3.11-slim（Python 小版本必须与运行时 distroless 一致，
@@ -22,7 +23,9 @@ WORKDIR /app
 COPY --from=builder /install/lib/python3.11/site-packages /usr/lib/python3/dist-packages
 COPY --from=builder /build/service/app ./app
 EXPOSE 8082
-# 健康检查由 K8s livenessProbe/readinessProbe 以 HTTP GET 承担
-# （distroless 无 shell，无法使用 Dockerfile HEALTHCHECK）
+# 容器级健康检查：exec 形式（distroless 无 shell，用 python3 -c 探测 /healthz）
+# K8s 环境忽略 Dockerfile HEALTHCHECK，探针由 livenessProbe/readinessProbe（HTTP GET）承担
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+  CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/healthz', timeout=2)"]
 ENTRYPOINT ["python3"]
 CMD ["-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8082"]

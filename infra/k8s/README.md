@@ -18,6 +18,7 @@ infra/k8s/
 │   ├── data-analytics.yaml        # 8083，2 副本
 │   ├── ota-service.yaml           # 8084，2 副本
 │   └── remote-control.yaml        # 8085，3 副本
+│       （以上镜像标签统一为 {version} 占位符，部署前经 scripts/render_k8s.py 渲染）
 ├── statefulsets/                  # 有状态中间件：headless Service + StatefulSet + PVC
 │   ├── postgres.yaml              # PostgreSQL 15 + TimescaleDB 2.13
 │   ├── kafka.yaml                 # Kafka 3.6（KRaft 3 节点，SASL_SSL + SCRAM-SHA-512）
@@ -26,55 +27,79 @@ infra/k8s/
 ├── jobs/
 │   ├── kafka-init-job.yaml        # 内部 Topic 创建（契约分区数/保留时间）
 │   └── minio-init-job.yaml        # 7 个 Bucket + 生命周期 + SSE-S3
+├── autoscaling/
+│   └── hpa.yaml                   # HPA：6 微服务，min=2 / max=5 / CPU 70%（缩容稳定窗口 300s）
+├── disruption/
+│   └── poddisruptionbudgets.yaml  # PDB：节点排空/升级时的副本下限（自愿中断保护）
+├── networkpolicies/
+│   └── network-policies.yaml      # 默认拒绝入向 + 仅网关可达后端（纵深防御）
 └── ingress.yaml                   # 网关路由表（/api/v1/**、/ws/remote/**）+ TLS
 ```
 
 ## 2. 部署顺序（必须遵守）
 
 ```bash
-# 0) 前置：镜像仓库凭据（私有仓库时）
+# 0) 版本渲染（镜像标签 = {version} 占位符，禁止硬编码版本）
+python scripts/render_k8s.py --check                  # 仅校验占位符契约（CI lint 同款）
+python scripts/render_k8s.py --version 0.1.0          # 渲染产物 build/k8s/（已被 .gitignore 忽略）
+K8S=build/k8s                                         # 以下全部 apply 渲染产物，不要直接 apply infra/k8s/
+
+# 1) 前置：镜像仓库凭据（私有仓库时）
 kubectl -n hunter-edge create secret docker-registry hunter-registry \
   --docker-server=<registry> --docker-username=<user> --docker-password=<token>
 
-# 1) 命名空间与配置
-kubectl apply -f infra/k8s/base/00-namespace.yaml
-kubectl apply -f infra/k8s/base/01-configmap-common.yaml
-cp infra/k8s/base/02-secret.example.yaml infra/k8s/base/02-secret.yaml   # 替换全部占位值后
+# 2) 命名空间与配置
+kubectl apply -f $K8S/base/00-namespace.yaml
+kubectl apply -f $K8S/base/01-configmap-common.yaml
+kubectl apply -f $K8S/base/03-configmap-contracts.yaml     # 运行时代码契约（消费侧 Schema 校验）
+cp $K8S/base/02-secret.example.yaml infra/k8s/base/02-secret.yaml   # 替换全部占位值后（不入版本库）
 kubectl apply -f infra/k8s/base/02-secret.yaml
 
-# 2) TLS 证书类 Secret（二进制，见第 3 节）
+# 3) TLS 证书类 Secret（二进制，见第 3 节）
 #    hunter-kafka-tls / hunter-minio-tls / hunter-edge-tls
 
-# 3) 中间件（有状态）
-kubectl apply -f infra/k8s/statefulsets/postgres.yaml
-kubectl apply -f infra/k8s/statefulsets/redis.yaml
-kubectl apply -f infra/k8s/statefulsets/kafka.yaml
-kubectl apply -f infra/k8s/statefulsets/minio.yaml
+# 4) 中间件（有状态）
+kubectl apply -f $K8S/statefulsets/postgres.yaml
+kubectl apply -f $K8S/statefulsets/redis.yaml
+kubectl apply -f $K8S/statefulsets/kafka.yaml
+kubectl apply -f $K8S/statefulsets/minio.yaml
 
-# 4) 等待就绪（Kafka 三节点 quorum / MinIO ≥3 节点）
+# 5) 等待就绪（Kafka 三节点 quorum / MinIO ≥3 节点）
 kubectl -n hunter-edge rollout status statefulset/kafka --timeout=10m
 kubectl -n hunter-edge rollout status statefulset/minio --timeout=10m
 kubectl -n hunter-edge rollout status statefulset/postgres --timeout=5m
 
-# 5) 初始化任务（Topic / Bucket）
-kubectl apply -f infra/k8s/jobs/kafka-init-job.yaml
-kubectl apply -f infra/k8s/jobs/minio-init-job.yaml
+# 6) 初始化任务（Topic / Bucket）
+kubectl apply -f $K8S/jobs/kafka-init-job.yaml
+kubectl apply -f $K8S/jobs/minio-init-job.yaml
 kubectl -n hunter-edge wait --for=condition=complete job/kafka-init --timeout=10m
 kubectl -n hunter-edge wait --for=condition=complete job/minio-init --timeout=10m
 
-# 6) 微服务与入口
-kubectl apply -f infra/k8s/services/
-kubectl apply -f infra/k8s/ingress.yaml
+# 7) 微服务与入口
+kubectl apply -f $K8S/services/
+kubectl apply -f $K8S/ingress.yaml
 
-# 7) 监控栈（见 infra/monitoring/README.md）
+# 8) 网络策略（默认拒绝入向 + 仅网关可达后端）
+kubectl apply -f $K8S/networkpolicies/
+
+# 9) 自动扩缩容与可用性（需 metrics-server；HPA 接管 Deployment 副本数）
+kubectl apply -f $K8S/autoscaling/hpa.yaml
+kubectl apply -f $K8S/disruption/poddisruptionbudgets.yaml
+kubectl -n hunter-edge get hpa,pdb
+
+# 10) 监控栈（见 infra/monitoring/README.md）
 kubectl apply -k infra/monitoring
 kubectl apply -f infra/monitoring/exporters/exporters.yaml
 ```
 
+> 也可由 GitLab CI 完成上述链路（tag 流水线）：`build-images` → `render-manifests` →
+> `deploy-prod`（手工触发），详见 `.gitlab-ci.yml`。
+
 静态校验（无需集群）：
 
 ```bash
-python scripts/verify_infra.py      # API 版本/命名空间/探针/资源/敏感字段/端口/契约一致性
+python scripts/render_k8s.py --check   # {version} 占位符 + 6 个微服务镜像齐备
+python scripts/verify_infra.py         # API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约一致性
 ```
 
 > 注意：`kubectl apply --dry-run=client` 仍需集群 API（openapi/group list），
@@ -145,7 +170,46 @@ broker 首次启动执行 `kafka-storage.sh format --add-scram` 时以
 `3×5 + 2×3 + 3×5 + 2×9 + 2×3 + 3×5 = 75`（含 max_overflow 峰值约 150）< `max_connections=300`，
 留出监控/运维会话余量。
 
-## 5. 关键设计决策
+## 5. 自动扩缩容与可用性（HPA / PDB）
+
+### 5.1 HPA（`autoscaling/hpa.yaml`，基于 CPU 使用率）
+
+| 服务 | 基线副本 | minReplicas | maxReplicas | 指标 | 缩容行为 |
+|------|---------|-------------|-------------|------|---------|
+| api-gateway | 3 | 2 | 5 | CPU 平均利用率 70% | 稳定窗口 300s，每分钟至多 -1 |
+| scene-service | 2 | 2 | 5 | 同上 | 同上 |
+| data-collector | 3 | 2 | 5 | 同上 | 同上 |
+| data-analytics | 2 | 2 | 5 | 同上 | 同上 |
+| ota-service | 2 | 2 | 5 | 同上 | 同上 |
+| remote-control | 3 | 2 | 5 | 同上 | 同上 |
+
+- 前置依赖：**metrics-server**（未安装时 `kubectl get hpa` 的 `TARGETS` 显示 `<unknown>`，
+  副本数回落 `minReplicas`，不影响服务可用性）。
+- 扩容策略：30s 窗口内 `Percent 100%` 或 `Pods +2` 取大者；缩容策略保守，避免指标抖动引发反复扩缩。
+- 仅作用于无状态微服务；有状态中间件（PostgreSQL/Kafka/Redis/MinIO）**禁止** HPA。
+
+⚠ 人工确认点（详见清单内注释）：
+1. 3 副本基线的服务在 HPA 接管后可能被缩到 **2 副本**；若要求“永不低于 3 副本”，
+   把这 3 个 HPA 的 `minReplicas` 改为 3（唯一改动点）。
+2. `remote-control` 为 WebRTC 长连接且副本不迁移（契约 pending #14）：缩容会中断在线操控会话，
+   建议操控期间人工冻结缩容。
+3. `data-collector` 的有效并行度受 `telemetry` 主题分区数（12）约束，`maxReplicas=5` 在范围内。
+
+### 5.2 PDB（`disruption/poddisruptionbudgets.yaml`，自愿中断保护）
+
+| 服务 | minAvailable | 基线副本 | 说明 |
+|------|--------------|---------|------|
+| api-gateway / data-collector / remote-control | 2 | 3 | 节点排空时至少保留 2 副本 |
+| scene-service / data-analytics / ota-service | 1 | 2 | 节点排空时至少保留 1 副本 |
+
+- 与 Deployment 的 `maxUnavailable: 0`（滚动更新不降级）互补：PDB 约束**自愿中断**
+  （`kubectl drain` / 集群升级 / 节点自动缩容），配合 `terminationGracePeriodSeconds`
+  （30s / 60s，见各服务清单）实现优雅终止，支撑可用性 ≥ 99.9%。
+- `minAvailable` 必须**小于**基线副本数，否则排空永久阻塞（`scripts/verify_infra.py` 强制校验）。
+- ⚠ HPA 与 PDB 叠加：HPA 缩容到 2 副本后，3 副本基线服务的 `minAvailable: 2` 会阻塞 drain，
+  建议改用 `maxUnavailable: 1`（随副本数浮动）—— 需人工确认。
+
+## 6. 关键设计决策
 
 | 决策 | 原因 |
 |------|------|
@@ -160,8 +224,12 @@ broker 首次启动执行 `kafka-storage.sh format --add-scram` 时以
 | Redis `maxmemory-policy noeviction` | Redis 承载会话、分布式锁（远程操控互斥）与限流计数，淘汰将导致掉线与互斥失效 |
 | MinIO 4 节点纠删码 | 容忍 2 节点故障（EC:2）；SSE-S3 服务端加密；HTTPS 强制 |
 | 有状态中间件单一 `standard` StorageClass | 生产按集群实际 StorageClass 覆盖；PVC 容量数值待核对 |
+| 镜像标签使用 `{version}` 占位符（仓库清单禁止硬编码版本） | 版本是部署期变量（CI 取 `$CI_COMMIT_TAG`）：单一来源、可审计；由 `scripts/render_k8s.py` 渲染后 apply，避免“清单版本与镜像版本漂移” |
+| HPA `min=2 / max=5 / CPU 70%` | 满足突发流量弹性与空闲成本；有状态中间件禁止自动扩缩（数据一致性与副本语义） |
+| PDB `minAvailable < 基线副本数` | 补齐“自愿中断”（节点排空/集群升级）的可用性约束；取值必须留出至少 1 个可驱逐副本，否则 drain 永久阻塞 |
+| 探针统一 HTTP GET `/healthz`（存活）/ `/readyz`（就绪） | distroless 无 shell，无法使用 exec/tcp 探针；就绪端点内部 2s 超时快速返回 503 + `code=5001` |
 
-## 6. 常见问题排查
+## 7. 常见问题排查
 
 | 现象 | 排查方向 |
 |------|---------|
@@ -173,3 +241,8 @@ broker 首次启动执行 `kafka-storage.sh format --add-scram` 时以
 | 服务连不上 Kafka | 应用需配置 `KAFKA_SSL_CAFILE`；如需严格 mTLS 需补 `KAFKA_SSL_CERTFILE/KEYFILE` 配置项 |
 | 服务 `/readyz` 返回 503 | 数据库/Redis 不可达（内部 2s 超时保护），检查中间件与网络策略 |
 | 容器无 shell 无法排查 | 使用 `kubectl debug -it --image=busybox --target=<container>` 注入临时容器 |
+| Pod `ImagePullBackOff`（镜像名含 `{version}`） | 直接 apply 了 `infra/k8s/` 源清单；先 `python scripts/render_k8s.py --version <版本>` 再 apply `build/k8s/` |
+| HPA `TARGETS` 显示 `<unknown>` | metrics-server 未部署或未就绪；`kubectl -n kube-system get deploy metrics-server` |
+| HPA 期望副本与 `kubectl get deploy` 的 `spec.replicas` 不一致 | 正常现象：HPA 接管后 Deployment 的 `replicas` 会被持续覆盖，以 `kubectl get hpa` 为准 |
+| `kubectl drain` 长时间卡在 “evicting pod” | PDB 的 `minAvailable` 大于等于当前副本数（HPA 已缩容）；核对 PDB 与 HPA 取值（见第 5 节） |
+| HPA 频繁扩缩（抖动） | 核对 `behavior.scaleDown.stabilizationWindowSeconds`（默认清单为 300s）；确认 CPU requests 设置合理（利用率按 requests 计算） |

@@ -17,7 +17,6 @@ from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from hunter_common.database import DatabaseSessionManager
 from hunter_common.logging import (
     configure_logging,
     get_logger,
@@ -30,6 +29,7 @@ from hunter_common.redis import RedisManager
 from app.config import settings
 from app.core import dependencies
 from app.core.error_handlers import register_exception_handlers
+from app.repositories.pipeline import MetricsReadOnlyRepository
 from app.routers import corner_cases, coverage, dashboard, evaluation, reports
 from app.routers.health import router as health_router
 
@@ -44,8 +44,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.log_level,
         json_output=settings.environment != "dev",
     )
-    app.state.db = DatabaseSessionManager(settings)
-    app.state.db.init()
+    # 只读就绪探针仓库（审查 Y10）：本服务仅以 hunter_analytics_ro 只读账号访问数据库，
+    # 不初始化全权限 DatabaseSessionManager（最小权限；契约 x-hunter-db-readonly）
+    app.state.readonly_metrics = MetricsReadOnlyRepository(settings)
     app.state.redis = RedisManager(settings)
     app.state.redis.init()
     logger.info("service_started", service=settings.service_name, port=settings.api_port)
@@ -61,7 +62,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if storage is not None:
         await storage.close()
     await app.state.redis.close()
-    await app.state.db.close()
+    await app.state.readonly_metrics.close()
     logger.info("service_stopped", service=settings.service_name)
 
 

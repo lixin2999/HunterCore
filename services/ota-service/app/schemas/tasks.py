@@ -8,11 +8,11 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
+from hunter_common.database.enums import OtaStatus, OtaTaskStatus
 from pydantic import BaseModel, ConfigDict, Field
 
-from hunter_common.database.enums import OtaStatus, OtaTaskStatus
-
 from app.schemas.common import (
+    VEHICLE_ID_PATTERN,
     OtaApiResponse,
     OtaBatchStatus,
     OtaNextAction,
@@ -20,7 +20,6 @@ from app.schemas.common import (
     OtaRollbackTarget,
     OtaTaskAction,
     ScheduleMode,
-    VEHICLE_ID_PATTERN,
 )
 
 
@@ -207,7 +206,7 @@ class OtaTaskDetail(OtaTaskItem):
     （前向引用见模块尾部 ``_rebuild_models``，避免循环导入）。
     """
 
-    target_version: "OtaVersionItemLike" = Field(description="内联目标版本（前端一次请求渲染任务全貌）")
+    target_version: OtaVersionItemLike = Field(description="内联目标版本（前端一次请求渲染任务全貌）")
     rollout: OtaRolloutView = Field(description="灰度推进视图")
 
 
@@ -348,8 +347,8 @@ def _rebuild_models() -> None:
 
     局部导入避免循环依赖；替换模块级占位名后重建模型（Pydantic v2 必需）。
     """
-    global OtaVersionItemLike  # noqa: PLW0603
-    from app.schemas.versions import OtaVersionItem  # noqa: PLC0415
+    global OtaVersionItemLike
+    from app.schemas.versions import OtaVersionItem
 
     OtaVersionItemLike = OtaVersionItem
     OtaTaskDetail.model_rebuild()

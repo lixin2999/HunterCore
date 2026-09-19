@@ -8,7 +8,6 @@ from fastapi import APIRouter, Depends, Path, Query, Request
 from hunter_common.database.enums import OtaVersionStatus
 from hunter_common.database.repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 
-from app.config import settings
 from app.core.dependencies import (
     require_execute_permission,
     require_read_permission,

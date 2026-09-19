@@ -24,6 +24,14 @@ dev = [
 testpaths = ["app/tests"]
 asyncio_mode = "auto"
 
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# B008：FastAPI 依赖注入的标准写法（`Depends()` 作为参数默认值），框架惯例豁免
+ignore = ["B008"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -123,8 +123,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await consumer_task
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — 退出阶段吞掉关闭异常
+        except Exception:
             logger.exception("ota_status_consumer_stop_failed")
+    # 等待后台任务收尾（审查 Y9：进度缓存 fire-and-forget 写入不遗留悬挂任务）
+    await app.state.task_service.aclose()
     await app.state.redis.close()
     await app.state.db.close()
     try:

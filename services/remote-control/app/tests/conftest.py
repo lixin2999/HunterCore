@@ -66,6 +66,7 @@ class FakeRedis:
 
     def __init__(self) -> None:
         self.store: dict[str, Any] = {}
+        self.ttl_seconds: dict[str, int] = {}
         self._lock_holders: dict[str, bool] = {}
 
     @property
@@ -100,6 +101,23 @@ class FakeRedis:
         """简化实现：一次性返回全部匹配键（测试数据规模小，cursor 恒 0）。"""
         keys = [key for key in self.store if fnmatch.fnmatch(key, match)]
         return 0, keys
+
+    async def scan_iter(self, match: str, count: int = 100) -> AsyncIterator[str]:
+        """异步迭代匹配键（契约守护任务用；与 redis-py scan_iter 语义一致）。"""
+        del count  # 替身无需分批
+        for key in [key for key in self.store if fnmatch.fnmatch(key, match)]:
+            yield key
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        """设置键 TTL（审查 R7：会话 Hash 硬 TTL 兜底）；记录到 ttl_seconds 供用例断言。"""
+        self.ttl_seconds[key] = int(seconds)
+        return key in self.store
+
+    async def ttl(self, key: str) -> int:
+        """读取键 TTL（-1 = 无 TTL，-2 = 键不存在）。"""
+        if key not in self.store:
+            return -2
+        return self.ttl_seconds.get(key, -1)
 
     async def smembers(self, key: str) -> set[str]:
         value = self.store.get(key)

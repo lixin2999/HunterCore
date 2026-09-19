@@ -1,0 +1,115 @@
+# =====================================================================
+# PodDisruptionBudget（自愿中断保护）
+#
+# 目的：Deployment 已配置 maxUnavailable: 0（滚动更新不降级），但节点维护
+#   （kubectl drain / 集群升级 / 自动缩容）属于**自愿中断**，由 PDB 约束：
+#   保证 drain 期间仍可用的副本数，配合 terminationGracePeriodSeconds
+#   （30s / 60s，见各服务清单）实现优雅终止 → 系统可用性 ≥ 99.9%。
+#
+# 取值规则（minAvailable 必须 < 基线副本数，否则 drain 永久阻塞）：
+#   - 基线 2 副本（scene-service / data-analytics / ota-service）→ minAvailable: 1
+#   - 基线 3 副本（api-gateway / data-collector / remote-control）→ minAvailable: 2
+#   ⚠ 启用 HPA 后副本数会低于/高于基线：HPA 缩容到 2 时 minAvailable: 2 会使
+#     drain 阻塞。若 HPA 与 PDB 同时启用，建议把 3 副本服务改为 maxUnavailable: 1
+#     （等价 minAvailable = replicas - 1，随副本数浮动），此决策需人工确认。
+#
+# 用法：
+#   kubectl apply -f infra/k8s/disruption/poddisruptionbudgets.yaml
+#   kubectl -n hunter-edge get pdb
+# =====================================================================
+
+# ---------- API 网关（3 副本基线） ----------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-gateway
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: api-gateway
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: availability
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api-gateway
+---
+# ---------- 场景生成（2 副本基线） ----------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: scene-service
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: scene-service
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: availability
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scene-service
+---
+# ---------- 数据采集（3 副本基线） ----------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: data-collector
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: data-collector
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: availability
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: data-collector
+---
+# ---------- 数据分析（2 副本基线） ----------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: data-analytics
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: data-analytics
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: availability
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: data-analytics
+---
+# ---------- OTA 管理（2 副本基线；升级任务领取依赖分布式锁，缩到 1 副本不丢任务） ----------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ota-service
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: ota-service
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: availability
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ota-service
+---
+# ---------- 远程操控（3 副本基线；长连接下 drain 会中断在线会话，见契约 pending #14） ----------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: remote-control
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: remote-control
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: availability
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: remote-control

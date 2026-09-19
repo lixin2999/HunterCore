@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -28,7 +29,6 @@ from hunter_common.database.models import OtaRecord, OtaTask, OtaVersion
 from app.config import settings
 from app.main import app
 from app.repositories.records import RecordSnapshot
-from app.services.gates import VehicleStateReader
 from app.services.records import RecordService
 from app.services.rollout import canonical_strategy
 from app.services.tasks import TaskService
@@ -36,6 +36,9 @@ from app.services.versions import VersionService
 
 ADMIN_HEADERS = {"X-User-Id": "11111111-1111-4111-8111-111111111111", "X-Roles": "admin"}
 VIEWER_HEADERS = {"X-User-Id": "22222222-2222-4222-8222-222222222222", "X-Roles": "viewer"}
+
+#: 默认创建者（模块级单例，避免 B008：函数默认参数中不得调用函数）
+_DEFAULT_CREATOR: UUID = UUID("11111111-1111-4111-8111-111111111111")
 
 
 class FakeRedis:
@@ -50,7 +53,7 @@ class FakeRedis:
         self.ttls: dict[str, int] = {}
 
     @property
-    def client(self) -> "FakeRedis":
+    def client(self) -> FakeRedis:
         return self
 
     async def get(self, key: str) -> str | None:
@@ -219,7 +222,7 @@ class FakeVersionRepository:
         if row is not None:
             row.status = status
             if release_time is not None:
-                row.release_time = datetime.fromtimestamp(release_time, tz=timezone.utc)
+                row.release_time = datetime.fromtimestamp(release_time, tz=UTC)
 
     async def count_tasks_for_version(self, version_id: UUID) -> int:
         return sum(1 for t in self._tasks.values() if t.target_version_id == version_id)
@@ -264,7 +267,7 @@ class FakeTaskRepository:
 
     async def create(self, session: Any, task: OtaTask) -> OtaTask:
         task.task_id = uuid4()
-        task.create_time = datetime.now(tz=timezone.utc)
+        task.create_time = datetime.now(tz=UTC)
         self.rows[task.task_id] = task
         return task
 
@@ -293,7 +296,7 @@ class FakeRecordRepository:
                 continue  # ON CONFLICT DO NOTHING（唯一索引 uq_ota_records_task_vehicle）
             record = OtaRecord(
                 record_id=self._next_id,
-                start_time=datetime.now(tz=timezone.utc),
+                start_time=datetime.now(tz=UTC),
                 **row,
             )
             self._next_id += 1
@@ -362,7 +365,7 @@ class FakeRecordRepository:
         record.error_code = kwargs.get("error_code")
         record.error_message = kwargs.get("error_message")
         if kwargs["status"] in OTA_TERMINAL:
-            record.end_time = datetime.fromtimestamp(kwargs["event_time"], tz=timezone.utc)
+            record.end_time = datetime.fromtimestamp(kwargs["event_time"], tz=UTC)
         return True
 
 
@@ -437,7 +440,7 @@ def make_version(
         changelog={"features": ["感知模型升级至 v2.1"]},
         applicable_models=["HUNTER_SE"],
         status=OtaVersionStatus(status),
-        release_time=datetime.now(tz=timezone.utc) if status == "published" else None,
+        release_time=datetime.now(tz=UTC) if status == "published" else None,
     )
 
 
@@ -446,7 +449,7 @@ def make_task(
     target_version_id: UUID,
     target_vehicles: list[str],
     status: OtaTaskStatus | str = OtaTaskStatus.CREATED,
-    creator: UUID = UUID("11111111-1111-4111-8111-111111111111"),
+    creator: UUID = _DEFAULT_CREATOR,
 ) -> OtaTask:
     """构造 ota_tasks 行（冻结规范灰度策略 + 默认门禁/调度；status 强转枚举）。"""
     from app.schemas.tasks import OtaTaskPreconditions, OtaTaskProgress, OtaTaskSchedule
@@ -471,7 +474,7 @@ def make_task(
             current_batch=0,
         ).model_dump(),
         creator=creator,
-        create_time=datetime.now(tz=timezone.utc),
+        create_time=datetime.now(tz=UTC),
     )
 
 
@@ -545,6 +548,8 @@ async def client(ota_env: _State) -> AsyncIterator[AsyncClient]:
 
 __all__ = [
     "ADMIN_HEADERS",
+    "PACKAGE_BYTES",
+    "VIEWER_HEADERS",
     "FakeCommandProducer",
     "FakeNotifyProducer",
     "FakePackageStorage",
@@ -552,8 +557,6 @@ __all__ = [
     "FakeTaskRepository",
     "FakeVehicleReader",
     "FakeVersionRepository",
-    "PACKAGE_BYTES",
-    "VIEWER_HEADERS",
     "client",
     "make_task",
     "make_version",

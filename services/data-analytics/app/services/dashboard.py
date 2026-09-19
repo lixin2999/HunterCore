@@ -134,19 +134,31 @@ class DashboardService:
         )
 
     async def _events_block(self, start: float, end: float, vehicle_id: str | None) -> EventStats:
-        """事件统计块：total 精确计数 + 最近 N 条类型分布近似（下游不可用整块降级）。"""
-        total = await self._events.count(start_time=start, end_time=end, vehicle_id=vehicle_id)
-        info = await self._events.count(start_time=start, end_time=end, event_level="info", vehicle_id=vehicle_id)
-        warning = await self._events.count(start_time=start, end_time=end, event_level="warning", vehicle_id=vehicle_id)
-        critical = await self._events.count(start_time=start, end_time=end, event_level="critical", vehicle_id=vehicle_id)
-        unacknowledged = await self._events.count(
-            start_time=start, end_time=end, acknowledged=False, vehicle_id=vehicle_id
-        )
-        latest = await self._events.fetch_latest(
-            start_time=start,
-            end_time=end,
-            limit=self._settings.dashboard_event_fetch_size,
-            vehicle_id=vehicle_id,
+        """事件统计块：total 精确计数 + 最近 N 条类型分布近似（下游不可用整块降级）。
+
+        审查 Y5：6 次 data-collector 查询**并发**发起（串行会累积 6 次网络往返，
+        在 P95 ≤ 200ms 预算内不可接受）；任一返回 None 即整块降级。
+        """
+        total, info, warning, critical, unacknowledged, latest = await asyncio.gather(
+            self._events.count(start_time=start, end_time=end, vehicle_id=vehicle_id),
+            self._events.count(
+                start_time=start, end_time=end, event_level="info", vehicle_id=vehicle_id
+            ),
+            self._events.count(
+                start_time=start, end_time=end, event_level="warning", vehicle_id=vehicle_id
+            ),
+            self._events.count(
+                start_time=start, end_time=end, event_level="critical", vehicle_id=vehicle_id
+            ),
+            self._events.count(
+                start_time=start, end_time=end, acknowledged=False, vehicle_id=vehicle_id
+            ),
+            self._events.fetch_latest(
+                start_time=start,
+                end_time=end,
+                limit=self._settings.dashboard_event_fetch_size,
+                vehicle_id=vehicle_id,
+            ),
         )
         if None in (total, info, warning, critical, unacknowledged, latest):
             return EventStats(available=False, reason="data-collector unavailable", total=0)

@@ -5,15 +5,26 @@ asyncio.to_thread 包装为异步，禁止在事件循环内做阻塞 IO（异�
 
 生命周期一致性：桶生命周期（30/90/永久）由 infra/docker/minio-init Job 配置，
 本模块只做对象操作（契约 x-hunter-file-upload-flow）。
+
+完整性校验（审查 R2 修复）：``stream_hashes`` 单次流式计算对象真实 size/MD5/SHA-256，
+是 complete 阶段「size_bytes / md5 / sha256 三者一致」契约判定的唯一数据来源
+（此前实现仅比对 ETag 与声明尺寸，sha256 从未参与校验）。
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import Any
 
 from botocore.exceptions import ClientError
+from hunter_common.exceptions import ResourceNotFoundError, ServiceUnavailableError
 
 from app.config import settings
+
+#: 流式哈希分块大小（1 MiB：内存占用与吞吐折中，非业务阈值；与 ota-service 一致）
+_STREAM_CHUNK_SIZE = 1024 * 1024
+#: 对象不存在（MinIO 可能返回 404 / NoSuchKey / NotFound）
+_NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 
 
 class MinioStorage:
@@ -83,7 +94,7 @@ class MinioStorage:
             resp = self._client.head_object(Bucket=bucket, Key=key)
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
-            if code in {"404", "NoSuchKey", "NotFound"}:
+            if code in _NOT_FOUND_CODES:
                 return None
             raise
         etag = resp.get("ETag")
@@ -96,6 +107,46 @@ class MinioStorage:
             "last_modified": last_modified.timestamp() if last_modified else 0.0,
             "content_type": resp.get("ContentType"),
         }
+
+    # ---------- 流式完整性校验（complete 阶段，审查 R2） ----------
+
+    def stream_hashes(self, bucket: str, key: str) -> tuple[int, str, str]:
+        """单次流式计算对象真实 ``(size_bytes, md5_hex, sha256_hex)``，不整包入内存。
+
+        契约依据：``contracts/openapi/data-collector.yaml``（POST /files/complete）
+        「完整性校验（size_bytes / md5 / sha256 三者必须全部一致，任一不符返回 6001）」。
+
+        Raises:
+            ResourceNotFoundError: 对象不存在（3001）。
+            ServiceUnavailableError: 对象存储不可用（5001）。
+                禁止静默降级为「校验通过」——完整性校验不可因依赖故障而失效。
+        """
+        try:
+            resp = self._client.get_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in _NOT_FOUND_CODES:
+                raise ResourceNotFoundError(
+                    message=f"对象不存在或尚未上传完成（bucket={bucket}, key={key}）"
+                ) from exc
+            raise ServiceUnavailableError(
+                message=f"对象存储不可用，无法完成完整性校验（bucket={bucket}）"
+            ) from exc
+        body = resp["Body"]
+        md5 = hashlib.md5()
+        sha256 = hashlib.sha256()
+        size = 0
+        try:
+            while True:
+                chunk = body.read(_STREAM_CHUNK_SIZE)
+                if not chunk:
+                    break
+                md5.update(chunk)
+                sha256.update(chunk)
+                size += len(chunk)
+        finally:
+            body.close()
+        return size, md5.hexdigest(), sha256.hexdigest()
 
     # ---------- 清单（list_objects_v2，marker 游标分页） ----------
 

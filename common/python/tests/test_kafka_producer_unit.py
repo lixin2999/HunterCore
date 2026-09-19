@@ -1,10 +1,13 @@
 """生产者契约行为单测（Mock confluent-kafka Producer，不需要 broker）。
 
 覆盖：契约 acks 选择 / 可重试错误指数退避 / 不可重试错误直接抛出 /
-重试耗尽落盘缓冲 / 契约驱动入口（Schema + key=vehicle_id）/ 缓冲重投。
+重试耗尽落盘缓冲 / 契约驱动入口（Schema + key=vehicle_id）/ 缓冲重投 /
+落盘与重投的线程归属（审查 R4：事件循环不得被同步文件 IO 阻塞）。
 """
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from pathlib import Path
 from typing import Any, ClassVar
@@ -256,6 +259,57 @@ async def test_replay_buffered_resends_and_clears(
     assert replayed == 1
     assert stats is not None and stats.message_count == 0
     assert patch_producer.instances[0].produced[-1]["value"] == b'{"seq":9}'
+
+
+async def test_buffer_write_does_not_block_event_loop(
+    tmp_path: Path, contract: KafkaContract, patch_producer: type[FakeProducer]
+) -> None:
+    """审查 R4 回归：落盘缓冲（open/flush/fsync）必须在事件循环外执行。
+
+    构造方式：让 ``LocalDiskBuffer.append`` 阻塞等待一个 **由并发协程** 设置的 Event。
+    若 append 运行在事件循环线程上，该协程永远无法被调度（事件循环被同步 IO 占住）
+    → ``asyncio.wait_for`` 超时失败；反之（下沉线程池）并发协程可正常插队并释放阻塞。
+    """
+    manager = KafkaProducerManager(make_config(tmp_path), contract=contract)
+    instance = patch_producer.instances[0]
+    instance.outcomes = [FakeError(retriable=True) for _ in range(3)]
+    assert manager.buffer is not None
+
+    started = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
+    append_threads: list[int] = []
+    original_append = manager.buffer.append
+
+    def _slow_append(record: BufferedRecord) -> None:
+        """模拟慢 fsync：记录线程归属并阻塞至并发协程放行。"""
+        append_threads.append(threading.get_ident())
+        started.set()
+        release.wait(timeout=3)
+        original_append(record)
+
+    async def _unblock_when_started() -> None:
+        """等待落盘开始后立即放行（证明事件循环仍可调度其他协程）。"""
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        release.set()
+
+    manager.buffer.append = _slow_append  # type: ignore[method-assign]
+    try:
+        produced, _ = await asyncio.wait_for(
+            asyncio.gather(
+                manager.produce("telemetry_raw", b'{"seq":1}', key=VEHICLE_ID.encode()),
+                _unblock_when_started(),
+            ),
+            timeout=5,
+        )
+    finally:
+        manager.buffer.append = original_append  # type: ignore[method-assign]
+        instance.outcomes = []
+        await manager.close()
+
+    assert produced.status == "buffered"
+    assert append_threads and append_threads[0] != loop_thread  # 落盘不在事件循环线程
 
 
 def test_backoff_is_exponential_and_capped(tmp_path: Path, contract: KafkaContract) -> None:

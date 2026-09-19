@@ -102,6 +102,20 @@ class MetricsReadOnlyRepository:
             await self._pool.close()
             self._pool = None
 
+    async def ping(self) -> bool:
+        """只读账号连通性探针（``/readyz`` 专用；失败返回 False 不抛出）。
+
+        审查 Y10：就绪探针必须复用只读账号（``hunter_analytics_ro``），
+        禁止为本服务初始化全权限 ``DatabaseSessionManager``（最小权限原则）。
+        """
+        try:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                return bool(await conn.fetchval("SELECT 1"))
+        except Exception:  # noqa: BLE001 - 探测失败即未就绪（禁止向探针路径抛出）
+            logger.warning("analytics_readonly_ping_failed")
+            return False
+
 
 class KafkaLagProbe:
     """Kafka 消费组滞后 / DLQ 水位探测（confluent-kafka 同步 API → to_thread 执行）。"""

@@ -7,10 +7,14 @@
 - 单条记录完整性：逐行 JSONL，写入后 flush + fsync（进程崩溃只影响最后一行，重放按行容错跳过）；
 - 容量上限：超过 ``max_bytes``（默认 1GB）时**整段淘汰最旧**（FIFO），累加丢弃指标 + WARNING 日志；
   唯一剩余段即使超限也不丢弃（避免刚写入的数据被立即抹掉），改为 CRITICAL 提示人工介入；
-- 重投崩溃安全：重投后原子重写剩余记录（``os.replace``），已成功部分不会被重复投递。
+- 重投崩溃安全：重投后原子重写剩余记录（``os.replace``），已成功部分不会被重复投递；
+- **异步纪律（审查 R4）**：本模块公开方法为同步阻塞实现（open/write/fsync/read_bytes/os.replace），
+  禁止在事件循环内直接调用；生产者侧经 ``asyncio.to_thread`` 转投递（见 ``producer.produce`` /
+  ``replay_buffered``），``replay`` 内部的文件 IO 同样下沉线程池（异步优先约束）。
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -87,7 +91,11 @@ class LocalDiskBuffer:
         return self._root
 
     def append(self, record: BufferedRecord) -> None:
-        """落盘一条消息（含容量淘汰）；水位同步刷新到 Prometheus。"""
+        """落盘一条消息（含容量淘汰）；水位同步刷新到 Prometheus。
+
+        阻塞实现（open/flush/fsync + 目录扫描）：**禁止在事件循环内直接调用**，
+        异步调用方必须经 ``asyncio.to_thread``（审查 R4：异步优先约束）。
+        """
         with self._lock:
             stamped = record if record.buffered_at else BufferedRecord(
                 topic=record.topic,
@@ -115,7 +123,9 @@ class LocalDiskBuffer:
         已成功的记录从文件中原子移除（下次重投只处理剩余部分）。
         """
         replayed = 0
-        for segment in self._segments():
+        # 目录扫描（glob）为阻塞 IO：下沉线程池（审查 R4，禁止阻塞事件循环）
+        segments = await asyncio.to_thread(self._segments)
+        for segment in segments:
             if max_records is not None and replayed >= max_records:
                 break
             sent, drained = await self._replay_segment(segment, send, max_records)
@@ -125,11 +135,14 @@ class LocalDiskBuffer:
                 break
         if replayed:
             kafka_metrics.record_buffer_replayed(self._service, replayed)
-            self._refresh_metrics()
+            await asyncio.to_thread(self._refresh_metrics)
         return replayed
 
     def stats(self) -> BufferStats:
-        """当前缓冲水位（重投期间也可安全读取）。"""
+        """当前缓冲水位（重投期间也可安全读取）。
+
+        阻塞实现（目录 glob）：异步调用方经 ``asyncio.to_thread``（审查 R4）。
+        """
         return BufferStats(
             message_count=self._message_count,
             bytes_size=self._bytes_size,
@@ -153,7 +166,9 @@ class LocalDiskBuffer:
         self, segment: Path, send: ReplaySender, max_records: int | None
     ) -> tuple[int, bool]:
         """重投单段；返回 ``(成功条数, 是否已处理完本段)``，并原子重写未处理部分（崩溃安全）。"""
-        lines = segment.read_bytes().splitlines(keepends=True)
+        # 整段读入为阻塞 IO：下沉线程池（段大小受 segment_max_records 约束）
+        raw = await asyncio.to_thread(segment.read_bytes)
+        lines = raw.splitlines(keepends=True)
         sent = 0
         processed = 0
         remainder: list[bytes] = []
@@ -181,7 +196,8 @@ class LocalDiskBuffer:
             sent += 1
         else:
             processed = len(lines)
-        self._finalize_segment(segment, remainder, processed)
+        # 结果落盘（原子重写/删除）为阻塞 IO：下沉线程池（审查 R4）
+        await asyncio.to_thread(self._finalize_segment, segment, remainder, processed)
         return sent, not remainder
 
     def _finalize_segment(self, segment: Path, remainder: list[bytes], processed: int) -> None:

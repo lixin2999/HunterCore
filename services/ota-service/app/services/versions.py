@@ -253,16 +253,17 @@ class VersionService:
                 details={"field": "package_md5", "expected": row.package_md5, "actual": md5_hex},
             )
         checks.md5_verified = True
-        if self._settings.ota_package_verify_sha256 and sha256_hex != row.package_sha256:
+        # 审查 Y3：校验开关关闭时**如实**回报（此前无论是否校验都置 True，构成假声明）
+        checks.sha256_verified = self._settings.ota_package_verify_sha256
+        if checks.sha256_verified and sha256_hex != row.package_sha256:
             OTA_PACKAGE_VERIFY_FAILURES.labels(_VERIFY_REASON_SHA256).inc()
             raise OtaPackageChecksumError(
                 message="SHA-256 校验失败（6001）",
                 details={"field": "package_sha256", "expected": row.package_sha256, "actual": sha256_hex},
             )
-        checks.sha256_verified = True
 
-
-        if self._settings.ota_package_verify_signature:
+        checks.signature_verified = self._settings.ota_package_verify_signature
+        if checks.signature_verified:
             try:
                 signature_ok = await asyncio.to_thread(
                     verify_package_signature,
@@ -276,7 +277,14 @@ class VersionService:
             if not signature_ok:
                 OTA_PACKAGE_VERIFY_FAILURES.labels(_VERIFY_REASON_SIGNATURE).inc()
                 raise OtaSignatureError(details={"algorithm": "RSASSA-PKCS1-v1_5_SHA256"})
-        checks.signature_verified = True
+        else:
+            # 开关关闭属于高危配置（契约 pending：开关是否允许关闭）：显式告警留痕
+            logger.warning(
+                "ota_package_verify_disabled",
+                version_id=str(version_id),
+                sha256_enabled=self._settings.ota_package_verify_sha256,
+                signature_enabled=False,
+            )
 
         max_code = await self._repository.max_published_code(list(row.applicable_models))
         if max_code is not None and row.version_code <= max_code:

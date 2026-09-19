@@ -7,17 +7,17 @@
 """
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
-
-from sqlalchemy import func, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from hunter_common.database import DatabaseSessionManager
 from hunter_common.database.enums import OTA_TERMINAL_STATUSES, OtaStatus
 from hunter_common.database.models import OtaRecord
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +174,7 @@ class OtaRecordRepository:
         record.error_code = error_code
         record.error_message = error_message
         if status in OTA_TERMINAL_STATUSES:
-            record.end_time = datetime.fromtimestamp(event_time, tz=timezone.utc)
+            record.end_time = datetime.fromtimestamp(event_time, tz=UTC)
         await session.flush()
         return True
 

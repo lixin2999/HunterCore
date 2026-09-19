@@ -177,6 +177,9 @@ class SessionService:
                 sidecar_key=sidecar_key,
             )
             await self._redis.client.hset(session_key, mapping=mapping)
+            # 硬 TTL 兜底（审查 R7 + redis-keys pending #4）：副本崩溃 / 客户端未走 DELETE 时，
+            # 残留会话会永久占用车辆互斥位（同车后续接管恒返回 7001）→ 设 6h 上限
+            await self._redis.client.expire(session_key, self._settings.rc_session_ttl_s)
             record = RecordArchiveInfo(
                 object_key=video_key, sidecar_object_key=sidecar_key
             )
@@ -302,7 +305,60 @@ class SessionService:
                 message="无权限结束他人操控会话（仅会话归属操作员或管理员）"
             )
 
-        session_operator_id = mapping.get(FIELD_OPERATOR_ID) or operator.user_id
+        return await self._finalize_session(
+            vehicle_id=vehicle_id,
+            session_id=session_id,
+            mapping=mapping,
+            reason=reason,
+            issued_by=operator.user_id,
+        )
+
+    async def close_stale_session(
+        self, session_id: str, *, reason: SessionEndReason
+    ) -> bool:
+        """系统侧结束陈旧会话（守护任务专用；审查 R7 + 契约 pending #4）。
+
+        与 :meth:`end_session` 的差异：
+        - **无操作员上下文**（非用户请求）→ 不做数据权限校验，``issued_by`` 置空；
+        - 幂等：会话已被操作员结束/键已过期 → 返回 False（不抛 3001）。
+
+        收尾顺序与操作员结束完全一致（「先安全后清理」，契约 267 行不可颠倒）。
+        """
+        found = await self._find_session(session_id)
+        if found is None:
+            return False
+        vehicle_id, mapping = found
+        await self._finalize_session(
+            vehicle_id=vehicle_id,
+            session_id=session_id,
+            mapping=mapping,
+            reason=reason,
+            issued_by=None,
+        )
+        logger.warning(
+            "session_forced_closed",
+            vehicle_id=vehicle_id,
+            session_id=session_id,
+            reason=reason.value,
+        )
+        return True
+
+    async def _finalize_session(
+        self,
+        *,
+        vehicle_id: str,
+        session_id: str,
+        mapping: dict[str, str],
+        reason: SessionEndReason,
+        issued_by: str | None,
+    ) -> RemoteSessionResult:
+        """「先安全后清理」收尾（契约 267 行顺序不可颠倒）。
+
+        1. 车端释放：stop 帧 + session_end 信令（producer 内部尽力而为，不抛 5001）；
+        2. 删会话 Hash + 活跃数指标回落；
+        3. sidecar 归档（尽力而为，失败置 ``sidecar_written=false`` 供人工核查）。
+        """
+        session_operator_id = mapping.get(FIELD_OPERATOR_ID) or ""
         # Hash 缺失/非法时以当前时间兜底（_to_float 的 None 分支仅类型层面兜底）
         started_at = _to_float(mapping.get(FIELD_STARTED_AT)) or time.time()
         ended_at = time.time()
@@ -326,7 +382,7 @@ class SessionService:
             vehicle_id,
             session_id=session_id,
             operator_id=session_operator_id,
-            issued_by=operator.user_id,
+            issued_by=issued_by,
             reason=reason,
         )
 
@@ -352,6 +408,7 @@ class SessionService:
             reason=reason,
             duration_s=duration_s,
             sidecar_written=sidecar_written,
+            issued_by=issued_by,
         )
         return RemoteSessionResult(
             session_id=session_id,

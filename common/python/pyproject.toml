@@ -31,7 +31,8 @@ dev = [
     # 真实 Session 语义测试（tests/test_repository_transactions.py：SAVEPOINT/事务边界回归）
     # 用 sqlite+aiosqlite 驱动，无需容器即可在单元阶段守护写路径纪律；仅测试依赖，运行时不使用
     "aiosqlite>=0.19,<1",
-    "ruff>=0.4,<1",
+    # 版本区间锁定：CI 与本地使用同一 lint 规则集，避免"文档通过、流水线失败"的版本漂移
+    "ruff>=0.16,<0.17",
     "mypy>=1.8,<2",
 ]
 

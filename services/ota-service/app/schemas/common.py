@@ -89,16 +89,16 @@ class OtaApiResponse(BaseModel):
 
 __all__ = [
     "DEFAULT_PAGE_SIZE",
-    "MD5_PATTERN",
     "MAX_PAGE_SIZE",
+    "MD5_PATTERN",
     "MODEL_NAME_PATTERN",
+    "SHA256_PATTERN",
+    "VEHICLE_ID_PATTERN",
     "OtaApiResponse",
     "OtaBatchStatus",
     "OtaNextAction",
     "OtaPreconditionName",
     "OtaRollbackTarget",
     "OtaTaskAction",
-    "SHA256_PATTERN",
     "ScheduleMode",
-    "VEHICLE_ID_PATTERN",
 ]

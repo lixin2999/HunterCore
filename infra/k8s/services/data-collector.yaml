@@ -21,6 +21,19 @@ data:
   KAFKA_SUBSCRIBE_PATTERNS: "hunter.*.telemetry,hunter.*.event,hunter.*.health,hunter.*.command_result"
   KAFKA_PRODUCE_TOPICS: "telemetry_raw,telemetry_clean,event_raw,sensor_file"
   KAFKA_AUTO_OFFSET_RESET: "earliest"
+  # 消费侧契约 Schema 校验（默认开启）：运行时契约目录由 hunter-contracts ConfigMap 挂载
+  # （生成：python scripts/generate_contracts_configmap.py）
+  INGEST_SCHEMA_VALIDATION_ENABLED: "true"
+  KAFKA_CONTRACT_DIR: "/app/contracts/kafka"
+  # 采集链路开关与批处理参数（审查 R1 落地；关闭任一消费者需变更评审）
+  TELEMETRY_CONSUMER_ENABLED: "true"
+  EVENT_CONSUMER_ENABLED: "true"
+  HEALTH_CONSUMER_ENABLED: "true"
+  CONSUMER_BATCH_SIZE: "100"
+  TELEMETRY_PUBLISH_CONCURRENCY: "50"
+  # 车辆离线判定与状态守护（系统约束：遥测中断 > 10s → 离线）
+  VEHICLE_OFFLINE_THRESHOLD_SECONDS: "10"
+  VEHICLE_OFFLINE_SWEEP_INTERVAL_SECONDS: "5"
   # 时序批量写入（性能指标：≥ 10000 点/秒，批量插入）
   TELEMETRY_BATCH_SIZE: "2000"
   TELEMETRY_FLUSH_INTERVAL_MS: "500"
@@ -86,7 +99,7 @@ spec:
               app.kubernetes.io/name: data-collector
       containers:
         - name: data-collector
-          image: hunter/data-collector:0.1.0
+          image: "hunter/data-collector:{version}"   # 版本变量：部署前由 scripts/render_k8s.py 注入
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -101,6 +114,10 @@ spec:
           volumeMounts:
             - name: kafka-tls
               mountPath: /etc/hunter/kafka-tls
+              readOnly: true
+            # 契约目录（data-collector 消费侧 Schema 校验；KAFKA_CONTRACT_DIR 指向此处）
+            - name: contracts
+              mountPath: /app/contracts/kafka
               readOnly: true
             - name: tmp
               mountPath: /tmp
@@ -122,25 +139,30 @@ spec:
               port: http
             periodSeconds: 5
             failureThreshold: 30
-          livenessProbe:
+          livenessProbe:                 # 存活：初始延迟 10s / 周期 5s
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 15
-            periodSeconds: 10
+            initialDelaySeconds: 10
+            periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
-          readinessProbe:
+          readinessProbe:                # 就绪：初始延迟 10s / 周期 5s（/readyz 含 DB/Redis 探测）
             httpGet:
               path: /readyz
               port: http
-            periodSeconds: 10
+            initialDelaySeconds: 10
+            periodSeconds: 5
             timeoutSeconds: 5
             failureThreshold: 3
       volumes:
         - name: kafka-tls
           secret:
             secretName: hunter-kafka-tls
+        # 运行时 Kafka 契约（消费侧 Schema 校验；由 scripts/generate_contracts_configmap.py 生成）
+        - name: contracts
+          configMap:
+            name: hunter-contracts
         - name: tmp
           emptyDir: {}
 ---

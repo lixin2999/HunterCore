@@ -27,3 +27,5 @@ spark-jobs
 infra
 scripts
 services/*/app/tests
+# K8s 清单版本渲染产物（build/k8s/，由 scripts/render_k8s.py 生成，禁止进入镜像构建上下文）
+build/

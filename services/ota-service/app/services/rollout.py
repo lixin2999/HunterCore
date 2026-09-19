@@ -13,7 +13,11 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from hunter_common.database.enums import OTA_ACTIVE_STATUSES, OTA_TERMINAL_STATUSES, OtaStatus
+from hunter_common.database.enums import (
+    OTA_ACTIVE_STATUSES,
+    OTA_TERMINAL_STATUSES,
+    OtaStatus,
+)
 from hunter_common.exceptions import InvalidParameterError
 
 from app.schemas.common import OtaBatchStatus, OtaNextAction
@@ -108,7 +112,7 @@ def build_rollout_view(
     *,
     strategy: OtaUpgradeStrategy,
     allocation: list[list[str]],
-    snapshots: dict[str, "RecordSnapshot"],
+    snapshots: dict[str, RecordSnapshot],
     now: float,
 ) -> OtaRolloutView:
     """灰度推进视图（任务详情 rollout 字段；数据来源 ota_records 聚合）。
@@ -185,7 +189,7 @@ def build_rollout_view(
 def build_task_progress(
     *,
     total_vehicles: int,
-    snapshots: dict[str, "RecordSnapshot"],
+    snapshots: dict[str, RecordSnapshot],
     current_batch: int,
 ) -> OtaTaskProgress:
     """任务聚合进度（写入 ota_tasks.progress JSONB；分母口径见契约 OtaTaskProgress）。"""

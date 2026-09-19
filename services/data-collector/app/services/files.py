@@ -3,8 +3,9 @@
 流程契约（x-hunter-file-upload-flow / x-hunter-pending-confirmation.p1/p2）：
 - presign：data_type→Bucket 映射 + 5.5 节命名规范生成对象路径（服务端生成，客户端不可指定）；
   对象路径含 `{timestamp}_{seq}` 段防覆盖（p1 已确认），seq 为秒内自增计数器；
-- complete：head_object 校验 size/md5/sha256 一致性，任一不匹配 → 6001（HTTP 422）；
-  multipart 先合并分片再校验；发布 sensor_file（key=vehicle_id，载荷契约固定）；
+- complete：head_object 定位对象 → **流式重算 size/MD5/SHA-256**（三者必须与声明值全部一致，
+  任一不符 → 6001 / HTTP 422，审查 R2 修复）→ multipart 先合并分片再校验 →
+  发布 sensor_file（key=vehicle_id，载荷契约固定）；
 - list：prefix 列举 + marker 游标分页，即时签发 15 分钟下载 URL。
 """
 from __future__ import annotations
@@ -171,7 +172,7 @@ class FileService:
         1. 对象路径必须归属请求车辆目录（前缀 {bucket}/{vehicle_id}/，否则 1002）；
         2. multipart：先合并分片（缺 upload_id/parts → 2001，非法会话中止并回滚）；
         3. head_object：对象不存在 → 3001；
-        4. size/md5/sha256 与 MinIO 元数据一致性校验（不匹配 → 6001，HTTP 422）；
+        4. 流式重算 size/md5/sha256 与声明值三者一致（任一不符 → 6001，HTTP 422）；
         5. 校验通过发布 sensor_file（key=vehicle_id；Kafka 故障 → 5001）。
         """
         self._validate_vehicle_prefix(
@@ -194,7 +195,7 @@ class FileService:
                     f"object_key={payload.object_key}）"
                 )
             )
-        self._verify_integrity(payload, metadata)
+        await self._verify_integrity(payload, metadata)
 
         data_type = self._resolve_data_type(payload)
         await self._producer.publish(
@@ -271,27 +272,51 @@ class FileService:
         """分片 ETag 归一化（客户端可能回带引号）。"""
         return etag.strip('"')
 
-    def _verify_integrity(self, payload: FileCompleteRequest, metadata: dict[str, Any]) -> None:
-        """完整性校验（x-hunter-file-upload-flow.complete 第 4 步；任一不匹配 → 6001）。
+    async def _verify_integrity(
+        self, payload: FileCompleteRequest, metadata: dict[str, Any]
+    ) -> None:
+        """完整性校验（x-hunter-file-upload-flow.complete 第 4 步；审查 R2 修复）。
 
-        - multipart 分片对象的 MinIO ETag 非整体 MD5（带 '-N' 后缀），
-          跳过 ETag==md5 比对，依赖 sha256 声明值；
-        - size_bytes 必须与对象 ContentLength 一致。
+        契约依据：``contracts/openapi/data-collector.yaml``（POST /files/complete）
+        「完整性校验（``size_bytes`` / ``md5`` / ``sha256`` 三者必须全部一致，
+        任一不符返回 6001）」。校验数据来自 ``MinioStorage.stream_hashes``：
+        单次流式重算对象真实摘要（1 MiB 分块，GB 级 ROS Bag 不整包入内存），
+        multipart 合并后的对象同样按内容校验（此前实现跳过 ETag/MD5 比对，
+        sha256 从未参与校验，且仍返回 ``verified=True``，属契约违反 + 假声明）。
+
+        差异语义：``size_bytes`` 先用对象元数据快速比对（省一次全量读取即失败），
+        再用流式读取长度二次比对（元数据与实际内容一致性的最终依据）。
         """
         if payload.size_bytes != metadata["size_bytes"]:
             raise OtaPackageChecksumError(
                 message=(
                     f"文件大小校验失败（6001）：声明 {payload.size_bytes} 字节，"
                     f"对象实际 {metadata['size_bytes']} 字节"
-                )
+                ),
+                details={
+                    "field": "size_bytes",
+                    "expected": payload.size_bytes,
+                    "actual": metadata["size_bytes"],
+                },
             )
-        object_etag = metadata.get("etag") or ""
-        is_multipart_object = "-" in object_etag
-        if not is_multipart_object and object_etag and object_etag != payload.md5:
+        # 流式哈希为阻塞 IO（boto3）：经 to_thread 包装，禁止阻塞事件循环
+        size, md5_hex, sha256_hex = await asyncio.to_thread(
+            self._storage.stream_hashes, payload.bucket.value, payload.object_key
+        )
+        if size != payload.size_bytes:
             raise OtaPackageChecksumError(
-                message=(
-                    f"MD5 校验失败（6001）：声明 md5={payload.md5}，对象 ETag={object_etag}"
-                )
+                message=f"对象读取长度与声明不符（6001）：{size} != {payload.size_bytes}",
+                details={"field": "size_bytes", "expected": payload.size_bytes, "actual": size},
+            )
+        if md5_hex != payload.md5:
+            raise OtaPackageChecksumError(
+                message="MD5 校验失败（6001）",
+                details={"field": "md5", "expected": payload.md5, "actual": md5_hex},
+            )
+        if sha256_hex != payload.sha256:
+            raise OtaPackageChecksumError(
+                message="SHA-256 校验失败（6001）",
+                details={"field": "sha256", "expected": payload.sha256, "actual": sha256_hex},
             )
 
     @staticmethod

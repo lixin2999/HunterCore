@@ -146,10 +146,37 @@ curl http://localhost:8081/healthz
 ### 4. 运行单元测试与静态检查
 
 ```bash
+# 全量单元回归（每个服务独立进程，避免顶层包名 app 冲突）
+python scripts/run_unit_tests.py
 pytest common/python/tests -q                     # 共享库测试（含 Kafka 契约/消息/缓冲/幂等/生产/消费）
 cd services/scene-service && pytest -q            # 服务测试（每个服务目录内执行）
-ruff check common services                        # Lint
+ruff check tests common/python services           # Lint（CI 同款命令）
 ```
+
+> ⚠ 测试根目录必须逐个运行（6 个服务共用顶层包名 `app`）：CI 与本地统一走
+> `python scripts/run_unit_tests.py`。
+
+## 数据采集链路（审查 R1 后已落地）
+
+`data-collector` 承担车端 Topic 的接入与预处理，链路与契约
+（`contracts/kafka/consumer-groups.yaml` + `contracts/openapi/data-collector.yaml`
+`x-hunter-ingest-pipeline`）一一对应：
+
+| 消费组 | 订阅 | 职责 | 产出 |
+|--------|------|------|------|
+| `data-collector-telemetry` | `hunter.*.telemetry` | 6 步预处理（校验→时间对齐→清洗→映射）→ 批量入库 | `telemetry_raw` / `telemetry_clean` + `vehicle_telemetry` |
+| `data-collector-health` | `hunter.*.health` | 写车辆实时读模型（不落库） | `vehicle:status:{id}` / `vehicle:online:set` |
+| `data-collector-events` | `hunter.*.event` | 等级一致性校验 → 幂等落库 | `event_raw` + `events` |
+
+- **批量入库**：缓冲达到 `TELEMETRY_BATCH_SIZE` 或消费者批次收尾时冲刷；
+  批次钩子在**提交 offset 之前**执行，钩子失败 → 跳过提交 → 消息重投（写侧
+  `ON CONFLICT (time, vehicle_id) DO NOTHING` 保证幂等）。
+- **车辆状态守护**：`VehicleStatusSweeper` 周期对账，心跳超
+  `VEHICLE_OFFLINE_THRESHOLD_SECONDS`（默认 10s）→ 置 `offline` 并移出在线集合
+  （OTA 门禁与远程接管判定的数据来源）。
+- **运行时契约**：消费侧 Schema 校验（`schema_name="auto"`）需要契约目录可访问，
+  集群内由 `hunter-contracts` ConfigMap 挂载（生成/校验：
+  `python scripts/generate_contracts_configmap.py [--check]`）。
 
 ## 本地启动顺序（依赖链）
 
@@ -165,16 +192,27 @@ ruff check common services                        # Lint
 静态校验与部署命令：
 
 ```bash
-# 静态校验（无需集群）：API 版本/命名空间/探针/资源配额/敏感字段/端口/契约一致性
+# 静态校验（无需集群）：API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约一致性
+python scripts/render_k8s.py --check    # 镜像 {version} 占位符契约（6 个微服务）
 python scripts/verify_infra.py
 
+# 版本渲染（{version} 占位符 → 发布版本；清单禁止硬编码版本，产物 build/k8s/）
+python scripts/render_k8s.py --version 0.1.0
+
 # 部署顺序（完整版见 infra/k8s/README.md）
-kubectl apply -f infra/k8s/base/            # 命名空间 + 共享 ConfigMap + Secret（先复制 02-secret.example.yaml）
+# 0) 生成运行时契约 ConfigMap（消费侧 Schema 校验依赖；契约变更后需重新生成）
+python scripts/generate_contracts_configmap.py
+kubectl apply -f build/k8s/base/            # 命名空间 + 共享 ConfigMap + 契约 ConfigMap + Secret（先复制 02-secret.example.yaml）
 # 前置：创建 TLS Secret hunter-kafka-tls / hunter-minio-tls / hunter-edge-tls
-kubectl apply -f infra/k8s/statefulsets/    # postgres / kafka / redis / minio
-kubectl apply -f infra/k8s/jobs/            # Topic 与 Bucket 初始化（契约一致）
-kubectl apply -f infra/k8s/services/        # 6 个微服务
-kubectl apply -f infra/k8s/ingress.yaml     # 网关路由表 + WebSocket + TLS
+kubectl apply -f build/k8s/statefulsets/    # postgres / kafka / redis / minio
+kubectl apply -f build/k8s/jobs/            # Topic 与 Bucket 初始化（契约一致）
+kubectl apply -f build/k8s/services/        # 6 个微服务
+kubectl apply -f build/k8s/ingress.yaml     # 网关路由表 + WebSocket + TLS
+# 网络策略（默认拒绝入向 + 仅网关可达后端；审查 R5 纵深防御）
+kubectl apply -f build/k8s/networkpolicies/
+# 自动扩缩容（min=2/max=5/CPU 70%）与自愿中断保护（PDB）
+kubectl apply -f build/k8s/autoscaling/hpa.yaml
+kubectl apply -f build/k8s/disruption/poddisruptionbudgets.yaml
 
 # 监控栈
 kubectl apply -k infra/monitoring
@@ -183,7 +221,10 @@ kubectl apply -f infra/monitoring/exporters/exporters.yaml
 
 要点：
 
-- **探针**：`startupProbe`/`livenessProbe` → `/healthz`，`readinessProbe` → `/readyz`（内部 2s 超时，依赖异常时快速 503 + `code=5001`）
+- **探针**：`startupProbe`/`livenessProbe` → `/healthz`，`readinessProbe` → `/readyz`（初始延迟 10s / 周期 5s；就绪端点内部 2s 超时，依赖异常时快速 503 + `code=5001`）
+- **优雅终止**：`terminationGracePeriodSeconds` 基准 30s（api-gateway / scene-service）；消费类与会话类服务 60s（data-collector 提交 offset、ota 任务交接、remote-control 会话收敛，契约 pending 已固化）
+- **滚动更新**：`maxSurge: 1` / `maxUnavailable: 0`（更新期间不降级），配合 PDB 覆盖节点排空场景
+- **自动扩缩容**：HPA 6 个微服务（min=2 / max=5 / CPU 70%），需集群安装 metrics-server；有状态中间件禁止 HPA
 - **指标**：各服务暴露 `GET /metrics`（`common/python/hunter_common/metrics.py`，统一前缀 `hunter_`），Prometheus 通过 Pod 注解自动发现
 - **安全**：`hunter-edge` 命名空间 `pod-security=restricted`；密钥/证书仅经 Secret 注入；Kafka `SASL_SSL + SCRAM-SHA-512`；MinIO HTTPS + SSE-S3
 - **告警**：5 组规则（服务健康 / API 性能 / 数据管道 / 中间件 / 业务约束），阈值需与设计文档 15.4.2 节核对
@@ -396,6 +437,8 @@ python scripts/verify_test_layer.py
 | 场景契约校验 | `cd services/scene-service && pytest app/tests/test_scene_contract.py -q`（契约 ↔ 设计文档 4 章/12.2 节 ↔ DDL ↔ Kafka ↔ K8s，29 项） |
 | 场景服务实现测试 | `cd services/scene-service && pytest -q`（端点/服务层/消费者/健康探针 100 项；含错误码 1001/1002/2001/2002/3001/3002/3003/5001 分支） |
 | 数据采集契约校验 | `cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q`（契约 ↔ 设计文档 5 章 ↔ DDL ↔ Kafka ↔ K8s，30 项） |
+| 数据采集链路测试 | `cd services/data-collector && pytest -q`（114 项：契约 + 健康探针 + FileService（含 SHA-256 内容校验回归）/ EventService / TelemetryService + 5.4 预处理流水线 + 批量入库 + 车辆读模型 + 三路消费者） |
+| 契约 ConfigMap 一致性 | `python scripts/generate_contracts_configmap.py --check`（运行时 Schema 校验依赖的 `hunter-contracts` 与 `contracts/kafka` 一致） |
 | 数据分析契约校验 | `cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q`（契约 ↔ 设计文档 6 章/12.4 节 ↔ DDL ↔ Kafka ↔ K8s，32 项） |
 | 远程操控契约校验 | `cd services/remote-control && pytest app/tests/test_remote_control_contract.py -q`（契约 ↔ 设计文档 15 条安全约束/12.6 节推导 ↔ Kafka ↔ MinIO 归档 ↔ K8s，契约测试随实现步骤落地） |
 | 契约文件静态校验 | `python -c "import yaml; yaml.safe_load(open('contracts/openapi/remote-control.yaml', encoding='utf-8'))"`（YAML 语法 + `$ref` 解析，无需服务） |
@@ -404,8 +447,9 @@ python scripts/verify_test_layer.py
 | 服务健康探针 | `curl http://localhost:<port>/healthz` |
 | 服务单元测试 | `cd services/<service> && pytest -q` |
 | 指标端点 | `curl http://localhost:<port>/metrics`（Prometheus 文本格式，含 `hunter_` 前缀指标） |
-| K8s/监控清单静态校验 | `python scripts/verify_infra.py`（68 个文档：API 版本/命名空间/探针/资源/敏感字段/端口/契约） |
-| 容器镜像构建 | `docker build -f services/<service>/Dockerfile -t hunter/<service>:0.1.0 .` |
+| K8s/监控清单静态校验 | `python scripts/verify_infra.py`（85 个文档：API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约） |
+| K8s 清单版本渲染 | `python scripts/render_k8s.py --check` / `--version 0.1.0`（镜像 `{version}` 占位符 → 渲染产物 `build/k8s/`） |
+| 容器镜像构建 | `docker build -f services/<service>/Dockerfile -t hunter/<service>:$VERSION .`（禁止 latest，与清单同源） |
 | 前端类型检查 | `cd frontend && npm run type-check`（vue-tsc 严格模式，0 error） |
 | 前端生产构建 | `cd frontend && npm run build`（type-check + vite build，产物 `frontend/dist/`） |
 | 前端本地联调 | `cd frontend && npm run dev` → `http://localhost:5173`（代理 `/api`、`/ws` 到网关 8080） |
@@ -423,7 +467,7 @@ python scripts/verify_test_layer.py
 
 ## 文档
 
-- `docs/`：设计文档索引与开发文档（含 `frontend-portal.md`：前端模块设计、鉴权与权限、远程操控实现要点、回归清单）
+- `docs/`：设计文档索引与开发文档（含 `deployment.md`：部署指南——镜像构建 / K8s 清单 / 版本变量 / HPA-PDB / 验证清单；`frontend-portal.md`：前端模块设计、鉴权与权限、远程操控实现要点、回归清单）
 - `frontend/README.md`：前端快速开始、环境变量、页面与契约端点映射、待确认项
 - `contracts/`：接口契约（数据库 DDL/ER/受控词表 + Redis Key / MinIO 对象存储契约、Kafka Topic 清单/消费者组/11 个消息 JSON Schema 已完成；OpenAPI 已完成 api-gateway / scene-service / data-collector / data-analytics / ota-service / remote-control，六个服务契约齐备）
 - `release.md`：版本变更记录

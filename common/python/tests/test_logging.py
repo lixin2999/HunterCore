@@ -57,3 +57,52 @@ def test_vehicle_id_context_injected(capsys: pytest.CaptureFixture[str]) -> None
         reset_vehicle_id(token)
     event = _parse_last_json_line(capsys)
     assert event["vehicle_id"] == "HUNTER-001"
+
+
+def test_nested_sensitive_fields_masked(capsys: pytest.CaptureFixture[str]) -> None:
+    """审查 Y1 回归：嵌套 dict / list 内的敏感字段必须同样掩码。
+
+    修复前仅掩码顶层 key，``payload={"password": ...}``、``items=[{"token": ...}]``
+    会明文落盘（结构化日志的实际泄露路径）。
+    """
+    configure_logging("unit-test", "INFO", json_output=True)
+    get_logger("test").info(
+        "probe",
+        payload={"password": "P@ssw0rd", "nested": [{"token": "abc"}, {"ok": "v"}]},
+        vehicle_id="HUNTER-001",
+    )
+    event = _parse_last_json_line(capsys)
+    assert event["payload"]["password"] == "***MASKED***"
+    assert event["payload"]["nested"][0]["token"] == "***MASKED***"
+    assert event["payload"]["nested"][1]["ok"] == "v"      # 非敏感字段保留
+    assert event["vehicle_id"] == "HUNTER-001"             # 非敏感顶层字段保留
+
+
+def test_sensitive_string_values_masked(capsys: pytest.CaptureFixture[str]) -> None:
+    """字段名正常但值是凭据：Bearer Token / PEM 私钥块必须掩码。"""
+    configure_logging("unit-test", "INFO", json_output=True)
+    get_logger("test").info(
+        "upstream_call",
+        request_header="Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature",
+        key_material="-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\n-----END PRIVATE KEY-----",
+        note="plain text",
+    )
+    event = _parse_last_json_line(capsys)
+    assert event["request_header"] == "***MASKED***"
+    assert event["key_material"] == "***MASKED***"
+    assert event["note"] == "plain text"
+
+
+def test_deeply_nested_structures_are_truncated_not_leaked(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """深度超限的嵌套结构一律掩码（防自引用结构拖垮日志路径）。"""
+    configure_logging("unit-test", "INFO", json_output=True)
+    payload: dict[str, object] = {"password": "deep-secret"}
+    for _ in range(10):
+        payload = {"level": payload}
+    get_logger("test").info("deep", payload=payload)
+
+    event = _parse_last_json_line(capsys)
+    serialized = json.dumps(event["payload"], ensure_ascii=False)
+    assert "deep-secret" not in serialized

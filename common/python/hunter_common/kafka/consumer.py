@@ -42,6 +42,9 @@ MessageHandler = Callable[[Message, Any], Awaitable[None]]
 #: 幂等键提取函数签名：(原始 Message, 解码后的值) -> 幂等键
 IdempotencyKeyFn = Callable[[Message, Any], str]
 
+#: 批次收尾钩子签名：本批全部 handler 执行完后、提交 offset 之前调用（无参）
+BatchEndHook = Callable[[], Awaitable[None]]
+
 #: schema_name 特殊值：按消息实际 Topic 自动解析契约 Schema
 SCHEMA_AUTO: Final[str] = "auto"
 
@@ -73,6 +76,7 @@ class KafkaConsumerManager:
         retry_backoff_ms: int | None = None,
         idempotency: IdempotencyGuard | None = None,
         idempotency_key: IdempotencyKeyFn | None = None,
+        on_batch_end: BatchEndHook | None = None,
         producer_manager: Any | None = None,
         contract: KafkaContract | None = None,
         lag_metrics_enabled: bool | None = None,
@@ -87,6 +91,8 @@ class KafkaConsumerManager:
                 其他值 = 固定 Schema 逻辑名（如 ``telemetry``，不存在则构造时抛错）。
             handler_max_attempts / retry_backoff_ms: 覆盖配置中的重试参数（默认取配置）。
             idempotency / idempotency_key: 同时提供才启用幂等跳过（契约 idempotency=required）。
+            on_batch_end: 批次收尾钩子（本批 handler 全部完成后、提交 offset 前调用）；
+                典型用途：批量写库前冲刷累积缓冲。钩子抛异常 → 跳过本次提交（消息重投）。
             producer_manager: DLQ 投递用的生产者（默认取全局单例；测试可注入替身）。
             consumer: 底层消费者实例（测试注入；默认按配置创建）。
         """
@@ -104,6 +110,7 @@ class KafkaConsumerManager:
         self._retry_backoff_ms = retry_backoff_ms or config.kafka_consumer_retry_backoff_ms
         self._idempotency = idempotency
         self._idempotency_key = idempotency_key
+        self._on_batch_end = on_batch_end
         self._producer_manager = producer_manager
         self._lag_metrics_enabled = (
             config.kafka_consumer_lag_metrics_enabled
@@ -196,8 +203,11 @@ class KafkaConsumerManager:
                     continue
                 for message in messages:
                     await self._handle_message(message, handler)
-                # 批次处理完成（含 DLQ 转投）后手动提交 offset（at-least-once 语义）
-                await loop.run_in_executor(None, self._commit)
+                # 批次收尾（如遥测累积批量入库）必须在提交 offset **之前**完成：
+                # 钩子失败 → 跳过本次提交，消息重新投递（配合写入侧幂等避免数据丢失）
+                if await self._run_batch_end_hook():
+                    # 批次处理完成（含 DLQ 转投）后手动提交 offset（at-least-once 语义）
+                    await loop.run_in_executor(None, self._commit)
                 await loop.run_in_executor(None, self._refresh_lag)
         finally:
             await loop.run_in_executor(None, self._close)
@@ -206,6 +216,22 @@ class KafkaConsumerManager:
     def stop(self) -> None:
         """请求停止消费循环（优雅停机：当前批次处理完成后退出）。"""
         self._running = False
+
+    async def _run_batch_end_hook(self) -> bool:
+        """执行批次收尾钩子，返回是否允许提交 offset。
+
+        钩子失败（如批量入库异常）→ 返回 False 并跳过提交：
+        本批消息在下次 poll 时重新投递，写入侧以唯一约束幂等去重（at-least-once 不丢数据）。
+        未配置钩子时直接放行（返回 True），行为与历史版本一致。
+        """
+        if self._on_batch_end is None:
+            return True
+        try:
+            await self._on_batch_end()
+        except Exception:
+            logger.exception("kafka_batch_end_hook_failed", group_id=self._group_id)
+            return False
+        return True
 
     # ---------- 单条消息处理 ----------
 
@@ -331,15 +357,22 @@ class KafkaConsumerManager:
     async def _send_to_dlq(
         self, message: Message, reason: str, error: BaseException | None = None
     ) -> None:
-        """转投死信队列 ``{topic}.dlq``（保留原位置与失败原因，便于排查与人工重放）。"""
+        """转投死信队列 ``{topic}.dlq``（保留原位置与失败原因，便于排查与人工重放）。
+
+        转投失败/不可用（DLQ 关闭、生产者未初始化、投递异常）时上报
+        ``hunter_kafka_dlq_failed_total`` 指标（审查 Y7）：此路径下消息会随 offset
+        提交而丢失，必须可告警、可人工从日志溯源重放（禁止静默失败）。
+        """
         topic = str(message.topic())
         kafka_metrics.record_dlq(self._service, self._group_id, topic, reason)
         if not self._dlq_enabled:
+            kafka_metrics.record_dlq_failed(self._service, self._group_id, topic, reason)
             logger.error("kafka_dlq_disabled", topic=topic, reason=reason)
             return
         producer = self._resolve_producer()
         if producer is None:
             # 生产者未初始化：仅记录日志，避免 DLQ 转投失败掩盖原始业务异常
+            kafka_metrics.record_dlq_failed(self._service, self._group_id, topic, reason)
             logger.error("dlq_producer_not_initialized", topic=topic, reason=reason)
             return
         headers: list[tuple[str, bytes]] = [
@@ -366,6 +399,7 @@ class KafkaConsumerManager:
                 reason=reason,
             )
         except KafkaException:
+            kafka_metrics.record_dlq_failed(self._service, self._group_id, topic, reason)
             logger.exception("kafka_dlq_produce_failed", topic=topic, reason=reason)
 
     def _resolve_producer(self) -> Any | None:

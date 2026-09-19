@@ -1,0 +1,251 @@
+# =====================================================================
+# HorizontalPodAutoscaler（基于 CPU 使用率自动扩缩容）
+#
+# 约束（不可更改）：
+#   - minReplicas = 2 / maxReplicas = 5 / Resource(cpu) averageUtilization = 70%
+#   - 仅作用于无状态微服务；有状态中间件（PostgreSQL/Kafka/Redis/MinIO）禁止 HPA
+#   - 前置依赖：metrics-server（未部署时 `kubectl get hpa` 的 TARGETS 显示 <unknown>，
+#     副本数回落为 minReplicas，不影响服务可用）
+#
+# ⚠ 与 Deployment 静态副本的关系（人工确认点）：
+#   - scene-service / data-analytics / ota-service：基线 2 副本 → HPA 区间 [2, 5] 一致
+#   - api-gateway / data-collector / remote-control：基线 3 副本（可用性 ≥99.9% 约束）；
+#     HPA 接管后按 minReplicas=2 计算，低负载时可能缩容到 2 副本。
+#     若要求“永不低于 3 副本”，把这 3 个 HPA 的 minReplicas 改为 3（唯一改动点，
+#     仍满足 maxReplicas=5 与 70% 目标）
+#   - 应用本清单后，Deployment.spec.replicas 由 HPA 持续接管（滚动更新策略不变）
+#
+# 行为策略：扩容快速（30s 窗口，Percent 100% 或 +2 取大者）；缩容保守
+#   （稳定窗口 300s + 每分钟至多 -1 副本），避免指标抖动导致反复扩缩。
+#
+# 用法：
+#   kubectl apply -f infra/k8s/autoscaling/hpa.yaml
+#   kubectl -n hunter-edge get hpa
+# =====================================================================
+
+# ---------- API 网关（8080，CPU 敏感：JWT 验签 + 限流计数） ----------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-gateway
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: api-gateway
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-gateway
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+        - { type: Pods, value: 2, periodSeconds: 30 }
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 60 }
+---
+# ---------- 场景生成（8081，场景 CRUD / OpenSCENARIO 导出） ----------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: scene-service
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: scene-service
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: scene-service
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+        - { type: Pods, value: 2, periodSeconds: 30 }
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 60 }
+---
+# ---------- 数据采集（8082，Kafka 消费 + 批量入库；副本数受分区数上限约束） ----------
+# 注意：消费者组有效并行度 ≤ telemetry 主题分区数（12），maxReplicas=5 仍在分区数内。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: data-collector
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: data-collector
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: data-collector
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+        - { type: Pods, value: 2, periodSeconds: 30 }
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 60 }
+---
+# ---------- 数据分析（8083，聚合 / Corner Case 挖掘，内存密集） ----------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: data-analytics
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: data-analytics
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: data-analytics
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+        - { type: Pods, value: 2, periodSeconds: 30 }
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 60 }
+---
+# ---------- OTA 管理（8084，任务调度与灰度编排；扩容依赖分布式锁保证任务不重复领取） ----------
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ota-service
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: ota-service
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ota-service
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+        - { type: Pods, value: 2, periodSeconds: 30 }
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 60 }
+---
+# ---------- 远程操控（8085，WebRTC 转发长连接；扩容需配合会话粘性） ----------
+# ⚠ 长连接副本不迁移（契约 pending #14）：缩容会中断在线操控会话。
+#   若要求“操控期间禁止缩容”，把本 HPA 的 scaleDown.stabilizationWindowSeconds 调大
+#   或改为人工扩缩容（仅此一处，需人工确认）。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: remote-control
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: remote-control
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: remote-control
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+        - { type: Pods, value: 2, periodSeconds: 30 }
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 60 }
+

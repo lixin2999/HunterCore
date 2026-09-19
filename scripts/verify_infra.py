@@ -3,7 +3,7 @@
 
 校验项：
   1. K8s YAML 语法可解析，且文档非空
-  2. apiVersion 白名单（apps/v1、v1、batch/v1、networking.k8s.io/v1）
+  2. apiVersion 白名单（apps/v1、v1、batch/v1、networking.k8s.io/v1、autoscaling/v2、policy/v1）
   3. 命名空间统一为 hunter-edge（Namespace 资源本身除外）
   4. 工作负载（Deployment/StatefulSet）resources.requests/limits 与三种探针齐备
   5. 镜像标签禁止 latest / 缺省（必须显式版本或发布日期）
@@ -11,6 +11,10 @@
   7. 微服务端口与设计文档端口表一致（8080-8085）
   8. Kafka Topic 契约一致性（K8s init Job vs docker-compose 脚本：名称/分区/保留）
   9. MinIO Bucket 集合一致性（K8s init Job vs docker-compose 脚本）
+ 10. 自有微服务镜像必须使用 `{version}` 版本变量占位符（由 scripts/render_k8s.py 注入）
+ 11. HPA 契约：6 个微服务齐备，minReplicas=2 / maxReplicas=5 / CPU 目标 70% / 缩容稳定窗口
+ 12. PDB 契约：无状态服务齐备，minAvailable 必须小于 Deployment 基线副本数
+ 13. Dockerfile 多阶段 / 非 root / 端口 / 容器级健康检查（exec 形式，兼容 distroless）
 
 用法：python scripts/verify_infra.py
 退出码：0 全部通过；1 存在失败项
@@ -40,6 +44,8 @@ ALLOWED_API_VERSIONS = {
     "batch/v1",
     "networking.k8s.io/v1",
     "rbac.authorization.k8s.io/v1",
+    "autoscaling/v2",   # HPA（infra/k8s/autoscaling/hpa.yaml）
+    "policy/v1",        # PodDisruptionBudget（infra/k8s/disruption/）
 }
 WORKLOAD_KINDS = {"Deployment", "StatefulSet", "DaemonSet"}
 #: 应用与中间件命名空间（restricted Pod 安全标准）
@@ -56,6 +62,17 @@ SERVICE_PORTS: dict[str, int] = {
     "ota-service": 8084,
     "remote-control": 8085,
 }
+
+#: 自有微服务镜像必须使用的版本变量占位符（禁止硬编码版本号；由 scripts/render_k8s.py 注入）
+VERSION_PLACEHOLDER = "{version}"
+#: 清单中的 image 字段行（字段级匹配，避免把注释里的镜像名误判为镜像声明）
+IMAGE_LINE_PATTERN = re.compile(r"^\s*image:\s*[\"']?(?P<image>[^\"'\s#]+)")
+#: 版本渲染脚本（版本变量的单一注入入口）
+RENDER_SCRIPT = "scripts/render_k8s.py"
+#: HPA 部署约束（不可放宽：min=2 / max=5 / CPU 目标 70%）
+HPA_MIN_REPLICAS = 2
+HPA_MAX_REPLICAS = 5
+HPA_CPU_TARGET_PERCENT = 70
 
 #: ConfigMap 中禁止出现的敏感字段模式
 SENSITIVE_KEY_PATTERN = re.compile(
@@ -302,7 +319,9 @@ def check_dockerfiles() -> None:
             fail(f"{rel(dockerfile)} 禁止使用 latest 标签")
         if f"EXPOSE {port}" not in content:
             fail(f"{rel(dockerfile)} EXPOSE 端口必须为 {port}")
-    ok("Dockerfile 多阶段/非 root/端口校验完成")
+        if "HEALTHCHECK" not in content:
+            fail(f"{rel(dockerfile)} 缺少容器级 HEALTHCHECK（exec 形式，兼容 distroless 无 shell）")
+    ok("Dockerfile 多阶段/非 root/端口/健康检查校验完成")
 
 
 def check_monitoring_configs() -> None:
@@ -366,6 +385,171 @@ def check_monitoring_configs() -> None:
     ok(f"Grafana 看板校验完成（{len(dashboards)} 个看板）")
 
 
+def check_version_placeholder() -> None:
+    """校验自有微服务镜像统一使用 `{version}` 版本变量（禁止硬编码具体版本号）。
+
+    版本是部署期变量（CI 用 $CI_COMMIT_TAG，手工部署用发布版本号），
+    仓库清单只保留占位符，由 scripts/render_k8s.py 渲染后 apply。
+    """
+    expected = {f"hunter/{service}" for service in SERVICE_PORTS}
+    declared: set[str] = set()
+    problems: list[str] = []
+
+    for path in sorted(K8S_DIR.rglob("*.yaml")):
+        content = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(content.splitlines(), start=1):
+            match = IMAGE_LINE_PATTERN.match(line)
+            if not match:
+                continue
+            image = match.group("image")
+            if not image.startswith("hunter/"):
+                continue  # 第三方镜像按自身版本号管理，不参与渲染
+            name, _, tag = image.partition(":")
+            if name not in expected:
+                problems.append(f"{rel(path)}:{lineno} 未登记的微服务镜像 {image}（模块表不可新增）")
+                continue
+            declared.add(name)
+            if tag != VERSION_PLACEHOLDER:
+                problems.append(
+                    f"{rel(path)}:{lineno} {name} 镜像标签必须为 {VERSION_PLACEHOLDER}，实际 {tag!r}"
+                )
+
+    missing = sorted(expected - declared)
+    if missing:
+        problems.append(f"以下微服务镜像未在清单中声明: {missing}")
+
+    render_script = ROOT / RENDER_SCRIPT
+    if not render_script.exists():
+        problems.append(f"缺少版本渲染脚本 {RENDER_SCRIPT}（版本变量无法注入）")
+    elif VERSION_PLACEHOLDER not in render_script.read_text(encoding="utf-8"):
+        problems.append(f"{RENDER_SCRIPT} 未引用 {VERSION_PLACEHOLDER}（版本变量单一来源缺失）")
+
+    if problems:
+        for item in problems:
+            fail(item)
+    else:
+        ok(f"镜像版本变量校验完成（{len(declared)} 个微服务镜像 = {VERSION_PLACEHOLDER}）")
+
+
+def check_autoscaling(documents: list[tuple[Path, dict[str, Any]]]) -> None:
+    """校验 HPA：目标为无状态微服务 Deployment，min/max/CPU 目标/缩容窗口符合部署约束。"""
+    targets: set[str] = set()
+    problems: list[str] = []
+
+    for path, doc in documents:
+        if doc.get("kind") != "HorizontalPodAutoscaler":
+            continue
+        name = (doc.get("metadata") or {}).get("name")
+        spec = doc.get("spec") or {}
+        target_ref = spec.get("scaleTargetRef") or {}
+        target = target_ref.get("name")
+        if target_ref.get("kind") != "Deployment" or target not in SERVICE_PORTS:
+            problems.append(
+                f"{rel(path)}:HPA/{name} scaleTargetRef 必须为微服务 Deployment，实际 {target_ref}"
+            )
+            continue
+        if target != name:
+            problems.append(f"{rel(path)}:HPA/{name} 名称必须与目标 Deployment {target} 一致")
+        targets.add(str(target))
+
+        if spec.get("minReplicas") != HPA_MIN_REPLICAS:
+            problems.append(
+                f"{rel(path)}:HPA/{name} minReplicas 必须为 {HPA_MIN_REPLICAS}，"
+                f"实际 {spec.get('minReplicas')}"
+            )
+        if spec.get("maxReplicas") != HPA_MAX_REPLICAS:
+            problems.append(
+                f"{rel(path)}:HPA/{name} maxReplicas 必须为 {HPA_MAX_REPLICAS}，"
+                f"实际 {spec.get('maxReplicas')}"
+            )
+
+        cpu_targets = [
+            ((metric.get("resource") or {}).get("target") or {})
+            for metric in (spec.get("metrics") or [])
+            if (metric.get("resource") or {}).get("name") == "cpu"
+        ]
+        if not any(
+            target_spec.get("type") == "Utilization"
+            and target_spec.get("averageUtilization") == HPA_CPU_TARGET_PERCENT
+            for target_spec in cpu_targets
+        ):
+            problems.append(
+                f"{rel(path)}:HPA/{name} 必须配置 CPU Utilization 目标 "
+                f"{HPA_CPU_TARGET_PERCENT}%（实际 {cpu_targets}）"
+            )
+
+        scale_down = (spec.get("behavior") or {}).get("scaleDown") or {}
+        if not scale_down.get("stabilizationWindowSeconds"):
+            problems.append(
+                f"{rel(path)}:HPA/{name} 必须配置 scaleDown.stabilizationWindowSeconds"
+                "（避免指标抖动导致反复扩缩）"
+            )
+
+    missing = sorted(set(SERVICE_PORTS) - targets)
+    if missing:
+        problems.append(f"以下微服务缺少 HPA: {missing}")
+
+    if problems:
+        for item in problems:
+            fail(item)
+    else:
+        ok(
+            f"HPA 契约校验完成（{len(targets)} 个微服务：min={HPA_MIN_REPLICAS}"
+            f"/max={HPA_MAX_REPLICAS}/CPU {HPA_CPU_TARGET_PERCENT}%）"
+        )
+
+
+def check_disruption_budgets(documents: list[tuple[Path, dict[str, Any]]]) -> None:
+    """校验 PDB：覆盖全部无状态微服务，且 minAvailable < 基线副本数（否则节点排空永久阻塞）。"""
+    replicas: dict[str, int] = {}
+    for _path, doc in documents:
+        if doc.get("kind") != "Deployment":
+            continue
+        name = (doc.get("metadata") or {}).get("name")
+        if name in SERVICE_PORTS:
+            replicas[str(name)] = int((doc.get("spec") or {}).get("replicas") or 0)
+
+    covered: set[str] = set()
+    problems: list[str] = []
+    for path, doc in documents:
+        if doc.get("kind") != "PodDisruptionBudget":
+            continue
+        name = (doc.get("metadata") or {}).get("name")
+        spec = doc.get("spec") or {}
+        labels = (spec.get("selector") or {}).get("matchLabels") or {}
+        selected = labels.get("app.kubernetes.io/name")
+        if selected not in SERVICE_PORTS:
+            problems.append(
+                f"{rel(path)}:PDB/{name} selector 必须指向微服务"
+                f"（app.kubernetes.io/name ∈ {sorted(SERVICE_PORTS)}），实际 {selected!r}"
+            )
+            continue
+        covered.add(str(selected))
+
+        min_available = spec.get("minAvailable")
+        if min_available is None:
+            problems.append(
+                f"{rel(path)}:PDB/{name} 必须声明 minAvailable（不能用 maxUnavailable 表达副本下限）"
+            )
+            continue
+        baseline = replicas.get(str(selected), 0)
+        if baseline and int(min_available) >= baseline:
+            problems.append(
+                f"{rel(path)}:PDB/{name} minAvailable={min_available} 必须小于基线副本数 "
+                f"{baseline}（否则节点排空永久阻塞）"
+            )
+
+    missing = sorted(set(SERVICE_PORTS) - covered)
+    if missing:
+        problems.append(f"以下微服务缺少 PodDisruptionBudget: {missing}")
+
+    if problems:
+        for item in problems:
+            fail(item)
+    else:
+        ok(f"PDB 校验完成（{len(covered)} 个微服务，minAvailable < 基线副本数）")
+
+
 def main() -> int:
     documents = load_documents()
     if not documents:
@@ -376,6 +560,9 @@ def main() -> int:
         check_workloads(documents)
         check_configmaps(documents)
         check_service_ports(documents)
+        check_version_placeholder()
+        check_autoscaling(documents)
+        check_disruption_budgets(documents)
         check_env_contract(documents)
         check_kafka_topics_contract(documents)
         check_minio_buckets_contract(documents)

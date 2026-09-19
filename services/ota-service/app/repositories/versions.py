@@ -6,14 +6,13 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
-
-from sqlalchemy import func, select
 
 from hunter_common.database import DatabaseSessionManager
 from hunter_common.database.enums import OtaTaskStatus, OtaVersionStatus
 from hunter_common.database.models import OtaTask, OtaVersion
+from sqlalchemy import func, select
 
 
 class OtaVersionRepository:
@@ -133,7 +132,7 @@ class OtaVersionRepository:
                 return
             version.status = status
             if release_time is not None:
-                version.release_time = datetime.fromtimestamp(release_time, tz=timezone.utc)
+                version.release_time = datetime.fromtimestamp(release_time, tz=UTC)
             await session.commit()
 
     async def count_tasks_for_version(self, version_id: UUID) -> int:

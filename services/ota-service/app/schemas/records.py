@@ -7,14 +7,13 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
-
 from hunter_common.database.enums import OtaStatus
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.common import VEHICLE_ID_PATTERN, OtaApiResponse
 
 # 供 OtaRecordList.summary 引用（任务级聚合摘要，仅 /tasks/{task_id}/records 返回）
-from app.schemas.tasks import OtaTaskProgress  # noqa: TC001
+from app.schemas.tasks import OtaTaskProgress
 
 
 class OtaRecordItem(BaseModel):

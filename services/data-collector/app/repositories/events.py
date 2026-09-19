@@ -7,14 +7,17 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator, Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from hunter_common.database import DatabaseSessionManager
+from hunter_common.database import EVENT_IDEMPOTENCY_COLUMNS, DatabaseSessionManager
 from hunter_common.database.enums import EventLevel, EventType
 from hunter_common.database.models import Event
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class EventRepository:
@@ -22,6 +25,26 @@ class EventRepository:
 
     def __init__(self, db: DatabaseSessionManager) -> None:
         self._db = db
+
+    def transaction(self) -> AsyncIterator[AsyncSession]:
+        """事务性会话上下文（事件入库与 event_raw 投递编排共用）。"""
+        return self._db.session()
+
+    async def insert_events(self, session: AsyncSession, rows: Sequence[Mapping[str, Any]]) -> int:
+        """批量幂等写入事件，返回「尝试写入行数」。
+
+        幂等键 = DDL 唯一索引 ``uq_events_vehicle_type_time``
+        （``ON CONFLICT (vehicle_id, event_type, event_time) DO NOTHING``）：
+        Kafka at-least-once 重放不会产生重复事件（消费组 data-collector-events）。
+        """
+        if not rows:
+            return 0
+        await session.execute(
+            pg_insert(Event)
+            .values([dict(row) for row in rows])
+            .on_conflict_do_nothing(index_elements=list(EVENT_IDEMPOTENCY_COLUMNS))
+        )
+        return len(rows)
 
     async def list_events(
         self,
@@ -76,7 +99,7 @@ class EventRepository:
             if not event.acknowledged:
                 event.acknowledged = True
                 event.acknowledged_by = UUID(user_id)
-                event.acknowledge_time = datetime.now(timezone.utc)
+                event.acknowledge_time = datetime.now(UTC)
                 session.add(event)
             return event
 
@@ -101,10 +124,10 @@ class EventRepository:
             filters.append(Event.acknowledged == acknowledged)
         if start_time is not None:
             filters.append(
-                Event.event_time >= datetime.fromtimestamp(start_time, tz=timezone.utc)
+                Event.event_time >= datetime.fromtimestamp(start_time, tz=UTC)
             )
         if end_time is not None:
-            filters.append(Event.event_time <= datetime.fromtimestamp(end_time, tz=timezone.utc))
+            filters.append(Event.event_time <= datetime.fromtimestamp(end_time, tz=UTC))
         return filters
 
 

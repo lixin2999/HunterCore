@@ -36,15 +36,33 @@ uvicorn app.main:app --reload --port 8082
 ## 测试
 
 ```bash
-cd services/data-collector && pytest -q                                  # 服务测试（健康探针 4 + 契约 30）
+cd services/data-collector && pytest -q                                  # 服务测试 114 项
 python scripts/verify_data_layer.py                                      # 数据层/Kafka 契约校验
+python scripts/generate_contracts_configmap.py --check                   # 运行时契约 ConfigMap 一致性
 ```
+
+## 采集链路（审查 R1 后已落地）
+
+| 层 | 组件 | 说明 |
+|----|------|------|
+| 消费者 | `app/consumers/{base,telemetry,health,events}.py` | 消费组/订阅/幂等键对齐 `consumer-groups.yaml`；`schema_name="auto"` 契约校验 + 手动提交 + DLQ |
+| 预处理 | `app/services/ingest.py` | 5.4 节 6 步流水线；批缓冲由 `KafkaConsumerManager.on_batch_end` 驱动（**写库成功才提交 offset**） |
+| 入库 | `app/repositories/{telemetry,events}.py` | 单条多值 `INSERT ... ON CONFLICT ... DO NOTHING`（≥ 10000 点/秒，重放幂等） |
+| 读模型 | `app/services/vehicle_status.py` | `vehicle:status:{id}` / `vehicle:online:set` 唯一写方 + 心跳超阈值离线守护 |
+| 投递 | `app/producers/pipeline.py` | `telemetry_raw` / `telemetry_clean` / `event_raw`，一律经契约校验入口 `publish_payload` |
+
+关键配置（K8s ConfigMap 已接线）：`TELEMETRY_BATCH_SIZE`、`TELEMETRY_PUBLISH_CONCURRENCY`、
+`TELEMETRY/EVENT/HEALTH_CONSUMER_ENABLED`、`VEHICLE_OFFLINE_THRESHOLD_SECONDS`、
+`INGEST_SCHEMA_VALIDATION_ENABLED`、`KAFKA_CONTRACT_DIR`（契约 ConfigMap 挂载点）。
 
 ## 分层状态
 
 - **L0（已完成）**：应用骨架（main/config/routers-health/core-error_handlers）+ 健康探针与指标
-- **L1（本次完成）**：接口契约（`data-collector.yaml` + `sensor_file.schema.json` + 契约测试 30 条）
-- **下一步**：Step 2 Pydantic v2 Schema + SQLAlchemy 2.0 模型（复用 `hunter_common.database.models.collector`）→ Services → Routers → Kafka 消费者/生产者 → 单元测试（覆盖率 ≥ 80%）
+- **L1（已完成）**：接口契约（`data-collector.yaml` + `sensor_file.schema.json` + 契约测试 30 条）
+- **L2（已完成）**：Schema/模型/Repository/Services/Routers
+- **L3（本次完成）**：Kafka 采集链路（三路消费者 + 6 步预处理 + 批量入库 + raw/clean 投递 +
+  车辆读模型与离线守护）+ 文件上传真实内容摘要校验（SHA-256/MD5）+ 业务层单测 62 条
+- **下一步**：Flink 实时作业（`flink-jobs/`）与 Spark 离线作业（`spark-jobs/`）落地
 
 ## ⚠ 待人工确认（契约 `x-hunter-pending-confirmation` 12 项，确认后回填契约再实现）
 

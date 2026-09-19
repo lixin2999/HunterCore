@@ -12,7 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 
-from hunter_common.exceptions import OtaSignatureError, ServiceUnavailableError
+from hunter_common.exceptions import ServiceUnavailableError
 from hunter_common.logging import get_logger
 
 logger = get_logger("app.core.signature")

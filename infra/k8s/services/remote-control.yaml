@@ -20,6 +20,11 @@ data:
   RC_COMMAND_TIMEOUT_MS: "500"              # >500ms 未收到指令自动减速停车
   RC_MAX_SPEED_MPS: "2.0"                   # 最高速度 2.0 m/s（可配置）
   RC_SESSION_EXCLUSIVE: "true"              # 同车同时仅一名操作员（Redis 分布式锁）
+  # 会话心跳与陈旧会话守护（审查 R7：残留会话会永久占用车辆互斥位 → 后续接管恒 7001）
+  RC_HEARTBEAT_INTERVAL_S: "10"             # 车辆侧心跳周期（契约固定 10s）
+  RC_HEARTBEAT_END_AFTER_S: "60"            # 无心跳持续 → 平台侧结束会话
+  RC_SESSION_TTL_S: "21600"                 # 会话 Hash 硬 TTL 兜底（6h）
+  RC_SESSION_REAPER_INTERVAL_S: "30"        # 守护对账周期
   # 视频编码（AGX Orin NVENC 车端编码，云端仅转发）
   RC_VIDEO_WIDTH: "1280"
   RC_VIDEO_HEIGHT: "720"
@@ -79,7 +84,7 @@ spec:
               app.kubernetes.io/name: remote-control
       containers:
         - name: remote-control
-          image: hunter/remote-control:0.1.0
+          image: "hunter/remote-control:{version}"   # 版本变量：部署前由 scripts/render_k8s.py 注入
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -115,19 +120,20 @@ spec:
               port: http
             periodSeconds: 5
             failureThreshold: 30
-          livenessProbe:
+          livenessProbe:                 # 存活：初始延迟 10s / 周期 5s
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 15
-            periodSeconds: 10
+            initialDelaySeconds: 10
+            periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
-          readinessProbe:
+          readinessProbe:                # 就绪：初始延迟 10s / 周期 5s（/readyz 含 DB/Redis 探测）
             httpGet:
               path: /readyz
               port: http
-            periodSeconds: 10
+            initialDelaySeconds: 10
+            periodSeconds: 5
             timeoutSeconds: 5
             failureThreshold: 3
       volumes:

@@ -1,0 +1,1612 @@
+# =====================================================================
+# HunterEdge Kafka 契约 ConfigMap（由脚本生成，禁止手工编辑）
+#
+# 生成命令：python scripts/generate_contracts_configmap.py
+# 一致性校验：python scripts/generate_contracts_configmap.py --check（CI lint 阶段）
+#
+# 用途：data-collector 采集消费者的运行时消息 Schema 校验（schema_name="auto"）；
+# 键保留相对路径（schemas/*.schema.json），挂载到 KAFKA_CONTRACT_DIR 后
+# 契约加载器即可按目录结构解析。
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hunter-contracts
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/name: hunter-contracts
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: contracts
+  annotations:
+    hunter-edge.local/generated-by: scripts/generate_contracts_configmap.py
+    hunter-edge.local/source: contracts/kafka
+data:
+
+  "consumer-groups.yaml": |-
+    # =====================================================================
+    # HunterEdge Kafka 消费者组契约
+    # 来源：系统上下文基座（Kafka Topic 表）+ 服务职责（模块划分表）
+    # 命名规范：<service-name>-<domain>[-<purpose>]，全小写中划线分隔
+    #   - 每个 (服务, 数据域) 一个消费组，保证各域 offset 独立、互不阻塞
+    #   - 车端按 vehicle_id 哈希分区，同一消费组内单车辆消息严格有序
+    # ⚠ 需核对：消费组命名规范与「上层业务 / 告警处理」消费方的落位服务（设计文档 5.3 节未给出）
+    # =====================================================================
+    schema_version: "1.0.0"
+
+    defaults:
+      enable_auto_commit: false        # 手动提交：handler 成功返回后 commit（hunter_common.kafka.consumer.run）
+      auto_offset_reset: earliest
+      max_poll_records: 100
+      dlq_enabled: true                # 失败消息转投 {topic}.dlq（保留原 topic/partition/offset 于消息头）
+      idempotency: required            # 消费幂等：以 (vehicle_id, timestamp/seq) 或业务唯一键去重
+
+    groups:
+      - group_id: data-collector-telemetry
+        service: data-collector
+        subscribes: ["hunter.*.telemetry"]
+        subscribe_mode: regex_pattern        # 动态车辆：新车上线无需改配置
+        produces: [telemetry_raw, telemetry_clean]
+        handler: "预处理（字段校验 → 清洗 → 时间对齐）→ 批量写 vehicle_telemetry + 投递 raw/clean"
+        idempotency_key: "(vehicle_id, seq) 与 (vehicle_id, time)"
+        target_latency: "入库延迟 ≤ 1s"
+        notes: "批量入库 ≥ 10000 点/秒；单车限流 100 msg/s"
+
+      - group_id: data-collector-events
+        service: data-collector
+        subscribes: ["hunter.*.event"]
+        subscribe_mode: regex_pattern
+        produces: [event_raw]
+        idempotency_key: "(vehicle_id, event_type, event_time)"
+        notes: "落库 events 表；critical 事件实时推送告警链路"
+
+      - group_id: data-collector-health
+        service: data-collector
+        subscribes: ["hunter.*.health"]
+        subscribe_mode: regex_pattern
+        produces: []
+        idempotency_key: "(vehicle_id, timestamp)"
+        notes: "写 Redis vehicle:status:{vehicle_id} / vehicle:online:set；不在 DB 落明细"
+
+      - group_id: data-collector-command-result
+        service: data-collector
+        subscribes: ["hunter.*.command_result"]
+        subscribe_mode: regex_pattern
+        produces: []
+        idempotency_key: command_id
+        notes: "指令执行结果留痕（供审计与 remote-control 结果回执）"
+
+      # ⚠ 契约修正（data-analytics Step 1，待人工确认，见 contracts/openapi/data-analytics.yaml
+      #   x-hunter-pending-confirmation）：原 data-analytics-telemetry 订阅 telemetry_raw 且声明「生产 telemetry_clean」，
+      #   与 topics.yaml（telemetry_clean 生产者 = data-collector）冲突；且原 data-analytics-telemetry-clean 与之重复消费。
+      #   现按设计文档 6.2 节作业输入归并为 4 组：清洗后遥测承担 4 个作业，原始遥测仅数据质量监控（对比丢包率）。
+      - group_id: data-analytics-telemetry
+        service: data-analytics
+        subscribes: [telemetry_clean]
+        produces: [alert_event, analytics_result]
+        writes: [data_analytics.algorithm_metrics]
+        engine: Flink 1.18 (DataStream)
+        jobs:
+          - vehicle_state_monitor            # 6.2.1 心跳/状态变更 → communication_loss
+          - driving_anomaly_detection        # 6.2.2 急加速/急减速/急转弯/超速/低电量
+          - collision_risk_assessment        # 6.2.3 TTC 计算 → collision_warning
+          - algorithm_performance_monitor    # 6.2.4 感知帧率/规划延迟/控制误差 → algorithm_metrics
+        idempotency_key: "(vehicle_id, time)"
+        target_latency: "实时告警触发 ≤ 2s"
+        notes: "实时流处理：阈值取 contracts/database/enums.md 第 3 节，不可放宽（禁止自行新增/改等级）"
+
+      - group_id: data-analytics-telemetry-raw
+        service: data-analytics
+        subscribes: [telemetry_raw]
+        produces: [analytics_result]
+        engine: Flink 1.18 (DataStream)
+        jobs: [data_quality_monitor]
+        idempotency_key: "(vehicle_id, time)"
+        notes: "6.2.5 数据质量监控：消费原始遥测统计丢包率/延迟/异常值 → analytics_result(result_type=metric)；需与 telemetry_clean 独立 offset 才可对比"
+
+      - group_id: data-analytics-events
+        service: data-analytics
+        subscribes: [event_raw]
+        produces: [analytics_result]
+        engine: "Flink 1.18（实时统计）/ Spark 3.5（离线 Corner Case 挖掘）"
+        jobs: [corner_case_mining]
+        idempotency_key: "(vehicle_id, event_type, event_time)"
+        notes: "事件统计与 Corner Case 挖掘（6.4 节：Isolation Forest + DBSCAN，消费组同一幂等键）"
+
+      - group_id: data-analytics-sensor-file
+        service: data-analytics
+        subscribes: [sensor_file]
+        produces: [analytics_result]
+        idempotency_key: object_key
+        notes: "对上传到 MinIO 的传感器文件做离线分析（感知精度评估 6.3.2 输入）；消息结构 contracts/kafka/schemas/sensor_file.schema.json"
+
+      - group_id: scene-service-analytics-result
+        service: scene-service
+        subscribes: [analytics_result]
+        produces: []                 # 提取结果直接落库 scene_svc.scenes（无 Kafka 生产）
+        dlq_enabled: true
+        idempotency_key: "(vehicle_id, window_start)"
+        notes: |
+          实车场景自动提取（设计文档 4.5 节）：仅处理 result_type=corner_case 且 trigger_event_type ∈
+          {harsh_braking, collision_warning, manual_takeover} 的消息，按 clip.pre_seconds/post_seconds（各 10s）
+          截取前后数据，输出 scene_type=real_vehicle_replay、status=draft 的场景。
+          消息结构：contracts/kafka/schemas/analytics_result.schema.json。
+          ⚠ 触发来源待核对：topics.yaml 将 scene-service 列为 event_raw 消费方，但本清单未登记
+          event_raw 消费组；若确认改由 event_raw 触发，需先在此登记新消费组再改实现。
+
+      - group_id: ota-service-ota-status
+        service: ota-service
+        subscribes: ["hunter.*.ota_status"]
+        subscribe_mode: regex_pattern
+        produces: []
+        idempotency_key: "(task_id, vehicle_id, status)"
+        notes: "推进 ota_records.status/phase/progress；同步 Redis ota:progress:{task_id}；批次成功率 <95% 暂停任务并告警"
+
+      - group_id: remote-control-command-result
+        service: remote-control
+        subscribes: ["hunter.*.command_result"]
+        subscribe_mode: regex_pattern
+        produces: []
+        idempotency_key: command_id
+        notes: "操控指令回执；>500ms 无回执视为链路异常，会话降级/终止"
+
+      - group_id: platform-alert-event
+        service: "告警处理（⚠ 落位服务待定：data-analytics 告警子模块 / api-gateway 推送）"
+        subscribes: [alert_event]
+        produces: []
+        idempotency_key: "(vehicle_id, alert_id)"
+        notes: "告警聚合、WebSocket 推送前端、对接 Alertmanager"
+  "schemas/alert_event.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/alert_event.schema.json",
+      "title": "alert_event",
+      "description": "平台内部 Topic alert_event 消息（生产者 data-analytics 的 Flink 1.18 实时作业，设计文档 6.2 节）。消费方：告警处理（⚠ 落位服务待定，见 contracts/kafka/consumer-groups.yaml 的 platform-alert-event）。语义：平台侧基于 telemetry_clean / telemetry_raw 重算触发的告警（与车端上报的 hunter.{vehicle_id}.event 相互独立，禁止混用）；实时告警触发延迟 ≤ 2s（性能指标）。level 必须等于受控词表 EVENT_LEVEL_BY_TYPE[alert_type]（contracts/database/enums.md 第 3 节，不可放宽）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vehicle_id",
+        "alert_id",
+        "alert_type",
+        "level",
+        "source_job",
+        "event_time",
+        "timestamp",
+        "rule"
+      ],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "车辆 ID；同时是 Kafka 消息 key（保证单车辆有序）"
+        },
+        "alert_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "description": "告警唯一 ID（UUID，由产生告警的 Flink 作业生成；消费方幂等键）"
+        },
+        "alert_type": {
+          "enum": [
+            "harsh_acceleration",
+            "harsh_braking",
+            "harsh_turning",
+            "over_speed",
+            "collision_warning",
+            "manual_takeover",
+            "emergency_stop",
+            "battery_low",
+            "battery_critical",
+            "communication_loss",
+            "sensor_fault",
+            "perception_fault",
+            "planning_fault",
+            "control_fault",
+            "ota_start",
+            "ota_success",
+            "ota_failed",
+            "ota_rollback"
+          ],
+          "description": "告警类型（受控词表：设计文档「事件类型定义」18 种，见 contracts/database/enums.md 第 3 节；禁止新增取值）"
+        },
+        "level": {
+          "enum": ["info", "warning", "critical"],
+          "description": "告警等级；必须等于 EVENT_LEVEL_BY_TYPE[alert_type]（受控映射，代码不得放宽：harsh_acceleration/harsh_braking/harsh_turning/battery_low/ota_rollback=warning，over_speed/collision_warning/emergency_stop/battery_critical/communication_loss/*_fault/ota_failed=critical，manual_takeover/ota_start/ota_success=info）"
+        },
+        "source_job": {
+          "enum": [
+            "vehicle_state_monitor",
+            "driving_anomaly_detection",
+            "algorithm_performance_monitor",
+            "collision_risk_assessment",
+            "data_quality_monitor"
+          ],
+          "description": "产生该告警的 Flink 实时作业（设计文档 6.2 节 5 个作业，与 contracts/openapi/data-analytics.yaml 的 x-hunter-realtime-jobs 一致）"
+        },
+        "event_time": {
+          "type": "number",
+          "description": "触发告警的异常发生时间（Unix epoch 秒，含毫秒小数；取车端遥测时间戳，禁止用处理时间替代）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "告警生成时间（Unix epoch 秒）；timestamp - event_time ≤ ALERT_TRIGGER_MAX_LATENCY_SECONDS(2s)"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "触发样本的遥测 seq（幂等去重辅助键，与 telemetry.seq 同源）"
+        },
+        "window_start": {
+          "type": "number",
+          "description": "检测窗口起点（Unix epoch 秒；持续型规则如 harsh_acceleration 持续 > 0.5s 时的窗口）"
+        },
+        "window_end": {
+          "type": "number",
+          "description": "检测窗口终点（Unix epoch 秒）"
+        },
+        "rule": {
+          "type": "object",
+          "description": "命中规则与阈值（阈值来源：设计文档 6.2.2 / 6.2.3 节，不可更改；阈值本体由环境变量注入，见 contracts/openapi/data-analytics.yaml 的 x-hunter-realtime-jobs.thresholds）",
+          "additionalProperties": false,
+          "required": ["name", "metric", "comparator", "threshold"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "description": "规则名（如 harsh_acceleration_gt_3ms2 / ttc_lt_1_5s / communication_loss_gt_10s）"
+            },
+            "metric": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "description": "被判定指标（遥测字段路径，如 chassis.velocity / localization.angular_velocity / chassis.battery_soc）"
+            },
+            "comparator": {
+              "enum": ["gt", "gte", "lt", "lte"],
+              "description": "比较符（gt 大于 / gte 大于等于 / lt 小于 / lte 小于等于）"
+            },
+            "threshold": {
+              "type": "number",
+              "description": "阈值（受控值：3.0 m/s²、0.5 s、0.8 rad/s、超速 1.1 倍、SOC 20%/10%、TTC 1.5 s、中断 10 s 等）"
+            },
+            "duration_seconds": {
+              "type": "number",
+              "minimum": 0,
+              "description": "持续时长门槛（如急加速/急减速需持续 > 0.5s；瞬时型规则省略）"
+            }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": { "type": "number" },
+          "description": "实测值集合（如 {acceleration: 3.42, ttc: 1.18, silence_seconds: 12.5}）；键为指标名，值为数值"
+        },
+        "location": {
+          "type": "object",
+          "description": "触发位置（定位段快照，用于告警地图定位）",
+          "additionalProperties": false,
+          "required": ["x", "y"],
+          "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "z": { "type": "number" },
+            "heading": { "type": "number", "description": "航向角（rad）" }
+          }
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "告警摘要（面向运维，可含实测值与阈值，禁止包含敏感信息）"
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "alert_id": "5e2b9c74-1a3f-4d68-9c07-8b6f4a2d1e30",
+          "alert_type": "over_speed",
+          "level": "critical",
+          "source_job": "driving_anomaly_detection",
+          "event_time": 1724035200.123,
+          "timestamp": 1724035201.456,
+          "seq": 12580,
+          "window_start": 1724035195.0,
+          "window_end": 1724035200.123,
+          "rule": {
+            "name": "over_speed_gt_limit_1_1x",
+            "metric": "chassis.velocity",
+            "comparator": "gt",
+            "threshold": 5.5
+          },
+          "metrics": { "velocity": 6.12, "speed_limit": 5.0 },
+          "location": { "x": 125.34, "y": 67.89, "z": 0.32, "heading": 1.234 },
+          "description": "超速 22.4%（实测 6.12 m/s、限速 5.0 m/s，阈值 1.1 倍）"
+        },
+        {
+          "vehicle_id": "HUNTER-002",
+          "alert_id": "9c1d7f38-4b62-4e5a-8f31-2d5a6c9b0e47",
+          "alert_type": "communication_loss",
+          "level": "critical",
+          "source_job": "vehicle_state_monitor",
+          "event_time": 1724035360.0,
+          "timestamp": 1724035361.2,
+          "rule": {
+            "name": "communication_loss_gt_10s",
+            "metric": "telemetry.heartbeat_interval",
+            "comparator": "gt",
+            "threshold": 10.0
+          },
+          "metrics": { "silence_seconds": 12.5, "last_velocity": 1.52 },
+          "description": "遥测中断 12.5s（> 10s），判定车辆失联"
+        },
+        {
+          "vehicle_id": "HUNTER-003",
+          "alert_id": "1b8e4a60-7c25-4f93-a1d8-6e2f0b7c3a55",
+          "alert_type": "harsh_braking",
+          "level": "warning",
+          "source_job": "driving_anomaly_detection",
+          "event_time": 1724035420.5,
+          "timestamp": 1724035421.1,
+          "seq": 13104,
+          "window_start": 1724035419.9,
+          "window_end": 1724035420.5,
+          "rule": {
+            "name": "harsh_braking_lt_-3ms2",
+            "metric": "chassis.acceleration",
+            "comparator": "lt",
+            "threshold": -3.0,
+            "duration_seconds": 0.5
+          },
+          "metrics": { "min_acceleration": -3.42, "velocity": 0.31 },
+          "location": { "x": 126.12, "y": 68.41, "z": 0.32, "heading": 1.236 },
+          "description": "急减速 -3.42 m/s² 持续 0.6s（阈值 -3.0 m/s² 且持续 > 0.5s）"
+        }
+      ]
+    }
+  "schemas/analytics_result.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/analytics_result.schema.json",
+      "title": "analytics_result",
+      "description": "平台内部 Topic analytics_result 消息（data-analytics Flink/Spark 产出）。消费方：scene-service（实车场景自动提取，设计文档 4.5 节）、上层业务。⚠ 设计文档 5.3 节未给出该消息结构，本契约按 4.5 节所需字段（触发事件、前后各 10 秒数据引用、自车轨迹、周边目标轨迹、环境条件）定义，需人工确认。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vehicle_id", "result_id", "result_type", "window_start", "window_end", "timestamp"],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "车辆 ID；同时是 Kafka 消息 key（保证单车辆有序）"
+        },
+        "result_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "description": "分析结果唯一 ID（幂等/去重键之一）"
+        },
+        "result_type": {
+          "enum": ["metric", "corner_case", "report"],
+          "description": "结果类型：指标计算 / Corner Case 挖掘 / 报告生成"
+        },
+        "trigger_event_type": {
+          "enum": [
+            "harsh_acceleration",
+            "harsh_braking",
+            "harsh_turning",
+            "over_speed",
+            "collision_warning",
+            "manual_takeover",
+            "emergency_stop",
+            "battery_low",
+            "battery_critical",
+            "communication_loss",
+            "sensor_fault",
+            "perception_fault",
+            "planning_fault",
+            "control_fault",
+            "ota_start",
+            "ota_success",
+            "ota_failed",
+            "ota_rollback"
+          ],
+          "description": "触发本次分析的事件类型（受控词表，见 contracts/database/enums.md 第 3 节）；corner_case 类型必填"
+        },
+        "event_level": {
+          "enum": ["info", "warning", "critical"],
+          "description": "触发事件等级（受控词表，见 enums.md 第 2 节）"
+        },
+        "window_start": {
+          "type": "number",
+          "description": "分析窗口起点（Unix epoch 秒，含毫秒小数）"
+        },
+        "window_end": {
+          "type": "number",
+          "description": "分析窗口终点（Unix epoch 秒，含毫秒小数）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "结果生成时间（Unix epoch 秒）"
+        },
+        "clip": {
+          "type": "object",
+          "description": "事件前后数据截取窗口（设计文档 4.5 节：截取事件前后各 10 秒数据，不可更改）",
+          "additionalProperties": false,
+          "required": ["pre_seconds", "post_seconds"],
+          "properties": {
+            "pre_seconds": { "enum": [10], "description": "事件前截取时长（s），契约固定 10" },
+            "post_seconds": { "enum": [10], "description": "事件后截取时长（s），契约固定 10" },
+            "data_file_url": {
+              "type": "string",
+              "description": "截取数据对象地址（MinIO hunter-rosbag / hunter-raw-data），无则省略"
+            }
+          }
+        },
+        "data_file_url": {
+          "type": "string",
+          "description": "分析所依据的数据文件对象地址（MinIO，如 hunter-rosbag 中的 bag 文件）"
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": { "type": "number" },
+          "description": "指标键值对（metric 类型）：如 avg_speed / collision_count / perception_latency_ms"
+        },
+        "ego_trajectory": {
+          "type": "array",
+          "description": "自车轨迹（4.5 节提取项之一）",
+          "items": { "$ref": "#/definitions/trajectory_point" }
+        },
+        "objects": {
+          "type": "array",
+          "description": "周边目标轨迹（4.5 节提取项之一）",
+          "items": { "$ref": "#/definitions/object_track" }
+        },
+        "environment": {
+          "type": "object",
+          "description": "环境条件（4.5 节提取项之一）",
+          "additionalProperties": false,
+          "properties": {
+            "weather": {
+              "enum": ["clear", "rainy", "foggy", "night", "backlight"],
+              "description": "天气/光照条件（对齐设计文档 4.2.1 环境场景分类）"
+            },
+            "road_type": { "type": "string", "description": "道路类型（⚠ 取值域待确认，如 urban/highway/parking）" },
+            "speed_limit": { "type": "number", "minimum": 0, "description": "限速（m/s）" }
+          }
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "结果摘要（报告类型：报告标题；corner_case：场景描述）"
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "result_id": "b7f1c3d2-5a4e-4c9b-8f2d-1e0a3b5c7d90",
+          "result_type": "corner_case",
+          "trigger_event_type": "harsh_braking",
+          "event_level": "warning",
+          "window_start": 1724035190.123,
+          "window_end": 1724035220.456,
+          "timestamp": 1724035221.789,
+          "clip": {
+            "pre_seconds": 10,
+            "post_seconds": 10,
+            "data_file_url": "s3://hunter-rosbag/events/HUNTER-001/1724035200.bag"
+          },
+          "data_file_url": "s3://hunter-raw-data/HUNTER-001/1724035200_lidar.pcd",
+          "metrics": {
+            "min_deceleration": -3.42,
+            "min_ttc": 1.18,
+            "avg_speed": 1.52
+          },
+          "ego_trajectory": [
+            { "timestamp": 1724035190.123, "x": 125.34, "y": 67.89, "z": 0.32, "heading": 1.234, "velocity": 1.52 },
+            { "timestamp": 1724035200.123, "x": 126.12, "y": 68.41, "z": 0.32, "heading": 1.236, "velocity": 0.31 }
+          ],
+          "objects": [
+            {
+              "object_id": "obj-1024",
+              "type": "vehicle",
+              "trajectory": [
+                { "timestamp": 1724035190.123, "x": 130.2, "y": 67.9, "heading": 1.23, "velocity": 0.0 },
+                { "timestamp": 1724035200.123, "x": 130.1, "y": 68.0, "heading": 1.24, "velocity": 0.0 }
+              ]
+            }
+          ],
+          "environment": { "weather": "rainy", "road_type": "urban", "speed_limit": 5.0 },
+          "description": "雨天城市道路前车急刹，自车最大减速度 3.42 m/s²，最小 TTC 1.18 s"
+        },
+        {
+          "vehicle_id": "HUNTER-002",
+          "result_id": "3c9d0e51-7b28-4f6a-9d10-2b4c6e8f0a12",
+          "result_type": "metric",
+          "trigger_event_type": "manual_takeover",
+          "event_level": "info",
+          "window_start": 1724035300.0,
+          "window_end": 1724035360.0,
+          "timestamp": 1724035361.5,
+          "metrics": {
+            "avg_perception_latency_ms": 85.4,
+            "avg_planning_latency_ms": 45.1,
+            "manual_takeover_count": 1
+          },
+          "environment": { "weather": "clear" },
+          "description": "60 秒窗口算法时延指标"
+        }
+      ],
+      "definitions": {
+        "trajectory_point": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["timestamp", "x", "y", "heading", "velocity"],
+          "properties": {
+            "timestamp": { "type": "number" },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "z": { "type": "number" },
+            "heading": { "type": "number", "description": "航向角（rad）" },
+            "velocity": { "type": "number", "description": "速度（m/s）" }
+          }
+        },
+        "object_track": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["object_id", "type", "trajectory"],
+          "properties": {
+            "object_id": { "type": "string", "minLength": 1 },
+            "type": {
+              "enum": ["vehicle", "pedestrian", "other"],
+              "description": "目标类型（与遥测 perception.object_types 域一致）"
+            },
+            "trajectory": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/definitions/trajectory_point" }
+            }
+          }
+        }
+      }
+    }
+  "schemas/command.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/command.schema.json",
+      "title": "HunterEdge 控制指令 hunter.{vehicle_id}.command / hunter.broadcast.command",
+      "description": "平台→车控制指令（按需下发，acks=all）。生产者：api-gateway / ota-service / remote-control；消费者：车端。单车辆消息必须携带 vehicle_id（= 消息 key）；广播消息改用 target_filter（二选一，oneOf 强制）。command_type 取值域待设计文档 5.3 节核对（⚠ 当前不设 enum，禁止前端硬编码分支）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command_id", "timestamp", "command_type"],
+      "oneOf": [
+        {"required": ["vehicle_id"], "not": {"required": ["target_filter"]}},
+        {"required": ["target_filter"], "not": {"required": ["vehicle_id"]}}
+      ],
+      "properties": {
+        "command_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "指令唯一标识（幂等键）；车端执行结果经 command_result.command_id 关联"
+        },
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "目标车辆（单车辆指令必填）"
+        },
+        "target_filter": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "广播指令的车辆筛选条件（仅 hunter.broadcast.command 使用）",
+          "properties": {
+            "models": {"type": "array", "items": {"type": "string"}, "description": "适用车型（如 [\"HUNTER_SE\"]）"},
+            "status": {
+              "type": "array",
+              "items": {"type": "string", "enum": ["offline", "online_idle", "auto_driving", "remote_controlled", "upgrading", "charging", "fault", "emergency"]},
+              "description": "按车辆状态筛选"
+            },
+            "vehicle_ids": {"type": "array", "items": {"type": "string"}, "description": "显式车辆列表（与 models/status 取交集）"}
+          }
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "指令下发时间（Unix epoch 秒）"
+        },
+        "command_type": {
+          "type": "string",
+          "description": "指令类型（⚠ 取值域待设计文档 5.3 节核对后补充 enum）"
+        },
+        "params": {
+          "type": "object",
+          "description": "指令参数（随 command_type 变化）"
+        },
+        "operator_id": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "操作者用户 ID（审计用；系统自动触发时为空）"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "指令执行超时（ms）；超时车端须保持安全状态并回报失败"
+        }
+      },
+      "examples": [
+        {
+          "command_id": "6f1a1f1c-0b1e-4b7a-8f1a-1f2c3d4e5f60",
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035200.0,
+          "command_type": "enable_auto_driving",
+          "params": {"max_velocity": 1.5},
+          "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
+          "timeout_ms": 5000
+        },
+        {
+          "command_id": "7a2b3c4d-1e2f-4a5b-9c6d-7e8f9a0b1c2d",
+          "timestamp": 1724035205.0,
+          "command_type": "enter_charging_mode",
+          "target_filter": {"models": ["HUNTER_SE"], "status": ["online_idle"]},
+          "params": {}
+        }
+      ]
+    }
+  "schemas/command_result.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/command_result.schema.json",
+      "title": "HunterEdge 指令执行结果 hunter.{vehicle_id}.command_result",
+      "description": "车端→平台指令执行结果（按需，acks=all）。消费者：data-collector（留痕/审计）、remote-control（操控指令回执；>500ms 无回执视为链路异常）。command_id 必须与请求一致，保证端到端可追溯与幂等。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command_id", "vehicle_id", "timestamp", "success"],
+      "properties": {
+        "command_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "对应指令的 command_id（幂等键）"
+        },
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "执行车辆（Kafka 消息 key）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "执行完成时间（Unix epoch 秒）"
+        },
+        "success": {
+          "type": "boolean",
+          "description": "是否执行成功"
+        },
+        "result_code": {
+          "type": ["string", "null"],
+          "description": "结果码：0/SUCCESS 或错误码（平台错误码表 / 车端自定义码；禁止在日志中输出敏感上下文）"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "结果描述（含失败原因）"
+        },
+        "data": {
+          "type": "object",
+          "description": "执行附加数据（如生效参数、当前状态快照）"
+        }
+      },
+      "examples": [
+        {
+          "command_id": "6f1a1f1c-0b1e-4b7a-8f1a-1f2c3d4e5f60",
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035200.45,
+          "success": true,
+          "result_code": "0",
+          "message": "auto driving enabled",
+          "data": {"control_mode": "AUTO", "max_velocity": 1.5}
+        },
+        {
+          "command_id": "7a2b3c4d-1e2f-4a5b-9c6d-7e8f9a0b1c2d",
+          "vehicle_id": "HUNTER-002",
+          "timestamp": 1724035210.1,
+          "success": false,
+          "result_code": "4002",
+          "message": "vehicle busy: upgrading",
+          "data": {}
+        }
+      ]
+    }
+  "schemas/event.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/event.schema.json",
+      "title": "HunterEdge 事件消息 hunter.{vehicle_id}.event / event_raw",
+      "description": "车辆事件（事件触发上报）。生产者：车端；消费者：data-collector（落库 data_collector.events）。event_type/event_level 取值与阈值见 contracts/database/enums.md 第 2、3 节，不可更改；类型↔等级映射由 data-collector 消费侧按 EVENT_LEVEL_BY_TYPE 校验（JSON Schema 不做跨字段映射校验）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vehicle_id", "timestamp", "event_type", "event_level"],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "车辆唯一标识（Kafka 消息 key）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "事件发生时间（Unix epoch 秒）→ 落库 events.event_time（禁止用入库时间替代）"
+        },
+        "event_type": {
+          "type": "string",
+          "enum": [
+            "harsh_acceleration", "harsh_braking", "harsh_turning", "over_speed",
+            "collision_warning", "manual_takeover", "emergency_stop", "battery_low",
+            "battery_critical", "communication_loss", "sensor_fault", "perception_fault",
+            "planning_fault", "control_fault", "ota_start", "ota_success",
+            "ota_failed", "ota_rollback"
+          ],
+          "description": "事件类型（18 种，触发阈值不可更改）"
+        },
+        "event_level": {
+          "type": "string",
+          "enum": ["info", "warning", "critical"],
+          "description": "事件等级；必须等于该 event_type 的契约等级"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "可读描述（落库 events.description）"
+        },
+        "data": {
+          "type": "object",
+          "description": "事件上下文（阈值、实测值、轨迹片段摘要等；结构随事件类型变化）→ 落库 events.data_json"
+        },
+        "data_file_url": {
+          "type": ["string", "null"],
+          "description": "关联文件对象地址（MinIO bucket/key，如 hunter-rosbag/events/...）→ 落库 events.data_file_url；对外下发必须另签 15 分钟预签名 URL"
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035260.5,
+          "event_type": "harsh_braking",
+          "event_level": "warning",
+          "description": "急刹：减速度 3.4 m/s² 超过 3 m/s² 阈值",
+          "data": {"deceleration": 3.4, "threshold": 3.0, "velocity": 1.8},
+          "data_file_url": "hunter-rosbag/events/HUNTER-001/20240819/1724035260.bag"
+        },
+        {
+          "vehicle_id": "HUNTER-002",
+          "timestamp": 1724035900.0,
+          "event_type": "battery_critical",
+          "event_level": "critical",
+          "description": "电量严重不足：SOC 8% 低于 10% 阈值",
+          "data": {"battery_soc": 8, "threshold": 10}
+        }
+      ]
+    }
+  "schemas/health.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/health.schema.json",
+      "title": "HunterEdge 系统健康消息 hunter.{vehicle_id}.health",
+      "description": "车辆系统健康数据（1Hz，acks=0）。生产者：车端；消费者：data-collector（写 Redis vehicle:status:{vehicle_id} / vehicle:online:set，不落明细表）。status 取值 = 车辆状态定义（8 态，不可更改）；system 段字段与遥测消息 system 段完全一致（复用采集代码）。⚠ 磁盘/服务进程等扩展健康字段待设计文档 5.3 节核对。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vehicle_id", "timestamp", "status", "system"],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "车辆唯一标识（Kafka 消息 key）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "上报时间（Unix epoch 秒）"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["offline", "online_idle", "auto_driving", "remote_controlled",
+                   "upgrading", "charging", "fault", "emergency"],
+          "description": "车辆业务状态（8 态，不可新增/更改）"
+        },
+        "system": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu_usage", "gpu_usage", "memory_usage_mb", "gpu_temp", "cpu_temp", "network_rssi", "network_latency_ms"],
+          "properties": {
+            "cpu_usage": {"type": "number", "minimum": 0, "maximum": 100, "description": "CPU 使用率 %"},
+            "gpu_usage": {"type": "number", "minimum": 0, "maximum": 100, "description": "GPU 使用率 %"},
+            "memory_usage_mb": {"type": "integer", "minimum": 0, "description": "内存占用 MB"},
+            "gpu_temp": {"type": "number", "description": "GPU 温度 ℃"},
+            "cpu_temp": {"type": "number", "description": "CPU 温度 ℃"},
+            "network_rssi": {"type": "integer", "maximum": 0, "description": "无线信号强度 dBm"},
+            "network_latency_ms": {"type": "number", "minimum": 0, "description": "车-云网络往返延迟 ms"}
+          }
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035201.0,
+          "status": "auto_driving",
+          "system": {
+            "cpu_usage": 45.2, "gpu_usage": 62.8, "memory_usage_mb": 18500,
+            "gpu_temp": 68.5, "cpu_temp": 65.2, "network_rssi": -65, "network_latency_ms": 45
+          }
+        }
+      ]
+    }
+  "schemas/ota_notify.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/ota_notify.schema.json",
+      "title": "HunterEdge OTA 升级通知 hunter.{vehicle_id}.ota_notify",
+      "description": "平台→车 OTA 升级通知（按需，acks=all，key=vehicle_id）。生产者：ota-service；消费者：车端。字段与 ota_svc.ota_versions 对齐；车端下载升级包后必须完成 SHA-256 完整性校验 + RSA-2048 签名验签 + version_code 单调性检查，任一失败即拒绝升级并回报 ota_status=FAILED（错误码 6001/6002）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vehicle_id", "timestamp", "task_id", "version_name", "version_code",
+                   "package_url", "package_size", "package_md5", "package_sha256", "signature"],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "目标车辆（Kafka 消息 key）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "通知下发时间（Unix epoch 秒）"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "升级任务 ID（ota_tasks.task_id）；车端状态上报必须回带"
+        },
+        "version_name": {
+          "type": "string",
+          "description": "目标版本展示名（如 V1.2.0）"
+        },
+        "version_code": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "目标版本单调递增编码（防回滚：车端拒绝 <= 当前版本号的包）"
+        },
+        "package_url": {
+          "type": "string",
+          "description": "升级包地址（MinIO hunter-ota-packages；预签名有效期 1 小时，含 Range 分片下载支持）"
+        },
+        "package_size": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "升级包字节数（车端预校验存储空间 ≥ 2GB 门禁）"
+        },
+        "package_md5": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "升级包 MD5（小写十六进制）"
+        },
+        "package_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "升级包 SHA-256（小写十六进制）；校验失败返回 6001"
+        },
+        "signature": {
+          "type": "string",
+          "description": "RSA-2048 数字签名（base64）；验签失败返回 6002"
+        },
+        "changelog": {
+          "type": "object",
+          "description": "变更说明（JSONB；结构与 ota_versions.changelog 一致）"
+        },
+        "preconditions": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "升级门禁（车端执行前逐项校验，不满足返回 6003）",
+          "properties": {
+            "soc_min": {"type": "integer", "minimum": 0, "maximum": 100, "description": "最低电量 %（默认 50）"},
+            "must_be_parked": {"type": "boolean", "description": "必须静止（P 档）"},
+            "network_stable": {"type": "boolean", "description": "必须网络稳定"},
+            "min_storage_mb": {"type": "integer", "minimum": 0, "description": "最小可用存储 MB（默认 2048）"}
+          }
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035200.0,
+          "task_id": "3f2b1a09-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+          "version_name": "V1.2.0",
+          "version_code": 10200,
+          "package_url": "https://minio.hunter-edge.local/hunter-ota-packages/hunter-edge/V1.2.0.tar.gz?X-Amz-Expires=3600",
+          "package_size": 524288000,
+          "package_md5": "d41d8cd98f00b204e9800998ecf8427e",
+          "package_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "signature": "MEQCIF9k...RSA2048_BASE64_SIGNATURE...",
+          "changelog": {"features": ["感知模型升级至 v2.1"], "fixes": ["修复远程操控时延抖动"]},
+          "preconditions": {"soc_min": 50, "must_be_parked": true, "network_stable": true, "min_storage_mb": 2048}
+        }
+      ]
+    }
+  "schemas/ota_status.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/ota_status.schema.json",
+      "title": "HunterEdge OTA 状态上报 hunter.{vehicle_id}.ota_status",
+      "description": "车端→平台 OTA 状态上报（状态变更触发，acks=all）。消费者：ota-service（推进 ota_svc.ota_records.status/phase/progress，同步 Redis ota:progress:{task_id}）。status/phase 取值 = 车端 OTA 状态机 IDLE→PENDING→DOWNLOAD→INSTALL→TEST→SUCCESS，自检失败 → ROLLBACK → ROLLED_BACK/FAILED，不可更改。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vehicle_id", "timestamp", "task_id", "status", "progress"],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "上报车辆（Kafka 消息 key）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "状态变更时间（Unix epoch 秒）"
+        },
+        "task_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "升级任务 ID（ota_tasks.task_id）"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["IDLE", "PENDING", "DOWNLOAD", "INSTALL", "TEST",
+                   "SUCCESS", "ROLLBACK", "ROLLED_BACK", "FAILED"],
+          "description": "升级整体状态（9 态状态机）"
+        },
+        "phase": {
+          "type": "string",
+          "enum": ["IDLE", "PENDING", "DOWNLOAD", "INSTALL", "TEST",
+                   "SUCCESS", "ROLLBACK", "ROLLED_BACK", "FAILED"],
+          "description": "当前执行阶段（与 status 同域；A/B 分区切换与自检进度细化）"
+        },
+        "progress": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "当前阶段进度 %（灰度监控与前端进度条数据源）"
+        },
+        "from_version": {
+          "type": ["string", "null"],
+          "description": "升级前版本名（首次装机为 null）"
+        },
+        "to_version": {
+          "type": ["string", "null"],
+          "description": "目标版本名"
+        },
+        "error_code": {
+          "type": ["string", "null"],
+          "description": "错误码：6001 校验失败 / 6002 验签失败 / 6003 门禁不满足 / 车端自定义码"
+        },
+        "error_message": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "失败原因（禁止输出密钥/证书等敏感信息）"
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035300.2,
+          "task_id": "3f2b1a09-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+          "status": "DOWNLOAD",
+          "phase": "DOWNLOAD",
+          "progress": 42,
+          "from_version": "V1.1.0",
+          "to_version": "V1.2.0"
+        },
+        {
+          "vehicle_id": "HUNTER-003",
+          "timestamp": 1724035600.0,
+          "task_id": "3f2b1a09-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+          "status": "ROLLED_BACK",
+          "phase": "ROLLED_BACK",
+          "progress": 100,
+          "from_version": "V1.0.0",
+          "to_version": "V1.2.0",
+          "error_code": "6002",
+          "error_message": "signature verification failed, rolled back to active partition"
+        }
+      ]
+    }
+  "schemas/remote_control.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/remote_control.schema.json",
+      "title": "HunterEdge 远程操控指令 hunter.{vehicle_id}.remote_control",
+      "description": "平台→车远程操控指令（20Hz，即 50ms 间隔，acks=all，key=vehicle_id）。生产者：remote-control；消费者：车端。安全约束：车端 >500ms 未收到控制指令必须自动减速停车；远程操控模式最高速度默认 2.0 m/s（可配置）；同一车辆同一时刻仅允许一名操作员（Redis rc:session:{vehicle_id} 互斥）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vehicle_id", "timestamp", "seq", "control"],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "受控车辆（Kafka 消息 key）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "指令生成时间（Unix epoch 秒，含毫秒）；车端据此计算指令时延与超时"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "操控指令单调递增序号（丢包/乱序检测，保证 20Hz 时序可校验）"
+        },
+        "session_id": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "操控会话 ID（对应 Redis rc:session:{vehicle_id} 与 MinIO hunter-video 录像片段）"
+        },
+        "operator_id": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "操作员用户 ID（审计与录像关联）"
+        },
+        "control": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target_velocity", "target_steer"],
+          "properties": {
+            "target_velocity": {
+              "type": "number",
+              "minimum": -2.0,
+              "maximum": 2.0,
+              "description": "目标车速 m/s（上限默认 2.0，可配置；超限由服务端截断，不依赖车端裁剪）"
+            },
+            "target_steer": {
+              "type": "number",
+              "description": "目标前轮转角 rad（符号：正为左转，量程由底盘标定，服务端需做限幅）"
+            }
+          }
+        },
+        "heartbeat": {
+          "type": "boolean",
+          "default": false,
+          "description": "心跳包标记：控制量无变化时仍以 20Hz 发送，用于保持操控链路与超时保护计时"
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035200.123,
+          "seq": 8801,
+          "session_id": "9c8b7a65-4d3e-2f10-9a8b-7c6d5e4f3a2b",
+          "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
+          "control": {"target_velocity": 1.2, "target_steer": 0.05},
+          "heartbeat": false
+        },
+        {
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035200.173,
+          "seq": 8802,
+          "session_id": "9c8b7a65-4d3e-2f10-9a8b-7c6d5e4f3a2b",
+          "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
+          "control": {"target_velocity": 1.2, "target_steer": 0.05},
+          "heartbeat": true
+        }
+      ]
+    }
+  "schemas/sensor_file.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/sensor_file.schema.json",
+      "title": "HunterEdge 传感器文件通知 sensor_file",
+      "description": "平台内部 Topic `sensor_file`（3 分区，保留 7 天，key = vehicle_id）。生产者：data-collector（文件上传完成且完整性校验通过后投递，见设计文档 5.5 节）；消费者：data-analytics（离线分析，幂等键 = object_key）。消息只包含 MinIO 对象元信息，不含文件本体；对象路径遵循 5.5 节命名规范 {bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}。校验依据：bucket/object_key/size/md5/sha256 必须与 MinIO 实际对象一致（不一致时 data-collector 返回错误码 6001，不投递本消息）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vehicle_id", "timestamp", "bucket", "object_key", "data_type", "size_bytes", "md5", "sha256"],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "车辆唯一标识，必须等于 Kafka 消息 key（保证单车辆有序）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "上传完成时间，Unix epoch 秒（含毫秒小数；车端上报时间，禁止用平台入库时间替代）"
+        },
+        "bucket": {
+          "type": "string",
+          "enum": ["hunter-raw-data", "hunter-rosbag", "hunter-video"],
+          "description": "MinIO Bucket（车端上传类；生命周期：hunter-raw-data 30 天 / hunter-rosbag 事件永久·常规 30 天 / hunter-video 90 天）"
+        },
+        "object_key": {
+          "type": "string",
+          "pattern": "^hunter-(raw-data|rosbag|video)/[A-Za-z0-9][A-Za-z0-9_-]{0,63}/[0-9]{4}-[0-9]{2}-[0-9]{2}/[a-z_]+/[0-9]+_[0-9]+\\.[A-Za-z0-9]+$",
+          "description": "对象路径（5.5 节命名规范 {bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}；consumer 幂等键）",
+          "examples": ["hunter-rosbag/HUNTER-001/2024-08-19/rosbag/1724035200_12580.bag"]
+        },
+        "data_type": {
+          "type": "string",
+          "enum": ["point_cloud", "camera_image", "rosbag", "video", "other"],
+          "description": "数据类型（对应 object_key 中的 {data_type} 段与 Bucket 映射；取值域见 data-collector.yaml x-hunter-file-upload-flow）"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "对象字节数（必须与 MinIO 对象一致）"
+        },
+        "md5": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "文件 MD5（小写十六进制），上传完成通知中声明的校验值"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "文件 SHA-256（小写十六进制），data-analytics 离线分析前可二次校验"
+        },
+        "data_file_url": {
+          "type": ["string", "null"],
+          "description": "对象逻辑地址（bucket/object_key 拼接形式，如 hunter-rosbag/HUNTER-001/2024-08-19/rosbag/1724035200_12580.bag）；不落长期签名，下载必须另签 15 分钟预签名 URL"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "车端文件/消息序号（对应命名规范 {seq} 段，用于丢包与重复检测）"
+        },
+        "etag": {
+          "type": ["string", "null"],
+          "description": "MinIO 对象 ETag（分片上传合并后由 MinIO 返回；可选，供对账）"
+        },
+        "content_type": {
+          "type": ["string", "null"],
+          "description": "MIME 类型（如 application/octet-stream；可选）"
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035200.123,
+          "bucket": "hunter-raw-data",
+          "object_key": "hunter-raw-data/HUNTER-001/2024-08-19/point_cloud/1724035200_12580.pcd",
+          "data_type": "point_cloud",
+          "size_bytes": 18874368,
+          "md5": "d41d8cd98f00b204e9800998ecf8427e",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "data_file_url": "hunter-raw-data/HUNTER-001/2024-08-19/point_cloud/1724035200_12580.pcd",
+          "seq": 12580,
+          "etag": "9f2b1a09c1d2e3f4a5b6c7d8e9f0a1b2",
+          "content_type": "application/octet-stream"
+        },
+        {
+          "vehicle_id": "HUNTER-002",
+          "timestamp": 1724035980.5,
+          "bucket": "hunter-rosbag",
+          "object_key": "hunter-rosbag/HUNTER-002/2024-08-19/rosbag/1724035980_20481.bag",
+          "data_type": "rosbag",
+          "size_bytes": 1073741824,
+          "md5": "0cc175b9c0f1b6a831c399e269772661",
+          "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+          "seq": 20481,
+          "content_type": "application/octet-stream"
+        }
+      ]
+    }
+  "schemas/telemetry.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-edge.local/contracts/kafka/schemas/telemetry.schema.json",
+      "title": "HunterEdge 遥测消息 hunter.{vehicle_id}.telemetry",
+      "description": "车辆遥测（10-50Hz）。生产者：车端（HUNTER SE / AGX Orin）；消费者：data-collector → telemetry_raw / data_collector.vehicle_telemetry。字段名/类型/嵌套结构不可更改（来源：设计文档 5.3 节）。additionalProperties=false：新增字段必须先更新契约。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vehicle_id", "timestamp", "seq", "chassis", "localization", "perception", "planning", "control", "system"],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "车辆唯一标识，必须等于 Kafka 消息 key（保证单车辆有序）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "车端采集时间，Unix epoch 秒（含毫秒小数）；禁止用平台入库时间替代"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "车端消息单调递增序号（幂等去重与丢包检测）"
+        },
+        "chassis": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["velocity", "steering_angle", "battery_voltage", "battery_soc", "battery_current", "battery_temp", "control_mode", "vehicle_state", "fault_code", "motor_rpm", "motor_current", "motor_temp"],
+          "properties": {
+            "velocity": {"type": "number", "description": "车速 m/s（前进为正）"},
+            "steering_angle": {"type": "number", "description": "前轮转角 rad"},
+            "battery_voltage": {"type": "number", "description": "电池电压 V"},
+            "battery_soc": {"type": "integer", "minimum": 0, "maximum": 100, "description": "剩余电量 %（<20% battery_low；<10% battery_critical）"},
+            "battery_current": {"type": "number", "description": "电池电流 A（放电为负）"},
+            "battery_temp": {"type": "number", "description": "电池温度 ℃"},
+            "control_mode": {"type": "string", "description": "底盘控制模式（遥测示例值 CAN；⚠ 完整取值域待设计文档核对）"},
+            "vehicle_state": {"type": "string", "description": "底盘状态字（遥测示例值 NORMAL；与车辆 8 态业务状态不同域）"},
+            "fault_code": {"type": "integer", "description": "底盘故障码，0 表示无故障"},
+            "motor_rpm": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "description": "各驱动电机转速 rpm"},
+            "motor_current": {"type": "array", "items": {"type": "number"}, "minItems": 1, "description": "各驱动电机电流 A"},
+            "motor_temp": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "description": "各驱动电机温度 ℃"}
+          }
+        },
+        "localization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x", "y", "z", "roll", "pitch", "heading", "linear_velocity", "angular_velocity", "position_std", "heading_std"],
+          "properties": {
+            "x": {"type": "number", "description": "地图坐标系 X / m"},
+            "y": {"type": "number", "description": "地图坐标系 Y / m"},
+            "z": {"type": "number", "description": "地图坐标系 Z / m"},
+            "roll": {"type": "number", "description": "横滚角 rad"},
+            "pitch": {"type": "number", "description": "俯仰角 rad"},
+            "heading": {"type": "number", "description": "航向角 rad（[-π, π]）"},
+            "linear_velocity": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "[vx, vy, vz] m/s"},
+            "angular_velocity": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "[ωx, ωy, ωz] rad/s"},
+            "position_std": {"type": "number", "minimum": 0, "description": "定位位置标准差 m（定位健康度）"},
+            "heading_std": {"type": "number", "minimum": 0, "description": "航向标准差 rad"}
+          }
+        },
+        "perception": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["detected_objects", "fps", "latency_ms", "object_types"],
+          "properties": {
+            "detected_objects": {"type": "integer", "minimum": 0, "description": "当前帧目标总数"},
+            "fps": {"type": "number", "minimum": 0, "description": "感知流水线帧率"},
+            "latency_ms": {"type": "number", "minimum": 0, "description": "感知端到端延迟 ms"},
+            "object_types": {
+              "type": "object",
+              "additionalProperties": {"type": "integer", "minimum": 0},
+              "description": "按类别统计（键为类别名，如 vehicle/pedestrian/other）"
+            }
+          }
+        },
+        "planning": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["trajectory_length", "trajectory_points", "planning_latency_ms", "current_behavior"],
+          "properties": {
+            "trajectory_length": {"type": "number", "minimum": 0, "description": "规划轨迹长度 m"},
+            "trajectory_points": {"type": "integer", "minimum": 0, "description": "轨迹点数量"},
+            "planning_latency_ms": {"type": "number", "minimum": 0, "description": "规划计算延迟 ms"},
+            "current_behavior": {"type": "string", "description": "当前行为（如 cruise；⚠ 完整取值域待核对）"}
+          }
+        },
+        "control": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target_velocity", "target_steer", "velocity_error", "steer_error", "control_latency_ms"],
+          "properties": {
+            "target_velocity": {"type": "number", "description": "控制目标车速 m/s"},
+            "target_steer": {"type": "number", "description": "控制目标转角 rad"},
+            "velocity_error": {"type": "number", "description": "速度跟踪误差 m/s"},
+            "steer_error": {"type": "number", "description": "转角跟踪误差 rad"},
+            "control_latency_ms": {"type": "number", "minimum": 0, "description": "控制计算延迟 ms"}
+          }
+        },
+        "system": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu_usage", "gpu_usage", "memory_usage_mb", "gpu_temp", "cpu_temp", "network_rssi", "network_latency_ms"],
+          "properties": {
+            "cpu_usage": {"type": "number", "minimum": 0, "maximum": 100, "description": "CPU 使用率 %"},
+            "gpu_usage": {"type": "number", "minimum": 0, "maximum": 100, "description": "GPU 使用率 %"},
+            "memory_usage_mb": {"type": "integer", "minimum": 0, "description": "内存占用 MB"},
+            "gpu_temp": {"type": "number", "description": "GPU 温度 ℃"},
+            "cpu_temp": {"type": "number", "description": "CPU 温度 ℃"},
+            "network_rssi": {"type": "integer", "maximum": 0, "description": "无线信号强度 dBm（负值，如 -65）"},
+            "network_latency_ms": {"type": "number", "minimum": 0, "description": "车-云网络往返延迟 ms"}
+          }
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035200.123,
+          "seq": 12580,
+          "chassis": {
+            "velocity": 1.52, "steering_angle": 0.12,
+            "battery_voltage": 25.6, "battery_soc": 78, "battery_current": -15.2, "battery_temp": 28.5,
+            "control_mode": "CAN", "vehicle_state": "NORMAL", "fault_code": 0,
+            "motor_rpm": [1500, 1520, 0], "motor_current": [8.5, 8.7, 2.1], "motor_temp": [45, 46, 42]
+          },
+          "localization": {
+            "x": 125.34, "y": 67.89, "z": 0.32, "roll": 0.01, "pitch": 0.02, "heading": 1.234,
+            "linear_velocity": [1.52, 0.01, 0.0], "angular_velocity": [0.0, 0.0, 0.05],
+            "position_std": 0.15, "heading_std": 0.02
+          },
+          "perception": {
+            "detected_objects": 12, "fps": 10.2, "latency_ms": 85,
+            "object_types": {"vehicle": 5, "pedestrian": 3, "other": 4}
+          },
+          "planning": {
+            "trajectory_length": 5.0, "trajectory_points": 50,
+            "planning_latency_ms": 45, "current_behavior": "cruise"
+          },
+          "control": {
+            "target_velocity": 1.6, "target_steer": 0.10,
+            "velocity_error": 0.08, "steer_error": 0.02, "control_latency_ms": 5
+          },
+          "system": {
+            "cpu_usage": 45.2, "gpu_usage": 62.8, "memory_usage_mb": 18500,
+            "gpu_temp": 68.5, "cpu_temp": 65.2, "network_rssi": -65, "network_latency_ms": 45
+          }
+        }
+      ]
+    }
+  "topics.yaml": |-
+    # =====================================================================
+    # HunterEdge Kafka Topic 契约（单一事实来源）
+    # 来源：设计文档 5.3 节 + 系统上下文基座「Kafka Topic 命名与配置」
+    # 命名规范：<domain>.<entity>.<type>，全小写点分隔；车端 Topic 为 hunter.{vehicle_id}.<type>
+    # 约束：禁止自行新增 Topic 或更改配置；变更需同步
+    #   - contracts/kafka/schemas/*.schema.json
+    #   - infra/docker/kafka/create-topics.sh
+    #   - infra/k8s/jobs/kafka-init-job.yaml
+    #   - common/python/hunter_common/kafka/{producer,consumer}.py
+    # ⚠ 需核对：车端 Topic 的保留时间与副本数（设计文档仅给出分区数/acks/频率）；
+    #   此处按平台内部同类 Topic 的值对齐（telemetry/health 7 天、event 30 天、指令类 7 天），副本数统一 3
+    # =====================================================================
+    schema_version: "1.0.0"
+    source: "设计文档 5.3 节（Kafka Topic 与消息格式）"
+    naming:
+      convention: "<domain>.<entity>.<type>"
+      case: lower_snake_case
+      separator: "."
+      vehicle_topic_pattern: "hunter.{vehicle_id}.<type>"
+      broadcast_topic: "hunter.broadcast.command"
+      # DLQ 由 hunter_common.kafka.consumer 派生：{original_topic}.dlq（保留 30 天，分区数继承源 Topic）
+      dlq_pattern: "{original_topic}.dlq"
+
+    # ---------- 全局默认（未显式覆盖时生效） ----------
+    defaults:
+      replication_factor: 3
+      min_insync_replicas: 2          # acks=all 时至少 2 副本落盘
+      cleanup_policy: delete
+      compression_type: lz4           # 车端生产者配置：compression.type=lz4
+      key: vehicle_id                 # 消息 key = vehicle_id，保证单车辆消息有序
+      message_format: json
+      security_protocol: SASL_SSL     # 车端与平台间强制
+      sasl_mechanism: SCRAM-SHA-512
+
+    producer_defaults:                # 对齐车端生产者基准配置
+      linger_ms: 5
+      batch_size: 16384
+      retries: 3
+      local_disk_buffer_bytes: 1073741824   # 网络中断时本地磁盘缓冲 1GB
+
+    consumer_defaults:
+      enable_auto_commit: false        # 手动提交 offset：处理成功后提交（hunter_common.kafka.consumer）
+      auto_offset_reset: earliest
+      max_poll_records: 100            # 单批处理量（batch_size 与 handler 幂等性配合）
+      isolation_level: read_committed
+
+    # =====================================================================
+    # 一、车端 ↔ 平台 Topic
+    # =====================================================================
+    vehicle_topics:
+      - name: "hunter.{vehicle_id}.telemetry"
+        direction: vehicle_to_platform
+        partitions: 6                    # 按 vehicle_id 哈希分区
+        partition_strategy: hash(vehicle_id)
+        acks: "1"                        # 高频遥测：容忍极少数丢失换取吞吐（acks=1）
+        frequency: "10-50Hz"
+        key: vehicle_id
+        retention_ms: 604800000
+        retention_human: "7 天"
+        producer: vehicle (HUNTER SE AGX Orin)
+        consumers: [data-collector]
+        schema: schemas/telemetry.schema.json
+        description: "车辆遥测（底盘/定位/感知/规划/控制/系统六段），单车 ≤100 msg/s"
+
+      - name: "hunter.{vehicle_id}.event"
+        direction: vehicle_to_platform
+        partitions: 3
+        partition_strategy: hash(vehicle_id)
+        acks: all
+        frequency: "事件触发"
+        key: vehicle_id
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        producer: vehicle
+        consumers: [data-collector]
+        schema: schemas/event.schema.json
+        description: "车辆事件（18 种类型/3 级等级，阈值见 contracts/database/enums.md）"
+
+      - name: "hunter.{vehicle_id}.health"
+        direction: vehicle_to_platform
+        partitions: 3
+        partition_strategy: hash(vehicle_id)
+        acks: "0"
+        frequency: "1Hz"
+        key: vehicle_id
+        retention_ms: 604800000
+        retention_human: "7 天"
+        producer: vehicle
+        consumers: [data-collector]
+        schema: schemas/health.schema.json
+        description: "系统健康数据（状态 + 车载计算平台资源/网络指标），最低可靠性要求"
+
+      - name: "hunter.{vehicle_id}.command"
+        direction: platform_to_vehicle
+        partitions: 3
+        partition_strategy: hash(vehicle_id)
+        acks: all
+        frequency: "按需"
+        key: vehicle_id
+        retention_ms: 604800000
+        retention_human: "7 天"
+        producer: [api-gateway, ota-service, remote-control]
+        consumers: [vehicle]
+        schema: schemas/command.schema.json
+        description: "控制指令（按需下发）；执行结果经 command_result 回报"
+
+      - name: "hunter.{vehicle_id}.command_result"
+        direction: vehicle_to_platform
+        partitions: 3
+        partition_strategy: hash(vehicle_id)
+        acks: all
+        frequency: "按需"
+        key: vehicle_id
+        retention_ms: 604800000
+        retention_human: "7 天"
+        producer: vehicle
+        consumers: [data-collector, remote-control]
+        schema: schemas/command_result.schema.json
+        description: "指令执行结果（command_id 关联请求，保证端到端可追溯）"
+
+      - name: "hunter.{vehicle_id}.ota_notify"
+        direction: platform_to_vehicle
+        partitions: 3
+        partition_strategy: hash(vehicle_id)
+        acks: all
+        frequency: "按需"
+        key: vehicle_id
+        retention_ms: 604800000
+        retention_human: "7 天"
+        producer: ota-service
+        consumers: [vehicle]
+        schema: schemas/ota_notify.schema.json
+        description: "OTA 升级通知（含包地址/大小/MD5/SHA-256/RSA-2048 签名，车端下载后必须逐项校验）"
+
+      - name: "hunter.{vehicle_id}.ota_status"
+        direction: vehicle_to_platform
+        partitions: 3
+        partition_strategy: hash(vehicle_id)
+        acks: all
+        frequency: "状态变更"
+        key: vehicle_id
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        producer: vehicle
+        consumers: [ota-service]
+        schema: schemas/ota_status.schema.json
+        description: "OTA 状态上报（车端状态机 IDLE→…→SUCCESS/ROLLED_BACK/FAILED，写 ota_records）"
+
+      - name: "hunter.{vehicle_id}.remote_control"
+        direction: platform_to_vehicle
+        partitions: 3
+        partition_strategy: hash(vehicle_id)
+        acks: all
+        frequency: "20Hz"
+        key: vehicle_id
+        retention_ms: 604800000
+        retention_human: "7 天"
+        producer: remote-control
+        consumers: [vehicle]
+        schema: schemas/remote_control.schema.json
+        description: "远程操控指令（20Hz/50ms 间隔，>500ms 未收到则车端自动减速停车）"
+
+      # ⚠ producer 为「设计预期生产者登记」：api-gateway 契约声明不生产任何 Topic、
+      #   ota-service 契约将广播场景列为待确认（x-hunter-pending-confirmation #12）→ 实现侧暂不生产该 Topic，
+      #   先由逐车 hunter.{vehicle_id}.command / ota_notify 承接；启用广播须先同步两份 OpenAPI 契约
+      - name: "hunter.broadcast.command"
+        direction: platform_to_all_vehicles
+        partitions: 3
+        partition_strategy: none          # 广播：所有消费者组均需收到
+        acks: all
+        frequency: "按需"
+        key: none                         # 广播消息不使用 vehicle_id 作为 key
+        retention_ms: 604800000
+        retention_human: "7 天"
+        producer: [api-gateway, ota-service]
+        consumers: [vehicle]
+        schema: schemas/command.schema.json
+        description: "广播指令（全车队）；消费者按 payload.target_filter 自行过滤"
+
+    # =====================================================================
+    # 二、平台内部 Topic（本地开发由 infra/docker/kafka/create-topics.sh 创建；
+    #     K8s 由 infra/k8s/jobs/kafka-init-job.yaml 创建；auto.create.topics.enable=false）
+    # ⚠ 副本数：本地 docker-compose 单 broker = 1（与 create-topics.sh 一致）；生产 K8s = 3（min.insync.replicas=2）
+    # =====================================================================
+    platform_topics:
+      - name: telemetry_raw
+        partitions: 12
+        acks: all
+        retention_ms: 604800000
+        retention_human: "7 天"
+        key: vehicle_id
+        producer: data-collector
+        consumers: [data-analytics (Flink)]
+        schema: schemas/telemetry.schema.json      # 复用遥测消息结构（原样透传）
+        description: "原始遥测（消费 hunter.{vehicle_id}.telemetry 后写入）"
+
+      - name: telemetry_clean
+        partitions: 12
+        acks: all
+        retention_ms: 604800000
+        retention_human: "7 天"
+        key: vehicle_id
+        producer: data-collector
+        consumers: [data-analytics (Flink)]
+        schema: schemas/telemetry.schema.json      # 清洗后仍为同一结构，异常点已剔除/插补
+        description: "清洗后遥测（校验/去重/时间对齐/野值处理后的结果）"
+
+      - name: event_raw
+        partitions: 6
+        acks: all
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        key: vehicle_id
+        producer: data-collector
+        consumers: [data-analytics, scene-service]
+        schema: schemas/event.schema.json          # 复用事件消息结构
+        description: "事件数据（消费 hunter.{vehicle_id}.event 后写入 + 落库 events 表）"
+
+      - name: sensor_file
+        partitions: 3
+        acks: all
+        retention_ms: 604800000
+        retention_human: "7 天"
+        key: vehicle_id
+        producer: data-collector
+        consumers: [data-analytics]
+        schema: schemas/sensor_file.schema.json    # 5.5 节上传完成通知（bucket/object_key/size/md5/sha256）
+        description: "传感器文件通知（MinIO 对象已上传且完整性校验通过：bucket/object_key/data_type/size/checksum），不含文件本体；幂等键 = object_key"
+
+      - name: analytics_result
+        partitions: 6
+        acks: all
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        key: vehicle_id
+        producer: data-analytics
+        consumers: [scene-service, 上层业务]
+        schema: schemas/analytics_result.schema.json
+        description: |
+          分析结果（指标计算 / Corner Case 挖掘 / 报告生成结果）；
+          scene-service 消费该 Topic 做实车场景自动提取（设计文档 4.5 节：触发事件 + 前后各 10 秒截取窗口）
+        result_types: [metric, corner_case, report]
+        consumed_by:
+          - service: scene-service
+            group_id: scene-service-analytics-result
+            usage: "实车场景自动提取 → 生成 scene_type=real_vehicle_replay 的 draft 场景"
+
+      - name: alert_event
+        partitions: 3
+        acks: all
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        key: vehicle_id
+        producer: data-analytics
+        consumers: [告警处理]
+        schema: schemas/alert_event.schema.json    # Flink 实时作业告警（6.2 节规则 + 受控词表等级映射）
+        description: "告警事件（平台侧重算触发；实时告警触发 ≤2s，推送 WebSocket + Alertmanager）"
+        # ⚠ 消费方「告警处理」落位服务待定（见 consumer-groups.yaml 的 platform-alert-event）
+        consumed_by:
+          - service: "告警处理（落位待定：data-analytics 告警子模块 / api-gateway 推送）"
+            group_id: platform-alert-event
+            usage: "告警聚合 → WebSocket 推送前端 + 对接 Alertmanager"
+        idempotency_key: "(vehicle_id, alert_id)"
+
+    # =====================================================================
+    # 三、Topic 级限流（设计文档附录 D，不可放宽）
+    # =====================================================================
+    throttles:
+      - scope: vehicle
+        metric: telemetry_produce_rate
+        limit: 100
+        unit: msg/s
+        enforcement: "data-collector 消费侧 + 车端生产者；超限丢弃最旧遥测并告警"
+      - scope: vehicle
+        metric: file_upload_bandwidth
+        limit: 10
+        unit: Mbps
+        enforcement: "预签名 URL 上传通道（data-collector 文件上传管理）"

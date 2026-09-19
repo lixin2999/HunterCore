@@ -11,18 +11,46 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator, Mapping, Sequence
+from datetime import UTC, datetime
+from typing import Any
 
-from hunter_common.database import DatabaseSessionManager
+from hunter_common.database import TELEMETRY_CONFLICT_COLUMNS, DatabaseSessionManager
 from hunter_common.database.models import VehicleTelemetry
 from sqlalchemy import Row, func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class TelemetryRepository:
-    """data_collector.vehicle_telemetry 只读查询。"""
+    """data_collector.vehicle_telemetry 只读查询 + 批量幂等写入。"""
 
     def __init__(self, db: DatabaseSessionManager) -> None:
         self._db = db
+
+    def transaction(self) -> AsyncIterator[AsyncSession]:
+        """事务性会话上下文（批量写入与投递编排共用；提交/回滚由会话上下文负责）。"""
+        return self._db.session()
+
+    async def insert_points(
+        self, session: AsyncSession, rows: Sequence[Mapping[str, Any]]
+    ) -> int:
+        """批量幂等写入遥测点，返回「尝试写入行数」。
+
+        - 单条 ``INSERT ... VALUES (多行) ON CONFLICT (time, vehicle_id) DO NOTHING``：
+          批量插入满足契约「≥ 10000 点/秒」，禁止逐条 commit；
+        - 冲突静默跳过 → Kafka at-least-once 重放幂等（消费组 data-collector-telemetry）；
+        - 返回值为「尝试写入行数」而非实际新增行数（asyncpg 驱动不支持 sane multi-rowcount，
+          与 ``BaseRepository.bulk_create_*`` 语义一致；重复率由消费指标/日志观察）。
+        """
+        if not rows:
+            return 0
+        await session.execute(
+            pg_insert(VehicleTelemetry)
+            .values([dict(row) for row in rows])
+            .on_conflict_do_nothing(index_elements=list(TELEMETRY_CONFLICT_COLUMNS))
+        )
+        return len(rows)
 
     async def query_page(
         self,
@@ -36,9 +64,8 @@ class TelemetryRepository:
 
         行含 vehicle_telemetry 全部扁平列；页序 time DESC。
         """
-        start_dt = datetime.fromtimestamp(start_time, tz=timezone.utc)
-        end_dt = datetime.fromtimestamp(end_time, tz=timezone.utc)
-        end_dt = datetime.fromtimestamp(end_time, tz=timezone.utc)
+        start_dt = datetime.fromtimestamp(start_time, tz=UTC)
+        end_dt = datetime.fromtimestamp(end_time, tz=UTC)
         async with self._db.session() as session:
             stmt = (
                 select(VehicleTelemetry)

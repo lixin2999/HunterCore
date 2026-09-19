@@ -96,6 +96,16 @@ class TaskService:
         self._settings = settings
         self._storage = storage
         self._redis = redis_manager
+        #: 后台任务强引用（审查 Y9：fire-and-forget 任务无引用可能被 GC 回收，
+        #: 异常也无人观察；由 :meth:`aclose` 在停机时统一等待收尾）
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    async def aclose(self) -> None:
+        """等待后台任务收尾（应用停机时调用；异常已在完成回调中记录，不向外抛）。"""
+        pending = list(self._background_tasks)
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
 
     # ---------- 查询 ----------
 
@@ -143,7 +153,9 @@ class TaskService:
         )
         item = self._to_item(task, include_vehicles=True)
         item.progress = progress
-        from app.schemas.versions import OtaVersionItem  # noqa: PLC0415  # 局部导入避免循环
+        from app.schemas.versions import (
+            OtaVersionItem,  # 局部导入避免循环
+        )
 
         target_version = OtaVersionItem(
             version_id=version_row.version_id,
@@ -538,7 +550,21 @@ class TaskService:
             )
             await client.expire(key, 86400)
 
-        asyncio.get_running_loop().create_task(_write())
+        def _on_done(task: asyncio.Task[None]) -> None:
+            """完成回调：释放引用并观察异常（审查 Y9，避免 "exception was never retrieved"）。"""
+            self._background_tasks.discard(task)
+            if not task.cancelled() and task.exception() is not None:
+                logger.warning(
+                    "ota_progress_cache_write_failed",
+                    task_id=str(task_id),
+                    error=str(task.exception()),
+                )
+
+        task = asyncio.get_running_loop().create_task(
+            _write(), name=f"ota-progress-cache-{task_id}"
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(_on_done)
 
     def _action_receipt(self, task: OtaTask, action: OtaTaskAction, *, batch_no: int | None) -> OtaTaskActionData:
         """幂等回执（重复 start：released/blocked 均为空，状态保持 running）。"""
@@ -729,7 +755,8 @@ class TaskService:
         门禁：静止 + P 档 + 网络稳定（回退不刷写镜像，不要求电量 ≥ 50%）；
         非 SUCCESS 记录 → rejected（reason=status_not_allowed）；离线 → rejected（vehicle_offline）。
         """
-        task = await self._require_task(task_id)
+        # 3001 守卫：任务不存在直接 404（返回值本方法不使用，故不赋值）
+        await self._require_task(task_id)
         snapshots = await self._records.snapshot_by_task(task_id)
         success_vehicles = [
             v for v, s in snapshots.items() if s.status == OtaStatus.SUCCESS

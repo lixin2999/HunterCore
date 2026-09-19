@@ -7,9 +7,8 @@
 """
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge
-
 from hunter_common.metrics import REGISTRY
+from prometheus_client import Counter, Gauge
 
 OTA_PACKAGE_VERIFY_FAILURES = Counter(
     "ota_package_verify_failures_total",

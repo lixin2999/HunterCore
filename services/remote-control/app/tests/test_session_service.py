@@ -104,6 +104,15 @@ async def test_create_session_success(rc_env) -> None:
     assert info.record.bucket == "hunter-video" and info.record.retention_days == 90
 
 
+async def test_create_session_sets_hard_ttl_on_session_key(rc_env) -> None:
+    """审查 R7 回归：会话 Hash 必须带硬 TTL（兜底副本崩溃/未走 DELETE 的残留会话）。"""
+    service: SessionService = rc_env.session_service
+    await service.create_session(VEHICLE_ONLINE, make_operator(), _request())
+
+    key = SESSION_HASH_KEY.format(vehicle_id=VEHICLE_ONLINE)
+    assert await rc_env.redis.ttl(key) == rc_env.session_service._settings.rc_session_ttl_s
+
+
 async def test_create_session_conflict_when_already_controlled(rc_env) -> None:
     """已有活跃会话 → 7001（锁内二次判定；契约 169 行）。"""
     _seed_session(rc_env.redis, VEHICLE_ONLINE, OTHER_ID)

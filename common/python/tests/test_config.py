@@ -52,3 +52,44 @@ def test_jwt_token_ttl_matches_spec() -> None:
     settings = DemoSettings()
     assert settings.jwt_access_token_expire_minutes == 120
     assert settings.jwt_refresh_token_expire_days == 7
+
+
+# ---------------------------------------------------------------------------
+# 生产凭据强校验（审查 Y2）
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("environment", ["staging", "prod"])
+def test_production_rejects_default_credentials(environment: str) -> None:
+    """staging/prod 沿用开发默认凭据（数据库/MinIO/JWT）→ 启动即失败。"""
+    with pytest.raises(ValueError, match="默认凭据"):
+        DemoSettings(environment=environment)
+
+
+@pytest.mark.parametrize("environment", ["staging", "prod"])
+def test_production_rejects_short_jwt_secret(environment: str) -> None:
+    """JWT 密钥不足 32 字节（HS256 下限）→ 启动即失败。"""
+    with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
+        DemoSettings(
+            environment=environment,
+            jwt_secret_key="short-secret",
+            postgres_password="s3cure-pg-pass",
+            minio_secret_key="s3cure-minio-pass",
+        )
+
+
+def test_production_accepts_injected_secrets() -> None:
+    """K8s Secret 注入强随机凭据后正常启动。"""
+    settings = DemoSettings(
+        environment="prod",
+        jwt_secret_key="X" * 48,
+        postgres_password="s3cure-pg-pass",
+        minio_secret_key="s3cure-minio-pass",
+    )
+    assert settings.environment == "prod"
+
+
+@pytest.mark.parametrize("environment", ["dev", "test"])
+def test_non_production_keeps_dev_defaults(environment: str) -> None:
+    """dev/test 环境保留默认值（本地起步体验），不触发 fail fast。"""
+    settings = DemoSettings(environment=environment)
+    assert settings.jwt_secret_key == "change-me-in-production"
+

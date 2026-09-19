@@ -1,7 +1,7 @@
 """升级记录端点测试（契约 records 组：任务监控明细 / 单车历史时间线）。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from httpx import AsyncClient
@@ -13,9 +13,9 @@ from app.tests.conftest import ADMIN_HEADERS, make_task, make_version
 
 def _record(task_id: Any, vehicle_id: str, to_version: str, *, status: OtaStatus) -> OtaRecord:
     """构造 ota_records 行（start/end 成对，duration 可派生）。"""
-    start = datetime(2026, 9, 18, 8, 0, 0, tzinfo=timezone.utc)
+    start = datetime(2026, 9, 18, 8, 0, 0, tzinfo=UTC)
     end = start if status is not OtaStatus.SUCCESS else datetime(
-        2026, 9, 18, 8, 30, 0, tzinfo=timezone.utc
+        2026, 9, 18, 8, 30, 0, tzinfo=UTC
     )
     return OtaRecord(
         record_id=1,
@@ -25,7 +25,7 @@ def _record(task_id: Any, vehicle_id: str, to_version: str, *, status: OtaStatus
         to_version=to_version,
         status=status,
         phase=status,
-        progress=100 if status is not OtaStatus.SUCCESS else 100,
+        progress=100,
         error_code="6001" if status is OtaStatus.FAILED else None,
         error_message="sha256 mismatch" if status is OtaStatus.FAILED else None,
         start_time=start,

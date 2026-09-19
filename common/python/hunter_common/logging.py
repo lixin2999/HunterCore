@@ -11,6 +11,7 @@ import contextvars
 import logging
 import re
 import sys
+from collections.abc import Mapping
 from typing import Any
 
 import structlog
@@ -24,7 +25,12 @@ _SENSITIVE_KEY_RE = re.compile(
     r"(password|passwd|secret|token|api[-_]?key|private[-_]?key|authorization|certificate)",
     re.IGNORECASE,
 )
+# 敏感值形态：HTTP Bearer 凭据 / PEM 私钥块（规避「字段名正常但值是凭据」的泄露）
+_BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9\-._~+/]{8,}=*")
+_PEM_PRIVATE_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 _MASKED = "***MASKED***"
+#: 递归脱敏深度上限（防止自引用/超深结构拖垮日志路径）
+_MAX_MASK_DEPTH = 6
 
 _service_name: str = "hunter-service"
 
@@ -95,11 +101,46 @@ def _add_trace_context(_: Any, __: str, event_dict: structlog.typing.EventDict) 
 
 
 def _mask_sensitive(_: Any, __: str, event_dict: structlog.typing.EventDict) -> structlog.typing.EventDict:
-    """敏感字段脱敏（password/token/secret/key 等），防止敏感信息泄露。"""
+    """敏感字段脱敏（password/token/secret/key 等），防止敏感信息泄露。
+
+    审查 Y1 修复：**递归**处理嵌套结构——仅掩码顶层 key 时，
+    ``logger.info("x", payload={"password": "..."})`` 这类结构化日志仍会明文落盘。
+    规则：
+    1. 任一层级 dict 的 key 命中敏感模式 → 值整体替换为 ``***MASKED***``；
+    2. 字符串值命中敏感形态（``Bearer <token>`` / PEM 私钥头）→ 同样掩码；
+    3. list/tuple/set 逐元素递归；深度上限 ``_MAX_MASK_DEPTH`` 防自引用结构。
+    """
     for key in list(event_dict):
         if _SENSITIVE_KEY_RE.search(str(key)):
             event_dict[key] = _MASKED
+            continue
+        event_dict[key] = _mask_payload(event_dict[key])
     return event_dict
+
+
+def _mask_payload(value: Any, depth: int = 0) -> Any:
+    """递归脱敏任意嵌套值（dict/list/tuple/set）；深度超限一律掩码。"""
+    if depth > _MAX_MASK_DEPTH:
+        return _MASKED
+    if isinstance(value, Mapping):
+        return {
+            key: _MASKED
+            if _SENSITIVE_KEY_RE.search(str(key))
+            else _mask_payload(item, depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_mask_payload(item, depth + 1) for item in value]
+    if isinstance(value, str):
+        return _mask_sensitive_text(value)
+    return value
+
+
+def _mask_sensitive_text(value: str) -> str:
+    """掩码字符串中的敏感形态（Bearer Token / PEM 私钥块）。"""
+    if _BEARER_RE.search(value) or _PEM_PRIVATE_KEY_RE.search(value):
+        return _MASKED
+    return value
 
 
 def configure_logging(

@@ -115,7 +115,7 @@ spec:
               app.kubernetes.io/name: data-analytics
       containers:
         - name: data-analytics
-          image: hunter/data-analytics:0.1.0
+          image: "hunter/data-analytics:{version}"   # 版本变量：部署前由 scripts/render_k8s.py 注入
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -151,19 +151,20 @@ spec:
               port: http
             periodSeconds: 5
             failureThreshold: 30
-          livenessProbe:
+          livenessProbe:                 # 存活：初始延迟 10s / 周期 5s
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 15
-            periodSeconds: 10
+            initialDelaySeconds: 10
+            periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
-          readinessProbe:
+          readinessProbe:                # 就绪：初始延迟 10s / 周期 5s（/readyz 含 DB/Redis 探测）
             httpGet:
               path: /readyz
               port: http
-            periodSeconds: 10
+            initialDelaySeconds: 10
+            periodSeconds: 5
             timeoutSeconds: 5
             failureThreshold: 3
       volumes:

@@ -8,10 +8,15 @@
 from __future__ import annotations
 
 import os
-from typing import Literal
+from typing import ClassVar, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: 开发默认凭据（staging/prod 启动时必须被 K8s Secret 覆盖，否则启动失败）
+_DEV_JWT_SECRETS: frozenset[str] = frozenset({"change-me-in-production", "changeme", "secret"})
+_DEV_DB_PASSWORDS: frozenset[str] = frozenset({"hunter_dev_123", "postgres", "hunter"})
+_DEV_MINIO_SECRETS: frozenset[str] = frozenset({"minioadmin", "minioadmin123"})
 
 
 class HunterBaseConfig(BaseSettings):
@@ -125,8 +130,42 @@ class HunterBaseConfig(BaseSettings):
     minio_secure: bool = False
 
     # ---------- 认证与安全 ----------
-    # 生产环境必须通过 K8s Secret 覆盖，禁止使用默认值上线
+    # 生产环境必须通过 K8s Secret 覆盖，禁止使用默认值上线（启动时强校验，见下）
     jwt_secret_key: str = "change-me-in-production"
+
+    #: JWT 密钥最小长度（HS256 密钥下限；PyJWT 对 <32 字节密钥发出告警）
+    JWT_MIN_SECRET_BYTES: ClassVar[int] = 32
+
+    @model_validator(mode="after")
+    def _reject_insecure_defaults_in_production(self) -> HunterBaseConfig:
+        """staging/prod 环境禁止沿用开发默认凭据（审查 Y2）。
+
+        动机：``postgres_password="hunter_dev_123"`` / ``minio_secret_key="minioadmin"`` /
+        ``jwt_secret_key="change-me-in-production"`` 一旦未覆盖即上线，等同于公开凭据：
+        攻击者可伪造任意用户 Token / 直连数据库与对象存储。
+        开发/测试环境保留默认值以便本地起步（fail fast 仅作用于 staging/prod）。
+        """
+        if self.environment not in ("staging", "prod"):
+            return self
+        insecure: list[str] = []
+        if self.jwt_secret_key.strip() in _DEV_JWT_SECRETS or (
+            len(self.jwt_secret_key.encode("utf-8")) < self.JWT_MIN_SECRET_BYTES
+        ):
+            insecure.append("JWT_SECRET_KEY（须为 ≥32 字节随机串）")
+        if self.postgres_password in _DEV_DB_PASSWORDS:
+            insecure.append("POSTGRES_PASSWORD")
+        if self.minio_secret_key in _DEV_MINIO_SECRETS:
+            insecure.append("MINIO_SECRET_KEY")
+        if self.kafka_sasl_password is not None and self.kafka_sasl_password in _DEV_DB_PASSWORDS:
+            insecure.append("KAFKA_SASL_PASSWORD")
+        if insecure:
+            raise ValueError(
+                "生产环境（environment={}）检测到未覆盖的默认凭据：{}；"
+                "请通过 K8s Secret 注入随机凭据后再启动".format(
+                    self.environment, "、".join(insecure)
+                )
+            )
+        return self
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 120   # Access Token 2h（设计文档：安全机制）
     jwt_refresh_token_expire_days: int = 7       # Refresh Token 7d

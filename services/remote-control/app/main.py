@@ -41,6 +41,7 @@ from app.repositories.storage import S3VideoArchiveStorage
 from app.routers import history, sessions, vehicles
 from app.routers.health import router as health_router
 from app.services.history_service import HistoryService
+from app.services.session_reaper import SessionReaper
 from app.services.session_service import SessionService
 from app.services.vehicle_view import VehicleViewReader
 
@@ -95,10 +96,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.history_service = HistoryService(
         storage=app.state.storage, settings=settings
     )
+    # 陈旧会话守护（审查 R7）：残留会话会永久占用车辆互斥位（同车后续接管恒 7001）
+    reaper = SessionReaper(
+        redis=app.state.redis,
+        session_service=app.state.session_service,
+        settings=settings,
+    )
+    app.state.session_reaper = reaper
+    await reaper.start()
     logger.info(
         "service_started", service=settings.service_name, port=settings.api_port
     )
     yield
+    # 停机顺序：先停会话守护（避免使用已关闭的 Redis），再释放依赖
+    await reaper.stop()
     await app.state.storage.close()
     await app.state.redis.close()
     await app.state.db.close()

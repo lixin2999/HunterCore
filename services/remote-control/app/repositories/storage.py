@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from hunter_common.config import HunterBaseConfig
@@ -28,7 +28,7 @@ KEY_PREFIX = "remote-control"
 
 def build_video_object_key(vehicle_id: str, started_at: float, session_id: str) -> str:
     """录像对象键：remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session_id}.mp4。"""
-    day = datetime.fromtimestamp(started_at, tz=timezone.utc)
+    day = datetime.fromtimestamp(started_at, tz=UTC)
     return (
         f"{KEY_PREFIX}/{vehicle_id}/{day.strftime('%Y')}/{day.strftime('%m')}/"
         f"{day.strftime('%d')}/{session_id}.{VIDEO_CONTAINER}"
@@ -39,7 +39,7 @@ def build_sidecar_object_key(
     vehicle_id: str, started_at: float, session_id: str
 ) -> str:
     """sidecar 对象键：与录像同目录同名 .json（契约 sidecar_schema）。"""
-    day = datetime.fromtimestamp(started_at, tz=timezone.utc)
+    day = datetime.fromtimestamp(started_at, tz=UTC)
     return (
         f"{KEY_PREFIX}/{vehicle_id}/{day.strftime('%Y')}/{day.strftime('%m')}/"
         f"{day.strftime('%d')}/{session_id}{SIDECAR_SUFFIX}"

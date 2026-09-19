@@ -37,9 +37,10 @@ async def readyz(request: Request) -> JSONResponse:
     用于 K8s readinessProbe；基础设施不可用时返回 503（code=5001 服务不可用）。
     """
     checks: dict[str, bool] = {}
-    db = getattr(request.app.state, "db", None)
+    # 数据库探针走只读账号（审查 Y10：本服务不得持有业务库读写凭据）
+    readonly = getattr(request.app.state, "readonly_metrics", None)
     checks["database"] = (
-        await _bounded_probe("database", db.check_connection()) if db is not None else False
+        await _bounded_probe("database", readonly.ping()) if readonly is not None else False
     )
     redis = getattr(request.app.state, "redis", None)
     checks["redis"] = await _bounded_probe("redis", redis.ping()) if redis is not None else False

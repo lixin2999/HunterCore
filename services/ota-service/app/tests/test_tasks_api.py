@@ -1,7 +1,7 @@
 """升级任务端点测试（契约 ota-service.yaml tasks 组：灰度/门禁/动作/回滚）。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -331,8 +331,8 @@ async def test_resume_rejected_when_halted(
             progress=30,
             error_code="6001",
             error_message="sha256 mismatch",
-            start_time=datetime.now(tz=timezone.utc),
-            end_time=datetime.now(tz=timezone.utc),  # 终态必写 end_time（消费链路语义）
+            start_time=datetime.now(tz=UTC),
+            end_time=datetime.now(tz=UTC),  # 终态必写 end_time（消费链路语义）
         )
     ]
     task.progress["current_batch"] = 1
@@ -396,7 +396,7 @@ async def test_rollback_success_records_dispatch_command(
             status=OtaStatus.SUCCESS,
             phase=OtaStatus.SUCCESS,
             progress=100,
-            start_time=datetime.now(tz=timezone.utc),
+            start_time=datetime.now(tz=UTC),
         ),
         OtaRecord(
             record_id=2,
@@ -406,7 +406,7 @@ async def test_rollback_success_records_dispatch_command(
             status=OtaStatus.DOWNLOAD,
             phase=OtaStatus.DOWNLOAD,
             progress=40,
-            start_time=datetime.now(tz=timezone.utc),
+            start_time=datetime.now(tz=UTC),
         ),
     ]
     ota_env.reader.seed(
@@ -452,7 +452,7 @@ async def test_rollback_offline_vehicle_rejected(
             status=OtaStatus.SUCCESS,
             phase=OtaStatus.SUCCESS,
             progress=100,
-            start_time=datetime.now(tz=timezone.utc),
+            start_time=datetime.now(tz=UTC),
         )
     ]
     resp = await client.post(

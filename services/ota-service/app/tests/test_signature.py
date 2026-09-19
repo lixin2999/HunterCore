@@ -12,12 +12,14 @@ import pytest
 
 pytest.importorskip("cryptography")
 
-from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import padding  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import (
+    padding,
+    rsa,
+)
+from hunter_common.exceptions import ServiceUnavailableError
 
-from app.core.signature import signature_payload, verify_package_signature  # noqa: E402
-from hunter_common.exceptions import ServiceUnavailableError  # noqa: E402
+from app.core.signature import signature_payload, verify_package_signature
 
 PACKAGE_BYTES = b"hunter-ota-package-content"
 SHA256_HEX = hashlib.sha256(PACKAGE_BYTES).hexdigest()

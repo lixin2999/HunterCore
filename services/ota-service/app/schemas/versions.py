@@ -8,11 +8,10 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
+from hunter_common.database.enums import OtaVersionStatus
 from pydantic import BaseModel, ConfigDict, Field
 
-from hunter_common.database.enums import OtaVersionStatus
-
-from app.schemas.common import MD5_PATTERN, OtaApiResponse, SHA256_PATTERN
+from app.schemas.common import MD5_PATTERN, SHA256_PATTERN, OtaApiResponse
 
 #: 上传预签名有效期（契约 OtaVersionUploadInfo.expires_in enum [3600]，固定 1 小时不可更改）
 PRESIGNED_UPLOAD_EXPIRES_IN: Literal[3600] = 3600
@@ -190,6 +189,7 @@ class OtaVersionDeprecateRequest(BaseModel):
 
 
 __all__ = [
+    "PRESIGNED_UPLOAD_EXPIRES_IN",
     "OtaVersionCreateData",
     "OtaVersionCreateRequest",
     "OtaVersionCreateResponse",
@@ -205,5 +205,4 @@ __all__ = [
     "OtaVersionPublishResponse",
     "OtaVersionUploadInfo",
     "OtaVersionUploadPart",
-    "PRESIGNED_UPLOAD_EXPIRES_IN",
 ]

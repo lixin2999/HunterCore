@@ -30,6 +30,26 @@ class Settings(HunterBaseConfig):
     # ---------- 时序批量写入（性能指标：≥ 10000 点/秒，批量插入，禁止逐条 commit） ----------
     telemetry_batch_size: int = 2000
     telemetry_flush_interval_ms: int = 500
+    # raw/clean 投递并发度（ack=all 需等待确认；有界并发避免入库延迟突破 ≤1s）
+    telemetry_publish_concurrency: int = 50
+
+    # ---------- 采集消费者开关与 Topic（契约 consumer-groups.yaml / topics.yaml，命名不可更改） ----------
+    telemetry_consumer_enabled: bool = True       # data-collector-telemetry
+    event_consumer_enabled: bool = True           # data-collector-events
+    health_consumer_enabled: bool = True          # data-collector-health
+    # 消费侧契约 Schema 校验（契约先行：默认开启；需 KAFKA_CONTRACT_DIR 可访问，
+    # K8s 由 hunter-contracts ConfigMap 挂载）。仅在明确知悉风险时关闭（记录 CRITICAL 告警）。
+    ingest_schema_validation_enabled: bool = True
+    telemetry_raw_topic: str = "telemetry_raw"
+    telemetry_clean_topic: str = "telemetry_clean"
+    event_raw_topic: str = "event_raw"
+    # 消费重试参数（契约 defaults：max_poll_records=100，手动提交）
+    consumer_batch_size: int = 100
+    consumer_poll_timeout_seconds: float = 1.0
+    # 健康消费：在线判定与通信中断阈值（系统约束：遥测中断 > 10s → 离线）
+    vehicle_offline_threshold_seconds: int = 10
+    # 车辆状态守护周期（redis-keys pending #5：在线集合无 TTL，需周期对账 SREM）
+    vehicle_offline_sweep_interval_seconds: int = 5
 
     # ---------- 遥测查询保护（x-hunter-telemetry-query-contract：跨度上限保护 API P95） ----------
     telemetry_query_max_range_hours: int = 24

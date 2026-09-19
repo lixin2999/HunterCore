@@ -1,6 +1,12 @@
 # HunterEdge Monorepo CI（GitLab CI）
-# 阶段：lint（风格/类型/测试层自检）→ unit（无容器）→ integration（容器化中间件）
-#       → e2e（业务链路）→ performance（第 10 条性能门槛）→ report（L5 报告 artifact）
+# 阶段：lint（风格/类型/测试层/基建清单自检）→ unit（无容器）→ integration（容器化中间件）
+#       → e2e（业务链路）→ performance（第 10 条性能门槛）→ build（镜像 + 清单渲染）
+#       → deploy（tag 流水线手工触发）→ report（L5 报告 artifact）
+#
+# 镜像版本变量链路（部署约束：镜像标签必须使用 {version} 变量）：
+#   git tag vX.Y.Z → $CI_COMMIT_TAG → docker build -t hunter/<svc>:$CI_COMMIT_TAG
+#                  → python scripts/render_k8s.py --version $CI_COMMIT_TAG（渲染 {version} 占位符）
+#                  → kubectl apply -f build/k8s/...（顺序见 infra/k8s/README.md）
 #
 # 说明：
 # - integration/e2e/performance 依赖 testcontainers，需要 Docker-in-Docker（dind）服务；
@@ -14,6 +20,8 @@ stages:
   - integration
   - e2e
   - performance
+  - build
+  - deploy
   - report
 
 variables:
@@ -26,6 +34,8 @@ variables:
   HUNTER_BENCH_API_REQUESTS: "300"
   HUNTER_BENCH_TELEMETRY_MESSAGES: "2000"
   HUNTER_BENCH_TIMESERIES_POINTS: "50000"
+  # 镜像版本变量（{version} 占位符的唯一来源）：tag 流水线取 tag 名（禁止 latest）
+  IMAGE_TAG: "$CI_COMMIT_TAG"
 
 default:
   image: python:3.11-slim
@@ -53,6 +63,11 @@ lint:
   stage: lint
   script:
     - python scripts/verify_test_layer.py
+    # 契约 ConfigMap 与 contracts/kafka 一致性（消费侧运行时 Schema 校验依赖，审查 R1）
+    - python scripts/generate_contracts_configmap.py --check
+    # 基础设施清单契约：镜像 {version} 占位符 / HPA(min2-max5-70%) / PDB / 探针 / 资源配额 / Dockerfile
+    - python scripts/render_k8s.py --check
+    - python scripts/verify_infra.py
     - ruff check tests common/python services
     # 仅校验 L5 测试层（存量脚本 verify_data_layer/verify_infra 的类型问题单独治理）；
     # stub 缺失（yaml/jsonschema/asyncpg）不阻塞，真实类型错误仍拦截
@@ -119,6 +134,92 @@ performance:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+# ================================================================
+# build：镜像构建推送（标签 = $CI_COMMIT_TAG，禁止 latest）+ K8s 清单版本渲染
+# ================================================================
+build-images:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_DRIVER: overlay2
+  script:
+    # 构建上下文 = 仓库根目录（.dockerignore 裁剪；见各服务 Dockerfile 头注释）
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - |
+      set -e
+      for svc in api-gateway scene-service data-collector data-analytics ota-service remote-control; do
+        image="$CI_REGISTRY_IMAGE/$svc:$IMAGE_TAG"
+        echo "==> build $image"
+        docker build -f "services/$svc/Dockerfile" -t "$image" .
+        docker push "$image"
+      done
+  rules:
+    - if: $CI_COMMIT_TAG
+
+render-manifests:
+  stage: build
+  image: python:3.11-slim
+  needs: []
+  script:
+    # {version} 占位符 → $IMAGE_TAG（版本变量的唯一注入点；渲染产物 build/k8s 不纳入版本库）
+    - python scripts/render_k8s.py --version "$IMAGE_TAG"
+  artifacts:
+    name: "k8s-manifests-$IMAGE_TAG"
+    paths:
+      - build/k8s/
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_TAG
+
+# ================================================================
+# deploy：按 infra/k8s/README.md 顺序应用（tag 流水线手工触发 + production 环境审批）
+# 前置 CI 变量：KUBE_CONFIG（File 类型，集群 kubeconfig）；
+#              镜像仓库凭据 CI_REGISTRY_USER/CI_REGISTRY_PASSWORD（GitLab 内置）；
+#              集群侧 TLS Secret hunter-kafka-tls / hunter-minio-tls / hunter-edge-tls 已创建
+# Secret 不随流水线应用（禁止把密钥写入制品）：由 Vault / SealedSecrets / kubectl create 注入
+# ================================================================
+deploy-prod:
+  stage: deploy
+  image: bitnami/kubectl:1.28
+  needs:
+    - job: build-images
+    - job: render-manifests
+      artifacts: true
+  environment:
+    name: production
+    url: https://hunter-edge.example.com
+  before_script:
+    - mkdir -p "$HOME/.kube" && cp "$KUBE_CONFIG" "$HOME/.kube/config" && chmod 600 "$HOME/.kube/config"
+    - kubectl version --client && kubectl -n hunter-edge get ns hunter-edge
+  script:
+    # 顺序不可调整：命名空间/配置 → 中间件 → 等待就绪 → 初始化 Job → 微服务 → 入口 → 扩缩容/可用性
+    - kubectl apply -f build/k8s/base/00-namespace.yaml
+    - kubectl apply -f build/k8s/base/01-configmap-common.yaml
+    - kubectl apply -f build/k8s/base/03-configmap-contracts.yaml
+    - kubectl apply -f build/k8s/statefulsets/
+    - kubectl -n hunter-edge rollout status statefulset/kafka --timeout=10m
+    - kubectl -n hunter-edge rollout status statefulset/postgres --timeout=5m
+    - kubectl apply -f build/k8s/jobs/
+    - kubectl -n hunter-edge wait --for=condition=complete job/kafka-init --timeout=10m
+    - kubectl apply -f build/k8s/services/
+    - kubectl -n hunter-edge rollout status deploy/api-gateway --timeout=5m
+    - kubectl -n hunter-edge rollout status deploy/scene-service --timeout=5m
+    - kubectl -n hunter-edge rollout status deploy/data-collector --timeout=5m
+    - kubectl -n hunter-edge rollout status deploy/data-analytics --timeout=5m
+    - kubectl -n hunter-edge rollout status deploy/ota-service --timeout=5m
+    - kubectl -n hunter-edge rollout status deploy/remote-control --timeout=5m
+    - kubectl apply -f build/k8s/ingress.yaml
+    - kubectl apply -f build/k8s/networkpolicies/
+    - kubectl apply -f build/k8s/autoscaling/hpa.yaml
+    - kubectl apply -f build/k8s/disruption/poddisruptionbudgets.yaml
+    - kubectl -n hunter-edge get deploy,hpa,pdb,ingress
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: manual
+      allow_failure: false
+
 report:
   stage: report
   image: python:3.11-slim
@@ -127,7 +228,10 @@ report:
     - e2e
     - performance
   script:
-    - python - <<'PY'
+    # 内联脚本改用块标量（|）：原 heredoc 直写在 `- ` 后，脚本中含 ": " 的行会被 YAML
+    # 误解析为映射（ScannerError: mapping values are not allowed here，存量缺陷）
+    - |
+      python - <<'PY'
       import json, pathlib
       path = pathlib.Path("docs/test-reports/l5-results.json")
       if not path.exists():

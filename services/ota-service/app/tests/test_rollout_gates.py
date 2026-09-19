@@ -35,7 +35,7 @@ class TestAllocateBatches:
         vehicles = [f"HUNTER-{i:03d}" for i in range(1, 101)]
         batches = allocate_batches(vehicles, [5.0, 20.0, 50.0, 100.0])
         assert [len(b) for b in batches] == [5, 20, 50, 25]
-        assert sum(batches, []) == vehicles  # 不重不漏、保序
+        assert [v for batch in batches for v in batch] == vehicles  # 不重不漏、保序
 
     def test_small_fleet_ceil_and_min_one(self) -> None:
         """7 台 → ceil 规则 [1, 2, 4, 0]（5%=0.35→1、20%=1.4→2、50%=3.5→4）。"""
@@ -178,14 +178,14 @@ class TestEvaluateGates:
     """升级门禁评估（电量 ≥ 50% / P 档 / 网络 ≤ 10s / 存储 ≥ 2048MB）。"""
 
     def _evaluate(self, status: dict[str, Any] | None, **overrides: Any):
-        kwargs: dict[str, Any] = dict(
-            require_soc=True,
-            require_parked=True,
-            require_network=True,
-            min_soc=50,
-            min_storage_mb=2048,
-            offline_threshold_seconds=10,
-        )
+        kwargs: dict[str, Any] = {
+            "require_soc": True,
+            "require_parked": True,
+            "require_network": True,
+            "min_soc": 50,
+            "min_storage_mb": 2048,
+            "offline_threshold_seconds": 10,
+        }
         kwargs.update(overrides)
         return evaluate_gates("HUNTER-001", status, **kwargs)
 

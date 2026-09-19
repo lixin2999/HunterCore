@@ -120,8 +120,18 @@ class KafkaProducerManager:
         """本地磁盘缓冲（``kafka_local_buffer_enabled=False`` 时为 None）。"""
         return self._buffer
 
+    async def buffer_stats_async(self) -> BufferStats | None:
+        """缓冲水位（异步安全：目录扫描下沉线程池；事件循环内必须用本方法）。"""
+        if self._buffer is None:
+            return None
+        return await asyncio.to_thread(self._buffer.stats)
+
     def buffer_stats(self) -> BufferStats | None:
-        """缓冲水位（无缓冲时返回 None）。"""
+        """缓冲水位（无缓冲时返回 None）。
+
+        ⚠ 同步阻塞实现（目录 glob）：仅限同步上下文/测试使用；异步路径请用
+        :meth:`buffer_stats_async`（审查 R4）。
+        """
         return self._buffer.stats() if self._buffer is not None else None
 
     @staticmethod
@@ -233,8 +243,13 @@ class KafkaProducerManager:
         duration = time.perf_counter() - started
         buffering = self._config.kafka_local_buffer_enabled if use_buffer is None else use_buffer
         if last_error is not None and retriable and buffering and self._buffer is not None:
-            self._buffer.append(
-                BufferedRecord(topic=topic, value=value_bytes, key=key_bytes, headers=header_items)
+            # 落盘为阻塞 IO（open/flush/fsync + 容量淘汰目录扫描）：下沉线程池，
+            # 禁止在事件循环内做同步文件 IO（异步优先约束；审查 R4）
+            await asyncio.to_thread(
+                self._buffer.append,
+                BufferedRecord(
+                    topic=topic, value=value_bytes, key=key_bytes, headers=header_items
+                ),
             )
             kafka_metrics.record_produced(self._service, topic, "buffered", duration)
             logger.error(
@@ -338,7 +353,7 @@ class KafkaProducerManager:
         self._closed = True
         self._poll_thread.join(timeout=2)
         await self.flush()
-        stats = self.buffer_stats()
+        stats = await self.buffer_stats_async()
         if stats is not None and stats.message_count:
             logger.warning(
                 "kafka_producer_closed_with_pending_buffer",

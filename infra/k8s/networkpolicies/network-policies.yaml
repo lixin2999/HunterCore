@@ -1,0 +1,115 @@
+# =====================================================================
+# HunterEdge 网络策略（审查 R5：后端服务身份头信任的纵深防御）
+#
+# 背景：后端服务（scene/data-collector/data-analytics/ota/remote-control）信任
+# 网关注入的明文身份头 X-User-Id / X-Roles（架构约定：JWT 只在网关校验）。
+# 若集群内任意 Pod 可直连后端 Service:8081-8085，即可伪造 admin 身份绕过
+# JWT/RBAC/限流（发布 OTA、结束他人操控会话）。本文件通过「最小入向放行」收敛该风险。
+#
+# 生效前提：
+# 1. 集群 CNI 必须实现 NetworkPolicy（Calico/Cilium/Weave 等）；
+# 2. kubelet 探针流量：多数 CNI 对 host-network 流量默认放行（Calico allow-from-host）。
+#    若所用 CNI 会拦截探针，请在此文件追加节点网段 ipBlock 规则（如 10.0.0.0/16）；
+# 3. 彻底消除明文头信任仍需网关↔后端 mTLS（见 docs「人工确认点」），本策略为第一道防线。
+#
+# 应用顺序：kubectl apply -f infra/k8s/networkpolicies/
+# =====================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hunter-default-deny-ingress
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# 网关是对外入口（Ingress TLS 终止后转发）：允许全部入向到 8080
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hunter-allow-ingress-to-gateway
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8080
+---
+# 后端服务：仅允许来自 api-gateway Pod 的入向（业务端口 8081-8085）
+# 禁止集群内其他 Pod / 其他命名空间直连（防身份头伪造）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hunter-allow-gateway-to-backends
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["backend"]
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 8082
+        - protocol: TCP
+          port: 8083
+        - protocol: TCP
+          port: 8084
+        - protocol: TCP
+          port: 8085
+---
+# Prometheus 抓取（monitoring 命名空间）与探针：放行指标端口
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hunter-allow-metrics-scrape
+  namespace: hunter-edge
+  labels:
+    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 8082
+        - protocol: TCP
+          port: 8083
+        - protocol: TCP
+          port: 8084
+        - protocol: TCP
+          port: 8085

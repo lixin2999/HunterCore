@@ -121,7 +121,7 @@ async def get_storage() -> OtaPackageStorage:
 
 def _build_sync_client() -> Any:
     """构建 boto3 S3 客户端（同步；局部导入避免模块导入期建立连接）。"""
-    import boto3  # noqa: PLC0415
+    import boto3
 
     return boto3.client(
         "s3",

@@ -72,7 +72,7 @@ class OtaStatusConsumer:
     async def _handle(self, message: Message, value: Any) -> None:
         """单条消息处理（抛异常 → KafkaConsumerManager 转投 DLQ）。"""
         if not isinstance(value, dict):
-            raise ValueError(f"ota_status 消息必须为 JSON 对象，实际 {type(value).__name__}")
+            raise TypeError(f"ota_status 消息必须为 JSON 对象，实际 {type(value).__name__}")
         try:
             payload = OtaStatusMessage.model_validate(value)
         except ValidationError as exc:
@@ -118,8 +118,8 @@ class OtaStatusConsumer:
         if task is None:
             logger.warning("ota_status_task_missing", task_id=str(task_id))
             return
-        from app.schemas.tasks import OtaUpgradeStrategy  # noqa: PLC0415  # 局部导入
-        from app.services.rollout import (  # noqa: PLC0415
+        from app.schemas.tasks import OtaUpgradeStrategy  # 局部导入
+        from app.services.rollout import (
             allocate_batches,
             build_rollout_view,
             build_task_progress,

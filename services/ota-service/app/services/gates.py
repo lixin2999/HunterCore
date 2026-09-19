@@ -178,4 +178,4 @@ async def check_vehicle(
         reset_vehicle_id(token)
 
 
-__all__ = ["GateResult", "PARKED_GEAR", "VehicleStateReader", "check_vehicle", "evaluate_gates"]
+__all__ = ["PARKED_GEAR", "GateResult", "VehicleStateReader", "check_vehicle", "evaluate_gates"]
