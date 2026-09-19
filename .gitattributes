@@ -1,0 +1,11 @@
+# ============================================================
+# HunterCore .gitattributes —— 保证 shell 脚本跨平台换行符正确
+# ============================================================
+# 背景：Windows 检出（core.autocrlf=true）会把 *.sh 转为 CRLF，导致：
+#   1) bash 报 "set: pipefail\r: invalid option name"（本仓库脚本 scp 到 Ubuntu 后直接失败）；
+#   2) infra/docker/*.sh 会被挂载进 Linux 容器执行，同样会失败。
+# 约定：shell 脚本一律以 LF 检出（覆盖 core.autocrlf）。
+# 说明：仅约束会被 Linux 解释器执行的脚本；如需对 yml/sql/json 等做整体 LF 归一化，
+#       请先确认后追加对应规则并执行 `git add --renormalize .`（会产生大范围 eol-only diff）。
+*.sh    text eol=lf
+*.bash  text eol=lf
