@@ -1,5 +1,5 @@
 # =====================================================================
-# HunterEdge API 网关契约（OpenAPI 3.0.3）—— 单一事实来源
+# HunterCore API 网关契约（OpenAPI 3.0.3）—— 单一事实来源
 # 来源：设计文档 3 章（API 网关：认证鉴权 / 限流熔断 / 路由转发 / 日志审计）、
 #       3.4 节（网关路由表）、12.1 节（REST API 规范）、14.1 节（认证与授权）、
 #       附录 A（错误码）、附录 D（API 限流配置）
@@ -22,7 +22,7 @@
 openapi: 3.0.3
 
 info:
-  title: HunterEdge - api-gateway
+  title: HunterCore - api-gateway
   version: 0.1.0
   description: |
     数据采集与分析系统 API 网关统一接入契约（端口 8080）。
@@ -41,10 +41,10 @@ info:
 
     **性能**：API 响应 P95 ≤ 200ms（设计文档 13.2 节）。
   license:
-    name: Proprietary - HunterEdge
+    name: Proprietary - HunterCore
 
 servers:
-  - url: https://hunter-edge.example.com
+  - url: https://hunter-core.example.com
     description: 生产环境（Ingress TLS，全链路 HTTPS）
   - url: http://localhost:8080
     description: 本地开发

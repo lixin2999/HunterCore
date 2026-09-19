@@ -11,7 +11,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: kafka-config
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: kafka
 data:
@@ -20,7 +20,7 @@ data:
   server.properties.tmpl: |
     process.roles=broker,controller
     node.id=__NODE_ID__
-    controller.quorum.voters=0@kafka-0.kafka-headless.hunter-edge.svc.cluster.local:9094,1@kafka-1.kafka-headless.hunter-edge.svc.cluster.local:9094,2@kafka-2.kafka-headless.hunter-edge.svc.cluster.local:9094
+    controller.quorum.voters=0@kafka-0.kafka-headless.hunter-core.svc.cluster.local:9094,1@kafka-1.kafka-headless.hunter-core.svc.cluster.local:9094,2@kafka-2.kafka-headless.hunter-core.svc.cluster.local:9094
 
     listeners=INTERNAL://:9093,CONTROLLER://:9094
     advertised.listeners=__ADVERTISED__
@@ -70,7 +70,7 @@ data:
 
     KAFKA_HOME=/opt/bitnami/kafka
     NODE_ID="${POD_NAME#kafka-}"
-    POD_FQDN="${POD_NAME}.kafka-headless.hunter-edge.svc.cluster.local"
+    POD_FQDN="${POD_NAME}.kafka-headless.hunter-core.svc.cluster.local"
     CONF_DIR=/tmp/hunter
     CONF="${CONF_DIR}/server.properties"
 
@@ -106,7 +106,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: kafka-headless
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: kafka
 spec:
@@ -127,10 +127,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: kafka
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: kafka
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
 spec:
   type: ClusterIP
   selector:
@@ -144,10 +144,10 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: kafka
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: kafka
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: mq
 spec:
   serviceName: kafka-headless
@@ -160,7 +160,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: kafka
-        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/part-of: hunter-core
         app.kubernetes.io/component: mq
       annotations:
         prometheus.io/scrape: "true"

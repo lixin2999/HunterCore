@@ -1,5 +1,5 @@
 # =====================================================================
-# HunterEdge 本地开发环境（仓库根目录执行：docker compose up -d）
+# HunterCore 本地开发环境（仓库根目录执行：docker compose up -d）
 # 版本严格对齐《数据采集与分析系统详细设计文档 V4.0》技术栈约束：
 #   PostgreSQL 15 + TimescaleDB 2.13 / Apache Kafka 3.6 / Redis 7 / MinIO
 # 说明：
@@ -17,7 +17,7 @@ services:
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-hunter}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hunter_dev_123}
-      POSTGRES_DB: ${POSTGRES_DB:-hunter_edge}
+      POSTGRES_DB: ${POSTGRES_DB:-hunter_core}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -25,7 +25,7 @@ services:
       # 初始化脚本：启用 timescaledb 扩展（vehicle_telemetry / algorithm_metrics hypertable 依赖）
       - ./infra/docker/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hunter} -d ${POSTGRES_DB:-hunter_edge}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hunter} -d ${POSTGRES_DB:-hunter_core}"]
       interval: 10s
       timeout: 5s
       retries: 10

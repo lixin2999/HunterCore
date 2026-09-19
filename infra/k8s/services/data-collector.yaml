@@ -7,7 +7,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: data-collector-config
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: data-collector
 data:
@@ -54,10 +54,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: data-collector
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: data-collector
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: backend
 spec:
   replicas: 3
@@ -74,7 +74,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: data-collector
-        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/part-of: hunter-core
         app.kubernetes.io/component: backend
       annotations:
         prometheus.io/scrape: "true"
@@ -170,10 +170,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: data-collector
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: data-collector
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
 spec:
   type: ClusterIP
   selector:

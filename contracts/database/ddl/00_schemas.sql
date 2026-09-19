@@ -1,5 +1,5 @@
 -- =====================================================================
--- HunterEdge 数据库契约 — 00 扩展 / schema / 公共函数
+-- HunterCore 数据库契约 — 00 扩展 / schema / 公共函数
 -- 来源：设计文档第 9 章（数据层）
 -- 约束：本目录 SQL 为数据库结构的单一事实来源；ORM 模型与 Alembic migration 必须与本文件保持一致
 -- 幂等：全部使用 IF NOT EXISTS / CREATE OR REPLACE，可重复执行
@@ -35,4 +35,4 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION public.common_set_update_time() IS 'HunterEdge 公共触发器函数：写入 update_time = now()';
+COMMENT ON FUNCTION public.common_set_update_time() IS 'HunterCore 公共触发器函数：写入 update_time = now()';

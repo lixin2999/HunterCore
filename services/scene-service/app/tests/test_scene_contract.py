@@ -198,10 +198,10 @@ def iter_registered_routes(routes: Any) -> Iterator[tuple[str, str]]:
 def test_contract_is_openapi_303(contract: dict[str, Any]) -> None:
     """契约必须为 OpenAPI 3.0.3，且声明网关地址与本地直连地址。"""
     assert contract["openapi"] == "3.0.3"
-    assert contract["info"]["title"] == "HunterEdge - scene-service"
+    assert contract["info"]["title"] == "HunterCore - scene-service"
     urls = {server["url"] for server in contract["servers"]}
     assert "http://localhost:8081" in urls
-    assert any("hunter-edge.example.com" in url for url in urls), "必须声明经网关的生产地址"
+    assert any("hunter-core.example.com" in url for url in urls), "必须声明经网关的生产地址"
 
 
 def test_all_refs_resolve(contract: dict[str, Any]) -> None:

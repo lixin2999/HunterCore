@@ -24,10 +24,10 @@ CONTRACT_DIR = ROOT / "contracts" / "kafka"
 OUTPUT = ROOT / "infra" / "k8s" / "base" / "03-configmap-contracts.yaml"
 
 CONFIGMAP_NAME = "hunter-contracts"
-NAMESPACE = "hunter-edge"
+NAMESPACE = "hunter-core"
 
 HEADER = """# =====================================================================
-# HunterEdge Kafka 契约 ConfigMap（由脚本生成，禁止手工编辑）
+# HunterCore Kafka 契约 ConfigMap（由脚本生成，禁止手工编辑）
 #
 # 生成命令：python scripts/generate_contracts_configmap.py
 # 一致性校验：python scripts/generate_contracts_configmap.py --check（CI lint 阶段）
@@ -43,11 +43,11 @@ metadata:
   namespace: {namespace}
   labels:
     app.kubernetes.io/name: {name}
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: contracts
   annotations:
-    hunter-edge.local/generated-by: scripts/generate_contracts_configmap.py
-    hunter-edge.local/source: contracts/kafka
+    hunter-core.local/generated-by: scripts/generate_contracts_configmap.py
+    hunter-core.local/source: contracts/kafka
 data:
 """
 

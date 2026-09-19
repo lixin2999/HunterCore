@@ -1,5 +1,5 @@
 # =====================================================================
-# HunterEdge 网络策略（审查 R5：后端服务身份头信任的纵深防御）
+# HunterCore 网络策略（审查 R5：后端服务身份头信任的纵深防御）
 #
 # 背景：后端服务（scene/data-collector/data-analytics/ota/remote-control）信任
 # 网关注入的明文身份头 X-User-Id / X-Roles（架构约定：JWT 只在网关校验）。
@@ -18,9 +18,9 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: hunter-default-deny-ingress
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: network-policy
 spec:
   podSelector: {}
@@ -32,9 +32,9 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: hunter-allow-ingress-to-gateway
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: network-policy
 spec:
   podSelector:
@@ -53,9 +53,9 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: hunter-allow-gateway-to-backends
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: network-policy
 spec:
   podSelector:
@@ -87,9 +87,9 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: hunter-allow-metrics-scrape
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: network-policy
 spec:
   podSelector: {}

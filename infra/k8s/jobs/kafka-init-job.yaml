@@ -9,7 +9,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: kafka-init-script
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: kafka-init
 data:
@@ -19,7 +19,7 @@ data:
     set -euo pipefail
 
     KAFKA_HOME=/opt/bitnami/kafka
-    BOOTSTRAP="kafka-0.kafka-headless.hunter-edge.svc.cluster.local:9093"
+    BOOTSTRAP="kafka-0.kafka-headless.hunter-core.svc.cluster.local:9093"
     RF="${KAFKA_TOPIC_REPLICATION_FACTOR:-3}"
     CONF=/tmp/hunter/client.properties
     mkdir -p /tmp/hunter
@@ -69,10 +69,10 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: kafka-init
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: kafka-init
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 86400        # 完成后保留 1 天便于日志排查

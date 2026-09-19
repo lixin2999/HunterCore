@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HunterEdge 微服务骨架生成器（L0）。
+"""HunterCore 微服务骨架生成器（L0）。
 
 为 6 个微服务生成统一骨架：FastAPI 入口（/healthz /readyz + trace_id 中间件）、
 pydantic-settings 配置、分层空目录（routers/schemas/models/services/repositories/

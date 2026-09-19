@@ -9,7 +9,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: minio-headless
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: minio
 spec:
@@ -26,10 +26,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: minio
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: minio
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
 spec:
   type: ClusterIP
   selector:
@@ -46,10 +46,10 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: minio
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: minio
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: objectstore
 spec:
   serviceName: minio-headless
@@ -62,7 +62,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: minio
-        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/part-of: hunter-core
         app.kubernetes.io/component: objectstore
       annotations:
         prometheus.io/scrape: "true"
@@ -84,7 +84,7 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - server
-            - "http://minio-{0...3}.minio-headless.hunter-edge.svc.cluster.local/data"
+            - "http://minio-{0...3}.minio-headless.hunter-core.svc.cluster.local/data"
             - "--console-address"
             - ":9001"
           ports:

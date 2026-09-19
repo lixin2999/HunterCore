@@ -284,7 +284,7 @@ class TestReport:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI：生成报告骨架（``--stdout`` 打印 Markdown，否则写入 docs/test-reports）。"""
-    parser = argparse.ArgumentParser(description="生成 HunterEdge L5 测试报告")
+    parser = argparse.ArgumentParser(description="生成 HunterCore L5 测试报告")
     parser.add_argument("--stdout", action="store_true", help="仅打印 Markdown，不落盘")
     args = parser.parse_args(argv)
     report = TestReport()

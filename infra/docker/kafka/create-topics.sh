@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# HunterEdge Kafka 平台内部 Topic 初始化（严格对齐 contracts/kafka 契约）
+# HunterCore Kafka 平台内部 Topic 初始化（严格对齐 contracts/kafka 契约）
 # 由 docker-compose 的 kafka-init 一次性任务执行：bash /create-topics.sh
 # 禁止新增契约之外的 Topic；车端 Topic（hunter.{vehicle_id}.*）在车辆注册时按契约创建
 # =====================================================================

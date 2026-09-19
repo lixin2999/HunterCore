@@ -92,7 +92,7 @@ def _success_criteria_line(config: SceneConfig, indent: str) -> str:
 # =====================================================================
 def _render_carla_scenarios(scenes: Sequence[Scene], stamp: str) -> list[str]:
     """渲染 Carla ScenarioRunner 场景文件（scenarios 根 + 逐场景 scenario 子节点）。"""
-    lines = [f"<!-- HunterEdge scene export generated_at={stamp} -->", "<scenarios>"]
+    lines = [f"<!-- HunterCore scene export generated_at={stamp} -->", "<scenarios>"]
     for scene in scenes:
         lines.extend(_carla_scenario(scene))
     lines.append("</scenarios>")
@@ -165,7 +165,7 @@ def _render_openscenario(scenes: Sequence[Scene], stamp: str) -> list[str]:
     if len(scenes) == 1:
         return _osc_scenario(scenes[0], stamp, indent="")
     lines = [
-        f"<!-- HunterEdge OpenSCENARIO export set generated_at={stamp} -->",
+        f"<!-- HunterCore OpenSCENARIO export set generated_at={stamp} -->",
         (
             f"<x-hunter-scenario-set x-scenario-version={quoteattr(scenes[0].version)} "
             f'count="{len(scenes)}">'

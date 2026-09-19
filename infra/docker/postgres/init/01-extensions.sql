@@ -1,5 +1,5 @@
 -- =====================================================================
--- HunterEdge PostgreSQL 初始化（容器首次启动时由 docker-entrypoint-initdb.d 执行）
+-- HunterCore PostgreSQL 初始化（容器首次启动时由 docker-entrypoint-initdb.d 执行）
 -- 镜像：timescale/timescaledb:2.13.1-pg15
 -- =====================================================================
 

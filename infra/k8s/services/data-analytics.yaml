@@ -7,7 +7,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: data-analytics-config
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: data-analytics
 data:
@@ -16,7 +16,7 @@ data:
   DB_POOL_SIZE: "9"          # 单副本可用 CPU(4 核) × 2 + 1
   DB_MAX_OVERFLOW: "5"
   # Flink 1.18 实时作业（flink-jobs/ 目录作业提交目标）
-  FLINK_JOBMANAGER_URL: "http://flink-jobmanager.hunter-edge.svc.cluster.local:8081"
+  FLINK_JOBMANAGER_URL: "http://flink-jobmanager.hunter-core.svc.cluster.local:8081"
   # 实时分析输入 Topic 与消费组（contracts/kafka/consumer-groups.yaml，禁止自行更改）
   KAFKA_CONSUMER_TOPIC_TELEMETRY_CLEAN: "telemetry_clean"
   KAFKA_CONSUMER_TOPIC_TELEMETRY_RAW: "telemetry_raw"
@@ -43,9 +43,9 @@ data:
   ALERT_WINDOW_SECONDS: "2"
   ALERT_TRIGGER_MAX_LATENCY_SECONDS: "2"
   # 依赖服务（服务间 REST；禁止跨 schema 直查）
-  DATA_COLLECTOR_BASE_URL: "http://data-collector.hunter-edge.svc.cluster.local:8082"
-  SCENE_SERVICE_BASE_URL: "http://scene-service.hunter-edge.svc.cluster.local:8081"
-  VEHICLE_SERVICE_BASE_URL: "http://vehicle-service.hunter-edge.svc.cluster.local:8086"
+  DATA_COLLECTOR_BASE_URL: "http://data-collector.hunter-core.svc.cluster.local:8082"
+  SCENE_SERVICE_BASE_URL: "http://scene-service.hunter-core.svc.cluster.local:8081"
+  VEHICLE_SERVICE_BASE_URL: "http://vehicle-service.hunter-core.svc.cluster.local:8086"
   # 实时告警阈值（设计文档 6.2.2 / 6.2.3 节 + 事件类型定义，不可放宽；仅环境变量化，禁止硬编码）
   ALERT_HARSH_ACCEL_MS2: "3.0"
   ALERT_HARSH_ACCEL_MIN_DURATION_SECONDS: "0.5"
@@ -70,10 +70,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: data-analytics
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: data-analytics
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: backend
 spec:
   replicas: 2
@@ -90,7 +90,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: data-analytics
-        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/part-of: hunter-core
         app.kubernetes.io/component: backend
       annotations:
         prometheus.io/scrape: "true"
@@ -178,10 +178,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: data-analytics
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: data-analytics
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
 spec:
   type: ClusterIP
   selector:

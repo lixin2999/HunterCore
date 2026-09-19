@@ -1,4 +1,4 @@
-"""HunterEdge 骨架模板（C）：全局异常处理器 / 健康探针路由。"""
+"""HunterCore 骨架模板（C）：全局异常处理器 / 健康探针路由。"""
 from __future__ import annotations
 
 from string import Template

@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://hunter-edge.local/contracts/kafka/schemas/command_result.schema.json",
-  "title": "HunterEdge 指令执行结果 hunter.{vehicle_id}.command_result",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/command_result.schema.json",
+  "title": "HunterCore 指令执行结果 hunter.{vehicle_id}.command_result",
   "description": "车端→平台指令执行结果（按需，acks=all）。消费者：data-collector（留痕/审计）、remote-control（操控指令回执；>500ms 无回执视为链路异常）。command_id 必须与请求一致，保证端到端可追溯与幂等。",
   "type": "object",
   "additionalProperties": false,

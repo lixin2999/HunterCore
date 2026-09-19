@@ -266,7 +266,7 @@ def _synthetic_value(field: str, prop: dict[str, Any], components: dict[str, Any
         return _minimal_instance_from(prop, components)
     if value_type == "object":
         return {}
-    return "hunter-edge-contract"  # string 兜底
+    return "hunter-core-contract"  # string 兜底
 
 
 def _minimal_instance_from(

@@ -1,5 +1,5 @@
 -- =====================================================================
--- HunterEdge 数据库契约 — 05 时序数据（TimescaleDB hypertable）
+-- HunterCore 数据库契约 — 05 时序数据（TimescaleDB hypertable）
 -- schema：data_collector（vehicle_telemetry）/ data_analytics（algorithm_metrics）
 -- 来源：设计文档第 9 章 + 遥测消息格式（字段即消息字段的扁平化映射）
 -- 约束（不可更改）：

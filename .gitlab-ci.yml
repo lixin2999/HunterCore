@@ -1,4 +1,4 @@
-# HunterEdge Monorepo CI（GitLab CI）
+# HunterCore Monorepo CI（GitLab CI）
 # 阶段：lint（风格/类型/测试层/基建清单自检）→ unit（无容器）→ integration（容器化中间件）
 #       → e2e（业务链路）→ performance（第 10 条性能门槛）→ build（镜像 + 清单渲染）
 #       → deploy（tag 流水线手工触发）→ report（L5 报告 artifact）
@@ -177,7 +177,7 @@ render-manifests:
 # deploy：按 infra/k8s/README.md 顺序应用（tag 流水线手工触发 + production 环境审批）
 # 前置 CI 变量：KUBE_CONFIG（File 类型，集群 kubeconfig）；
 #              镜像仓库凭据 CI_REGISTRY_USER/CI_REGISTRY_PASSWORD（GitLab 内置）；
-#              集群侧 TLS Secret hunter-kafka-tls / hunter-minio-tls / hunter-edge-tls 已创建
+#              集群侧 TLS Secret hunter-kafka-tls / hunter-minio-tls / hunter-core-tls 已创建
 # Secret 不随流水线应用（禁止把密钥写入制品）：由 Vault / SealedSecrets / kubectl create 注入
 # ================================================================
 deploy-prod:
@@ -189,32 +189,32 @@ deploy-prod:
       artifacts: true
   environment:
     name: production
-    url: https://hunter-edge.example.com
+    url: https://hunter-core.example.com
   before_script:
     - mkdir -p "$HOME/.kube" && cp "$KUBE_CONFIG" "$HOME/.kube/config" && chmod 600 "$HOME/.kube/config"
-    - kubectl version --client && kubectl -n hunter-edge get ns hunter-edge
+    - kubectl version --client && kubectl -n hunter-core get ns hunter-core
   script:
     # 顺序不可调整：命名空间/配置 → 中间件 → 等待就绪 → 初始化 Job → 微服务 → 入口 → 扩缩容/可用性
     - kubectl apply -f build/k8s/base/00-namespace.yaml
     - kubectl apply -f build/k8s/base/01-configmap-common.yaml
     - kubectl apply -f build/k8s/base/03-configmap-contracts.yaml
     - kubectl apply -f build/k8s/statefulsets/
-    - kubectl -n hunter-edge rollout status statefulset/kafka --timeout=10m
-    - kubectl -n hunter-edge rollout status statefulset/postgres --timeout=5m
+    - kubectl -n hunter-core rollout status statefulset/kafka --timeout=10m
+    - kubectl -n hunter-core rollout status statefulset/postgres --timeout=5m
     - kubectl apply -f build/k8s/jobs/
-    - kubectl -n hunter-edge wait --for=condition=complete job/kafka-init --timeout=10m
+    - kubectl -n hunter-core wait --for=condition=complete job/kafka-init --timeout=10m
     - kubectl apply -f build/k8s/services/
-    - kubectl -n hunter-edge rollout status deploy/api-gateway --timeout=5m
-    - kubectl -n hunter-edge rollout status deploy/scene-service --timeout=5m
-    - kubectl -n hunter-edge rollout status deploy/data-collector --timeout=5m
-    - kubectl -n hunter-edge rollout status deploy/data-analytics --timeout=5m
-    - kubectl -n hunter-edge rollout status deploy/ota-service --timeout=5m
-    - kubectl -n hunter-edge rollout status deploy/remote-control --timeout=5m
+    - kubectl -n hunter-core rollout status deploy/api-gateway --timeout=5m
+    - kubectl -n hunter-core rollout status deploy/scene-service --timeout=5m
+    - kubectl -n hunter-core rollout status deploy/data-collector --timeout=5m
+    - kubectl -n hunter-core rollout status deploy/data-analytics --timeout=5m
+    - kubectl -n hunter-core rollout status deploy/ota-service --timeout=5m
+    - kubectl -n hunter-core rollout status deploy/remote-control --timeout=5m
     - kubectl apply -f build/k8s/ingress.yaml
     - kubectl apply -f build/k8s/networkpolicies/
     - kubectl apply -f build/k8s/autoscaling/hpa.yaml
     - kubectl apply -f build/k8s/disruption/poddisruptionbudgets.yaml
-    - kubectl -n hunter-edge get deploy,hpa,pdb,ingress
+    - kubectl -n hunter-core get deploy,hpa,pdb,ingress
   rules:
     - if: $CI_COMMIT_TAG
       when: manual

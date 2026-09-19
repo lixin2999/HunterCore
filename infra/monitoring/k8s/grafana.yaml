@@ -9,7 +9,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: hunter-grafana-data
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: grafana
 spec:
@@ -23,10 +23,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: grafana
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: grafana
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: monitoring
 spec:
   replicas: 1
@@ -40,7 +40,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: grafana
-        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/part-of: hunter-core
         app.kubernetes.io/component: monitoring
     spec:
       automountServiceAccountToken: false
@@ -73,7 +73,7 @@ spec:
             - name: GF_ANALYTICS_CHECK_FOR_UPDATES
               value: "false"
             - name: GF_SERVER_ROOT_URL
-              value: "https://hunter-edge.example.com/grafana"
+              value: "https://hunter-core.example.com/grafana"
           volumeMounts:
             - name: provisioning
               mountPath: /etc/grafana/provisioning
@@ -127,10 +127,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: grafana
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: grafana
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
 spec:
   type: ClusterIP
   selector:

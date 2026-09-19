@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HunterEdge 数据层契约校验（L2）。
+"""HunterCore 数据层契约校验（L2）。
 
 校验项：
   1. 契约文件齐备（contracts/database/ddl/*.sql + enums.md + er.md；contracts/kafka 清单与 Schema）
@@ -1261,7 +1261,7 @@ def main() -> int:
         if reconfigure is not None:
             reconfigure(encoding="utf-8", errors="replace")
 
-    print("HunterEdge 数据层契约校验（L2）")
+    print("HunterCore 数据层契约校验（L2）")
     print("=" * 78)
     check_contract_files()
     ddl, _orm = check_ddl_orm_parity()

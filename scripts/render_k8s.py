@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HunterEdge K8s 清单版本渲染（`{version}` 占位符 → 具体镜像标签）。
+"""HunterCore K8s 清单版本渲染（`{version}` 占位符 → 具体镜像标签）。
 
 设计意图（部署约束）：
   仓库内所有 `infra/k8s/**` 清单的**自有镜像**（`hunter/<service>`）一律写成

@@ -46,6 +46,6 @@ kubectl apply -f infra/monitoring/exporters/exporters.yaml
 ## 安全基线（基础设施侧）
 
 - 敏感值只经 K8s Secret 注入；仓库仅保留 `02-secret.example.yaml` 模板（真实 Secret 已被 `.gitignore` 忽略）
-- `hunter-edge` 命名空间启用 `pod-security=restricted`（非 root、drop ALL、seccomp RuntimeDefault）
+- `hunter-core` 命名空间启用 `pod-security=restricted`（非 root、drop ALL、seccomp RuntimeDefault）
 - 全链路 TLS：Ingress（HTTPS）+ Kafka（SASL_SSL/SCRAM-SHA-512 + 内部双向校验）+ MinIO（HTTPS + SSE-S3）
 

@@ -1,7 +1,7 @@
 {
   "uid": "hunter-fleet-overview",
-  "title": "HunterEdge / 车队概览",
-  "tags": ["hunteredge", "fleet", "overview"],
+  "title": "HunterCore / 车队概览",
+  "tags": ["huntercore", "fleet", "overview"],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,

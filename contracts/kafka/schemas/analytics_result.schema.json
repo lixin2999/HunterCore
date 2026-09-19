@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://hunter-edge.local/contracts/kafka/schemas/analytics_result.schema.json",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/analytics_result.schema.json",
   "title": "analytics_result",
   "description": "平台内部 Topic analytics_result 消息（data-analytics Flink/Spark 产出）。消费方：scene-service（实车场景自动提取，设计文档 4.5 节）、上层业务。⚠ 设计文档 5.3 节未给出该消息结构，本契约按 4.5 节所需字段（触发事件、前后各 10 秒数据引用、自车轨迹、周边目标轨迹、环境条件）定义，需人工确认。",
   "type": "object",

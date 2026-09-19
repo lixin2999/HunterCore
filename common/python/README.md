@@ -1,4 +1,4 @@
-# hunter_common —— HunterEdge 共享代码库
+# hunter_common —— HunterCore 共享代码库
 
 供所有微服务以 editable 方式安装：`pip install -e common/python`
 

@@ -121,7 +121,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="HunterEdge - remote-control",
+    title="HunterCore - remote-control",
     description="远程操控：WebRTC 视频流转发、控制指令转发（20Hz）、操作员权限管理、操控会话与录像记录",
     version="0.1.0",
     lifespan=lifespan,

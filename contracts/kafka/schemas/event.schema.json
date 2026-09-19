@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://hunter-edge.local/contracts/kafka/schemas/event.schema.json",
-  "title": "HunterEdge 事件消息 hunter.{vehicle_id}.event / event_raw",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/event.schema.json",
+  "title": "HunterCore 事件消息 hunter.{vehicle_id}.event / event_raw",
   "description": "车辆事件（事件触发上报）。生产者：车端；消费者：data-collector（落库 data_collector.events）。event_type/event_level 取值与阈值见 contracts/database/enums.md 第 2、3 节，不可更改；类型↔等级映射由 data-collector 消费侧按 EVENT_LEVEL_BY_TYPE 校验（JSON Schema 不做跨字段映射校验）。",
   "type": "object",
   "additionalProperties": false,

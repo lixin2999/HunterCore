@@ -14,7 +14,7 @@ export * from './permissions'
 export * from './remote'
 
 /** 应用标题 */
-export const APP_TITLE: string = import.meta.env.VITE_APP_TITLE ?? 'HunterEdge 运营管理后台'
+export const APP_TITLE: string = import.meta.env.VITE_APP_TITLE ?? 'HunterCore 运营管理后台'
 
 /** REST 基础路径（网关统一入口；相对路径，禁止硬编码后端主机） */
 export const API_BASE_URL: string = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'

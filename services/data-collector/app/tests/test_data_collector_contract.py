@@ -197,7 +197,7 @@ def test_contract_is_openapi_303(contract: dict[str, Any]) -> None:
     """契约必须为 OpenAPI 3.0.3，且声明生产与本地地址。"""
     assert contract["openapi"] == "3.0.3"
     urls = [server["url"] for server in contract["servers"]]
-    assert any("hunter-edge.example.com" in url for url in urls)
+    assert any("hunter-core.example.com" in url for url in urls)
     assert any("localhost:8082" in url for url in urls)
 
 
@@ -876,7 +876,7 @@ def _synthetic_value(field: str, prop: dict[str, Any], components: dict[str, Any
         return _minimal_instance_from(prop, components)  # 嵌套实体（items[] 元素）递归构造
     if value_type == "object":
         return {}
-    return "hunter-edge-contract"  # string 兜底
+    return "hunter-core-contract"  # string 兜底
 
 
 def _minimal_instance_from(

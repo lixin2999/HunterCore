@@ -1,4 +1,4 @@
-"""HunterEdge 共享代码库（common/python/hunter_common）。
+"""HunterCore 共享代码库（common/python/hunter_common）。
 
 模块清单：
 - config      pydantic-settings 基础配置（所有服务配置基类）

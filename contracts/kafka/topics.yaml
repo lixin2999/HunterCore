@@ -1,5 +1,5 @@
 # =====================================================================
-# HunterEdge Kafka Topic 契约（单一事实来源）
+# HunterCore Kafka Topic 契约（单一事实来源）
 # 来源：设计文档 5.3 节 + 系统上下文基座「Kafka Topic 命名与配置」
 # 命名规范：<domain>.<entity>.<type>，全小写点分隔；车端 Topic 为 hunter.{vehicle_id}.<type>
 # 约束：禁止自行新增 Topic 或更改配置；变更需同步

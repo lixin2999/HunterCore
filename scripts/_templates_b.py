@@ -1,4 +1,4 @@
-"""HunterEdge 骨架模板（B）：服务 README / FastAPI 入口 main.py。"""
+"""HunterCore 骨架模板（B）：服务 README / FastAPI 入口 main.py。"""
 from __future__ import annotations
 
 from string import Template
@@ -85,7 +85,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="HunterEdge - $service",
+    title="HunterCore - $service",
     description="$desc",
     version="0.1.0",
     lifespan=lifespan,

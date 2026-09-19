@@ -15,7 +15,7 @@
 #
 # 用法：
 #   kubectl apply -f infra/k8s/disruption/poddisruptionbudgets.yaml
-#   kubectl -n hunter-edge get pdb
+#   kubectl -n hunter-core get pdb
 # =====================================================================
 
 # ---------- API 网关（3 副本基线） ----------
@@ -23,10 +23,10 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: api-gateway
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: api-gateway
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: availability
 spec:
   minAvailable: 2
@@ -39,10 +39,10 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: scene-service
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: scene-service
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: availability
 spec:
   minAvailable: 1
@@ -55,10 +55,10 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: data-collector
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: data-collector
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: availability
 spec:
   minAvailable: 2
@@ -71,10 +71,10 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: data-analytics
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: data-analytics
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: availability
 spec:
   minAvailable: 1
@@ -87,10 +87,10 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: ota-service
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: ota-service
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: availability
 spec:
   minAvailable: 1
@@ -103,10 +103,10 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: remote-control
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: remote-control
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: availability
 spec:
   minAvailable: 2

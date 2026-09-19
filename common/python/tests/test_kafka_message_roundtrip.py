@@ -173,7 +173,7 @@ def test_platform_topic_roundtrip_sensor_file(contract: KafkaContract) -> None:
 def test_unregistered_topic_rejected_when_contract_available(contract: KafkaContract) -> None:
     """契约可用时禁止投递契约外 Topic（避免「先实现后补契约」）。"""
     with pytest.raises(KafkaContractError):
-        build_record("hunter_edge.not_registered", {"vehicle_id": VEHICLE_ID}, contract=contract)
+        build_record("hunter_core.not_registered", {"vehicle_id": VEHICLE_ID}, contract=contract)
 
 
 def test_decode_rejects_invalid_json() -> None:

@@ -426,7 +426,7 @@ def make_version(
     name: str = "V1.2.0",
 ) -> OtaVersion:
     """构造 ota_versions 行（package_url 指向 FakePackageStorage 对象键；status 强转枚举）。"""
-    object_key = f"hunter-edge/ota/HUNTER_SE/{name}/{code}/package.tar.gz"
+    object_key = f"hunter-core/ota/HUNTER_SE/{name}/{code}/package.tar.gz"
     return OtaVersion(
         version_id=uuid4(),
         version_name=name,

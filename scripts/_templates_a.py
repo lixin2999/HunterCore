@@ -1,4 +1,4 @@
-"""HunterEdge 骨架模板（A）：包说明 / 配置 / 测试 / Dockerfile / pyproject。
+"""HunterCore 骨架模板（A）：包说明 / 配置 / 测试 / Dockerfile / pyproject。
 
 模板占位符使用 string.Template 语法（$service / $port / $desc），避免与代码中的花括号冲突。
 """

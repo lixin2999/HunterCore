@@ -126,7 +126,7 @@ def _load_k8s_documents(path: Path) -> list[dict[str, Any]]:
 # =====================================================================
 def test_contract_is_valid_openapi_3(contract: dict[str, Any]) -> None:
     assert contract["openapi"] == "3.0.3"
-    assert contract["info"]["title"] == "HunterEdge - api-gateway"
+    assert contract["info"]["title"] == "HunterCore - api-gateway"
     assert contract["info"]["version"] == "0.1.0"
     assert {"servers", "tags", "paths", "components"} <= set(contract)
 

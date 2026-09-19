@@ -120,7 +120,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="HunterEdge - scene-service",
+    title="HunterCore - scene-service",
     description="场景生成：场景库管理、场景编辑、场景参数化、OpenSCENARIO 导出、实车场景自动提取",
     version="0.1.0",
     lifespan=lifespan,

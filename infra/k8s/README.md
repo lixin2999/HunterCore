@@ -1,6 +1,6 @@
 # infra/k8s — Kubernetes 部署清单（L1）
 
-> 目标：将 HunterEdge 6 个微服务与 4 类有状态中间件以生产可用方式部署到 K8s 1.28。
+> 目标：将 HunterCore 6 个微服务与 4 类有状态中间件以生产可用方式部署到 K8s 1.28。
 > 所有清单使用 `apps/v1` / `v1` / `batch/v1` / `networking.k8s.io/v1` / `rbac.authorization.k8s.io/v1`。
 
 ## 1. 目录结构
@@ -8,7 +8,7 @@
 ```
 infra/k8s/
 ├── base/
-│   ├── 00-namespace.yaml          # 命名空间 hunter-edge（pod-security=restricted）
+│   ├── 00-namespace.yaml          # 命名空间 hunter-core（pod-security=restricted）
 │   ├── 01-configmap-common.yaml   # 共享非敏感配置（envFrom 注入所有服务）
 │   └── 02-secret.example.yaml     # Secret 模板（禁止提交真实值；复制为 02-secret.yaml 使用）
 ├── services/                      # 6 个微服务：ConfigMap + Deployment + Service
@@ -45,7 +45,7 @@ python scripts/render_k8s.py --version 0.1.0          # 渲染产物 build/k8s/�
 K8S=build/k8s                                         # 以下全部 apply 渲染产物，不要直接 apply infra/k8s/
 
 # 1) 前置：镜像仓库凭据（私有仓库时）
-kubectl -n hunter-edge create secret docker-registry hunter-registry \
+kubectl -n hunter-core create secret docker-registry hunter-registry \
   --docker-server=<registry> --docker-username=<user> --docker-password=<token>
 
 # 2) 命名空间与配置
@@ -56,7 +56,7 @@ cp $K8S/base/02-secret.example.yaml infra/k8s/base/02-secret.yaml   # 替换全�
 kubectl apply -f infra/k8s/base/02-secret.yaml
 
 # 3) TLS 证书类 Secret（二进制，见第 3 节）
-#    hunter-kafka-tls / hunter-minio-tls / hunter-edge-tls
+#    hunter-kafka-tls / hunter-minio-tls / hunter-core-tls
 
 # 4) 中间件（有状态）
 kubectl apply -f $K8S/statefulsets/postgres.yaml
@@ -65,15 +65,15 @@ kubectl apply -f $K8S/statefulsets/kafka.yaml
 kubectl apply -f $K8S/statefulsets/minio.yaml
 
 # 5) 等待就绪（Kafka 三节点 quorum / MinIO ≥3 节点）
-kubectl -n hunter-edge rollout status statefulset/kafka --timeout=10m
-kubectl -n hunter-edge rollout status statefulset/minio --timeout=10m
-kubectl -n hunter-edge rollout status statefulset/postgres --timeout=5m
+kubectl -n hunter-core rollout status statefulset/kafka --timeout=10m
+kubectl -n hunter-core rollout status statefulset/minio --timeout=10m
+kubectl -n hunter-core rollout status statefulset/postgres --timeout=5m
 
 # 6) 初始化任务（Topic / Bucket）
 kubectl apply -f $K8S/jobs/kafka-init-job.yaml
 kubectl apply -f $K8S/jobs/minio-init-job.yaml
-kubectl -n hunter-edge wait --for=condition=complete job/kafka-init --timeout=10m
-kubectl -n hunter-edge wait --for=condition=complete job/minio-init --timeout=10m
+kubectl -n hunter-core wait --for=condition=complete job/kafka-init --timeout=10m
+kubectl -n hunter-core wait --for=condition=complete job/minio-init --timeout=10m
 
 # 7) 微服务与入口
 kubectl apply -f $K8S/services/
@@ -85,7 +85,7 @@ kubectl apply -f $K8S/networkpolicies/
 # 9) 自动扩缩容与可用性（需 metrics-server；HPA 接管 Deployment 副本数）
 kubectl apply -f $K8S/autoscaling/hpa.yaml
 kubectl apply -f $K8S/disruption/poddisruptionbudgets.yaml
-kubectl -n hunter-edge get hpa,pdb
+kubectl -n hunter-core get hpa,pdb
 
 # 10) 监控栈（见 infra/monitoring/README.md）
 kubectl apply -k infra/monitoring
@@ -113,7 +113,7 @@ Kafka 采用 **PEM 格式证书**（`ssl.keystore.type=PEM`），MinIO 与 Ingre
 ```bash
 # 3.1 内部 CA
 openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
-  -keyout ca.key -out ca.crt -subj "/CN=hunter-edge-internal-ca"
+  -keyout ca.key -out ca.crt -subj "/CN=hunter-core-internal-ca"
 
 # 3.2 Kafka broker 证书（SAN 覆盖 3 个 Pod DNS + Service DNS）
 cat > kafka-san.cnf <<'EOF'
@@ -126,24 +126,24 @@ CN = kafka
 [v3_req]
 subjectAltName = @alt
 [alt]
-DNS.1 = kafka-0.kafka-headless.hunter-edge.svc.cluster.local
-DNS.2 = kafka-1.kafka-headless.hunter-edge.svc.cluster.local
-DNS.3 = kafka-2.kafka-headless.hunter-edge.svc.cluster.local
-DNS.4 = kafka.hunter-edge.svc.cluster.local
+DNS.1 = kafka-0.kafka-headless.hunter-core.svc.cluster.local
+DNS.2 = kafka-1.kafka-headless.hunter-core.svc.cluster.local
+DNS.3 = kafka-2.kafka-headless.hunter-core.svc.cluster.local
+DNS.4 = kafka.hunter-core.svc.cluster.local
 EOF
 openssl req -new -newkey rsa:2048 -nodes -keyout tls.key -out tls.csr -config kafka-san.cnf
 openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -out tls.crt -days 825 -extensions v3_req -extfile kafka-san.cnf
 
-kubectl -n hunter-edge create secret generic hunter-kafka-tls \
+kubectl -n hunter-core create secret generic hunter-kafka-tls \
   --from-file=ca.crt=ca.crt --from-file=tls.crt=tls.crt --from-file=tls.key=tls.key
 
-# 3.3 MinIO 证书（SAN 含 minio.hunter-edge.svc / minio-0..3.minio-headless）
-kubectl -n hunter-edge create secret tls hunter-minio-tls \
+# 3.3 MinIO 证书（SAN 含 minio.hunter-core.svc / minio-0..3.minio-headless）
+kubectl -n hunter-core create secret tls hunter-minio-tls \
   --cert=minio.crt --key=minio.key
 
 # 3.4 Ingress 控制台证书
-kubectl -n hunter-edge create secret tls hunter-edge-tls \
+kubectl -n hunter-core create secret tls hunter-core-tls \
   --cert=console.crt --key=console.key
 ```
 
@@ -217,7 +217,7 @@ broker 首次启动执行 `kafka-storage.sh format --add-scram` 时以
 | 三种探针齐备（startup/liveness/readiness） | distroless 无 shell，统一使用 HTTP GET：`/healthz`（存活）、`/readyz`（就绪，内部带 2s 超时，依赖不可用时快速 503 + code=5001） |
 | `maxUnavailable: 0` + 3 副本 | 滚动更新期间不降低接入能力（可用性 ≥ 99.9%） |
 | `topologySpreadConstraints` | 同服务副本分散到不同节点，规避单节点故障 |
-| Pod 安全上下文：非 root + drop ALL + seccomp RuntimeDefault | `hunter-edge` 命名空间启用 `pod-security=restricted`；distroless `:nonroot` 为 UID 65532 |
+| Pod 安全上下文：非 root + drop ALL + seccomp RuntimeDefault | `hunter-core` 命名空间启用 `pod-security=restricted`；distroless `:nonroot` 为 UID 65532 |
 | `automountServiceAccountToken: false`（业务服务） | 服务不访问 K8s API，最小权限（Prometheus 例外，需服务发现） |
 | Kafka 显式 `server.properties` + 启动脚本 | 不依赖镜像默认魔法；SASL_SSL + SCRAM-SHA-512 + `auto.create.topics.enable=false`（Topic 仅按契约创建） |
 | Kafka 3 副本 + `min.insync.replicas=2` | 单 broker 故障仍可写，配合 `acks=all` 满足事件/指令类不丢消息要求 |

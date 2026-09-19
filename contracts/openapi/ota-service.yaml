@@ -1,7 +1,7 @@
 openapi: 3.0.3
 
 info:
-  title: HunterEdge - ota-service
+  title: HunterCore - ota-service
   version: 0.1.0
   description: |
     OTA 管理服务 REST 契约（网关前缀 `/api/v1/ota` → ota-service:8084）。
@@ -31,12 +31,12 @@ info:
       `created → pending_approval → running → paused → succeeded / failed / canceled`
     - 版本（`ota_versions.status`）：`draft → published → deprecated / disabled`
   contact:
-    name: HunterEdge Platform Team
+    name: HunterCore Platform Team
   license:
     name: Proprietary
 
 servers:
-  - url: https://api.hunter-edge.example.com
+  - url: https://api.hunter-core.example.com
     description: 经 API 网关（8080）统一入口；网关按前缀 /api/v1/ota 转发至 ota-service:8084
   - url: http://ota-service:8084
     description: 集群内直连（mTLS；仅联调与内部调用使用）
@@ -1154,7 +1154,7 @@ components:
         package_url:
           type: string
           description: 落库对象地址（MinIO bucket hunter-ota-packages，永久保留）
-          example: "s3://hunter-ota-packages/hunter-edge/ota/HUNTER_SE/V1.2.0/package.tar.gz"
+          example: "s3://hunter-ota-packages/hunter-core/ota/HUNTER_SE/V1.2.0/package.tar.gz"
         package_size: { type: integer, format: int64, minimum: 1, description: 字节数 }
         package_md5: { type: string, pattern: "^[0-9a-f]{32}$" }
         package_sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
@@ -1290,7 +1290,7 @@ components:
         object_key:
           type: string
           description: 服务端生成的对象键（bucket hunter-ota-packages）
-          example: hunter-edge/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz
+          example: hunter-core/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz
         upload_url: { type: string, description: 单分片预签名 PUT 地址（part_count=1 时直接使用） }
         expires_in: { type: integer, enum: [3600], description: 有效期秒数（固定 1 小时，不可更改） }
         part_count: { type: integer, minimum: 1 }
@@ -2150,7 +2150,7 @@ x-hunter-version-upload-flow:
     - step: 4
       action: "GET /api/v1/ota/versions/{version_id} 或列表"
       detail: "返回即时签发的 15 分钟下载预签名地址 package_download_url（支持 Range 分片下载）"
-  object_key_pattern: "hunter-edge/ota/{model}/{version_name}/{version_code}/package.tar.gz（例：hunter-edge/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz）"
+  object_key_pattern: "hunter-core/ota/{model}/{version_name}/{version_code}/package.tar.gz（例：hunter-core/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz）"
   presign_policy:
     upload_expires_seconds: 3600
     download_expires_seconds: 900

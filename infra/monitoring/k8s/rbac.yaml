@@ -6,15 +6,15 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: prometheus
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: prometheus
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: hunter-edge-prometheus
+  name: hunter-core-prometheus
   labels:
     app.kubernetes.io/name: prometheus
 rules:
@@ -33,14 +33,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: hunter-edge-prometheus
+  name: hunter-core-prometheus
   labels:
     app.kubernetes.io/name: prometheus
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: hunter-edge-prometheus
+  name: hunter-core-prometheus
 subjects:
   - kind: ServiceAccount
     name: prometheus
-    namespace: hunter-edge
+    namespace: hunter-core

@@ -1,4 +1,4 @@
-# HunterEdge L5 测试报告（{{VERSION}}）
+# HunterCore L5 测试报告（{{VERSION}}）
 
 > 本文件由 `tests/support/report.py` 依据模板自动生成，禁止手工修改结论字段。
 > 模板路径：`tests/report-template.md`；生成命令：`python -m tests.support.report`。

@@ -7,15 +7,15 @@
 #   2) 与设计文档“网关路由表”语义一致：前缀 → 目标服务的关系由网关维护
 # 若设计文档明确要求 Ingress 直连各服务，可将 backend 改为对应 Service 名与端口。
 #
-# 前置：TLS 证书 Secret hunter-edge-tls（kubernetes.io/tls，创建方式见 README）
+# 前置：TLS 证书 Secret hunter-core-tls（kubernetes.io/tls，创建方式见 README）
 # =====================================================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: hunter-edge-api
-  namespace: hunter-edge
+  name: hunter-core-api
+  namespace: hunter-core
   labels:
-    app.kubernetes.io/name: hunter-edge
+    app.kubernetes.io/name: hunter-core
     app.kubernetes.io/component: ingress
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"        # 全链路 TLS（强制 HTTPS）
@@ -29,10 +29,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - hunter-edge.example.com
-      secretName: hunter-edge-tls
+        - hunter-core.example.com
+      secretName: hunter-core-tls
   rules:
-    - host: hunter-edge.example.com
+    - host: hunter-core.example.com
       http:
         paths:
           # ---------- 网关路由表（前缀不可更改） ----------
@@ -94,10 +94,10 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: hunter-edge-ws
-  namespace: hunter-edge
+  name: hunter-core-ws
+  namespace: hunter-core
   labels:
-    app.kubernetes.io/name: hunter-edge
+    app.kubernetes.io/name: hunter-core
     app.kubernetes.io/component: ingress-ws
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
@@ -111,10 +111,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - hunter-edge.example.com
-      secretName: hunter-edge-tls
+        - hunter-core.example.com
+      secretName: hunter-core-tls
   rules:
-    - host: hunter-edge.example.com
+    - host: hunter-core.example.com
       http:
         paths:
           - path: /ws/remote               # → remote-control（WebSocket）

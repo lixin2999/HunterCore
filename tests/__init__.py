@@ -1,4 +1,4 @@
-"""HunterEdge L5 集成与测试层（tests/）。
+"""HunterCore L5 集成与测试层（tests/）。
 
 分层：
 - ``tests/support``     测试支撑库（契约加载、消息工厂、容器基础设施、业务流程参考实现、报告）

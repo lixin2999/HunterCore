@@ -1,8 +1,8 @@
 {
-  "name": "hunter-edge-web-portal",
+  "name": "hunter-core-web-portal",
   "version": "0.1.0",
   "private": true,
-  "description": "HunterEdge 数据采集与分析系统前端管理后台（Vue 3 + TypeScript + Vite）",
+  "description": "HunterCore 数据采集与分析系统前端管理后台（Vue 3 + TypeScript + Vite）",
   "type": "module",
   "engines": {
     "node": ">=20.19.0"

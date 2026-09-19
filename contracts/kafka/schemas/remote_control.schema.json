@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://hunter-edge.local/contracts/kafka/schemas/remote_control.schema.json",
-  "title": "HunterEdge 远程操控指令 hunter.{vehicle_id}.remote_control",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/remote_control.schema.json",
+  "title": "HunterCore 远程操控指令 hunter.{vehicle_id}.remote_control",
   "description": "平台→车远程操控指令（20Hz，即 50ms 间隔，acks=all，key=vehicle_id）。生产者：remote-control；消费者：车端。安全约束：车端 >500ms 未收到控制指令必须自动减速停车；远程操控模式最高速度默认 2.0 m/s（可配置）；同一车辆同一时刻仅允许一名操作员（Redis rc:session:{vehicle_id} 互斥）。",
   "type": "object",
   "additionalProperties": false,

@@ -1,7 +1,7 @@
 {
   "uid": "hunter-api-performance",
-  "title": "HunterEdge / API 性能",
-  "tags": ["hunteredge", "api", "slo"],
+  "title": "HunterCore / API 性能",
+  "tags": ["huntercore", "api", "slo"],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,

@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="HunterEdge - data-analytics",
+    title="HunterCore - data-analytics",
     description="数据分析：Flink 实时流处理、Spark 离线批处理、指标计算、Corner Case 挖掘、报告生成",
     version="0.1.0",
     lifespan=lifespan,

@@ -1,7 +1,7 @@
 {
   "uid": "hunter-kafka",
-  "title": "HunterEdge / Kafka 监控",
-  "tags": ["hunteredge", "kafka", "mq"],
+  "title": "HunterCore / Kafka 监控",
+  "tags": ["huntercore", "kafka", "mq"],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,

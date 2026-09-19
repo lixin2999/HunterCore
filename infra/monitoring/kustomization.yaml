@@ -1,14 +1,14 @@
 # =====================================================================
 # Kustomize 入口（监控栈）
 # 用法：
-#   kubectl apply -k infra/monitoring                                    # 监控组件（hunter-edge 命名空间）
+#   kubectl apply -k infra/monitoring                                    # 监控组件（hunter-core 命名空间）
 #   kubectl apply -f infra/monitoring/exporters/exporters.yaml           # 采集器（monitoring 命名空间）
 # 说明：配置类 ConfigMap 由 configMapGenerator 从仓库源文件生成（单一事实来源，禁止手工 kubectl create）
 # =====================================================================
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: hunter-edge
+namespace: hunter-core
 
 resources:
   - k8s/rbac.yaml
@@ -19,7 +19,7 @@ resources:
 generatorOptions:
   disableNameSuffixHash: true      # 固定 ConfigMap 名（Deployment 按名引用）
   labels:
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
 
 configMapGenerator:
   # Prometheus 主配置 -> /etc/prometheus/prometheus.yml

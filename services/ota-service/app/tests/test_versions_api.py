@@ -79,7 +79,7 @@ async def test_create_version_returns_presigned_upload(client: AsyncClient) -> N
     upload = body["data"]["upload"]
     assert upload["expires_in"] == 3600
     assert upload["part_count"] == 1
-    assert upload["object_key"] == "hunter-edge/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz"
+    assert upload["object_key"] == "hunter-core/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz"
 
 
 async def test_create_version_multipart_parts(client: AsyncClient) -> None:

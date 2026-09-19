@@ -1,4 +1,4 @@
-# HunterEdge —— HUNTER 自动驾驶数据采集与分析系统
+# HunterCore —— HUNTER 自动驾驶数据采集与分析系统
 
 基于 **HUNTER SE 阿克曼 UGV 底盘 + EDU Pro Kit 传感器套件 + NVIDIA AGX Orin** 车载平台构建的
 自动驾驶数据采集与分析云端系统，承担五大核心职能：
@@ -203,7 +203,7 @@ python scripts/render_k8s.py --version 0.1.0
 # 0) 生成运行时契约 ConfigMap（消费侧 Schema 校验依赖；契约变更后需重新生成）
 python scripts/generate_contracts_configmap.py
 kubectl apply -f build/k8s/base/            # 命名空间 + 共享 ConfigMap + 契约 ConfigMap + Secret（先复制 02-secret.example.yaml）
-# 前置：创建 TLS Secret hunter-kafka-tls / hunter-minio-tls / hunter-edge-tls
+# 前置：创建 TLS Secret hunter-kafka-tls / hunter-minio-tls / hunter-core-tls
 kubectl apply -f build/k8s/statefulsets/    # postgres / kafka / redis / minio
 kubectl apply -f build/k8s/jobs/            # Topic 与 Bucket 初始化（契约一致）
 kubectl apply -f build/k8s/services/        # 6 个微服务
@@ -226,7 +226,7 @@ kubectl apply -f infra/monitoring/exporters/exporters.yaml
 - **滚动更新**：`maxSurge: 1` / `maxUnavailable: 0`（更新期间不降级），配合 PDB 覆盖节点排空场景
 - **自动扩缩容**：HPA 6 个微服务（min=2 / max=5 / CPU 70%），需集群安装 metrics-server；有状态中间件禁止 HPA
 - **指标**：各服务暴露 `GET /metrics`（`common/python/hunter_common/metrics.py`，统一前缀 `hunter_`），Prometheus 通过 Pod 注解自动发现
-- **安全**：`hunter-edge` 命名空间 `pod-security=restricted`；密钥/证书仅经 Secret 注入；Kafka `SASL_SSL + SCRAM-SHA-512`；MinIO HTTPS + SSE-S3
+- **安全**：`hunter-core` 命名空间 `pod-security=restricted`；密钥/证书仅经 Secret 注入；Kafka `SASL_SSL + SCRAM-SHA-512`；MinIO HTTPS + SSE-S3
 - **告警**：5 组规则（服务健康 / API 性能 / 数据管道 / 中间件 / 业务约束），阈值需与设计文档 15.4.2 节核对
 - **看板**：`hunter-fleet-overview`、`hunter-kafka`、`hunter-api-performance`（Git 供给，UI 只读）
 
@@ -425,7 +425,7 @@ python scripts/verify_test_layer.py
 | L5 测试报告 | `python -m pytest tests -q --l5-report`（`docs/test-reports/`，Markdown + JSON） |
 | 测试层自检 | `python scripts/verify_test_layer.py`（标记/阈值来源/模板占位符/用例号） |
 | 基础设施健康 | `docker compose ps` |
-| TimescaleDB 扩展 | `docker exec hunter-postgres psql -U hunter -d hunter_edge -c "SELECT extname FROM pg_extension WHERE extname='timescaledb';"` |
+| TimescaleDB 扩展 | `docker exec hunter-postgres psql -U hunter -d hunter_core -c "SELECT extname FROM pg_extension WHERE extname='timescaledb';"` |
 | Kafka 平台内部 Topic | `docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list` |
 | MinIO Bucket | 浏览器打开 `http://localhost:9001`（7 个 Bucket：hunter-raw-data / rosbag / video / ota-packages / reports / logs / scene-assets） |
 | Redis | `docker exec hunter-redis redis-cli ping` |
@@ -443,7 +443,7 @@ python scripts/verify_test_layer.py
 | 远程操控契约校验 | `cd services/remote-control && pytest app/tests/test_remote_control_contract.py -q`（契约 ↔ 设计文档 15 条安全约束/12.6 节推导 ↔ Kafka ↔ MinIO 归档 ↔ K8s，契约测试随实现步骤落地） |
 | 契约文件静态校验 | `python -c "import yaml; yaml.safe_load(open('contracts/openapi/remote-control.yaml', encoding='utf-8'))"`（YAML 语法 + `$ref` 解析，无需服务） |
 | 数据库迁移 | `alembic -c common/python/alembic.ini current` / `... upgrade head` / `... upgrade head --sql`（离线预览） |
-| 表结构核对 | `docker exec hunter-postgres psql -U hunter -d hunter_edge -c "\\dt scene_svc.*"` |
+| 表结构核对 | `docker exec hunter-postgres psql -U hunter -d hunter_core -c "\\dt scene_svc.*"` |
 | 服务健康探针 | `curl http://localhost:<port>/healthz` |
 | 服务单元测试 | `cd services/<service> && pytest -q` |
 | 指标端点 | `curl http://localhost:<port>/metrics`（Prometheus 文本格式，含 `hunter_` 前缀指标） |

@@ -1,4 +1,4 @@
-// HunterEdge 前端构建配置
+// HunterCore 前端构建配置
 // 说明：
 // 1. 开发环境通过 Vite dev server 反向代理到 api-gateway(8080)，避免本地 CORS；
 //    生产环境由 Ingress 按网关路由表前缀（/api/v1/**、/ws/remote/**）同源转发，

@@ -150,7 +150,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="HunterEdge - data-collector",
+    title="HunterCore - data-collector",
     description="数据采集：Kafka 消息消费接入、数据预处理、数据路由、文件上传管理",
     version="0.1.0",
     lifespan=lifespan,

@@ -144,7 +144,7 @@ const router = createRouter({
 
 router.beforeEach(async (to) => {
   const userStore = useUserStore()
-  document.title = to.meta.title ? `${to.meta.title} · HunterEdge` : 'HunterEdge'
+  document.title = to.meta.title ? `${to.meta.title} · HunterCore` : 'HunterCore'
 
   if (to.meta.public) {
     // 已登录用户访问登录页 → 回看板

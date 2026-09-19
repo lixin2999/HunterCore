@@ -1,4 +1,4 @@
-"""HunterEdge 服务基础配置（pydantic-settings）。
+"""HunterCore 服务基础配置（pydantic-settings）。
 
 约束（设计文档：配置管理）：
 - 所有可调参数从环境变量/.env 读取，禁止在业务代码中硬编码 URL/密钥/端口/阈值
@@ -48,7 +48,7 @@ class HunterBaseConfig(BaseSettings):
     postgres_port: int = 5432
     postgres_user: str = "hunter"
     postgres_password: str = "hunter_dev_123"
-    postgres_db: str = "hunter_edge"
+    postgres_db: str = "hunter_core"
     db_echo: bool = False
     # 连接池大小 = CPU 核数 × 2 + 1（开发规则：数据库连接池）
     db_pool_size: int = Field(default_factory=lambda: (os.cpu_count() or 2) * 2 + 1)

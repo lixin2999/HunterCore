@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# HunterEdge MinIO Bucket 初始化（Bucket 名称与生命周期见设计文档，不可更改）
+# HunterCore MinIO Bucket 初始化（Bucket 名称与生命周期见设计文档，不可更改）
 # 由 docker-compose 的 minio-init 一次性任务执行：bash /init-buckets.sh
 # =====================================================================
 set -euo pipefail

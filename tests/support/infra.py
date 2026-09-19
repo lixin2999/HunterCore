@@ -35,7 +35,7 @@ KAFKA_IMAGE = os.getenv("HUNTER_TEST_KAFKA_IMAGE", "confluentinc/cp-kafka:7.6.0"
 REDIS_IMAGE = os.getenv("HUNTER_TEST_REDIS_IMAGE", "redis:7.2-alpine")
 MINIO_IMAGE = os.getenv("HUNTER_TEST_MINIO_IMAGE", "minio/minio:RELEASE.2024-01-16T16-07-38Z")
 
-POSTGRES_DB = os.getenv("HUNTER_TEST_POSTGRES_DB", "hunter_edge")
+POSTGRES_DB = os.getenv("HUNTER_TEST_POSTGRES_DB", "hunter_core")
 POSTGRES_USER = os.getenv("HUNTER_TEST_POSTGRES_USER", "hunter")
 POSTGRES_PASSWORD = os.getenv("HUNTER_TEST_POSTGRES_PASSWORD", "hunter_test_pwd")
 MINIO_ROOT_USER = os.getenv("HUNTER_TEST_MINIO_USER", "minioadmin")

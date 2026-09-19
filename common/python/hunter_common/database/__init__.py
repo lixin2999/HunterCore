@@ -1,4 +1,4 @@
-"""HunterEdge 数据访问层（SQLAlchemy 2.0 异步 + TimescaleDB）。
+"""HunterCore 数据访问层（SQLAlchemy 2.0 异步 + TimescaleDB）。
 
 模块结构：
 - ``session``        异步引擎/会话管理（DatabaseSessionManager，FastAPI 依赖注入）

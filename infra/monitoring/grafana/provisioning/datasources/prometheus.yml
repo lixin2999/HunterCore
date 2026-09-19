@@ -9,7 +9,7 @@ datasources:
     uid: prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus.hunter-edge.svc.cluster.local:9090
+    url: http://prometheus.hunter-core.svc.cluster.local:9090
     isDefault: true
     editable: false
     jsonData:

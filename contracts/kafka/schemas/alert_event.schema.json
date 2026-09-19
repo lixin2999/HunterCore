@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://hunter-edge.local/contracts/kafka/schemas/alert_event.schema.json",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/alert_event.schema.json",
   "title": "alert_event",
   "description": "平台内部 Topic alert_event 消息（生产者 data-analytics 的 Flink 1.18 实时作业，设计文档 6.2 节）。消费方：告警处理（⚠ 落位服务待定，见 contracts/kafka/consumer-groups.yaml 的 platform-alert-event）。语义：平台侧基于 telemetry_clean / telemetry_raw 重算触发的告警（与车端上报的 hunter.{vehicle_id}.event 相互独立，禁止混用）；实时告警触发延迟 ≤ 2s（性能指标）。level 必须等于受控词表 EVENT_LEVEL_BY_TYPE[alert_type]（contracts/database/enums.md 第 3 节，不可放宽）。",
   "type": "object",

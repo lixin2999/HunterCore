@@ -7,7 +7,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: scene-service-config
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: scene-service
 data:
@@ -57,10 +57,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: scene-service
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: scene-service
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: backend
 spec:
   replicas: 2
@@ -77,7 +77,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: scene-service
-        app.kubernetes.io/part-of: hunter-edge
+        app.kubernetes.io/part-of: hunter-core
         app.kubernetes.io/component: backend
       annotations:
         prometheus.io/scrape: "true"
@@ -165,10 +165,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: scene-service
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: scene-service
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
 spec:
   type: ClusterIP
   selector:

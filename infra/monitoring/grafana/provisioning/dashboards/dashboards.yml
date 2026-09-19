@@ -6,9 +6,9 @@
 apiVersion: 1
 
 providers:
-  - name: hunter-edge
+  - name: hunter-core
     orgId: 1
-    folder: HunterEdge          # 看板统一归入 HunterEdge 目录
+    folder: HunterCore          # 看板统一归入 HunterCore 目录
     type: file
     disableDeletion: true       # 看板以 Git 为准，禁止 UI 删除
     allowUiUpdates: false       # 变更必须提交仓库（避免配置漂移）

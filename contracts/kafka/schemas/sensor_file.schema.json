@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://hunter-edge.local/contracts/kafka/schemas/sensor_file.schema.json",
-  "title": "HunterEdge 传感器文件通知 sensor_file",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/sensor_file.schema.json",
+  "title": "HunterCore 传感器文件通知 sensor_file",
   "description": "平台内部 Topic `sensor_file`（3 分区，保留 7 天，key = vehicle_id）。生产者：data-collector（文件上传完成且完整性校验通过后投递，见设计文档 5.5 节）；消费者：data-analytics（离线分析，幂等键 = object_key）。消息只包含 MinIO 对象元信息，不含文件本体；对象路径遵循 5.5 节命名规范 {bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}。校验依据：bucket/object_key/size/md5/sha256 必须与 MinIO 实际对象一致（不一致时 data-collector 返回错误码 6001，不投递本消息）。",
   "type": "object",
   "additionalProperties": false,

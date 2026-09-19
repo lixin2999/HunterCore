@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://hunter-edge.local/contracts/kafka/schemas/health.schema.json",
-  "title": "HunterEdge 系统健康消息 hunter.{vehicle_id}.health",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/health.schema.json",
+  "title": "HunterCore 系统健康消息 hunter.{vehicle_id}.health",
   "description": "车辆系统健康数据（1Hz，acks=0）。生产者：车端；消费者：data-collector（写 Redis vehicle:status:{vehicle_id} / vehicle:online:set，不落明细表）。status 取值 = 车辆状态定义（8 态，不可更改）；system 段字段与遥测消息 system 段完全一致（复用采集代码）。⚠ 磁盘/服务进程等扩展健康字段待设计文档 5.3 节核对。",
   "type": "object",
   "additionalProperties": false,

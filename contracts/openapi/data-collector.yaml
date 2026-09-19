@@ -1,5 +1,5 @@
 # =====================================================================
-# HunterEdge 数据采集服务契约（OpenAPI 3.0.3）—— 单一事实来源
+# HunterCore 数据采集服务契约（OpenAPI 3.0.3）—— 单一事实来源
 # 来源：设计文档 5 章（5.3.1 Kafka Topic / 5.3.3 遥测消息格式 / 5.4 数据预处理流程 /
 #       5.5 文件上传管理）、附录 A（错误码）、附录 D（API 限流）、MinIO Bucket 规划、
 #       Redis Key 设计、性能指标（遥测入库 ≤1s、写入 ≥10000 点/秒、单车 ≤100 msg/s）
@@ -26,7 +26,7 @@
 openapi: 3.0.3
 
 info:
-  title: HunterEdge - data-collector
+  title: HunterCore - data-collector
   version: 0.1.0
   description: |
     数据采集服务统一契约（端口 8082，网关前缀 `/api/v1/data`）。
@@ -54,10 +54,10 @@ info:
     **性能**：API 响应 P95 ≤ 200ms；遥测入库延迟 ≤ 1s；时序写入 ≥ 10000 点/秒；
     实时告警 ≤ 2s（由 data-analytics 触发）；列表默认分页 20 条、上限 200 条。
   license:
-    name: Proprietary - HunterEdge
+    name: Proprietary - HunterCore
 
 servers:
-  - url: https://hunter-edge.example.com
+  - url: https://hunter-core.example.com
     description: 生产环境（控制台经网关 /api/v1/data 转发；车端数据面走 Kafka / MinIO 直传）
   - url: http://localhost:8082
     description: 本地开发（直连服务）

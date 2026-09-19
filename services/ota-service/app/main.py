@@ -137,7 +137,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="HunterEdge - ota-service",
+    title="HunterCore - ota-service",
     description="OTA 管理：版本仓库管理、升级任务调度、灰度发布、升级监控、A/B 分区回滚",
     version="0.1.0",
     lifespan=lifespan,

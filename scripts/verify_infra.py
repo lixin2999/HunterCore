@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""HunterEdge 基础设施清单校验（L1）。
+"""HunterCore 基础设施清单校验（L1）。
 
 校验项：
   1. K8s YAML 语法可解析，且文档非空
   2. apiVersion 白名单（apps/v1、v1、batch/v1、networking.k8s.io/v1、autoscaling/v2、policy/v1）
-  3. 命名空间统一为 hunter-edge（Namespace 资源本身除外）
+  3. 命名空间统一为 hunter-core（Namespace 资源本身除外）
   4. 工作负载（Deployment/StatefulSet）resources.requests/limits 与三种探针齐备
   5. 镜像标签禁止 latest / 缺省（必须显式版本或发布日期）
   6. ConfigMap 不得包含敏感字段（密码/密钥/私钥）
@@ -49,9 +49,9 @@ ALLOWED_API_VERSIONS = {
 }
 WORKLOAD_KINDS = {"Deployment", "StatefulSet", "DaemonSet"}
 #: 应用与中间件命名空间（restricted Pod 安全标准）
-NAMESPACE = "hunter-edge"
+NAMESPACE = "hunter-core"
 #: 允许的命名空间；monitoring 用于采集器（node-exporter 需要 host 网络/文件系统）
-ALLOWED_NAMESPACES = {"hunter-edge", "monitoring"}
+ALLOWED_NAMESPACES = {"hunter-core", "monitoring"}
 
 #: 服务名 -> 端口（设计文档模块划分，不可更改）
 SERVICE_PORTS: dict[str, int] = {
@@ -149,7 +149,7 @@ def check_workloads(documents: list[tuple[Path, dict[str, Any]]]) -> None:
             fail(f"{rel(path)}:{name} 未定义容器")
             continue
         # monitoring 命名空间的采集器（node-exporter 需 host 网络/文件系统）豁免
-        # restricted 校验；hunter-edge（应用/中间件/监控组件）强制非 root + drop ALL
+        # restricted 校验；hunter-core（应用/中间件/监控组件）强制非 root + drop ALL
         strict_security = (doc.get("metadata") or {}).get("namespace") != "monitoring"
         for container in containers:
             cname = container.get("name")

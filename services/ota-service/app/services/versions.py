@@ -44,7 +44,7 @@ from app.schemas.versions import (
 logger = get_logger("app.services.versions")
 
 #: 对象键命名模板（x-hunter-version-upload-flow.object_key_pattern，契约固定）
-OBJECT_KEY_TEMPLATE = "hunter-edge/ota/{model}/{version_name}/{version_code}/package.tar.gz"
+OBJECT_KEY_TEMPLATE = "hunter-core/ota/{model}/{version_name}/{version_code}/package.tar.gz"
 
 #: 发布校验失败归因（Prometheus reason 标签）
 _VERIFY_REASON_SIZE = "size"

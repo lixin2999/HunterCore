@@ -124,7 +124,7 @@
   （推导依据逐条登记在 `x-hunter-endpoints.items`）
 - **版本上传两步式（`x-hunter-version-upload-flow`）**：建草稿（`draft`）→ 服务端签发 1 小时上传预签名地址 → 客户端直传
   MinIO `hunter-ota-packages` → `publish` 由服务端**单次流式**校验；对象键
-  `hunter-edge/ota/{model}/{version_name}/{version_code}/package.tar.gz`（服务端生成，禁止客户端指定）
+  `hunter-core/ota/{model}/{version_name}/{version_code}/package.tar.gz`（服务端生成，禁止客户端指定）
 - **发布门禁（唯一）**：`publish` 依次校验 包长/MD5/SHA-256（→ 6001）→ RSA-2048 验签 `RSASSA-PKCS1-v1_5 + SHA-256`
   （→ 6002）→ `version_code` 同 `applicable_models` 范围单调递增（→ 6003），全部通过才 `draft → published` + 写 `release_time`；
   该项为**长耗时操作**，已在 `x-hunter-service.performance.exceptions` 登记为性能例外（网关超时 ≥300s，见 pending #9）

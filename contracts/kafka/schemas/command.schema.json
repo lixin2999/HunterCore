@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://hunter-edge.local/contracts/kafka/schemas/command.schema.json",
-  "title": "HunterEdge 控制指令 hunter.{vehicle_id}.command / hunter.broadcast.command",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/command.schema.json",
+  "title": "HunterCore 控制指令 hunter.{vehicle_id}.command / hunter.broadcast.command",
   "description": "平台→车控制指令（按需下发，acks=all）。生产者：api-gateway / ota-service / remote-control；消费者：车端。单车辆消息必须携带 vehicle_id（= 消息 key）；广播消息改用 target_filter（二选一，oneOf 强制）。command_type 取值域待设计文档 5.3 节核对（⚠ 当前不设 enum，禁止前端硬编码分支）。",
   "type": "object",
   "additionalProperties": false,

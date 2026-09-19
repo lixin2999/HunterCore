@@ -34,23 +34,23 @@ infra/monitoring/
 ## 2. 部署
 
 ```bash
-# 监控组件（命名空间 hunter-edge；配置由 configMapGenerator 从仓库源文件生成）
+# 监控组件（命名空间 hunter-core；配置由 configMapGenerator 从仓库源文件生成）
 kubectl apply -k infra/monitoring
 
 # 采集器（命名空间 monitoring；node-exporter 需要 host 网络/文件系统）
 kubectl apply -f infra/monitoring/exporters/exporters.yaml
 
 # 校验
-kubectl -n hunter-edge rollout status deploy/prometheus
-kubectl -n hunter-edge rollout status deploy/grafana
+kubectl -n hunter-core rollout status deploy/prometheus
+kubectl -n hunter-core rollout status deploy/grafana
 python scripts/verify_infra.py
 ```
 
 访问入口（生产建议经网关统一暴露并加鉴权，禁止直接对外暴露 Prometheus/Grafana）：
 
 ```bash
-kubectl -n hunter-edge port-forward svc/grafana 3000:3000     # 本地调试
-kubectl -n hunter-edge port-forward svc/prometheus 9090:9090
+kubectl -n hunter-core port-forward svc/grafana 3000:3000     # 本地调试
+kubectl -n hunter-core port-forward svc/prometheus 9090:9090
 ```
 
 Grafana 管理员口令来自 `hunter-app-secrets/GRAFANA_ADMIN_PASSWORD`（见 `infra/k8s/base/02-secret.example.yaml`）。

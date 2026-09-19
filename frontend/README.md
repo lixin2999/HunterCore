@@ -1,4 +1,4 @@
-# frontend — HunterEdge 运营管理后台（Vue 3）
+# frontend — HunterCore 运营管理后台（Vue 3）
 
 技术栈：**Vue 3 + TypeScript + Vite 5 + Element Plus + Pinia + Vue Router 4 + ECharts 5 + Three.js**。
 
@@ -22,7 +22,7 @@ npm run preview             # 预览构建产物 http://localhost:4173
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `VITE_APP_TITLE` | HunterEdge 运营管理后台 | 应用标题（浏览器标签 + 顶栏） |
+| `VITE_APP_TITLE` | HunterCore 运营管理后台 | 应用标题（浏览器标签 + 顶栏） |
 | `VITE_API_BASE_URL` | `/api/v1` | REST 基础路径（网关统一入口，相对路径） |
 | `VITE_WS_BASE_URL` | `/ws` | WebSocket 基础路径（`/ws/remote/**`） |
 | `VITE_PROXY_TARGET` | `http://localhost:8080` | 仅开发环境：Vite 代理目标（网关） |

@@ -1,4 +1,4 @@
-"""HunterEdge 统一异常体系。
+"""HunterCore 统一异常体系。
 
 错误码为全局预定义值（见 System Prompt 错误码表），禁止新增或更改含义。
 所有业务异常必须继承 HunterBaseException，由各服务全局异常处理器转换为统一响应格式。
@@ -32,7 +32,7 @@ class ErrorCode(IntEnum):
 
 
 class HunterBaseException(Exception):
-    """HunterEdge 业务异常基类。
+    """HunterCore 业务异常基类。
 
     Attributes:
         code: 预定义错误码（默认 5000 服务器内部错误）。

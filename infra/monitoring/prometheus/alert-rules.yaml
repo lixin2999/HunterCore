@@ -1,5 +1,5 @@
 # =====================================================================
-# Prometheus 告警规则（HunterEdge L1）
+# Prometheus 告警规则（HunterCore L1）
 # 阈值来源：
 #   - 《数据采集与分析系统详细设计文档 V4.0》15.4.2 告警阈值（⚠ 需人工核对：本文档未随仓库提供，
 #     当前阈值按系统上下文基座中的性能指标 + 通用运维经验取值）
@@ -24,7 +24,7 @@ groups:
         annotations:
           summary: "服务实例不可用：{{ $labels.service }}"
           description: "Pod {{ $labels.pod }} 已连续 1 分钟无法抓取 /metrics（up==0）。"
-          action: "检查 Pod 状态与事件：kubectl -n hunter-edge describe pod {{ $labels.pod }}"
+          action: "检查 Pod 状态与事件：kubectl -n hunter-core describe pod {{ $labels.pod }}"
 
       - alert: HunterServiceHighErrorRate
         expr: |
@@ -40,7 +40,7 @@ groups:
           action: "查询统一响应体中的 code 与 request_id 定位异常（结构化日志检索 trace_id）。"
 
       - alert: HunterContainerRestarting
-        expr: increase(kube_pod_container_status_restarts_total{namespace="hunter-edge"}[15m]) > 3
+        expr: increase(kube_pod_container_status_restarts_total{namespace="hunter-core"}[15m]) > 3
         for: 5m
         labels:
           severity: warning
@@ -50,7 +50,7 @@ groups:
           description: "15 分钟内重启 {{ $value }} 次，可能与 OOM 或探针失败相关。"
 
       - alert: HunterContainerOOMKilled
-        expr: kube_pod_container_status_last_terminated_reason{namespace="hunter-edge",reason="OOMKilled"} == 1
+        expr: kube_pod_container_status_last_terminated_reason{namespace="hunter-core",reason="OOMKilled"} == 1
         for: 1m
         labels:
           severity: critical

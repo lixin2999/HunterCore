@@ -1,5 +1,5 @@
 # =====================================================================
-# HunterEdge 对象存储（MinIO）契约（单一事实来源）
+# HunterCore 对象存储（MinIO）契约（单一事实来源）
 #
 # 来源：系统关键约束第 7 条「MinIO Bucket 规划（名称与生命周期不可更改）」+ 第 9 条
 #       「数据安全：SSE-S3」+ 设计文档 5.5 节（文件上传命名规范）、6.5 节（报告产物）、
@@ -124,9 +124,9 @@ buckets:
     writers: [ota-service]
     readers: [ota-service, api-gateway]
     object_key_conventions:
-      - pattern: "hunter-edge/ota/{model}/{version_name}/{version_code}/package.tar.gz"
+      - pattern: "hunter-core/ota/{model}/{version_name}/{version_code}/package.tar.gz"
         style: bucket_excluded
-        example: "hunter-edge/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz"
+        example: "hunter-core/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz"
         declared_in: "contracts/openapi/ota-service.yaml#x-hunter-version-upload-flow.object_key_pattern"
     access:
       upload: "预签名直传 3600s（part_count>1 时分片 + 断点续传）"
@@ -234,7 +234,7 @@ x-hunter-pending-confirmation:
   # 结构对齐各服务 OpenAPI 既有约定：{id, question, impact, contract_decision}（禁止自行发明键名）
   items:
     - id: 1
-      question: "对象键风格不统一（是否包含 Bucket 名）：data-collector 与 data-analytics 的对象键含 bucket 前缀（hunter-raw-data/HUNTER-001/...、hunter-reports/...）；ota-service / remote-control / scene-service 的对象键不含 bucket（hunter-edge/ota/...、remote-control/...、scenarios/...）"
+      question: "对象键风格不统一（是否包含 Bucket 名）：data-collector 与 data-analytics 的对象键含 bucket 前缀（hunter-raw-data/HUNTER-001/...、hunter-reports/...）；ota-service / remote-control / scene-service 的对象键不含 bucket（hunter-core/ota/...、remote-control/...、scenarios/...）"
       impact: "阻塞（blocking）：六服务 key 模板无法统一校验与复用，预签名签名串风格不一致（前端/车端需按服务分别拼接）"
       contract_decision: "统一为「不含 bucket」或「含 bucket」其一（推荐不含，bucket 由预签名请求的 bucket 字段承载）；统一前实现必须按各服务既有契约执行，禁止跨服务复用同一 key 模板"
     - id: 2

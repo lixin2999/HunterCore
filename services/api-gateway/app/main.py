@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="HunterEdge - api-gateway",
+    title="HunterCore - api-gateway",
     description="API 网关：统一接入、JWT 认证鉴权、五级限流熔断、路由转发、日志审计",
     version="0.1.0",
     lifespan=lifespan,

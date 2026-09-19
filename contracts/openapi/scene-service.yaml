@@ -1,5 +1,5 @@
 # =====================================================================
-# HunterEdge 场景生成服务契约（OpenAPI 3.0.3）—— 单一事实来源
+# HunterCore 场景生成服务契约（OpenAPI 3.0.3）—— 单一事实来源
 # 来源：设计文档 4 章（4.2.1 场景分类体系 / 4.2.2 场景配置结构 / 4.3 场景导出 /
 #       4.4 场景下发到 Carla / 4.5 实车场景自动提取）、12.2 节（scene-service REST API）、
 #       附录 A（错误码）、附录 D（限流）、MinIO Bucket 规划、Redis Key 设计
@@ -25,7 +25,7 @@
 openapi: 3.0.3
 
 info:
-  title: HunterEdge - scene-service
+  title: HunterCore - scene-service
   version: 0.1.0
   description: |
     场景生成服务统一契约（端口 8081，网关前缀 `/api/v1/scene`）。
@@ -51,10 +51,10 @@ info:
 
     **性能**：API 响应 P95 ≤ 200ms（13.2 节）；场景列表默认分页 20 条、上限 200 条。
   license:
-    name: Proprietary - HunterEdge
+    name: Proprietary - HunterCore
 
 servers:
-  - url: https://hunter-edge.example.com
+  - url: https://hunter-core.example.com
     description: 生产环境（经网关 /api/v1/scene 转发）
   - url: http://localhost:8081
     description: 本地开发（直连服务）

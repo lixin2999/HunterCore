@@ -35,7 +35,7 @@ class Settings(HunterBaseConfig):
     minio_region: str = "us-east-1"
 
     # ---------- 公网入口（WebRTC 信令/控制通道 URL 下发用；网关 TLS 终结） ----------
-    rc_public_ws_base_url: str = "wss://hunter-edge.example.com"
+    rc_public_ws_base_url: str = "wss://hunter-core.example.com"
 
     # ---------- 控制安全（x-hunter-control-safety；系统约束第 15 条，不可放宽） ----------
     rc_max_speed_mps: float = 2.0          # 远程操控限速（不可上调 >2.0）
@@ -80,7 +80,7 @@ class Settings(HunterBaseConfig):
     rc_srs_whep_url: str = ""
 
     # ---------- WebRTC ICE（STUN/TURN；TURN 走 REST API 短期凭据） ----------
-    rc_stun_urls: str = "stun:stun.hunter-edge.example.com:3478"
+    rc_stun_urls: str = "stun:stun.hunter-core.example.com:3478"
     rc_turn_urls: str = ""
     rc_turn_username: str = ""
     rc_turn_shared_secret: str = ""        # 敏感：生产经 K8s Secret 注入

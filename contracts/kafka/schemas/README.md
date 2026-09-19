@@ -1,7 +1,7 @@
 # contracts/kafka/schemas — 消息 JSON Schema
 
 规范：**JSON Schema draft-07**，文件名 = 消息名 + `.schema.json`，`$id` 固定为
-`https://hunter-edge.local/contracts/kafka/schemas/<name>.schema.json`，每个 Schema 自带 `examples`
+`https://hunter-core.local/contracts/kafka/schemas/<name>.schema.json`，每个 Schema 自带 `examples`
 （设计文档原例），由 `scripts/verify_data_layer.py` 与
 `common/python/tests/test_kafka_contracts.py` 校验：Schema 合法 + examples 通过自身校验 + required/enum 完整。
 

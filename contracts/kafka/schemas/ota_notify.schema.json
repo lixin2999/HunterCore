@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://hunter-edge.local/contracts/kafka/schemas/ota_notify.schema.json",
-  "title": "HunterEdge OTA 升级通知 hunter.{vehicle_id}.ota_notify",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/ota_notify.schema.json",
+  "title": "HunterCore OTA 升级通知 hunter.{vehicle_id}.ota_notify",
   "description": "平台→车 OTA 升级通知（按需，acks=all，key=vehicle_id）。生产者：ota-service；消费者：车端。字段与 ota_svc.ota_versions 对齐；车端下载升级包后必须完成 SHA-256 完整性校验 + RSA-2048 签名验签 + version_code 单调性检查，任一失败即拒绝升级并回报 ota_status=FAILED（错误码 6001/6002）。",
   "type": "object",
   "additionalProperties": false,
@@ -77,7 +77,7 @@
       "task_id": "3f2b1a09-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
       "version_name": "V1.2.0",
       "version_code": 10200,
-      "package_url": "https://minio.hunter-edge.local/hunter-ota-packages/hunter-edge/V1.2.0.tar.gz?X-Amz-Expires=3600",
+      "package_url": "https://minio.hunter-core.local/hunter-ota-packages/hunter-core/V1.2.0.tar.gz?X-Amz-Expires=3600",
       "package_size": 524288000,
       "package_md5": "d41d8cd98f00b204e9800998ecf8427e",
       "package_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",

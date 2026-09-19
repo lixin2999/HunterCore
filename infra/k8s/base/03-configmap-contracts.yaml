@@ -1,5 +1,5 @@
 # =====================================================================
-# HunterEdge Kafka 契约 ConfigMap（由脚本生成，禁止手工编辑）
+# HunterCore Kafka 契约 ConfigMap（由脚本生成，禁止手工编辑）
 #
 # 生成命令：python scripts/generate_contracts_configmap.py
 # 一致性校验：python scripts/generate_contracts_configmap.py --check（CI lint 阶段）
@@ -12,19 +12,19 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: hunter-contracts
-  namespace: hunter-edge
+  namespace: hunter-core
   labels:
     app.kubernetes.io/name: hunter-contracts
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     app.kubernetes.io/component: contracts
   annotations:
-    hunter-edge.local/generated-by: scripts/generate_contracts_configmap.py
-    hunter-edge.local/source: contracts/kafka
+    hunter-core.local/generated-by: scripts/generate_contracts_configmap.py
+    hunter-core.local/source: contracts/kafka
 data:
 
   "consumer-groups.yaml": |-
     # =====================================================================
-    # HunterEdge Kafka 消费者组契约
+    # HunterCore Kafka 消费者组契约
     # 来源：系统上下文基座（Kafka Topic 表）+ 服务职责（模块划分表）
     # 命名规范：<service-name>-<domain>[-<purpose>]，全小写中划线分隔
     #   - 每个 (服务, 数据域) 一个消费组，保证各域 offset 独立、互不阻塞
@@ -158,7 +158,7 @@ data:
   "schemas/alert_event.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/alert_event.schema.json",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/alert_event.schema.json",
       "title": "alert_event",
       "description": "平台内部 Topic alert_event 消息（生产者 data-analytics 的 Flink 1.18 实时作业，设计文档 6.2 节）。消费方：告警处理（⚠ 落位服务待定，见 contracts/kafka/consumer-groups.yaml 的 platform-alert-event）。语义：平台侧基于 telemetry_clean / telemetry_raw 重算触发的告警（与车端上报的 hunter.{vehicle_id}.event 相互独立，禁止混用）；实时告警触发延迟 ≤ 2s（性能指标）。level 必须等于受控词表 EVENT_LEVEL_BY_TYPE[alert_type]（contracts/database/enums.md 第 3 节，不可放宽）。",
       "type": "object",
@@ -366,7 +366,7 @@ data:
   "schemas/analytics_result.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/analytics_result.schema.json",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/analytics_result.schema.json",
       "title": "analytics_result",
       "description": "平台内部 Topic analytics_result 消息（data-analytics Flink/Spark 产出）。消费方：scene-service（实车场景自动提取，设计文档 4.5 节）、上层业务。⚠ 设计文档 5.3 节未给出该消息结构，本契约按 4.5 节所需字段（触发事件、前后各 10 秒数据引用、自车轨迹、周边目标轨迹、环境条件）定义，需人工确认。",
       "type": "object",
@@ -572,8 +572,8 @@ data:
   "schemas/command.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/command.schema.json",
-      "title": "HunterEdge 控制指令 hunter.{vehicle_id}.command / hunter.broadcast.command",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/command.schema.json",
+      "title": "HunterCore 控制指令 hunter.{vehicle_id}.command / hunter.broadcast.command",
       "description": "平台→车控制指令（按需下发，acks=all）。生产者：api-gateway / ota-service / remote-control；消费者：车端。单车辆消息必须携带 vehicle_id（= 消息 key）；广播消息改用 target_filter（二选一，oneOf 强制）。command_type 取值域待设计文档 5.3 节核对（⚠ 当前不设 enum，禁止前端硬编码分支）。",
       "type": "object",
       "additionalProperties": false,
@@ -652,8 +652,8 @@ data:
   "schemas/command_result.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/command_result.schema.json",
-      "title": "HunterEdge 指令执行结果 hunter.{vehicle_id}.command_result",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/command_result.schema.json",
+      "title": "HunterCore 指令执行结果 hunter.{vehicle_id}.command_result",
       "description": "车端→平台指令执行结果（按需，acks=all）。消费者：data-collector（留痕/审计）、remote-control（操控指令回执；>500ms 无回执视为链路异常）。command_id 必须与请求一致，保证端到端可追溯与幂等。",
       "type": "object",
       "additionalProperties": false,
@@ -715,8 +715,8 @@ data:
   "schemas/event.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/event.schema.json",
-      "title": "HunterEdge 事件消息 hunter.{vehicle_id}.event / event_raw",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/event.schema.json",
+      "title": "HunterCore 事件消息 hunter.{vehicle_id}.event / event_raw",
       "description": "车辆事件（事件触发上报）。生产者：车端；消费者：data-collector（落库 data_collector.events）。event_type/event_level 取值与阈值见 contracts/database/enums.md 第 2、3 节，不可更改；类型↔等级映射由 data-collector 消费侧按 EVENT_LEVEL_BY_TYPE 校验（JSON Schema 不做跨字段映射校验）。",
       "type": "object",
       "additionalProperties": false,
@@ -784,8 +784,8 @@ data:
   "schemas/health.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/health.schema.json",
-      "title": "HunterEdge 系统健康消息 hunter.{vehicle_id}.health",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/health.schema.json",
+      "title": "HunterCore 系统健康消息 hunter.{vehicle_id}.health",
       "description": "车辆系统健康数据（1Hz，acks=0）。生产者：车端；消费者：data-collector（写 Redis vehicle:status:{vehicle_id} / vehicle:online:set，不落明细表）。status 取值 = 车辆状态定义（8 态，不可更改）；system 段字段与遥测消息 system 段完全一致（复用采集代码）。⚠ 磁盘/服务进程等扩展健康字段待设计文档 5.3 节核对。",
       "type": "object",
       "additionalProperties": false,
@@ -836,8 +836,8 @@ data:
   "schemas/ota_notify.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/ota_notify.schema.json",
-      "title": "HunterEdge OTA 升级通知 hunter.{vehicle_id}.ota_notify",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/ota_notify.schema.json",
+      "title": "HunterCore OTA 升级通知 hunter.{vehicle_id}.ota_notify",
       "description": "平台→车 OTA 升级通知（按需，acks=all，key=vehicle_id）。生产者：ota-service；消费者：车端。字段与 ota_svc.ota_versions 对齐；车端下载升级包后必须完成 SHA-256 完整性校验 + RSA-2048 签名验签 + version_code 单调性检查，任一失败即拒绝升级并回报 ota_status=FAILED（错误码 6001/6002）。",
       "type": "object",
       "additionalProperties": false,
@@ -913,7 +913,7 @@ data:
           "task_id": "3f2b1a09-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
           "version_name": "V1.2.0",
           "version_code": 10200,
-          "package_url": "https://minio.hunter-edge.local/hunter-ota-packages/hunter-edge/V1.2.0.tar.gz?X-Amz-Expires=3600",
+          "package_url": "https://minio.hunter-core.local/hunter-ota-packages/hunter-core/V1.2.0.tar.gz?X-Amz-Expires=3600",
           "package_size": 524288000,
           "package_md5": "d41d8cd98f00b204e9800998ecf8427e",
           "package_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -926,8 +926,8 @@ data:
   "schemas/ota_status.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/ota_status.schema.json",
-      "title": "HunterEdge OTA 状态上报 hunter.{vehicle_id}.ota_status",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/ota_status.schema.json",
+      "title": "HunterCore OTA 状态上报 hunter.{vehicle_id}.ota_status",
       "description": "车端→平台 OTA 状态上报（状态变更触发，acks=all）。消费者：ota-service（推进 ota_svc.ota_records.status/phase/progress，同步 Redis ota:progress:{task_id}）。status/phase 取值 = 车端 OTA 状态机 IDLE→PENDING→DOWNLOAD→INSTALL→TEST→SUCCESS，自检失败 → ROLLBACK → ROLLED_BACK/FAILED，不可更改。",
       "type": "object",
       "additionalProperties": false,
@@ -1011,8 +1011,8 @@ data:
   "schemas/remote_control.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/remote_control.schema.json",
-      "title": "HunterEdge 远程操控指令 hunter.{vehicle_id}.remote_control",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/remote_control.schema.json",
+      "title": "HunterCore 远程操控指令 hunter.{vehicle_id}.remote_control",
       "description": "平台→车远程操控指令（20Hz，即 50ms 间隔，acks=all，key=vehicle_id）。生产者：remote-control；消费者：车端。安全约束：车端 >500ms 未收到控制指令必须自动减速停车；远程操控模式最高速度默认 2.0 m/s（可配置）；同一车辆同一时刻仅允许一名操作员（Redis rc:session:{vehicle_id} 互斥）。",
       "type": "object",
       "additionalProperties": false,
@@ -1089,8 +1089,8 @@ data:
   "schemas/sensor_file.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/sensor_file.schema.json",
-      "title": "HunterEdge 传感器文件通知 sensor_file",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/sensor_file.schema.json",
+      "title": "HunterCore 传感器文件通知 sensor_file",
       "description": "平台内部 Topic `sensor_file`（3 分区，保留 7 天，key = vehicle_id）。生产者：data-collector（文件上传完成且完整性校验通过后投递，见设计文档 5.5 节）；消费者：data-analytics（离线分析，幂等键 = object_key）。消息只包含 MinIO 对象元信息，不含文件本体；对象路径遵循 5.5 节命名规范 {bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}。校验依据：bucket/object_key/size/md5/sha256 必须与 MinIO 实际对象一致（不一致时 data-collector 返回错误码 6001，不投递本消息）。",
       "type": "object",
       "additionalProperties": false,
@@ -1186,8 +1186,8 @@ data:
   "schemas/telemetry.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
-      "$id": "https://hunter-edge.local/contracts/kafka/schemas/telemetry.schema.json",
-      "title": "HunterEdge 遥测消息 hunter.{vehicle_id}.telemetry",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/telemetry.schema.json",
+      "title": "HunterCore 遥测消息 hunter.{vehicle_id}.telemetry",
       "description": "车辆遥测（10-50Hz）。生产者：车端（HUNTER SE / AGX Orin）；消费者：data-collector → telemetry_raw / data_collector.vehicle_telemetry。字段名/类型/嵌套结构不可更改（来源：设计文档 5.3 节）。additionalProperties=false：新增字段必须先更新契约。",
       "type": "object",
       "additionalProperties": false,
@@ -1333,7 +1333,7 @@ data:
     }
   "topics.yaml": |-
     # =====================================================================
-    # HunterEdge Kafka Topic 契约（单一事实来源）
+    # HunterCore Kafka Topic 契约（单一事实来源）
     # 来源：设计文档 5.3 节 + 系统上下文基座「Kafka Topic 命名与配置」
     # 命名规范：<domain>.<entity>.<type>，全小写点分隔；车端 Topic 为 hunter.{vehicle_id}.<type>
     # 约束：禁止自行新增 Topic 或更改配置；变更需同步

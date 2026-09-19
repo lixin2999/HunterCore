@@ -1,5 +1,5 @@
 # =====================================================================
-# HunterEdge Redis Key 契约（单一事实来源）
+# HunterCore Redis Key 契约（单一事实来源）
 #
 # 来源：系统关键约束第 8 条「Redis Key 设计（不可更改命名模式）」+ 设计文档 9.5 节
 # 客户端：redis-py 异步封装 hunter_common/redis.py（RedisManager，进程级单例）

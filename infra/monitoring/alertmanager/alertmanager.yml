@@ -32,17 +32,17 @@ inhibit_rules:
 receivers:
   - name: hunter-default
     webhook_configs:
-      - url: "http://alert-webhook.hunter-edge.svc.cluster.local:8080/alerts"
+      - url: "http://alert-webhook.hunter-core.svc.cluster.local:8080/alerts"
         send_resolved: true
 
   - name: hunter-critical
     webhook_configs:
-      - url: "http://alert-webhook.hunter-edge.svc.cluster.local:8080/alerts/critical"
+      - url: "http://alert-webhook.hunter-core.svc.cluster.local:8080/alerts/critical"
         send_resolved: true
     # 邮件通道示例（SMTP 凭据走环境变量替换，禁止明文）
     # email_configs:
-    #   - to: "oncall@hunter-edge.example.com"
-    #     from: "alertmanager@hunter-edge.example.com"
+    #   - to: "oncall@hunter-core.example.com"
+    #     from: "alertmanager@hunter-core.example.com"
     #     smarthost: "smtp.example.com:587"
     #     auth_username: "$SMTP_USER"
     #     auth_password: "$SMTP_PASSWORD"

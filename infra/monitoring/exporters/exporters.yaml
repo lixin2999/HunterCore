@@ -1,7 +1,7 @@
 # =====================================================================
 # 指标采集器（exporters）
 # 命名空间 monitoring：node-exporter 需要 hostPath/hostNetwork，
-# 不满足 hunter-edge 命名空间的 pod-security=restricted 约束，故独立命名空间部署。
+# 不满足 hunter-core 命名空间的 pod-security=restricted 约束，故独立命名空间部署。
 # ⚠ prometheus.yml 中 exporter 目标地址使用 *.monitoring.svc.cluster.local（保持一致）
 # =====================================================================
 apiVersion: v1
@@ -9,7 +9,7 @@ kind: Namespace
 metadata:
   name: monitoring
   labels:
-    app.kubernetes.io/part-of: hunter-edge
+    app.kubernetes.io/part-of: hunter-core
     pod-security.kubernetes.io/enforce: privileged   # 仅 node-exporter 需要（host 网络与文件系统）
 ---
 # =====================================================================
@@ -102,7 +102,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: hunter-edge-kube-state-metrics
+  name: hunter-core-kube-state-metrics
 rules:
   - apiGroups: [""]
     resources: ["configmaps", "secrets", "nodes", "pods", "services", "resourcequotas", "replicationcontrollers", "limitranges", "persistentvolumeclaims", "persistentvolumes", "namespaces", "endpoints"]
@@ -123,11 +123,11 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: hunter-edge-kube-state-metrics
+  name: hunter-core-kube-state-metrics
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: hunter-edge-kube-state-metrics
+  name: hunter-core-kube-state-metrics
 subjects:
   - kind: ServiceAccount
     name: kube-state-metrics
@@ -223,7 +223,7 @@ spec:
               containerPort: 9187
           env:
             - name: DATA_SOURCE_URI
-              value: "postgres.hunter-edge.svc.cluster.local:5432/hunter_edge?sslmode=disable"
+              value: "postgres.hunter-core.svc.cluster.local:5432/hunter_core?sslmode=disable"
             - name: DATA_SOURCE_USER
               valueFrom:
                 configMapKeyRef:
@@ -299,7 +299,7 @@ spec:
               containerPort: 9121
           env:
             - name: REDIS_ADDR
-              value: "redis://redis.hunter-edge.svc.cluster.local:6379"
+              value: "redis://redis.hunter-core.svc.cluster.local:6379"
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -365,9 +365,9 @@ spec:
           image: danielqsj/kafka-exporter:v1.7.0
           imagePullPolicy: IfNotPresent
           args:
-            - "--kafka.server=kafka-0.kafka-headless.hunter-edge.svc.cluster.local:9093"
-            - "--kafka.server=kafka-1.kafka-headless.hunter-edge.svc.cluster.local:9093"
-            - "--kafka.server=kafka-2.kafka-headless.hunter-edge.svc.cluster.local:9093"
+            - "--kafka.server=kafka-0.kafka-headless.hunter-core.svc.cluster.local:9093"
+            - "--kafka.server=kafka-1.kafka-headless.hunter-core.svc.cluster.local:9093"
+            - "--kafka.server=kafka-2.kafka-headless.hunter-core.svc.cluster.local:9093"
             - "--sasl.enabled"
             - "--sasl.mechanism=scram-sha512"
             - "--sasl.username=$(KAFKA_SASL_USERNAME)"

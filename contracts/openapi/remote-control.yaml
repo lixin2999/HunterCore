@@ -1,7 +1,7 @@
 openapi: 3.0.3
 
 info:
-  title: HunterEdge - remote-control
+  title: HunterCore - remote-control
   version: 0.1.0
   description: |
     远程操控服务 REST 契约（网关前缀 `/api/v1/remote` → remote-control:8085；
@@ -38,12 +38,12 @@ info:
     - 视频：H.264 硬编码（车端 AGX Orin NVENC）720p@30fps、2–4 Mbps、关键帧间隔 1s
     - 会话心跳 10s（`x-hunter-session-heartbeat`）；操控录像保留 **90 天**（`hunter-video`）
   contact:
-    name: HunterEdge Platform Team
+    name: HunterCore Platform Team
   license:
     name: Proprietary
 
 servers:
-  - url: https://api.hunter-edge.example.com
+  - url: https://api.hunter-core.example.com
     description: 经 API 网关（8080）统一入口；网关按前缀 /api/v1/remote 转发至 remote-control:8085
   - url: http://remote-control:8085
     description: 集群内直连（mTLS；仅联调与内部调用使用）
@@ -791,11 +791,11 @@ components:
         signal_ws_url:
           type: string
           description: WebRTC 信令通道（WSS；JWT 经握手 Authorization 头携带，禁止查询串明文 Token）
-          example: "wss://api.hunter-edge.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/signal"
+          example: "wss://api.hunter-core.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/signal"
         control_ws_url:
           type: string
           description: 控制指令通道（WSS；20Hz 指令 + 回执 + 10s 心跳）
-          example: "wss://api.hunter-edge.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/control"
+          example: "wss://api.hunter-core.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/control"
         publisher: { type: string, enum: [vehicle], description: 车端为唯一发布方（前端只订阅） }
         subscriber: { type: string, enum: [browser], description: 浏览器为订阅方（前端不得推流） }
         transport: { type: string, enum: [srtp], description: WebRTC SRTP（UDP 优先 / TCP 兜底，TLS 1.3 信令） }
@@ -805,12 +805,12 @@ components:
           items: { $ref: "#/components/schemas/IceServer" }
         media_server: { $ref: "#/components/schemas/SrsMediaInfo" }
       example:
-        signal_ws_url: "wss://api.hunter-edge.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/signal"
-        control_ws_url: "wss://api.hunter-edge.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/control"
+        signal_ws_url: "wss://api.hunter-core.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/signal"
+        control_ws_url: "wss://api.hunter-core.example.com/ws/remote/6f1c2b8e-6c1f-4a3a-9b8c-2f3a1d5e7b90/control"
         publisher: vehicle
         subscriber: browser
         transport: srtp
-        ice_servers: [{ urls: ["stun:stun.hunter-edge.example.com:3478"], credential_ttl_s: 7200 }]
+        ice_servers: [{ urls: ["stun:stun.hunter-core.example.com:3478"], credential_ttl_s: 7200 }]
         media_server: { app: remote_control, stream: HUNTER-001_6f1c2b8e }
 
     IceServer:
@@ -818,7 +818,7 @@ components:
       description: ICE 服务器（STUN/TURN）；TURN 凭证随会话短期签发，禁止写入日志
       required: [urls]
       properties:
-        urls: { type: array, items: { type: string }, example: ["turn:turn.hunter-edge.example.com:3478?transport=udp"] }
+        urls: { type: array, items: { type: string }, example: ["turn:turn.hunter-core.example.com:3478?transport=udp"] }
         username: { type: string, description: 短期 TURN 凭证用户名（禁止写入日志/审计） }
         credential: { type: string, description: 短期 TURN 凭证（禁止写入日志/审计） }
         credential_ttl_s: { type: integer, minimum: 1, description: 凭证有效期（秒），应覆盖会话时长 }
