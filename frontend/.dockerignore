@@ -1,0 +1,11 @@
+# web-portal 构建上下文排除（docker build 上下文 = ./frontend）
+node_modules
+dist
+dist-ssr
+.env.local
+.env.*.local
+*.log
+.DS_Store
+.vscode
+.idea
+npm-debug.log*

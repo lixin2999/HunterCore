@@ -1,0 +1,600 @@
+# =====================================================================
+# HunterCore 单机生产部署包 — Docker Compose 编排（infra/deploy/docker-compose.yml）
+# 部署落位：复制到 ${APP_DIR}/docker-compose.yml（默认 /opt/hunter-edge/docker-compose.yml）
+# 驱动脚本：scripts/install.sh（step_6 构建 → step_7 中间件 → step_8~10 数据初始化 →
+#           step_11 业务服务 → step_12 健康检查）；容器名必须与 scripts/common.sh 的 C_* 常量一致。
+#
+# ⚠ 关键设计（与仓库既有决策/契约对齐，勿随意按通用模板改动）：
+#   1) 变量名与 hunter_common.config.HunterBaseConfig 字段一一对应（大小写不敏感、无 env_prefix）：
+#      POSTGRES_* / REDIS_* / KAFKA_* / MINIO_* / JWT_SECRET_KEY / ENVIRONMENT。
+#      —— 不使用 DB_HOST / TS_HOST / JWT_SECRET 等模板名，否则服务读不到配置。
+#   2) 数据库为“单实例”形态：TimescaleDB 是 PostgreSQL 扩展，业务表与时序表同库
+#      （contracts/database 契约固定，services 仅读 POSTGRES_*）。因此【不】拆分独立 timescale 容器。
+#      install.sh 用 compose_service_exists timescale 兼容可选实例；如需拆分请先改契约与 6 服务配置。
+#   3) 业务镜像为 distroless（python3-debian12:nonroot，无 shell/无 curl）：
+#      容器健康检查用 `python3 -c` 探测 /healthz；不引入 entrypoint.sh + curl 方案（会破坏非 root 与最小攻击面约束）。
+#   4) Kafka 内部监听 SASL_PLAINTEXT（SCRAM-SHA-512）、对外 SASL_SSL；关闭自动建 Topic
+#      （Topic 由 scripts/init-kafka.sh 按契约创建）—— 与“生产禁止 PLAINTEXT/禁止隐式建 Topic”一致。
+#   5) 数据全部 bind mount 到 ${DATA_DIR:-/data}；对外仅 80 与 8080，其余中间件/业务端口只绑 127.0.0.1（DBA/运维工具用）。
+#   6) Flink Web UI 容器内 8081 与 scene-service 冲突 → 宿主机改用 ${FLINK_UI_HOST_PORT:-8088}。
+#   7) 日志轮转（json-file 100m×5）由 /etc/docker/daemon.json 全局兜底；此处再显式声明一次以自证。
+#   8) build.context 使用 `.`（= APP_DIR，仓库根复制到部署目录后包含 common/ services/ frontend/ contracts/）；
+#      生产环境镜像通常已由 CI 构建/导入，`docker compose up -d <svc>` 命中已有 image 即不重建。
+#
+# 相对路径均相对于本 compose 文件所在目录（APP_DIR）：./config、./certs、./sql、./services、./frontend、./contracts、./flink-jobs。
+# =====================================================================
+
+# ---------- 可复用锚点 ----------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "5"
+
+# 业务服务通用运行环境（真实 pydantic-settings 字段名；各服务再叠加私有变量）
+x-business-env: &business-env
+  TZ: ${TZ:-Asia/Shanghai}
+  ENVIRONMENT: ${ENVIRONMENT:-prod}        # dev|test|staging|prod；prod 会拒绝默认凭据（config 强校验）
+  DEBUG: ${DEBUG:-false}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  API_HOST: "0.0.0.0"
+  CORS_ORIGINS: ${CORS_ORIGINS}
+  # PostgreSQL 15 + TimescaleDB（单实例，业务/时序同库）
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: ${POSTGRES_DB}
+  # Redis 7
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  REDIS_DB: ${REDIS_DB:-0}
+  # Kafka（容器间走内部监听 9092 = SASL_PLAINTEXT + SCRAM-SHA-512）
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_SECURITY_PROTOCOL: ${KAFKA_INTERNAL_SECURITY_PROTOCOL:-SASL_PLAINTEXT}
+  KAFKA_SASL_MECHANISM: ${KAFKA_SASL_MECHANISM:-SCRAM-SHA-512}
+  KAFKA_SASL_USERNAME: ${KAFKA_SASL_USER}
+  KAFKA_SASL_PASSWORD: ${KAFKA_SASL_PASSWORD}
+  KAFKA_CONTRACT_DIR: ${KAFKA_CONTRACT_DIR:-/app/contracts/kafka}
+  KAFKA_LOCAL_BUFFER_DIR: ${KAFKA_LOCAL_BUFFER_DIR:-/app/data/kafka-buffer}
+  KAFKA_LOCAL_BUFFER_ENABLED: ${KAFKA_LOCAL_BUFFER_ENABLED:-true}
+  # MinIO（S3 兼容对象存储）
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+  MINIO_SECURE: ${MINIO_SECURE:-false}
+  # JWT / 认证
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+  JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-120}
+  JWT_REFRESH_TOKEN_EXPIRE_DAYS: ${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-7}
+
+# 业务服务通用挂载：Kafka 契约目录只读（标量锚点，供各服务 volumes 列表项引用）
+x-contracts-vol: &contracts-vol ./contracts:/app/contracts:ro
+
+services:
+  # ===================================================================
+  # 中间件层
+  # ===================================================================
+
+  # ---------- 1. PostgreSQL 15 + TimescaleDB 2.13（单实例：业务库 hunter_core + 时序表同库） ----------
+  postgres:
+    image: timescale/timescaledb:2.13.1-pg15
+    container_name: hunter-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: ${TZ:-Asia/Shanghai}
+    # 仅绑 127.0.0.1（DBA/运维工具），不对外网暴露
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - ${DATA_DIR:-/data}/postgresql:/var/lib/postgresql/data
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }      # 生产建议 4C/8Gi 并配置主从流复制
+        requests: { cpus: "1", memory: 2G }
+    # ⚠ 数据库结构由 scripts/init-db.sh 应用 infra/deploy/sql/{schema,timescaledb,init-data}.sql（勿依赖镜像内 init 脚本）
+
+  # ---------- 2. Redis 7（会话/缓存/分布式锁/限流；AOF 持久化） ----------
+  redis:
+    image: redis:7.2-alpine
+    container_name: hunter-redis
+    # 注意：maxmemory-policy=noeviction —— 会话与分布式锁不可被淘汰（与 K8s 清单一致，勿改 allkeys-lru）
+    command:
+      ["redis-server", "--requirepass", "${REDIS_PASSWORD}",
+       "--appendonly", "${REDIS_APPENDONLY:-yes}",
+       "--maxmemory", "${REDIS_MAXMEMORY:-2gb}",
+       "--maxmemory-policy", "${REDIS_MAXMEMORY_POLICY:-noeviction}"]
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - ${DATA_DIR:-/data}/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a '${REDIS_PASSWORD}' ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 2G }
+
+  # ---------- 3. ZooKeeper 3.8（Kafka 协调；单机开发允许匿名，生产启用 SASL digest） ----------
+  zookeeper:
+    image: bitnami/zookeeper:3.8
+    container_name: hunter-zookeeper
+    user: "1001:1001"          # bitnami 镜像非 root
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"    # ⚠ 生产启用认证：设为 no 并配 ZOO_ENABLE_AUTH/ZOO_SERVER_USERS/ZOO_SERVER_PASSWORDS
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:2181:2181"
+    volumes:
+      - ${DATA_DIR:-/data}/zookeeper:/bitnami/zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2181 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 2G }
+
+  # ---------- 4. Kafka 3.6（ZooKeeper 模式；内部 9092=SASL_PLAINTEXT，对外 9093=SASL_SSL） ----------
+  kafka:
+    image: bitnami/kafka:3.6
+    container_name: hunter-kafka
+    user: "1001:1001"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: ${KAFKA_BROKER_ID:-1}
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      # 三监听器：INTERNAL(容器间/业务服务) / EXTERNAL(车端，宿主机映射) / BROKER(inter-broker)
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_SSL,BROKER:SASL_PLAINTEXT
+      KAFKA_CFG_LISTENERS: INTERNAL://:9092,EXTERNAL://:9093,BROKER://:9094
+      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${SERVER_IP}:9093
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: BROKER
+      # SASL/SCRAM 机制（inter-broker 与 INTERNAL 走 SCRAM；账号由 bitnami 依下列变量创建）
+      KAFKA_CFG_SASL_ENABLED_MECHANISMS: SCRAM-SHA-512
+      KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL: SCRAM-SHA-512
+      KAFKA_INTER_BROKER_USER: ${KAFKA_SASL_USER}
+      KAFKA_INTER_BROKER_PASSWORD: ${KAFKA_SASL_PASSWORD}
+      KAFKA_CLIENT_USERS: ${KAFKA_SASL_USER},${KAFKA_SASL_VEHICLE_USER}
+      KAFKA_CLIENT_PASSWORDS: ${KAFKA_SASL_PASSWORD},${KAFKA_SASL_VEHICLE_PASSWORD}
+      # 对外 SASL_SSL 需要的 broker 密钥库/信任库（gen-kafka-certs.sh 生成的 JKS，只读挂载）
+      KAFKA_CFG_SSL_KEYSTORE_LOCATION: /opt/bitnami/kafka/config/certs/kafka.keystore.jks
+      KAFKA_CFG_SSL_KEYSTORE_PASSWORD: ${KAFKA_SSL_PASSWORD}
+      KAFKA_CFG_SSL_KEY_PASSWORD: ${KAFKA_SSL_PASSWORD}
+      KAFKA_CFG_SSL_TRUSTSTORE_LOCATION: /opt/bitnami/kafka/config/certs/kafka.truststore.jks
+      KAFKA_CFG_SSL_TRUSTSTORE_PASSWORD: ${KAFKA_SSL_PASSWORD}
+      KAFKA_CFG_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""    # 开发放宽主机名校验；生产按证书 SAN 收紧
+      # 保留与分区（内部 Topic 单独由 init-kafka.sh 按契约覆盖）
+      KAFKA_CFG_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-168}
+      KAFKA_CFG_NUM_PARTITIONS: ${KAFKA_NUM_PARTITIONS:-12}
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: ${KAFKA_AUTO_CREATE_TOPICS_ENABLE:-false}   # 契约：禁止隐式建 Topic
+      KAFKA_CFG_MESSAGE_MAX_BYTES: "10485760"
+      KAFKA_CFG_LOG_DIRS: /bitnami/kafka/data
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:9092:9092"     # 内部监听（宿主机运维工具用，仅回环）
+      - "${SERVER_IP}:${KAFKA_EXTERNAL_LISTEN_PORT:-9093}:9093"   # 车端 SASL_SSL 接入（需真实 SERVER_IP）
+    volumes:
+      - ${DATA_DIR:-/data}/kafka:/bitnami/kafka
+      - ./certs/kafka:/opt/bitnami/kafka/config/certs:ro
+    healthcheck:
+      # 内部监听为 SASL_PLAINTEXT，容器内 --list 需凭据；此处仅探活 broker 端口（就绪由此 + install.sh 双重判定）
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }     # 生产 4C/8Gi + replication-factor≥3
+
+  # ---------- 5. MinIO（S3 兼容对象存储；单机开发模式，7 Bucket 由 init-minio.sh 创建） ----------
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z   # 固定 release tag；升级需同步 minio/mc 客户端
+    container_name: hunter-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_SERVER_URL: http://${SERVER_IP}:9000
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "9000:9000"        # 车端/前端预签名下载直连 API（对外）
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"   # Console 仅回环，经 SSH 隧道访问
+    volumes:
+      - ${DATA_DIR:-/data}/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }     # 生产用分布式多节点纠删码；单节点仅供开发测试
+
+  # ---------- 6. SRS 5.0（RTMP 1935 / WebRTC 8000udp / HTTP API 9090；远程操控视频流） ----------
+  srs:
+    image: ossrs/srs:5
+    container_name: hunter-srs
+    command: ["./objs/srs", "-c", "conf/srs.conf"]
+    ports:
+      - "${SRS_RTMP_PORT:-1935}:1935"           # 车端 RTMP 推流
+      - "${SRS_RTC_UDP_PORT:-8000}:8000/udp"    # WebRTC 媒体
+      - "127.0.0.1:${SRS_HTTP_API_HOST_PORT:-9090}:9090"   # HTTP API / WHEP 信令（仅回环）
+    volumes:
+      - ./config/srs.conf:/usr/local/srs/conf/srs.conf:ro
+      - ${DATA_DIR:-/data}/srs:/usr/local/srs/objs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/api/v1/versions"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }
+
+  # ---------- 7. Flink 1.18（实时分析；JobManager Web UI 容器 8081 → 宿主机 8088） ----------
+  flink-jm:
+    image: flink:1.18.1-scala_2.12-java17
+    container_name: hunter-flink-jm
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jm
+        jobmanager.memory.process.size: ${FLINK_JM_PROCESS_MEM:-2048m}
+        classloader.check-leaked-classloader: false
+        state.checkpoints.dir: file:///opt/flink/data/checkpoints
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:${FLINK_UI_HOST_PORT:-8088}:8081"
+    volumes:
+      - ${DATA_DIR:-/data}/flink:/opt/flink/data
+      - ./flink-jobs:/opt/flink/jobs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }
+
+  flink-tm:
+    image: flink:1.18.1-scala_2.12-java17
+    container_name: hunter-flink-tm
+    command: taskmanager
+    depends_on:
+      flink-jm:
+        condition: service_healthy
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jm
+        taskmanager.memory.process.size: ${FLINK_TM_PROCESS_MEM:-4096m}
+        taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-2}
+        classloader.check-leaked-classloader: false
+        state.checkpoints.dir: file:///opt/flink/data/checkpoints
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ${DATA_DIR:-/data}/flink:/opt/flink/data
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "4", memory: 8G }     # 开发 scale 1，生产 2+（--scale flink-tm=N）
+
+  # ===================================================================
+  # 业务服务层（image: ${IMAGE_PREFIX:-hunter}/{name}:${VERSION}；多阶段 distroless，/healthz 探针）
+  # ===================================================================
+
+  # ---------- 8. api-gateway（对外 8080；上游路由表注入） ----------
+  api-gateway:
+    image: ${IMAGE_PREFIX:-hunter}/api-gateway:${VERSION}
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-api-gateway
+    environment:
+      <<: *business-env
+      SERVICE_NAME: api-gateway
+      API_PORT: "8080"
+      # 网关上游路由表（hunter-net 内 DNS 服务名）
+      SCENE_SERVICE_URL: ${SCENE_SERVICE_URL:-http://scene-service:8081}
+      DATA_COLLECTOR_SERVICE_URL: ${DATA_COLLECTOR_SERVICE_URL:-http://data-collector:8082}
+      DATA_ANALYTICS_SERVICE_URL: ${DATA_ANALYTICS_SERVICE_URL:-http://data-analytics:8083}
+      OTA_SERVICE_URL: ${OTA_SERVICE_URL:-http://ota-service:8084}
+      REMOTE_CONTROL_SERVICE_URL: ${REMOTE_CONTROL_SERVICE_URL:-http://remote-control:8085}
+      RATE_LIMIT_GLOBAL_QPS: ${RATE_LIMIT_GLOBAL_QPS:-10000}
+      RATE_LIMIT_PER_USER_QPS: ${RATE_LIMIT_PER_USER_QPS:-100}
+      RATE_LIMIT_PER_IP_QPS: ${RATE_LIMIT_PER_IP_QPS:-200}
+    ports:
+      - "${API_GATEWAY_PORT:-8080}:8080"        # 对外唯一业务入口
+    volumes:
+      - *contracts-vol
+      - ${DATA_DIR:-/data}/kafka-buffer/api-gateway:/app/data/kafka-buffer
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 2G }
+
+  # ---------- 9. scene-service（8081；Carla/场景私有配置） ----------
+  scene-service:
+    image: ${IMAGE_PREFIX:-hunter}/scene-service:${VERSION}
+    build:
+      context: .
+      dockerfile: services/scene-service/Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-scene
+    environment:
+      <<: *business-env
+      SERVICE_NAME: scene-service
+      API_PORT: "8081"
+      # 私有：MinIO 场景资源 Bucket + Carla 管理 API（详见 infra/deploy/.env.example §scene-service）
+      MINIO_BUCKET_SCENE_ASSETS: ${MINIO_BUCKET_SCENE_ASSETS:-hunter-scene-assets}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      CARLA_MANAGEMENT_ENDPOINT: ${CARLA_MANAGEMENT_ENDPOINT:-}
+      SCENE_EXTRACTION_CONSUMER_ENABLED: ${SCENE_EXTRACTION_CONSUMER_ENABLED:-true}
+    ports:
+      - "127.0.0.1:${SCENE_SERVICE_PORT:-8081}:8081"
+    volumes:
+      - *contracts-vol
+      - ${DATA_DIR:-/data}/kafka-buffer/scene-service:/app/data/kafka-buffer
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 2G }
+
+  # ---------- 10. data-collector（8082；消费遥测写入时序/原始数据到 MinIO） ----------
+  data-collector:
+    image: ${IMAGE_PREFIX:-hunter}/data-collector:${VERSION}
+    build:
+      context: .
+      dockerfile: services/data-collector/Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-collector
+    environment:
+      <<: *business-env
+      SERVICE_NAME: data-collector
+      API_PORT: "8082"
+      # 私有：消费组等（契约 consumer-groups.yaml；其余走 KAFKA_CONTRACT_DIR 校验）
+    ports:
+      - "127.0.0.1:${DATA_COLLECTOR_PORT:-8082}:8082"
+    volumes:
+      - *contracts-vol
+      - ${DATA_DIR:-/data}/kafka-buffer/data-collector:/app/data/kafka-buffer
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }
+
+  # ---------- 11. data-analytics（8083；提交/监控 Flink 作业，读时序结果） ----------
+  data-analytics:
+    image: ${IMAGE_PREFIX:-hunter}/data-analytics:${VERSION}
+    build:
+      context: .
+      dockerfile: services/data-analytics/Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-analytics
+    environment:
+      <<: *business-env
+      SERVICE_NAME: data-analytics
+      API_PORT: "8083"
+      FLINK_JM_URL: ${FLINK_JM_URL:-http://flink-jm:8081}   # 私有：访问 JobManager REST
+    ports:
+      - "127.0.0.1:${DATA_ANALYTICS_PORT:-8083}:8083"
+    volumes:
+      - *contracts-vol
+      - ${DATA_DIR:-/data}/kafka-buffer/data-analytics:/app/data/kafka-buffer
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      flink-jm: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }
+
+  # ---------- 12. ota-service（8084；OTA 包管理/下发，包体存 MinIO） ----------
+  ota-service:
+    image: ${IMAGE_PREFIX:-hunter}/ota-service:${VERSION}
+    build:
+      context: .
+      dockerfile: services/ota-service/Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-ota
+    environment:
+      <<: *business-env
+      SERVICE_NAME: ota-service
+      API_PORT: "8084"
+      MINIO_BUCKET_OTA_PACKAGES: ${MINIO_BUCKET_OTA_PACKAGES:-hunter-ota-packages}   # 私有
+    ports:
+      - "127.0.0.1:${OTA_SERVICE_PORT:-8084}:8084"
+    volumes:
+      - *contracts-vol
+      - ${DATA_DIR:-/data}/kafka-buffer/ota-service:/app/data/kafka-buffer
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8084/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 2G }
+
+  # ---------- 13. remote-control（8085；WebRTC/RTMP 会话，指令 20Hz） ----------
+  remote-control:
+    image: ${IMAGE_PREFIX:-hunter}/remote-control:${VERSION}
+    build:
+      context: .
+      dockerfile: services/remote-control/Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-remote
+    environment:
+      <<: *business-env
+      SERVICE_NAME: remote-control
+      API_PORT: "8085"
+      # 私有：SRS 地址与操控参数（详见 .env.example §remote-control）
+      RC_SRS_RTMP_URL: ${RC_SRS_RTMP_URL:-rtmp://srs:1935/remote_control}
+      RC_SRS_WHEP_URL: ${RC_SRS_WHEP_URL:-http://srs:9090/rtc/v1/whep/}
+      RC_PUBLIC_WS_BASE_URL: ${RC_PUBLIC_WS_BASE_URL:-ws://${SERVER_IP}/ws/remote}
+      RC_STUN_URLS: ${RC_STUN_URLS:-stun:${SERVER_IP}:8000}
+      RC_COMMAND_HZ: ${RC_COMMAND_HZ:-20}
+      RC_MAX_SPEED_MPS: ${RC_MAX_SPEED_MPS:-2.0}
+    ports:
+      - "127.0.0.1:${REMOTE_CONTROL_PORT:-8085}:8085"
+    volumes:
+      - *contracts-vol
+      - ${DATA_DIR:-/data}/kafka-buffer/remote-control:/app/data/kafka-buffer
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      srs: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }
+
+  # ---------- 14. web-portal（Nginx + Vue3 dist；对外 80，同源反代 /api 与 /ws） ----------
+  web-portal:
+    image: ${IMAGE_PREFIX:-hunter}/web-portal:${VERSION}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-web
+    ports:
+      - "${WEB_PORT:-80}:80"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro     # 用法 A：整份 nginx.conf 覆盖
+    depends_on:
+      api-gateway: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 512M }
+
+# ---------- 顶层配置 ----------
+networks:
+  hunter-net:
+    external: true      # 需提前：docker network create --driver bridge --subnet 172.28.0.0/16 hunter-net
+
+# 全部有状态数据使用 bind mount（${DATA_DIR:-/data}），不定义命名卷
