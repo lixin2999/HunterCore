@@ -53,11 +53,12 @@ from app.schemas.tasks import (
     OtaTaskStartRequest,
     OtaUpgradeStrategy,
 )
-from app.services.gates import GateResult, VehicleStateReader, check_vehicle
+from app.services.gates import GateResult, VehicleStateReader, check_batch, check_vehicle
 from app.services.rollout import (
     allocate_batches,
     build_rollout_view,
     build_task_progress,
+    derive_scheduler_action,
     resolve_strategy,
 )
 
@@ -421,27 +422,35 @@ class TaskService:
     async def _release_batch(
         self, session, task: OtaTask, batch_no: int, version
     ) -> tuple[list[GateResult], list[OtaPreconditionFailure]]:
-        """批次下发核心：逐车门禁 → 插入记录（幂等）→ 返回放行/拦截清单（不提交事务）。"""
+        """批次下发核心：批量取数门禁→插入记录（幂等）→返回放行/拦截清单（不提交事务）。
+
+        G-14 批次批量取数：先按幂等过滤未下发车辆，再以 :func:`check_batch` 两次批量读
+        （is_online_many + get_status_many）代替代逐车 2N 次 Redis 往返，门禁判定口径不变。
+        """
         allocation = self._allocation_of(task)
         batch_vehicles = allocation[batch_no - 1] if batch_no <= len(allocation) else []
         if not batch_vehicles:
             return [], []
         existing = await self._records.map_by_vehicles(session, task.task_id, batch_vehicles)
+        # 幂等：已进入 DOWNLOAD/INSTALL/TEST/SUCCESS 的车辆不二次通知（先过滤减少取数）
+        need_release = [
+            vehicle_id
+            for vehicle_id in batch_vehicles
+            if (record := existing.get(vehicle_id)) is None or record.status == _PENDING_STATUS
+        ]
+        if not need_release:
+            return [], []
+        gates = await check_batch(self._reader, need_release, self._settings)
         released: list[GateResult] = []
         blocked: list[OtaPreconditionFailure] = []
         to_insert: list[dict[str, object]] = []
-        for vehicle_id in batch_vehicles:
-            record = existing.get(vehicle_id)
-            if record is not None and record.status != _PENDING_STATUS:
-                # 幂等：已进入 DOWNLOAD/INSTALL/TEST/SUCCESS 的车辆不二次通知
-                continue
-            gate = await check_vehicle(self._reader, vehicle_id, self._settings)
+        for gate in gates:
             if gate.released:
                 released.append(gate)
                 to_insert.append(
                     {
                         "task_id": task.task_id,
-                        "vehicle_id": vehicle_id,
+                        "vehicle_id": gate.vehicle_id,
                         "from_version": None,  # 车辆版本权威值属 vehicle-service（读模型无该字段）
                         "to_version": version.version_name,
                         "status": _PENDING_STATUS,
@@ -452,7 +461,7 @@ class TaskService:
             elif gate.offline:
                 blocked.append(
                     OtaPreconditionFailure(
-                        vehicle_id=vehicle_id,
+                        vehicle_id=gate.vehicle_id,
                         failed_conditions=[OtaPreconditionName.NETWORK_STABLE],
                         actual={"reason": "vehicle_offline"},
                     )
@@ -460,7 +469,7 @@ class TaskService:
             else:
                 blocked.append(
                     OtaPreconditionFailure(
-                        vehicle_id=vehicle_id,
+                        vehicle_id=gate.vehicle_id,
                         failed_conditions=list(gate.failed_conditions),
                         actual=gate.actual,
                     )
@@ -847,6 +856,137 @@ class TaskService:
             executed_at=time.time(),
             operator_id=UUID(user_id),
         )
+
+
+    # ---------- 灰度自动调度器入口（x-hunter-canary-rollout.scheduler） ----------
+
+    async def scheduler_tick(self, *, operator: str = "scheduler") -> dict[str, int]:
+        """执行一轮灰度调度（供后台调度器周期调用）；返回本轮各动作计数（可观测）。
+
+        契约 §scheduler.actions_per_tick：推进批次 / 到期置 succeeded / 成功率不达标置 paused；
+        另实现 §start 第 5 步：``schedule.mode=scheduled`` 到点自动启动首批。
+        单任务异常不阻断其余任务（逐任务独立事务 + FOR UPDATE 行锁，不新增 Redis key）。
+
+        说明：契约 §scheduler 提及「发 alert_event」，但 ``alert_event`` Topic 生产者唯一归属
+        data-analytics（contracts/kafka，本服务不生产，见 x-hunter-pending-confirmation）；
+        故 halt 以 CRITICAL 审计日志承载，与整批门禁全失败路径一致。
+        """
+        counters = {"start": 0, "advance": 0, "halt": 0, "succeed": 0, "errors": 0}
+        now = time.time()
+        try:
+            candidates = await self._tasks.list_for_scheduler(now=now)
+        except Exception:  # 候选取数失败不影响下轮
+            counters["errors"] += 1
+            logger.exception("ota_scheduler_list_failed")
+            return counters
+        for task_id, status in candidates:
+            try:
+                if status == OtaTaskStatus.RUNNING:
+                    action = await self._evaluate_running(task_id, now, operator)
+                else:
+                    action = await self._start_due_scheduled(task_id, now, operator)
+            except Exception:  # 单任务失败不阻断其他任务
+                counters["errors"] += 1
+                logger.exception("ota_scheduler_task_failed", task_id=str(task_id))
+                continue
+            if action in counters:
+                counters[action] += 1
+        return counters
+
+    async def _start_due_scheduled(self, task_id: UUID, now: float, operator: str) -> str:
+        """到点启动 scheduled 任务首批（created|pending_approval → running）；幂等。"""
+        async with self._tasks.transaction() as session:
+            task = await self._tasks.get_for_update(session, task_id)
+            if task is None or task.status not in (
+                OtaTaskStatus.CREATED,
+                OtaTaskStatus.PENDING_APPROVAL,
+            ):
+                return "none"
+            schedule = self._schedule_of(task)
+            if schedule.mode.value != "scheduled" or schedule.start_time is None or schedule.start_time > now:
+                return "none"
+            version = await self._require_published_version(task)
+            batch_no = self._current_batch_of(task) + 1
+            released, blocked = await self._release_batch(session, task, batch_no, version)
+            new_status = self._status_after_release(task, released, blocked)
+            self._persist_progress(session, task, new_status, batch_no)
+            await session.commit()
+
+        await self._dispatch_notifications(task, released, version)
+        self._write_progress_cache(task_id, task.progress)
+        self._audit(
+            "ota_scheduled_start",
+            operator,
+            task_id,
+            batch_no=batch_no,
+            released=[g.vehicle_id for g in released],
+            blocked=[b.vehicle_id for b in blocked],
+        )
+        return "start"
+
+    async def _evaluate_running(self, task_id: UUID, now: float, operator: str) -> str:
+        """评估 running 任务：halt（成功率不达标）/ succeed（末批达标）/ advance（推进下批）。"""
+        snapshots = await self._records.snapshot_by_task(task_id)
+        async with self._tasks.transaction() as session:
+            task = await self._tasks.get_for_update(session, task_id)
+            if task is None or task.status != OtaTaskStatus.RUNNING:
+                return "none"
+            strategy = self._strategy_of(task)
+            rollout = build_rollout_view(
+                strategy=strategy,
+                allocation=self._allocation_of(task),
+                snapshots=snapshots,
+                now=now,
+            )
+            action = derive_scheduler_action(rollout)
+            if action == "none":
+                return "none"
+            if action == "halt":
+                task.status = OtaTaskStatus.PAUSED
+                session.add(task)
+                await session.commit()
+                self._write_progress_cache(task_id, task.progress)
+                logger.critical(
+                    "ota_canary_halted",
+                    task_id=str(task_id),
+                    batch_no=rollout.current_batch,
+                    halt_reason=rollout.halt_reason,
+                    operator=operator,
+                )
+                self._audit(
+                    "ota_canary_halted",
+                    operator,
+                    task_id,
+                    batch_no=rollout.current_batch,
+                    halt_reason=rollout.halt_reason,
+                )
+                return "halt"
+            if action == "succeed":
+                task.status = OtaTaskStatus.SUCCEEDED
+                session.add(task)
+                await session.commit()
+                self._write_progress_cache(task_id, task.progress)
+                self._audit("ota_canary_succeeded", operator, task_id, batch_no=rollout.current_batch)
+                return "succeed"
+            # advance：当前批已过观察窗且达标，推进下一批（禁止跳批：batch_no = 当前 + 1）
+            batch_no = rollout.current_batch + 1
+            version = await self._require_published_version(task)
+            released, blocked = await self._release_batch(session, task, batch_no, version)
+            new_status = self._status_after_release(task, released, blocked)
+            self._persist_progress(session, task, new_status, batch_no)
+            await session.commit()
+
+        await self._dispatch_notifications(task, released, version)
+        self._write_progress_cache(task_id, task.progress)
+        self._audit(
+            "ota_canary_advanced",
+            operator,
+            task_id,
+            batch_no=batch_no,
+            released=[g.vehicle_id for g in released],
+            blocked=[b.vehicle_id for b in blocked],
+        )
+        return "advance"
 
 
 __all__ = ["TaskService"]

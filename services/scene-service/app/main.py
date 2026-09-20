@@ -81,6 +81,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         scenario_path=settings.carla_scenario_submit_path,
         timeout_seconds=settings.carla_request_timeout_seconds,
         max_retries=settings.carla_request_max_retries,
+        get_path=settings.carla_instance_get_path,
+        result_path=settings.carla_instance_result_path,
     )
     scene_repository = SceneRepository(app.state.db)
     app.state.scene_repository = scene_repository
@@ -94,7 +96,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.scene_service, app.state.storage, settings
     )
     app.state.simulation_service = SceneSimulationService(
-        app.state.scene_service, app.state.carla, settings
+        app.state.scene_service, app.state.carla, settings, storage=app.state.storage
     )
 
     consumer_task: asyncio.Task[None] | None = None

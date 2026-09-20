@@ -4,8 +4,14 @@
  * 安全：OTA 包必须 SHA-256 + RSA-2048 签名校验，版本号单调递增（防回滚）。
  */
 
-/** 版本状态（DDL CHECK 约束，不可更改） */
-export type OtaVersionStatus = 'draft' | 'published' | 'deprecated' | 'disabled'
+/** 版本状态（DDL CHECK 约束，G-18② 审核流六态，不可更改） */
+export type OtaVersionStatus =
+  | 'draft'
+  | 'testing'
+  | 'reviewing'
+  | 'published'
+  | 'deprecated'
+  | 'disabled'
 
 /**
  * 版本发布类型（⚠ 契约未定义 enum，DDL 注释为「正式/灰度/补丁」，example=formal）
@@ -136,6 +142,16 @@ export interface OtaVersionPublishData {
   status: OtaVersionStatus
   release_time: number
   checks: OtaVersionPublishChecks
+}
+
+/** 提交审核请求（G-18②；test_summary 仅审计留痕，可省略） */
+export interface OtaVersionSubmitReviewRequest {
+  test_summary?: string
+}
+
+/** 审核驳回请求（G-18②；reviewing → draft，reason 必填） */
+export interface OtaVersionRejectReviewRequest {
+  reason: string
 }
 
 /** 版本弃用/下线请求（status 仅可取 deprecated / disabled） */

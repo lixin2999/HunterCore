@@ -20,12 +20,13 @@
       "type": "string",
       "enum": [
         "harsh_acceleration", "harsh_braking", "harsh_turning", "over_speed",
+        "collision_pre_warning",
         "collision_warning", "manual_takeover", "emergency_stop", "battery_low",
         "battery_critical", "communication_loss", "sensor_fault", "perception_fault",
         "planning_fault", "control_fault", "ota_start", "ota_success",
         "ota_failed", "ota_rollback"
       ],
-      "description": "事件类型（18 种，触发阈值不可更改）"
+      "description": "事件类型（19 种，触发阈值不可更改；G-22② 新增 collision_pre_warning）"
     },
     "event_level": {
       "type": "string",

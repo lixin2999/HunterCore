@@ -10,6 +10,7 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -69,6 +71,8 @@ class Vehicle(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     device_cert_sn: Mapped[str | None] = mapped_column(Text)
+    # G-11（设计文档 8.4.2 地理围栏）：circle/polygon 围栏定义 + 可选限速；NULL = 不校验
+    fence_json: Mapped[dict | None] = mapped_column(JSONB)
     description: Mapped[str | None] = mapped_column(Text)
 
     # 无 relationship：events / vehicle_telemetry / algorithm_metrics / ota_records 的 vehicle_id
@@ -101,6 +105,13 @@ class User(Base):
     status: Mapped[UserStatus] = mapped_column(
         StrEnumType(UserStatus), nullable=False, server_default=text("'enabled'")
     )
+    # G-06（设计文档 14.1）：首登/重置后强制改密；默认管理员初始化置 true
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    # G-23（设计文档 3.2.2/14.1 MFA）：密钥须应用层加密后存 totp_secret，两字段禁止接口回传明文
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    totp_secret: Mapped[str | None] = mapped_column(Text)
     create_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

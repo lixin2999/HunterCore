@@ -9,9 +9,11 @@
  * 见 x-hunter-pending-confirmation #2），因此前端不得硬编码分支，仅原样展示字符串。
  */
 
-/** 版本状态 */
+/** 版本状态（G-18② 审核流六态：draft → testing → reviewing → published → deprecated/disabled） */
 export const OTA_VERSION_STATUS_LABELS: Record<string, string> = {
   draft: '草稿',
+  testing: '测试中',
+  reviewing: '审核中',
   published: '已发布',
   deprecated: '已弃用',
   disabled: '已下线',
@@ -20,6 +22,8 @@ export const OTA_VERSION_STATUS_LABELS: Record<string, string> = {
 /** 版本状态 → 标签类型 */
 export const OTA_VERSION_STATUS_TAG_TYPES: Record<string, string> = {
   draft: 'info',
+  testing: 'primary',
+  reviewing: 'warning',
   published: 'success',
   deprecated: 'warning',
   disabled: 'danger',

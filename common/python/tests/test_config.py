@@ -48,9 +48,9 @@ def test_cors_origins_list() -> None:
 
 
 def test_jwt_token_ttl_matches_spec() -> None:
-    """Access Token 2h / Refresh Token 7d（设计文档：安全机制）。"""
+    """Access Token 30min（G-04 决策①收紧，原设计文档 2h）/ Refresh Token 7d。"""
     settings = DemoSettings()
-    assert settings.jwt_access_token_expire_minutes == 120
+    assert settings.jwt_access_token_expire_minutes == 30
     assert settings.jwt_refresh_token_expire_days == 7
 
 
@@ -83,8 +83,45 @@ def test_production_accepts_injected_secrets() -> None:
         jwt_secret_key="X" * 48,
         postgres_password="s3cure-pg-pass",
         minio_secret_key="s3cure-minio-pass",
+        gateway_hmac_secret="Y" * 48,
     )
     assert settings.environment == "prod"
+
+
+def test_production_requires_gateway_hmac_secret() -> None:
+    """G-02：staging/prod 未配 GATEWAY_HMAC_SECRET → 启动即失败（身份头必须签名）。"""
+    with pytest.raises(ValueError, match="GATEWAY_HMAC_SECRET"):
+        DemoSettings(
+            environment="prod",
+            jwt_secret_key="X" * 48,
+            postgres_password="s3cure-pg-pass",
+            minio_secret_key="s3cure-minio-pass",
+        )
+
+
+def test_production_requires_kafka_mtls_client_cert() -> None:
+    """G-01：staging/prod 下 SASL_SSL 客户端缺证书/私钥 → 启动即失败（broker 已 required）。"""
+    with pytest.raises(ValueError, match="KAFKA_SSL_CERTFILE"):
+        DemoSettings(
+            environment="prod",
+            jwt_secret_key="X" * 48,
+            postgres_password="s3cure-pg-pass",
+            minio_secret_key="s3cure-minio-pass",
+            gateway_hmac_secret="Y" * 48,
+            kafka_security_protocol="SASL_SSL",
+        )
+    # 补齐证书后正常
+    settings = DemoSettings(
+        environment="prod",
+        jwt_secret_key="X" * 48,
+        postgres_password="s3cure-pg-pass",
+        minio_secret_key="s3cure-minio-pass",
+        gateway_hmac_secret="Y" * 48,
+        kafka_security_protocol="SASL_SSL",
+        kafka_ssl_certfile="/etc/hunter/kafka-tls/client.crt",
+        kafka_ssl_keyfile="/etc/hunter/kafka-tls/client.key",
+    )
+    assert settings.kafka_ssl_certfile.endswith("client.crt")
 
 
 @pytest.mark.parametrize("environment", ["dev", "test"])

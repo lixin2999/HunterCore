@@ -14,8 +14,9 @@
 # ⚠ 待核对（设计文档未明确，需人工确认后回填；禁止擅自新增端点 / 字段 / 错误码 / 阈值）：
 #   1) scenes.scene_type 取值域：4.2.1 节仅给出「分类 → 场景」两级结构，未给出编码值；
 #      本契约按「叶子场景」取值（如 straight_cruise），分类由 x-hunter-scene-types 映射
-#   2) 4.4 节第 6/7 步（实时监控仿真进度、保存仿真结果）设计文档未定义 REST 端点，
-#      本契约不擅自新增，端点缺口见 x-hunter-pending-confirmation
+#   2) 4.4 节第 6/7 步（实时监控仿真进度、保存仿真结果）：已按决策 G-20① 补
+#      GET /api/v1/scene/simulations/{sim_instance_id}（进度）与 …/result（结果）查询端点，
+#      服务端无状态代理 Carla 管理 API；设计文档 12.2 节清单同步登记见 x-hunter-endpoints
 #   3) spawn_point / actor.behavior / event.trigger / event.action 内部结构未定义
 #   4) scenes.status 含 archived，但 12.2 节无归档端点（本契约不新增）
 #   5) 场景导出返回形式（直接返回 XML 文本 / MinIO 预签名 URL）未定义；本契约按
@@ -450,6 +451,69 @@ paths:
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/scene/simulations/{sim_instance_id}:
+    get:
+      tags: [simulation]
+      summary: 查询仿真实例进度（4.4 节第 6 步，决策 G-20①）
+      description: |
+        服务端**无状态代理**：转发到 Carla 管理 API 实例查询接口并透传进度字段，
+        平台不落库仿真实例状态（无实例表，Carla 为唯一事实来源）。
+
+        规则：
+        - 实例不存在（Carla 返回 404）→ 3001
+        - Carla 管理 API 未配置 / 不可达 / 非 404 的 4xx/5xx / 响应结构非法 → 5001
+        - `progress_percent` 等进度字段 Carla 未提供时置 null（前端按 status 降级展示）
+        - 实例子路径经 `CARLA_INSTANCE_GET_PATH` 环境变量注入（⚠ Carla API 形状待确认 #9）
+      operationId: getSimulationProgress
+      parameters:
+        - $ref: "#/components/parameters/SimInstanceIdPath"
+      responses:
+        "200":
+          description: 查询成功（仿真实例进度快照）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimulationProgressResponse" }
+        "404": { $ref: "#/components/responses/SimInstanceNotFound" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/simulations/{sim_instance_id}/result:
+    get:
+      tags: [simulation]
+      summary: 查询仿真实例结果（4.4 节第 7 步，决策 G-20①）
+      description: |
+        仅终态实例（`succeeded` / `failed` / `canceled`）可查询结果；
+        非终态（`pending` / `running`）返回 3003（结果未就绪）。
+
+        规则：
+        - 产物 `artifacts[].object_key` 落在 hunter-scene-assets 时，服务端换发
+          预签名下载地址（有效期 15 分钟，与 4.3 节导出策略一致）
+        - 实例不存在（Carla 返回 404）→ 3001；Carla 不可达等 → 5001（同进度端点）
+        - 结果子路径经 `CARLA_INSTANCE_RESULT_PATH` 环境变量注入（⚠ 待确认 #9）
+      operationId: getSimulationResult
+      parameters:
+        - $ref: "#/components/parameters/SimInstanceIdPath"
+      responses:
+        "200":
+          description: 查询成功（仿真结果与产物清单；非终态不会出现在这里）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimulationResultResponse" }
+        "404": { $ref: "#/components/responses/SimInstanceNotFound" }
+        "409": { $ref: "#/components/responses/SimResultNotReady" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /healthz:
     get:
       tags: [ops]
@@ -508,7 +572,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT Access Token（2 小时，网关签发）。载荷：`sub`(user_id) / `username` / `roles` / `permissions` /
+        JWT Access Token（30 分钟，网关签发，G-04① 收紧）。载荷：`sub`(user_id) / `username` / `roles` / `permissions` /
         `iat` / `exp` / `iss` / `jti`。网关校验后注入 `X-User-Id`、`X-Roles`、`X-Trace-Id`，
         服务侧据此执行 RBAC（`permissions.resource=scene`，action ∈ create/read/update/delete/execute）
         与数据权限（按 creator/项目隔离）。
@@ -525,6 +589,12 @@ components:
       required: true
       description: 场景 ID（UUID，对应 scene_svc.scenes.scene_id）
       schema: { type: string, format: uuid }
+    SimInstanceIdPath:
+      name: sim_instance_id
+      in: path
+      required: true
+      description: Carla 仿真实例 ID（POST /api/v1/scene/{scene_id}/run 返回值，4.4 节第 5 步）
+      schema: { type: string, maxLength: 128 }
     PageQuery:
       name: page
       in: query
@@ -615,6 +685,30 @@ components:
           example:
             code: 3001
             message: 资源不存在
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    SimInstanceNotFound:
+      description: 仿真实例不存在（code=3001，Carla 管理 API 返回 404 或实例已回收）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 3001
+            message: 资源不存在
+            data: null
+            request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
+            timestamp: 1724035200
+    SimResultNotReady:
+      description: |
+        仿真结果未就绪（code=3003，资源状态冲突）：实例仍处 pending/running 终态前状态，
+        请先轮询 GET /api/v1/scene/simulations/{sim_instance_id} 待进入终态后再查结果。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 3003
+            message: 资源状态冲突
             data: null
             request_id: 8f9c2b7a-1d3e-4f5a-9b6c-0d1e2f3a4b5c
             timestamp: 1724035200
@@ -1022,6 +1116,57 @@ components:
           additionalProperties: true
           description: "实际生效的参数覆盖（回显，便于追溯）"
 
+    SimulationProgress:
+      type: object
+      description: |
+        仿真实例进度快照（4.4 节第 6 步，决策 G-20①）。
+        ⚠ 进度字段 Carla 管理 API 未定义（待确认 #9），服务端宽松透传，缺失置 null。
+      required: [sim_instance_id, status]
+      properties:
+        sim_instance_id: { type: string, description: "Carla 仿真实例 ID" }
+        scene_id: { type: string, format: uuid, nullable: true, description: "关联场景 ID（Carla 响应携带时透传）" }
+        status: { $ref: "#/components/schemas/SimulationStatus" }
+        progress_percent: { type: number, minimum: 0, maximum: 100, nullable: true, description: "完成百分比（Carla 未提供时 null）" }
+        current_time_s: { type: number, minimum: 0, nullable: true, description: "已仿真时长（秒）" }
+        total_time_s: { type: number, minimum: 0, nullable: true, description: "场景总时长（秒，对应 SceneConfig.duration）" }
+        message: { type: string, nullable: true, maxLength: 512, description: "状态补充说明（失败原因等）" }
+        updated_at: { type: string, format: date-time, nullable: true, description: "Carla 侧最后更新时间（UTC）" }
+
+    SimulationArtifact:
+      type: object
+      description: 仿真产物（日志 / 视频 / 指标文件等；落 hunter-scene-assets 时换发预签名 URL）
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 256, description: "产物名称/文件名" }
+        object_key: { type: string, nullable: true, description: "MinIO hunter-scene-assets 对象键（非对象存储产物为 null）" }
+        size_bytes: { type: integer, format: int64, minimum: 0, nullable: true }
+        download_url: { type: string, format: uri, nullable: true, description: "预签名下载地址（有效期 15 分钟，与 4.3 节一致）" }
+        expires_in: { type: integer, nullable: true, description: "预签名过期秒数（仅 download_url 非空时返回）" }
+
+    SimulationResult:
+      type: object
+      description: |
+        仿真实例结果（4.4 节第 7 步，决策 G-20①；仅终态实例可查）。
+        ⚠ 结果结构 Carla 侧未定义（待确认 #9），success_criteria_result 为宽松对象透传。
+      required: [sim_instance_id, status]
+      properties:
+        sim_instance_id: { type: string }
+        scene_id: { type: string, format: uuid, nullable: true }
+        status: { $ref: "#/components/schemas/SimulationStatus" }
+        success: { type: boolean, nullable: true, description: "是否达成 success_criteria（Carla 未判定时 null）" }
+        success_criteria_result:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: "成功判据逐项结果（透传 Carla/评估器输出，结构待确认 #9）"
+        message: { type: string, nullable: true, maxLength: 512, description: "失败原因 / 取消原因等补充说明" }
+        artifacts:
+          type: array
+          items: { $ref: "#/components/schemas/SimulationArtifact" }
+          description: "产物清单（对象存储产物已换发预签名 URL）"
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true, description: "仿真结束时间（UTC）" }
+
 
     # ---------- 成功响应（data 已定型，便于前端 TS 类型生成） ----------
     SceneResponse:
@@ -1071,6 +1216,22 @@ components:
           required: [data]
           properties:
             data: { $ref: "#/components/schemas/SceneRunData" }
+
+    SimulationProgressResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SimulationProgress" }
+
+    SimulationResultResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SimulationResult" }
 
     # ---------- 请求体 ----------
     SceneCreateRequest:
@@ -1210,6 +1371,8 @@ x-hunter-service:
     - CARLA_INSTANCE_CREATE_PATH            # ② 创建仿真实例路径（默认 /api/v1/instances）
     - CARLA_INSTANCE_QUERY_PATH             # 并行实例查询路径（默认 /api/v1/instances）
     - CARLA_SCENARIO_SUBMIT_PATH            # ③④ 下发场景配置路径（含 {sim_instance_id}）
+    - CARLA_INSTANCE_GET_PATH               # ⑥ 进度查询路径（含 {sim_instance_id}，决策 G-20①）
+    - CARLA_INSTANCE_RESULT_PATH            # ⑦ 结果查询路径（含 {sim_instance_id}，决策 G-20①）
     - CARLA_REQUEST_TIMEOUT_SECONDS
     - CARLA_REQUEST_MAX_RETRIES
     # ---------- 场景约束与缓存（4.2 节 + Redis Key 契约） ----------
@@ -1254,6 +1417,9 @@ x-hunter-endpoints:
     - "POST /api/v1/scene/export"
     - "POST /api/v1/scene/{scene_id}/run"
     - "GET /api/v1/scene/templates"
+    # 决策 G-20① 新增（设计文档 12.2 节清单未列，4.4 节步骤⑥⑦补齐，待设计文档同步勘误）
+    - "GET /api/v1/scene/simulations/{sim_instance_id}"
+    - "GET /api/v1/scene/simulations/{sim_instance_id}/result"
   ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]
 
 x-hunter-scene-types:
@@ -1359,11 +1525,11 @@ x-hunter-simulation-flow:
     - "③ 下发场景配置 JSON（4.2.2 结构 + param_overrides 白名单深合并）"
     - "④ Carla 加载地图、生成参与者、设置环境（weather/actors）"
     - "⑤ 返回 sim_instance_id，场景运行状态更新为 running"
-    - "⑥ 实时监控仿真进度（⚠ 12.2 节无进度查询端点）"
-    - "⑦ 仿真结束 → 回收资源 → 保存结果（⚠ 12.2 节无结果保存端点）"
+    - "⑥ 实时监控仿真进度：GET /api/v1/scene/simulations/{sim_instance_id}（决策 G-20①，无状态代理 Carla）"
+    - "⑦ 仿真结束 → 回收资源 → 保存结果：GET /api/v1/scene/simulations/{sim_instance_id}/result（决策 G-20①；产物预签名 15 分钟）"
   implementations_pending:
-    - "⑥ 进度监控：建议由 Carla 回调或服务端轮询后经 WebSocket 推送（需确认方案与端点）"
-    - "⑦ 结果保存：建议写入 MinIO hunter-scene-assets 或 hunter-rosbag（需确认）"
+    - "主动推送（Carla 回调 / WebSocket 进度推送）未实现：本期前端轮询进度端点；如需推送另行立项"
+    - "⑦ 结果落库（Carla → hunter-scene-assets 产物转存）由 Carla 侧完成，平台仅代理查询（产物 key 约定待确认 #9）"
   entrypoint_env: CARLA_MANAGEMENT_ENDPOINT   # ⚠ 键名待确认
   timeout_policy: "连接/读超时与重试次数需环境变量化（禁止硬编码）"
 
@@ -1443,8 +1609,8 @@ x-hunter-pending-confirmation:
       impact: "DB 无 CHECK 约束、前后端筛选与 OpenSCENARIO 导出映射"
     - id: 2
       question: "4.4 节第 6/7 步（实时监控仿真进度、保存仿真结果）无 REST 端点"
-      contract_decision: "不擅自新增端点；缺口登记于 x-hunter-simulation-flow.implementations_pending"
-      impact: "仿真进度前端展示方案（轮询 / WebSocket / Carla 回调）"
+      contract_decision: "已决策（G-20①）：新增 GET /api/v1/scene/simulations/{sim_instance_id}（进度）与 …/result（结果）两端点，服务端无状态代理 Carla 管理 API，不落库实例状态；进度/结果子路径环境变量化（#9 延续）"
+      impact: "前端仿真面板轮询这两个端点；Carla 实例回收后历史结果不可查（如需持久化另行立项）"
     - id: 3
       question: "spawn_point / actor.behavior / event.trigger / event.action 内部结构未定义"
       contract_decision: "按 Carla transform 与 OpenSCENARIO 条件语义给出最小结构，behavior_type/action_type 暂为字符串"
@@ -1471,7 +1637,7 @@ x-hunter-pending-confirmation:
       impact: "网关/服务错误处理"
     - id: 9
       question: "Carla 管理 API 地址与配置键名、仿真并发上限、场景时长上限"
-      contract_decision: "键名暂定 CARLA_MANAGEMENT_ENDPOINT，值域与上限均需环境变量化；实现侧以 CARLA_INSTANCE_CREATE_PATH / CARLA_INSTANCE_QUERY_PATH（默认 /api/v1/instances）与 CARLA_SCENARIO_SUBMIT_PATH（默认 /api/v1/instances/{sim_instance_id}/scenario）及 SCENE_DURATION_MAX_SECONDS（默认 600s）落地，人工确认后仅调整配置不改代码"
+      contract_decision: "键名暂定 CARLA_MANAGEMENT_ENDPOINT，值域与上限均需环境变量化；实现侧以 CARLA_INSTANCE_CREATE_PATH / CARLA_INSTANCE_QUERY_PATH（默认 /api/v1/instances）与 CARLA_SCENARIO_SUBMIT_PATH（默认 /api/v1/instances/{sim_instance_id}/scenario）及 SCENE_DURATION_MAX_SECONDS（默认 600s）落地；G-20① 追加 CARLA_INSTANCE_GET_PATH / CARLA_INSTANCE_RESULT_PATH（默认 /api/v1/instances/{sim_instance_id} 与 …/result），人工确认后仅调整配置不改代码"
       impact: "Step 3 服务层实现与 K8s ConfigMap"
     - id: 10
       question: "实车场景提取触发源：analytics_result 还是 event_raw"

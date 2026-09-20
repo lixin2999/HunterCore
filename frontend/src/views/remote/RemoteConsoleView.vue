@@ -26,7 +26,6 @@ import {
   POLL_INTERVALS,
   RC_LIMITS,
   SESSION_END_REASON_LABELS,
-  WS_JWT_SUBPROTOCOL,
   WS_UPLINK_TYPES,
 } from '@/constants'
 import { PERMISSIONS } from '@/constants/permissions'
@@ -46,7 +45,7 @@ import type {
 import { HunterApiError } from '@/utils/error-code'
 import { formatNumber, formatTime } from '@/utils/format'
 import { WebRtcClient } from '@/utils/webrtc'
-import { ReconnectingSocket, buildWsUrl } from '@/utils/websocket'
+import { ReconnectingSocket, buildWsUrl, hunterJwtProtocols } from '@/utils/websocket'
 
 const route = useRoute()
 const userStore = useUserStore()
@@ -115,7 +114,8 @@ function startVideo(): void {
   }
   const client = new WebRtcClient({
     session: current,
-    protocols: [WS_JWT_SUBPROTOCOL],
+    protocols: hunterJwtProtocols(), // 决策 #20①：子协议承载 JWT
+
     onStateChange: (state) => {
       connectionState.value = state
     },
@@ -172,7 +172,7 @@ function startControlLoop(): void {
         ? current.webrtc.control_ws_url
         : `/remote/${current.session_id}/control`,
     ),
-    protocols: [WS_JWT_SUBPROTOCOL],
+    protocols: hunterJwtProtocols(), // 决策 #20①：子协议承载 JWT
     heartbeatIntervalMs: RC_LIMITS.heartbeatIntervalMs,
     createHeartbeatFrame: (): WsHeartbeatFrame => ({
       type: WS_UPLINK_TYPES.heartbeat,

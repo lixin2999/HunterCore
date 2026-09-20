@@ -11,7 +11,7 @@ import { defineStore } from 'pinia'
 import * as userApi from '@/api/user'
 import { SESSION_EXPIRED_EVENT } from '@/api/request'
 import { ADMIN_ROLE } from '@/constants'
-import type { LoginRequest, UserProfile } from '@/types/user'
+import type { ChangePasswordRequest, LoginRequest, UserProfile } from '@/types/user'
 import {
   clearStoredSession,
   getStoredSession,
@@ -35,6 +35,8 @@ export const useUserStore = defineStore('user', () => {
   const displayName = computed<string>(
     () => profile.value?.real_name || profile.value?.username || '未登录',
   )
+  /** G-06 首登强制改密：服务端标志（登录后/刷新 /me 后同步） */
+  const mustChangePassword = computed<boolean>(() => Boolean(profile.value?.must_change_password))
 
   /** 登录（MFA 启用时须携带 totp_code，6 位数字） */
   async function login(payload: LoginRequest): Promise<void> {
@@ -62,6 +64,19 @@ export const useUserStore = defineStore('user', () => {
     const session = getStoredSession()
     if (session) {
       setStoredSession({ ...session, user })
+    }
+  }
+
+  /** 修改密码（G-06）：成功后本地标志复位（服务端已同步置 false） */
+  async function changePassword(payload: ChangePasswordRequest): Promise<void> {
+    await userApi.changePassword(payload)
+    if (profile.value) {
+      const updated: UserProfile = { ...profile.value, must_change_password: false }
+      profile.value = updated
+      const session = getStoredSession()
+      if (session) {
+        setStoredSession({ ...session, user: updated })
+      }
     }
   }
 
@@ -122,10 +137,12 @@ export const useUserStore = defineStore('user', () => {
     isAuthenticated,
     isAdmin,
     displayName,
+    mustChangePassword,
     sessionExpiredMessage,
     loading,
     login,
     fetchProfile,
+    changePassword,
     logout,
     hasPermission,
     reset,

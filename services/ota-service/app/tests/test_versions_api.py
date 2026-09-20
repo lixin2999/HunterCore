@@ -160,13 +160,13 @@ async def test_get_version_not_found(client: AsyncClient) -> None:
 async def test_publish_success_returns_five_checks(
     client: AsyncClient, ota_env: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """发布成功：五项校验全 true + status=published（契约 OtaVersionPublishData）。
+    """发布（审核批准）成功：五项校验全 true + status=published（前置 reviewing，G-18②）。
 
     验签以替身放行（真实 RSA-2048 验签链路见 test_signature.py，importorskip cryptography）。
     """
     import app.services.versions as versions_module
 
-    row = make_version(status="draft")
+    row = make_version(status="reviewing")
     ota_env.versions.rows[row.version_id] = row
     object_key = row.package_url.removeprefix("s3://").split("/", 1)[1]
     ota_env.storage.put(object_key, PACKAGE_BYTES)
@@ -194,7 +194,7 @@ async def test_publish_reports_verification_switches_honestly(
     monkeypatch.setattr(settings, "ota_package_verify_sha256", False)
     monkeypatch.setattr(settings, "ota_package_verify_signature", False)
 
-    row = make_version(status="draft", name="V1.3.0", code=10300)
+    row = make_version(status="reviewing", name="V1.3.0", code=10300)
     # 声明的 md5 与实际内容一致（通过 MD5 门禁），但 sha256 为错误值：
     # 开关关闭时该差异被跳过 → 必须如实回报 sha256_verified=false（修复前为 true）
     row.package_sha256 = hashlib.sha256(b"unrelated-content").hexdigest()
@@ -218,7 +218,7 @@ async def test_publish_checksum_mismatch_returns_6001(
     client: AsyncClient, ota_env: Any
 ) -> None:
     """SHA-256 不匹配 → 422 + code=6001 + expected/actual（契约 checksum_failed 示例）。"""
-    row = make_version(status="draft", name="V9.9.9", code=99900)
+    row = make_version(status="reviewing", name="V9.9.9", code=99900)
     ota_env.versions.rows[row.version_id] = row
     object_key = row.package_url.removeprefix("s3://").split("/", 1)[1]
     ota_env.storage.put(object_key, b"tampered-content")
@@ -231,15 +231,182 @@ async def test_publish_checksum_mismatch_returns_6001(
     assert set(body["data"]) >= {"expected", "actual"}
 
 
-async def test_publish_non_draft_conflict(client: AsyncClient, ota_env: Any) -> None:
-    """重复发布（非 draft）→ 409 + code=3003 + current_status（契约 state_conflict 示例）。"""
+async def test_publish_non_reviewing_conflict(client: AsyncClient, ota_env: Any) -> None:
+    """G-18② 前置门禁：未经审核（draft/published 等非 reviewing）发布 → 409 + code=3003。"""
     row = make_version(status="published")
     ota_env.versions.rows[row.version_id] = row
     resp = await client.post(
         f"/api/v1/ota/versions/{row.version_id}/publish", headers=ADMIN_HEADERS
     )
     assert resp.status_code == 409
+    body = resp.json()
+    assert body["code"] == 3003
+    assert body["data"]["allowed_status"] == ["reviewing"]
+
+
+async def test_publish_draft_rejected_before_review(
+    client: AsyncClient, ota_env: Any
+) -> None:
+    """G-18② 半行回归：draft 直接发布被拒（旧行为已封死，必须先经提测/提审）。"""
+    row = make_version(status="draft")
+    ota_env.versions.rows[row.version_id] = row
+    object_key = row.package_url.removeprefix("s3://").split("/", 1)[1]
+    ota_env.storage.put(object_key, PACKAGE_BYTES)
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/publish", headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 409
     assert resp.json()["code"] == 3003
+
+
+# ---------- G-18② 审核流（§7.2.2：提测 / 提审 / 驳回） ----------
+
+
+async def test_submit_testing_success(client: AsyncClient, ota_env: Any) -> None:
+    """提测：draft + 包已直传 → testing（返回版本详情）。"""
+    row = make_version(status="draft")
+    ota_env.versions.rows[row.version_id] = row
+    object_key = row.package_url.removeprefix("s3://").split("/", 1)[1]
+    ota_env.storage.put(object_key, PACKAGE_BYTES)
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/submit-testing", headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["status"] == "testing"
+
+
+async def test_submit_testing_missing_package_returns_6001(
+    client: AsyncClient, ota_env: Any
+) -> None:
+    """提测前置校验：对象不存在（未直传）→ 422 + code=6001。"""
+    row = make_version(status="draft")
+    ota_env.versions.rows[row.version_id] = row
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/submit-testing", headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == 6001
+
+
+async def test_submit_testing_non_draft_conflict(client: AsyncClient, ota_env: Any) -> None:
+    """非 draft 提测 → 409 + code=3003。"""
+    row = make_version(status="testing")
+    ota_env.versions.rows[row.version_id] = row
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/submit-testing", headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 409
+    assert resp.json()["code"] == 3003
+
+
+async def test_submit_review_success_with_summary(
+    client: AsyncClient, ota_env: Any
+) -> None:
+    """提审：testing → reviewing（test_summary 可选，仅审计留痕不落库）。"""
+    row = make_version(status="testing")
+    ota_env.versions.rows[row.version_id] = row
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/submit-review",
+        json={"test_summary": "5 台实车验证 72h 无异常"},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["status"] == "reviewing"
+
+
+async def test_submit_review_non_testing_conflict(client: AsyncClient, ota_env: Any) -> None:
+    """非 testing 提审（draft 跳步）→ 409 + code=3003（审核流不可跳过）。"""
+    row = make_version(status="draft")
+    ota_env.versions.rows[row.version_id] = row
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/submit-review",
+        json={},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["code"] == 3003
+
+
+async def test_reject_review_returns_to_draft(client: AsyncClient, ota_env: Any) -> None:
+    """驳回：reviewing → draft（可重新提测/提审返工）。"""
+    row = make_version(status="reviewing")
+    ota_env.versions.rows[row.version_id] = row
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/reject-review",
+        json={"reason": "测试报告缺少高速场景覆盖"},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["status"] == "draft"
+    # 驳回后可重新提测（返工闭环）
+    object_key = row.package_url.removeprefix("s3://").split("/", 1)[1]
+    ota_env.storage.put(object_key, PACKAGE_BYTES)
+    retry = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/submit-testing", headers=ADMIN_HEADERS
+    )
+    assert retry.status_code == 200
+    assert retry.json()["data"]["status"] == "testing"
+
+
+async def test_reject_review_requires_reason(client: AsyncClient, ota_env: Any) -> None:
+    """驳回缺少 reason（必填 1~512）→ 422 + code=2001。"""
+    row = make_version(status="reviewing")
+    ota_env.versions.rows[row.version_id] = row
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/reject-review",
+        json={},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == 2001
+
+
+async def test_reject_review_non_reviewing_conflict(client: AsyncClient, ota_env: Any) -> None:
+    """非 reviewing 驳回 → 409 + code=3003。"""
+    row = make_version(status="testing")
+    ota_env.versions.rows[row.version_id] = row
+    resp = await client.post(
+        f"/api/v1/ota/versions/{row.version_id}/reject-review",
+        json={"reason": "越态驳回"},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["code"] == 3003
+
+
+async def test_review_flow_end_to_end_publish(
+    client: AsyncClient, ota_env: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """全链路：create → 直传 → 提测 → 提审 → 发布（审核批准）逐态推进。"""
+    import app.services.versions as versions_module
+
+    monkeypatch.setattr(versions_module, "verify_package_signature", lambda *args: True)
+    resp = await client.post(
+        "/api/v1/ota/versions", json=_create_payload(part_count=1), headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 200
+    body = resp.json()["data"]
+    version_id = body["version"]["version_id"]
+    assert body["version"]["status"] == "draft"
+    ota_env.storage.put(body["upload"]["object_key"], PACKAGE_BYTES)
+
+    for path, expected in (
+        ("submit-testing", "testing"),
+        ("submit-review", "reviewing"),
+    ):
+        step = await client.post(
+            f"/api/v1/ota/versions/{version_id}/{path}", json={}, headers=ADMIN_HEADERS
+        )
+        assert step.status_code == 200, path
+        assert step.json()["data"]["status"] == expected
+
+    published = await client.post(
+        f"/api/v1/ota/versions/{version_id}/publish", headers=ADMIN_HEADERS
+    )
+    assert published.status_code == 200
+    data = published.json()["data"]
+    assert data["status"] == "published"
+    assert all(data["checks"].values()), data["checks"]
 
 
 async def test_deprecate_published_version(client: AsyncClient, ota_env: Any) -> None:

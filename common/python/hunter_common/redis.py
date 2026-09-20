@@ -68,7 +68,7 @@ class RedisManager:
         return await self.client.get(key)
 
     async def set(self, key: str, value: str, *, expire_seconds: int | None = None) -> None:
-        """写入键值；expire_seconds 用于过期控制（如 session:{user_id} 2 小时）。"""
+        """写入键值；expire_seconds 用于过期控制（如 session:{user_id} 30 分钟，G-04①）。"""
         await self.client.set(key, value, ex=expire_seconds)
 
     async def delete(self, *keys: str) -> int:

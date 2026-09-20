@@ -410,6 +410,53 @@ class SceneRunData(BaseModel):
     )
 
 
+class SimulationProgress(BaseModel):
+    """仿真实例进度快照（GET /api/v1/scene/simulations/{sim_instance_id}，G-20①）。
+
+    ⚠ 进度字段 Carla 管理 API 未定义（待确认 #9），服务端宽松透传，缺失置 null。
+    """
+
+    sim_instance_id: str = Field(description="Carla 仿真实例 ID")
+    scene_id: UUID | None = Field(default=None, description="关联场景 ID（Carla 携带时透传）")
+    status: SimulationStatus = Field(description="仿真实例状态")
+    progress_percent: float | None = Field(
+        default=None, ge=0, le=100, description="完成百分比（Carla 未提供时 null）"
+    )
+    current_time_s: float | None = Field(default=None, ge=0, description="已仿真时长（秒）")
+    total_time_s: float | None = Field(default=None, ge=0, description="场景总时长（秒）")
+    message: str | None = Field(default=None, max_length=512, description="状态补充说明（失败原因等）")
+    updated_at: datetime | None = Field(default=None, description="Carla 侧最后更新时间（UTC）")
+
+
+class SimulationArtifact(BaseModel):
+    """仿真产物（落 hunter-scene-assets 时换发预签名 URL，15 分钟）。"""
+
+    name: str = Field(max_length=256, description="产物名称/文件名")
+    object_key: str | None = Field(default=None, description="MinIO 对象键（非对象存储产物为 null）")
+    size_bytes: int | None = Field(default=None, ge=0)
+    download_url: str | None = Field(default=None, description="预签名下载地址（900s）")
+    expires_in: int | None = Field(default=None, description="预签名过期秒数（仅 download_url 非空时）")
+
+
+class SimulationResult(BaseModel):
+    """仿真实例结果（GET …/simulations/{sim_instance_id}/result，G-20①；仅终态可查）。
+
+    ⚠ 结果结构 Carla 侧未定义（待确认 #9），success_criteria_result 为宽松对象透传。
+    """
+
+    sim_instance_id: str = Field(description="Carla 仿真实例 ID")
+    scene_id: UUID | None = Field(default=None, description="关联场景 ID（Carla 携带时透传）")
+    status: SimulationStatus = Field(description="仿真实例状态（终态）")
+    success: bool | None = Field(default=None, description="是否达成 success_criteria（未判定时 null）")
+    success_criteria_result: dict[str, Any] | None = Field(
+        default=None, description="成功判据逐项结果（透传，结构待确认 #9）"
+    )
+    message: str | None = Field(default=None, max_length=512, description="失败/取消原因等补充说明")
+    artifacts: list[SimulationArtifact] = Field(default_factory=list, description="产物清单")
+    started_at: datetime | None = Field(default=None)
+    finished_at: datetime | None = Field(default=None, description="仿真结束时间（UTC）")
+
+
 # =====================================================================
 # 四、请求体（契约 additionalProperties: false → extra="forbid"）
 # =====================================================================
@@ -513,6 +560,14 @@ class SceneRunResponse(ApiResponse[SceneRunData]):
     """下发响应（POST /api/v1/scene/{scene_id}/run）。"""
 
 
+class SimulationProgressResponse(ApiResponse[SimulationProgress]):
+    """仿真进度查询响应（GET /api/v1/scene/simulations/{sim_instance_id}，G-20①）。"""
+
+
+class SimulationResultResponse(ApiResponse[SimulationResult]):
+    """仿真结果查询响应（GET …/simulations/{sim_instance_id}/result，G-20①）。"""
+
+
 __all__ = [
     "EXPORT_EXTENSION_BY_FORMAT",
     "SCENE_CATEGORY_BY_TYPE",
@@ -557,6 +612,11 @@ __all__ = [
     "SceneTemplateListResponse",
     "SceneType",
     "SceneUpdateRequest",
+    "SimulationArtifact",
+    "SimulationProgress",
+    "SimulationProgressResponse",
+    "SimulationResult",
+    "SimulationResultResponse",
     "SimulationStatus",
     "SortOrder",
     "SpawnPoint",

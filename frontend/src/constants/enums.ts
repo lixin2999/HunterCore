@@ -53,13 +53,14 @@ export const EVENT_LEVEL_COLORS: Record<string, string> = {
   critical: '#f56c6c',
 }
 
-/** 事件类型（系统约束第 13 条：18 种，不可新增/更改） */
+/** 事件类型（系统约束第 13 条：19 种，不可新增/更改；G-22② 新增 collision_pre_warning） */
 export const EVENT_TYPE_LABELS: Record<string, string> = {
   harsh_acceleration: '急加速',
   harsh_braking: '急刹车',
   harsh_turning: '急转弯',
   over_speed: '超速',
-  collision_warning: '碰撞预警',
+  collision_pre_warning: '碰撞预警',
+  collision_warning: '碰撞告警',
   manual_takeover: '人工接管',
   emergency_stop: '紧急停车',
   battery_low: '电量低',
@@ -81,6 +82,7 @@ export const EVENT_TYPE_THRESHOLDS: Record<string, string> = {
   harsh_braking: '减速度 > 3 m/s²',
   harsh_turning: '横摆角速度 > 0.8 rad/s',
   over_speed: '超速 > 10%',
+  collision_pre_warning: 'TTC < 3.0 s',
   collision_warning: 'TTC < 1.5 s',
   battery_low: 'SOC < 20%',
   battery_critical: 'SOC < 10%',

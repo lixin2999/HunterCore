@@ -32,6 +32,9 @@ class Settings(HunterBaseConfig):
     carla_instance_create_path: str = "/api/v1/instances"
     carla_instance_query_path: str = "/api/v1/instances"
     carla_scenario_submit_path: str = "/api/v1/instances/{sim_instance_id}/scenario"
+    # G-20① 仿真进度/结果查询子路径（无状态代理，契约 x-hunter-simulation-flow ⑥⑦）
+    carla_instance_get_path: str = "/api/v1/instances/{sim_instance_id}"
+    carla_instance_result_path: str = "/api/v1/instances/{sim_instance_id}/result"
     carla_request_timeout_seconds: float = 5.0
     carla_request_max_retries: int = 1
 

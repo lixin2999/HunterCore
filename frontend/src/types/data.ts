@@ -107,12 +107,13 @@ export interface TelemetryQuery {
   order?: 'asc' | 'desc'
 }
 
-/** 事件类型（18 种受控词表，系统约束第 13 条） */
+/** 事件类型（19 种受控词表，系统约束第 13 条；G-22② 新增 collision_pre_warning） */
 export type EventType =
   | 'harsh_acceleration'
   | 'harsh_braking'
   | 'harsh_turning'
   | 'over_speed'
+  | 'collision_pre_warning'
   | 'collision_warning'
   | 'manual_takeover'
   | 'emergency_stop'

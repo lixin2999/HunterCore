@@ -60,6 +60,17 @@ class VehicleStateReader(Protocol):
         """判定车辆是否在 vehicle:online:set 中。"""
         ...
 
+    async def get_status_many(self, vehicle_ids: list[str]) -> dict[str, dict[str, Any] | None]:
+        """批量读取多车 vehicle:status（G-14 批次批量取数；单次 pipeline，避免 N+1）。
+
+        返回 vehicle_id → status dict（读模型缺失的车辆值为 None）。
+        """
+        ...
+
+    async def is_online_many(self, vehicle_ids: list[str]) -> dict[str, bool]:
+        """批量判定多车在线状态（G-14 批次批量取数；单次读取 vehicle:online:set）。"""
+        ...
+
 
 def _as_int(value: Any) -> int | None:
     """宽松整数解析（Redis 读模型值统一为字符串存储）。"""
@@ -178,4 +189,62 @@ async def check_vehicle(
         reset_vehicle_id(token)
 
 
-__all__ = ["PARKED_GEAR", "GateResult", "VehicleStateReader", "check_vehicle", "evaluate_gates"]
+async def check_batch(
+    reader: VehicleStateReader,
+    vehicle_ids: list[str],
+    settings: Settings,
+    *,
+    require_soc: bool = True,
+) -> list[GateResult]:
+    """批次门禁批量检查（G-14 批次批量取数）：两次批量读代替逐车 2N 次 Redis 往返。
+
+    与 :func:`check_vehicle` 判定口径完全一致（在线→读模型→evaluate_gates，
+    fallback 与缺失拒绝策略同源），仅将「逐车 SISMEMBER + HGETALL」改为
+    批量 is_online_many + get_status_many，保证同一批内门禁结论确定。输入为空返回 []。
+    """
+    if not vehicle_ids:
+        return []
+    online_map = await reader.is_online_many(vehicle_ids)
+    status_map = await reader.get_status_many(vehicle_ids)
+    results: list[GateResult] = []
+    for vehicle_id in vehicle_ids:
+        token = set_vehicle_id(vehicle_id)
+        try:
+            if not online_map.get(vehicle_id, False):
+                results.append(GateResult(vehicle_id=vehicle_id, offline=True))
+                continue
+            status = status_map.get(vehicle_id)
+            if status is None and settings.ota_offline_fallback_enabled:
+                logger.warning("ota_gate_missing_read_model_fallback", vehicle_id=vehicle_id)
+                results.append(GateResult(vehicle_id=vehicle_id, released=True))
+                continue
+            result = evaluate_gates(
+                vehicle_id,
+                status,
+                require_soc=require_soc,
+                require_parked=settings.ota_precondition_require_parked,
+                require_network=True,
+                min_soc=settings.ota_precondition_min_soc,
+                min_storage_mb=settings.ota_precondition_min_storage_mb,
+                offline_threshold_seconds=settings.ota_offline_threshold_seconds,
+            )
+            if not result.released:
+                logger.info(
+                    "ota_gate_rejected",
+                    vehicle_id=vehicle_id,
+                    failed_conditions=json.dumps([c.value for c in result.failed_conditions]),
+                )
+            results.append(result)
+        finally:
+            reset_vehicle_id(token)
+    return results
+
+
+__all__ = [
+    "PARKED_GEAR",
+    "GateResult",
+    "VehicleStateReader",
+    "check_batch",
+    "check_vehicle",
+    "evaluate_gates",
+]

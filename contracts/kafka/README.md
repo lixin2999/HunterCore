@@ -80,6 +80,6 @@ Topic 命名规范：`<domain>.<entity>.<type>`，全小写，点分隔；车端
 ## 安全
 
 - 车端接入强制 `SASL_SSL` + `SCRAM-SHA-512`，禁止 PLAINTEXT（本地开发除外，`KAFKA_SECURITY_PROTOCOL` 控制）
-- 生产 `auto.create.topics.enable=false`、`min.insync.replicas=2`、`ssl.client.auth=requested`
+- 生产 `auto.create.topics.enable=false`、`min.insync.replicas=2`、`ssl.client.auth=required`（严格 mTLS，设计文档 3.2.3/14.2：客户端证书经 `KAFKA_SSL_CERTFILE/KEYFILE` 配置，车端证书由 `gen-kafka-certs.sh` 签发）
 - 消息 key = `vehicle_id`，保证单车辆消息有序；禁止在消息中携带 Token/私钥/密码
 

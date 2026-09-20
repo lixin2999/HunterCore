@@ -181,6 +181,7 @@ tasks = await OtaTaskRepository(session).find_all(
 | `ota-service` | `OtaVersionRepository`、`OtaTaskRepository`、`OtaRecordRepository` | `ota_svc` 三表（灰度成功率统计等） |
 | `api-gateway` | `UserRepository`、`RoleRepository`、`PermissionRepository`、`UserRoleRepository`、`RolePermissionRepository`、`VehicleRepository` | 鉴权链路（`user_svc` RBAC 五表）+ 车辆台账只读 |
 | `remote-control` | `VehicleRepository` | 车辆状态读取（状态写入走 REST 调 vehicle-service） |
+| `flink-jobs`（非服务，书面豁免） | 无（禁止使用任何 Repository） | G-13 写侧豁免：实时作业（`hunter_flink`）经 Kafka 写 `alert_event`/`algorithm_metrics`，不直连数据库、不经 hunter_common 数据层；不在 services/ 目录（校验 14 不扫描），本行为书面登记 |
 <!-- service-repository-table:end -->
 
 ⚠ 未列入白名单的 schema（如车辆主数据写入、其他服务业务表）必须通过 REST API 访问

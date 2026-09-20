@@ -7,12 +7,14 @@
 - /healthz 存活探针、/readyz 就绪探针（DB/Redis 连通性）
 - /metrics Prometheus 指标端点（供 infra/monitoring 抓取）
 - 业务路由：/api/v1/remote/**（vehicles / session(s) / history，契约 remote-control.yaml）
+  与 /ws/remote/{session_id}/{control,signal}（G-09 WS 控制/信令通道，JWT 握手鉴权）
 - Kafka：生产 hunter.{vehicle_id}.remote_control（会话帧）与 hunter.{vehicle_id}.command（信令）；
-  消费侧（command_result → rc:session 统计回写）随 WS 控制通道接入（pending #13-#16）
+  消费 hunter.*.command_result（回执 → rc:session 统计回写 + WS ack 帧下行）
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -34,16 +36,20 @@ from hunter_common.metrics import register_metrics
 from hunter_common.redis import RedisManager
 
 from app.config import settings
+from app.consumers.command_result import CommandResultConsumer
 from app.core.error_handlers import register_exception_handlers
 from app.producers.remote_control import RemoteControlFrameProducer
 from app.producers.session_command import SessionCommandProducer
 from app.repositories.storage import S3VideoArchiveStorage
-from app.routers import history, sessions, vehicles
+from app.repositories.vehicle_fence import VehicleFenceRepository
+from app.routers import history, sessions, vehicles, websocket
 from app.routers.health import router as health_router
+from app.services.geofence import GeofenceChecker
 from app.services.history_service import HistoryService
 from app.services.session_reaper import SessionReaper
 from app.services.session_service import SessionService
 from app.services.vehicle_view import VehicleViewReader
+from app.services.ws_hub import WsHub
 
 logger = get_logger("app.main")
 
@@ -66,7 +72,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     - db / redis：hunter_common 管理器；storage：hunter-video 桶归档存储（S3 协议）；
     - vehicle_view：车辆可控性读模型（Redis 只读）；
     - frame_producer / command_producer：车端会话帧与信令通道（ProduceFn 注入）；
-    - session_service / history_service：业务服务。
+    - session_service / history_service：业务服务；
+    - ws_hub：WS 连接注册表（路由与 command_result 消费者共用）；
+    - command_result_consumer：Kafka 回执消费任务（RC_COMMAND_RESULT_CONSUMER_ENABLED 可关）。
     """
     configure_logging(
         settings.service_name,
@@ -85,6 +93,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.vehicle_view = VehicleViewReader(app.state.redis, settings)
     app.state.frame_producer = RemoteControlFrameProducer(_produce, settings)
     app.state.command_producer = SessionCommandProducer(_produce, settings)
+    # G-11 地理围栏门禁（fence_json 只读 repo + 定位新鲜度判定；创建链路首个 PG 依赖）
+    app.state.fence_repo = VehicleFenceRepository(app.state.db)
+    app.state.geofence = GeofenceChecker(
+        fence_repo=app.state.fence_repo, redis=app.state.redis, settings=settings
+    )
     app.state.session_service = SessionService(
         redis=app.state.redis,
         vehicle_view=app.state.vehicle_view,
@@ -92,10 +105,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         command_producer=app.state.command_producer,
         storage=app.state.storage,
         settings=settings,
+        geofence=app.state.geofence,
     )
     app.state.history_service = HistoryService(
         storage=app.state.storage, settings=settings
     )
+    # WS 连接注册表（G-09）：单副本内存注册表 + 会话粘性路由前提（契约 sticky_routing）
+    app.state.ws_hub = WsHub()
+    command_result_task: asyncio.Task[None] | None = None
+    if settings.rc_command_result_consumer_enabled:
+        command_result_consumer = CommandResultConsumer(
+            settings, app.state.session_service, app.state.ws_hub
+        )
+        app.state.command_result_consumer = command_result_consumer
+        command_result_task = asyncio.create_task(
+            command_result_consumer.run(), name="command-result-consumer"
+        )
     # 陈旧会话守护（审查 R7）：残留会话会永久占用车辆互斥位（同车后续接管恒 7001）
     reaper = SessionReaper(
         redis=app.state.redis,
@@ -108,7 +133,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "service_started", service=settings.service_name, port=settings.api_port
     )
     yield
-    # 停机顺序：先停会话守护（避免使用已关闭的 Redis），再释放依赖
+    # 停机顺序：先停消费者/会话守护并关闭存量 WS 连接，再释放依赖
+    if command_result_task is not None:
+        command_result_task.cancel()
+        try:
+            await command_result_task
+        except asyncio.CancelledError:
+            pass  # 预期路径：取消即正常收尾
+        except Exception:
+            logger.exception("command_result_consumer_stop_failed")
+    await app.state.ws_hub.close_all(1001, "service_shutdown")
     await reaper.stop()
     await app.state.storage.close()
     await app.state.redis.close()
@@ -162,6 +196,7 @@ app.include_router(health_router)
 app.include_router(vehicles.router)
 app.include_router(sessions.router)
 app.include_router(history.router)
+app.include_router(websocket.router)
 register_metrics(app, settings.service_name, version="0.1.0")
 register_exception_handlers(app)
 

@@ -4,8 +4,8 @@
   契约 x-hunter-remote-config.redis_keys；⚠ pending #6 字段定稿前冻结）；
 - 互斥：``rc:lock:{vehicle_id}`` 分布式锁（TTL 30s）+ 锁内二次判定（创建），
   同车同时仅一名操作员（系统约束第 15 条）；
-- 创建 = 可控性判定（4001/4002/7001）→ 加锁 → 写 Hash → rc_session_start 信令 →
-  boot 心跳帧；任一 Kafka 投递失败 → 回滚 Hash 删除 → 5001（ServiceUnavailableError）；
+- 创建 = 可控性判定（4001/4002/7001）→ 地理围栏门禁（G-11，3003）→ 加锁 → 写 Hash →
+  rc_session_start 信令 → boot 心跳帧；任一 Kafka 投递失败 → 回滚 Hash 删除 → 5001（ServiceUnavailableError）；
 - 结束 = 「先安全后清理」（契约 267 行顺序不可颠倒）：stop 帧 + session_end 信令
   （均尽力而为）→ 删 Hash → sidecar 归档（尽力而为，失败置 sidecar_written=false）；
 - 操作员身份只取网关注入头（X-User-Id / X-Roles），不查 user-service 表
@@ -74,12 +74,13 @@ from app.schemas.sessions import (
     VideoPreference,
     WebRtcConnectionInfo,
 )
+from app.services.geofence import GeofenceChecker
 from app.services.metrics import (
     ARCHIVE_FAILED_TOTAL,
     SESSION_CONFLICTS_TOTAL,
     SESSIONS_ACTIVE,
 )
-from app.services.vehicle_view import VehicleViewReader
+from app.services.vehicle_view import KEY_VEHICLE_STATUS, VehicleViewReader
 
 if TYPE_CHECKING:
     # 循环依赖规避：dependencies.py 装配本服务，类型仅注解期引用（运行时鸭子类型）
@@ -116,6 +117,7 @@ class SessionService:
         command_producer: SessionCommandProducer,
         storage: VideoArchiveStorage,
         settings: Settings,
+        geofence: GeofenceChecker | None = None,
     ) -> None:
         self._redis = redis
         self._vehicle_view = vehicle_view
@@ -123,6 +125,8 @@ class SessionService:
         self._command_producer = command_producer
         self._storage = storage
         self._settings = settings
+        # G-11 围栏门禁（未装配时跳过；生产 lifespan 必接，测试可注入替身）
+        self._geofence = geofence
 
     # ---------- 创建（POST /session；契约 x-hunter-session-lifecycle） ----------
     async def create_session(
@@ -139,6 +143,11 @@ class SessionService:
         view = await self._vehicle_view.get_controllable_view(vehicle_id)
         if not view.controllable:
             self._raise_blocked(vehicle_id, view.block_reason)
+
+        # G-11 地理围栏门禁（契约 x-hunter-geofence.check_point：可控性判定之后、
+        # 互斥锁获取之前；拒绝 3003 不取锁不留脏状态）
+        if self._geofence is not None:
+            await self._geofence.check(vehicle_id, operator_id=operator.user_id)
 
         session_id = str(uuid4())
         started_at = time.time()
@@ -434,6 +443,86 @@ class SessionService:
             video_stats=None,  # 视频质量统计源（SRS API/WS 回执）未接入（pending #10/#12）
             record=record,
             sidecar_written=sidecar_written,
+        )
+
+    # ---------- WS 控制通道支撑（G-09；契约 x-hunter-websocket-contract） ----------
+    async def resolve_ws_session(
+        self, session_id: str, operator: OperatorContext
+    ) -> tuple[str, dict[str, str]]:
+        """WS 握手会话归属校验（契约 handshake.checks 第 3/4 条）。
+
+        不存在/已结束 → 3001；非归属操作员（admin 除外）→ 1002（WS 为主动建连场景，
+        区别于 REST 查询的 3001 防探测收敛）。
+        """
+        found = await self._find_session(session_id)
+        if found is None:
+            raise ResourceNotFoundError(message=f"操控会话 {session_id} 不存在或已结束")
+        vehicle_id, mapping = found
+        if not self._can_access(operator, mapping):
+            raise PermissionDeniedError(
+                message="无权限：会话不属于当前操作员（仅归属操作员或管理员可接入）"
+            )
+        if mapping.get(FIELD_STATUS) == SessionStatus.ENDED.value:
+            raise ResourceNotFoundError(message=f"操控会话 {session_id} 已结束")
+        return vehicle_id, mapping
+
+    async def get_session_mapping(self, vehicle_id: str) -> dict[str, str] | None:
+        """按车辆直读会话 Hash（WS 状态推送/回执回写热路径，免 SCAN）。"""
+        mapping = await self._redis.client.hgetall(
+            SESSION_HASH_KEY.format(vehicle_id=vehicle_id)
+        )
+        return dict(mapping) if mapping else None
+
+    async def next_control_seq(self, vehicle_id: str) -> int | None:
+        """服务端指令序号自增 + commands_sent 计数（HINCRBY 原子；不复用前端 seq）。
+
+        返回 None = 会话键已不存在（结束/被守护清理），调用方按 3001 收敛。
+        """
+        key = SESSION_HASH_KEY.format(vehicle_id=vehicle_id)
+        exists = await self._redis.client.hexists(key, FIELD_SESSION_ID)
+        if not exists:
+            return None
+        seq = await self._redis.client.hincrby(key, FIELD_SEQ_LAST, 1)
+        await self._redis.client.hincrby(key, FIELD_COMMANDS_SENT, 1)
+        return int(seq)
+
+    async def touch_session_heartbeat(
+        self, vehicle_id: str, *, activate: bool = False
+    ) -> None:
+        """刷新 last_heartbeat_at（控制/心跳帧均视同存活）；activate=True 时 connecting → active。
+
+        会话键已消失（结束竞态）则静默跳过——由状态推送循环统一收敛 4001。
+        """
+        key = SESSION_HASH_KEY.format(vehicle_id=vehicle_id)
+        if not await self._redis.client.hexists(key, FIELD_SESSION_ID):
+            return
+        mapping: dict[str, str] = {FIELD_LAST_HEARTBEAT_AT: repr(time.time())}
+        if activate:
+            current = await self._redis.client.hget(key, FIELD_STATUS)
+            if current == SessionStatus.CONNECTING.value:
+                mapping[FIELD_STATUS] = SessionStatus.ACTIVE.value
+        await self._redis.client.hset(key, mapping=mapping)
+
+    async def set_session_status(
+        self, vehicle_id: str, status: SessionStatus
+    ) -> None:
+        """回写会话状态（degraded 持久化 / 浏览器断开后置 degraded；键消失则跳过）。"""
+        key = SESSION_HASH_KEY.format(vehicle_id=vehicle_id)
+        if not await self._redis.client.hexists(key, FIELD_SESSION_ID):
+            return
+        await self._redis.client.hset(key, FIELD_STATUS, status.value)
+
+    async def record_commands_acked(self, vehicle_id: str) -> int | None:
+        """command_result 回执计数回写（近似关联，pending #16）；无会话返回 None。"""
+        key = SESSION_HASH_KEY.format(vehicle_id=vehicle_id)
+        if not await self._redis.client.hexists(key, FIELD_SESSION_ID):
+            return None
+        return int(await self._redis.client.hincrby(key, FIELD_COMMANDS_ACKED, 1))
+
+    async def vehicle_status_snapshot(self, vehicle_id: str) -> str | None:
+        """车辆状态快照（ack 帧 vehicle_state；读 vehicle:status Hash，缺失容错 None）。"""
+        return await self._redis.client.hget(
+            KEY_VEHICLE_STATUS.format(vehicle_id=vehicle_id), "status"
         )
 
     # ---------- 内部：会话定位与权限 ----------

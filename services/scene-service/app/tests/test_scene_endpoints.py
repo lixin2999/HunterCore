@@ -634,6 +634,119 @@ async def test_run_scene_reuses_instance_when_parallel_allowed(
 
 
 # =====================================================================
+# GET /api/v1/scene/simulations/…（G-20① 进度/结果查询，无状态代理 Carla）
+# =====================================================================
+SIM_BASE = f"{SCENE_BASE}/simulations"
+
+
+async def test_get_simulation_progress_full_fields(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """进度查询：Carla 字段宽松透传（百分比/时长/时间戳）。"""
+    scene_env.carla.progress["sim-0001"] = {  # type: ignore[attr-defined]
+        "status": "running",
+        "scene_id": str(uuid4()),
+        "progress_percent": 42.5,
+        "current_time_s": 12,
+        "total_time_s": 60,
+        "message": "loading map",
+        "updated_at": "2026-09-17T08:00:00Z",
+    }
+    resp = await client.get(f"{SIM_BASE}/sim-0001", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    data = _assert_envelope(resp.json())["data"]
+    assert data["sim_instance_id"] == "sim-0001"  # type: ignore[index]
+    assert data["status"] == "running"  # type: ignore[index]
+    assert data["progress_percent"] == 42.5  # type: ignore[index]
+    assert data["current_time_s"] == 12.0 and data["total_time_s"] == 60.0  # type: ignore[index]
+    assert data["updated_at"].startswith("2026-09-17T08:00:00")  # type: ignore[index]
+
+
+async def test_get_simulation_progress_minimal_fields_null(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """Carla 仅提供 status → 进度字段全部 null（前端按 status 降级展示）。"""
+    scene_env.carla.progress["sim-min"] = {"status": "pending"}  # type: ignore[attr-defined]
+    resp = await client.get(f"{SIM_BASE}/sim-min", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    data = _assert_envelope(resp.json())["data"]
+    assert data["status"] == "pending"  # type: ignore[index]
+    assert data["progress_percent"] is None  # type: ignore[index]
+    assert data["scene_id"] is None and data["updated_at"] is None  # type: ignore[index]
+
+
+async def test_get_simulation_progress_unknown_instance_3001(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """实例不存在（Carla 404）→ 404 + code=3001。"""
+    resp = await client.get(f"{SIM_BASE}/sim-missing", headers=ADMIN_HEADERS)
+    assert resp.status_code == 404
+    _assert_envelope(resp.json(), code=3001)
+
+
+async def test_get_simulation_progress_carla_unavailable_5001(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """Carla 不可达 → 503 + code=5001。"""
+    scene_env.carla.unavailable = True  # type: ignore[attr-defined]
+    resp = await client.get(f"{SIM_BASE}/sim-0001", headers=ADMIN_HEADERS)
+    assert resp.status_code == 503
+    _assert_envelope(resp.json(), code=5001)
+
+
+async def test_get_simulation_result_terminal_with_presigned_artifacts(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """终态结果：判据透传 + object_key 产物换发预签名 URL（15 分钟）。"""
+    scene_env.carla.results["sim-done"] = {  # type: ignore[attr-defined]
+        "status": "succeeded",
+        "success": True,
+        "success_criteria_result": {"no_collision": True, "min_safe_distance": 3.2},
+        "finished_at": "2026-09-17T08:05:00Z",
+        "artifacts": [
+            {"name": "run.log", "object_key": "simulations/sim-done/run.log", "size_bytes": 128},
+            {"name": "stdout.txt"},
+        ],
+    }
+    resp = await client.get(f"{SIM_BASE}/sim-done/result", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    data = _assert_envelope(resp.json())["data"]
+    assert data["status"] == "succeeded"  # type: ignore[index]
+    assert data["success"] is True  # type: ignore[index]
+    assert data["success_criteria_result"] == {"no_collision": True, "min_safe_distance": 3.2}  # type: ignore[index]
+    artifacts = data["artifacts"]  # type: ignore[index]
+    assert artifacts[0]["download_url"].startswith("https://minio.test/hunter-scene-assets/")
+    assert artifacts[0]["expires_in"] == 900
+    assert artifacts[1]["download_url"] is None and artifacts[1]["object_key"] is None
+
+
+async def test_get_simulation_result_non_terminal_conflict_3003(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """非终态（running）查结果 → 409 + code=3003（结果未就绪）。"""
+    scene_env.carla.results["sim-live"] = {"status": "running"}  # type: ignore[attr-defined]
+    resp = await client.get(f"{SIM_BASE}/sim-live/result", headers=ADMIN_HEADERS)
+    assert resp.status_code == 409
+    _assert_envelope(resp.json(), code=3003)
+
+
+async def test_get_simulation_result_unknown_instance_3001(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """结果查询同样受 404 → 3001 传导。"""
+    resp = await client.get(f"{SIM_BASE}/sim-none/result", headers=ADMIN_HEADERS)
+    assert resp.status_code == 404
+    _assert_envelope(resp.json(), code=3001)
+
+
+async def test_get_simulation_progress_requires_authentication(client: AsyncClient) -> None:
+    """缺失网关注入身份头 → 401 + code=1001（scene:read）。"""
+    resp = await client.get(f"{SIM_BASE}/sim-0001")
+    assert resp.status_code == 401
+    _assert_envelope(resp.json(), code=1001)
+
+
+# =====================================================================
 # 未知路径（统一响应体，不得裸 404 文本）
 # =====================================================================
 async def test_unknown_scene_path_returns_unified_error(client: AsyncClient, scene_env: object) -> None:

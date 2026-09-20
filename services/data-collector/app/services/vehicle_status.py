@@ -9,9 +9,11 @@
 
 ⚠ 字段来源与待定稿项（redis-keys pending #1/#5，须人工确认后回填契约）：
 - health 消息提供 ``status`` + ``system`` 段；telemetry 消息提供 ``battery_soc``/``velocity``；
-- **``gear``（P 档判定）与 ``free_storage_mb`` 在 health/telemetry Schema 中无来源** →
-  OTA 门禁的 ``vehicle_parked`` / ``storage`` 两项无法被满足（缺数据即拒绝，安全默认），
-  须先定稿字段来源再补齐；**禁止在本模块伪造默认值**（否则门禁被静默绕过）；
+- **``gear``（P 档判定）与 ``free_storage_mb`` 自 G-08（决策①）起由 health 顶层可选字段提供**：
+  需车端排期上报；未上报时本模块不写入该 field（**禁止伪造默认值**，否则 OTA 门禁被静默绕过），
+  OTA 的 ``vehicle_parked`` / ``storage`` 两项在缺数据时仍拒绝（安全默认）；
+- **G-11：``lat`` / ``lng``（GPS WGS84 度）由 health 顶层可选字段提供**（同 G-08 模式，
+  车端排期上报；不写入未上报的 field），供 remote-control 地理围栏接管门禁只读消费；
 - ``last_seen_seconds`` 由 ``last_seen_at`` 与当前时间推导（:class:`VehicleStatusSweeper`
   周期刷新并在超阈值时移出在线集合，实现「遥测中断 > 10s → 离线」约束）。
 """
@@ -97,6 +99,19 @@ class VehicleStatusWriter:
             value = system.get(field)
             if value is not None:
                 mapping[field] = str(value)
+        # G-08（决策①）：gear / free_storage_mb 由 health 顶层可选字段提供（车端排期上报）；
+        # 未上报时不写入该 field（禁止伪造默认值 → OTA 门禁缺数据即拒绝）。
+        for field in ("gear", "free_storage_mb"):
+            value = payload.get(field)
+            if value is not None:
+                mapping[field] = str(value)
+        # G-11：lat / lng（GPS WGS84 度）同模式——**成对且携带写入时刻 lat_lng_at** 才写入
+        # （围栏判定新鲜度依据；缺任一则不写，陈旧定位不得静默参与接管门禁）。
+        lat, lng = payload.get("lat"), payload.get("lng")
+        if lat is not None and lng is not None:
+            mapping["lat"] = str(lat)
+            mapping["lng"] = str(lng)
+            mapping["lat_lng_at"] = f"{current:.3f}"
         if timestamp > 0:
             mapping["vehicle_ts"] = f"{timestamp:.3f}"
         await self._redis.hset(status_key(vehicle_id), mapping=mapping)

@@ -212,6 +212,41 @@ export interface SceneRunData {
   param_overrides?: Record<string, unknown>
 }
 
+/** 仿真实例进度快照（GET /api/v1/scene/simulations/{sim_instance_id}，决策 G-20①） */
+export interface SimulationProgress {
+  sim_instance_id: string
+  scene_id?: string | null
+  status: SimulationStatus
+  /** 完成百分比（Carla 未提供时 null，按 status 降级展示） */
+  progress_percent?: number | null
+  current_time_s?: number | null
+  total_time_s?: number | null
+  message?: string | null
+  updated_at?: string | null
+}
+
+/** 仿真产物（object_key 落 hunter-scene-assets 时已换发预签名 URL，15 分钟） */
+export interface SimulationArtifact {
+  name: string
+  object_key?: string | null
+  size_bytes?: number | null
+  download_url?: string | null
+  expires_in?: number | null
+}
+
+/** 仿真实例结果（GET …/simulations/{sim_instance_id}/result，G-20①；仅终态可查） */
+export interface SimulationResult {
+  sim_instance_id: string
+  scene_id?: string | null
+  status: SimulationStatus
+  success?: boolean | null
+  success_criteria_result?: Record<string, unknown> | null
+  message?: string | null
+  artifacts: SimulationArtifact[]
+  started_at?: string | null
+  finished_at?: string | null
+}
+
 /** 创建/更新场景请求（同一结构） */
 export interface SceneUpsertRequest {
   scene_name: string

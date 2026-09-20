@@ -1,9 +1,20 @@
 """文件上传模型（契约 components.schemas：UploadBucket → FileCompleteResponse，5.5 节）。"""
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.common import FileDataType, UploadBucket, UploadMethod
+
+#: 生命周期归类（G-12，契约 FilePresignRequest/FileCompleteRequest.retention）
+FileRetention = Literal["regular", "event"]
+
+#: 打标义务说明（与 contracts/database/object-storage.yaml lifecycle.tagging 同源）
+_RETENTION_DESC = (
+    "生命周期归类（G-12，仅 hunter-rosbag 消费）：事件包必须显式 event（永久），"
+    "缺省 regular（30 天）；服务端 complete 阶段据此打 Tag hunter-retention=<retention>"
+)
 
 
 class FilePresignRequest(BaseModel):
@@ -30,6 +41,7 @@ class FilePresignRequest(BaseModel):
         pattern=r"^[0-9a-f]{64}$",
         description="可选：文件 SHA-256（上传前声明，供 complete 阶段校验）",
     )
+    retention: FileRetention = Field(default="regular", description=_RETENTION_DESC)
 
 
 class FilePresignPart(BaseModel):
@@ -104,6 +116,7 @@ class FileCompleteRequest(BaseModel):
         default=None, description="分片 ETag 列表（method=multipart 时必传，用于合并对象）"
     )
     timestamp: float = Field(description="上传完成时间（Unix epoch 秒，车端时间）")
+    retention: FileRetention = Field(default="regular", description=_RETENTION_DESC)
 
 
 class FileCompleteData(BaseModel):

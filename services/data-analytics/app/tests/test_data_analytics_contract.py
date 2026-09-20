@@ -527,15 +527,15 @@ def test_alert_contract_level_mapping_matches_orm(contract: dict[str, Any]) -> N
         event_type.value: EVENT_LEVEL_BY_TYPE[event_type].value for event_type in EventType
     }
     assert alert["level_mapping"]["by_type"] == expected
-    assert len(alert["level_mapping"]["by_type"]) == 18
+    assert len(alert["level_mapping"]["by_type"]) == 19
     assert set(alert["level_mapping"]["by_type"].values()) == {
         level.value for level in EventLevel
     }
     # 平台侧重算的类型集合 ⊆ 受控词表；车端上报类型不由本服务重算
     emitted = " ".join(alert["emitted_types"])
     for event_type in ("communication_loss", "harsh_braking", "over_speed", "battery_low",
-                       "battery_critical", "collision_warning", "harsh_acceleration",
-                       "harsh_turning"):
+                       "battery_critical", "collision_warning", "collision_pre_warning",
+                       "harsh_acceleration", "harsh_turning"):
         assert event_type in emitted, f"实时作业未声明产出 {event_type}"
     assert "manual_takeover" in " ".join(alert["not_emitted"])
 
@@ -546,7 +546,7 @@ def test_alert_event_schema_matches_alert_contract(contract: dict[str, Any]) -> 
     assert schema["additionalProperties"] is False
     properties = schema["properties"]
     alert = contract["x-hunter-alert-contract"]
-    # 类型 = 受控词表 18 种；等级 = 3 级；来源作业 = 6.2 节 5 个作业
+    # 类型 = 受控词表 19 种；等级 = 3 级；来源作业 = 6.2 节 5 个作业
     assert set(properties["alert_type"]["enum"]) == {t.value for t in EventType}
     assert set(properties["level"]["enum"]) == {level.value for level in EventLevel}
     assert set(properties["source_job"]["enum"]) == EXPECTED_REALTIME_JOBS
@@ -576,23 +576,31 @@ def test_alert_event_schema_matches_alert_contract(contract: dict[str, Any]) -> 
     assert contract["x-hunter-kafka"]["produces"][1]["key"] == "vehicle_id"
 
 
-def test_collision_ttc_level_conflict_is_registered(contract: dict[str, Any]) -> None:
-    """6.2.3 节 3.0s 预警与受控词表等级冲突必须显式登记（禁止静默放宽等级）。"""
+def test_collision_ttc_conflict_resolved_by_pre_warning(contract: dict[str, Any]) -> None:
+    """G-22②：6.2.3 节 3.0s 预警与 collision_warning(critical) 等级冲突已通过新增
+    collision_pre_warning(warning) 消解，两档均投 alert_event，受控词表扩展为 19 种。"""
     jobs = contract["x-hunter-realtime-jobs"]["jobs"]
     collision = job_by_name(jobs, "collision_risk_assessment")
     assert collision["section"] == "6.2.3"
-    assert "TTC = d / v_rel" in " ".join(collision["logic"])
-    assert "collision_warning" in collision["conflict_note"]
+    logic = " ".join(collision["logic"])
+    assert "TTC = d / v_rel" in logic
+    # 双档分发：collision_warning（critical，<1.5s）与 collision_pre_warning（warning，<3.0s）均投 alert_event
+    assert "collision_warning" in logic and "collision_pre_warning" in logic
+    assert "冲突已消解" in collision["conflict_note"]
     assert "pending #3" in collision["conflict_note"]
 
     questions = "\n".join(
         f"{item['question']}\n{item['contract_decision']}"
         for item in contract["x-hunter-pending-confirmation"]["items"]
     )
-    assert "TTC" in questions and "collision_warning" in questions
-    # 受控词表未扩展：alert_event.alert_type 仍为 18 种事件类型（3.0s 预警不新增类型）
+    assert "TTC" in questions and "collision_pre_warning" in questions
+    assert "已结案 G-22②" in questions
+    # 受控词表已扩展：alert_event.alert_type 为 19 种事件类型（新增 collision_pre_warning）
     schema = load_json(SCHEMA_DIR / "alert_event.schema.json")
-    assert len(schema["properties"]["alert_type"]["enum"]) == 18
+    alert_enum = set(schema["properties"]["alert_type"]["enum"])
+    assert len(alert_enum) == 19
+    assert "collision_pre_warning" in alert_enum
+    assert EVENT_LEVEL_BY_TYPE[EventType.COLLISION_PRE_WARNING].value == "warning"
     rules = job_by_name(jobs, "driving_anomaly_detection")["rules"]
     for rule in rules:
         assert rule["level"] == EVENT_LEVEL_BY_TYPE[EventType(rule["name"])].value

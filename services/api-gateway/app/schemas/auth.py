@@ -9,12 +9,13 @@ from typing import Literal
 from uuid import UUID
 
 from hunter_common.responses import ApiResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 __all__ = [
     "ApiResponseEmpty",
     "ApiResponseTokenPair",
     "ApiResponseUserProfile",
+    "ChangePasswordRequest",
     "LoginRequest",
     "LogoutRequest",
     "RefreshTokenRequest",
@@ -61,6 +62,34 @@ class LogoutRequest(BaseModel):
     )
 
 
+class ChangePasswordRequest(BaseModel):
+    """POST /api/v1/user/change-password 请求体（契约 ChangePasswordRequest；G-06）。"""
+
+    old_password: str = Field(
+        min_length=8,
+        max_length=128,
+        description="当前口令（bcrypt 校验；失败统一 1001，禁止写入日志）",
+    )
+    new_password: str = Field(
+        min_length=8,
+        max_length=128,
+        description="新口令（≥8 位且含大写、小写、数字；设计文档 14.1 节口令强度策略）",
+    )
+
+    @field_validator("new_password")
+    @classmethod
+    def _require_complexity(cls, value: str) -> str:
+        """契约 pattern `^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d).+$` 的等价实现。
+
+        pydantic 内置 regex 引擎不支持 lookahead，故用校验器实现同一强度策略；
+        失败→422 + 2001（与其他字段校验同一映射）。
+        """
+        if not (any(c.islower() for c in value) and any(c.isupper() for c in value)
+                and any(c.isdigit() for c in value)):
+            raise ValueError("新口令需包含大写字母、小写字母与数字")
+        return value
+
+
 # =====================================================================
 # 数据模型（契约 UserProfile / TokenPair）
 # =====================================================================
@@ -75,12 +104,16 @@ class UserProfile(BaseModel):
         default_factory=list,
         description="权限编码列表（user_svc.permissions.permission_code，形如 `scene:read`）",
     )
+    must_change_password: bool = Field(
+        default=False,
+        description="G-06 首登强制改密标志；true 时前端应引导调用 /user/change-password",
+    )
 
 
 class TokenPair(BaseModel):
-    """Token 对（契约 TokenPair；Access 2h + Refresh 7d 单次轮换）。"""
+    """Token 对（契约 TokenPair；Access 30min + Refresh 7d 单次轮换）。"""
 
-    access_token: str = Field(description="JWT Access Token（2 小时）")
+    access_token: str = Field(description="JWT Access Token（30 分钟，G-04①）")
     refresh_token: str = Field(description="Refresh Token（7 天，单次使用轮换）")
     token_type: Literal["Bearer"] = "Bearer"
     expires_in: int = Field(description="Access Token 有效期（秒）")

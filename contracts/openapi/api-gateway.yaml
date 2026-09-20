@@ -29,7 +29,7 @@ info:
 
     **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功，非 0 为预定义错误码（附录 A）。
 
-    **认证**：`Authorization: Bearer <JWT>`；Access Token 2h、Refresh Token 7d，支持 MFA(TOTP)。
+    **认证**：`Authorization: Bearer <JWT>`；Access Token 30min（G-04 决策①收紧，原设计文档 2h）、Refresh Token 7d，支持 MFA(TOTP)。
     车辆设备采用 X.509 双向 TLS（CommonName = vehicle_id）+ Kafka SASL_SSL，不通过 REST 认证。
 
     **链路追踪**：入口优先透传 `X-Request-ID`，未提供则生成 UUID；转发后端时附加
@@ -64,11 +64,11 @@ paths:
       tags: [auth]
       summary: 用户登录（用户名密码 + 可选 MFA(TOTP)）
       description: |
-        设计文档 3.2.1 节登录流程：验证用户名密码 → 生成 JWT Access Token(2h) + Refresh Token(7d)。
+        设计文档 3.2.1 节登录流程：验证用户名密码 → 生成 JWT Access Token(30min，G-04①) + Refresh Token(7d)。
 
         - MFA(TOTP)：请求携带 `totp_code`；缺失或校验失败返回 1001（附录 A 无 MFA 专用错误码，禁止新增）
         - 暴力破解防护（14.5 节）：登录失败次数限制 + IP 锁定；失败/成功均审计留痕（禁止记录密码）
-        - 成功后更新 `user_svc.users.last_login_time`，并写 Redis `session:{user_id}`（2 小时）
+        - 成功后更新 `user_svc.users.last_login_time`，并写 Redis `session:{user_id}`（30 分钟，G-04①）
       security: []
       parameters:
         - $ref: '#/components/parameters/TraceRequestId'
@@ -145,7 +145,7 @@ paths:
       description: |
         设计文档 14.1 节：支持主动注销。
 
-        - 清除 Redis `session:{user_id}`；Access Token 加入黑名单直至其自然过期（≥ 2h 保留窗口）
+        - 清除 Redis `session:{user_id}`；Access Token 加入黑名单直至其自然过期（≥ 30min 保留窗口，G-04① 收紧后窗口同步缩短）
         - 幂等：Token 已失效仍返回 code=0（不泄露 Token 状态）
       security:
         - bearerAuth: []
@@ -200,6 +200,45 @@ paths:
           $ref: '#/components/responses/InternalError'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/user/change-password:
+    post:
+      operationId: userChangePassword
+      tags: [auth]
+      summary: 修改密码（G-06 首登强制改密）
+      description: |
+        设计文档 14.1 节口令策略 + V4.0 差距分析 G-06：默认管理员口令已去除，
+        初始化账号 `must_change_password=true`，首次登录后必须调用本端点改密。
+
+        - 校验 old_password（bcrypt）；新口令强度见 ChangePasswordRequest（≥8 位，含大小写与数字）
+        - 成功后置 `user_svc.users.must_change_password=false` 并更新 password_hash
+        - 当前 Access Token 随会话继续有效（改密不强制重登；强制下线为后续增强项）
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TraceRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '200':
+          description: 修改成功（data 为 null）
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseEmpty'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/InvalidParameter'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   # ------------------------------------------------------------------
   # 运维端点（非 /api/v1 前缀；K8s probe 与 Prometheus 抓取使用，不经网关路由表）
@@ -288,7 +327,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT Access Token（2 小时）。载荷结构（设计文档 3.2.2 节）：
+        JWT Access Token（30 分钟；G-04 决策①：前端 Token 存 localStorage，服务端同步收紧 TTL，原设计文档 2h）。载荷结构（设计文档 3.2.2 节）：
         `sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` / `iss="hunter-platform"` / `jti`。
 
         校验失败映射：Token 缺失或无效 → 1001；Token 过期 → 1003（客户端调用 /api/v1/user/refresh）；
@@ -601,13 +640,31 @@ components:
           writeOnly: true
           description: 可选；提供时一并作废，不提供则仅注销当前 Access Token 会话
 
+    ChangePasswordRequest:
+      type: object
+      required: [old_password, new_password]
+      properties:
+        old_password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          writeOnly: true
+          description: 当前口令（bcrypt 校验；失败统一 1001，禁止写入日志）
+        new_password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          pattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+$'
+          writeOnly: true
+          description: 新口令（≥8 位且含大写、小写、数字；设计文档 14.1 节口令强度策略）
+
     TokenPair:
       type: object
       required: [access_token, refresh_token, token_type, expires_in, refresh_expires_in, user]
       properties:
         access_token:
           type: string
-          description: JWT Access Token（2 小时）
+          description: JWT Access Token（30 分钟，G-04①）
         refresh_token:
           type: string
           writeOnly: true
@@ -618,7 +675,7 @@ components:
           default: Bearer
         expires_in:
           type: integer
-          example: 7200
+          example: 1800
           description: Access Token 有效期（秒）
         refresh_expires_in:
           type: integer
@@ -651,6 +708,12 @@ components:
           items:
             type: string
           description: 权限编码列表（user_svc.permissions.permission_code，形如 `scene:read`）
+        must_change_password:
+          type: boolean
+          default: false
+          description: |
+            G-06 首登强制改密标志（user_svc.users.must_change_password）；
+            true 时前端应引导跳转改密页，调用 /api/v1/user/change-password 后复位
 
     # ---------- 运维探测 ----------
     HealthStatus:
@@ -686,8 +749,10 @@ components:
 x-hunter-gateway-routes:
   source: "设计文档 3.4 节 + 系统上下文基座「网关路由表」"
   route_headers:
-    description: 网关转发至后端时注入的请求头（客户端同名头一律被覆盖，防身份伪造）
-    headers: [X-User-Id, X-Roles, X-Trace-Id]
+    description: 网关转发至后端时注入的请求头（客户端同名头一律被覆盖，防身份伪造）；
+      X-Identity-Timestamp/X-Internal-MAC 为 G-02 身份头 HMAC-SHA256 签名加固
+      （密钥 GATEWAY_HMAC_SECRET，网关与后端共享，后端配置后强制验签，防集群内伪造身份绕过 RBAC）
+    headers: [X-User-Id, X-Roles, X-Trace-Id, X-Identity-Timestamp, X-Internal-MAC]
   strip_prefix: false        # 后端按 /api/v1/<domain>/... 全路径注册路由（与各服务契约一致）
   routes:
     - prefix: /api/v1/scene
@@ -779,7 +844,7 @@ x-hunter-websocket-routes:
     protocol: websocket
     security_protocol: WSS（TLS，设计文档 14.2 节）
     auth: "JWT（握手阶段校验）"
-    auth_detail: "⚠ 传送方式（Authorization 头 / Sec-WebSocket-Protocol / 首帧认证）待人工确认；禁止查询串明文携带 Token（日志泄露风险）"
+    auth_detail: "传送方式已定稿（remote-control 契约 pending #20 决策①，修改须同步该段）：浏览器经 Sec-WebSocket-Protocol 子协议承载——hunter-jwt, <token> 双值或 hunter-jwt.<token> 单值，服务端相应回显；非浏览器客户端兼容 Authorization: Bearer 头；禁止查询串明文携带 Token（日志泄露风险）"
     constraints:
       - "控制指令 20Hz（50ms 间隔）；>500ms 未收到指令，车辆自动减速停车"
       - "远程操控最高速度 2.0 m/s（可配置）；视频 720p@30fps、H.264 硬编码、码率 2-4Mbps、关键帧间隔 1s"

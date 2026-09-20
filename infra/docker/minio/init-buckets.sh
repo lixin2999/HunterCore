@@ -22,20 +22,20 @@ create_bucket() {
   echo "[minio-init] bucket ready: $1"
 }
 
-# add_expiry <bucket> <days> [prefix]
+# add_expiry <bucket> <days> [tags]（G-12：rosbag 按对象 Tag 而非前缀区分生命周期）
 add_expiry() {
-  local bucket="$1" days="$2" prefix="${3:-}"
-  if [ -n "$prefix" ]; then
-    mc ilm rule add --expire-days "$days" --prefix "$prefix" "$ALIAS/$bucket" >/dev/null
+  local bucket="$1" days="$2" tags="${3:-}"
+  if [ -n "$tags" ]; then
+    mc ilm rule add --expire-days "$days" --tags "$tags" "$ALIAS/$bucket" >/dev/null
   else
     mc ilm rule add --expire-days "$days" "$ALIAS/$bucket" >/dev/null
   fi
-  echo "[minio-init] lifecycle: $bucket expire ${days}d${prefix:+ (prefix=$prefix)}"
+  echo "[minio-init] lifecycle: $bucket expire ${days}d${tags:+ (tags=$tags)}"
 }
 
 # ---- 7 个 Bucket（名称与生命周期不可更改） ----
 create_bucket "hunter-raw-data"       # 传感器原始数据（点云/图像）   30 天
-create_bucket "hunter-rosbag"         # ROS Bag 文件                 事件永久/常规 30 天
+create_bucket "hunter-rosbag"         # ROS Bag 文件                 按 Tag：event 永久/regular 30 天
 create_bucket "hunter-video"          # 远程操控录像                  90 天
 create_bucket "hunter-ota-packages"   # OTA 升级包                    永久
 create_bucket "hunter-reports"        # 分析报告                      永久
@@ -44,9 +44,10 @@ create_bucket "hunter-scene-assets"   # 场景资源（地图/模型）         
 
 # ---- 生命周期规则 ----
 add_expiry "hunter-raw-data" 30
-# rosbag 约定：常规数据存于 regular/ 前缀（30 天过期）；
-# 事件数据存于 events/ 前缀（无过期规则 = 永久），由 data-collector 上传时遵循
-add_expiry "hunter-rosbag" 30 "regular/"
+# rosbag 约定（G-12）：生命周期按对象 Tag hunter-retention 区分，不再按前缀；
+# hunter-retention=regular → 30 天过期；hunter-retention=event → 无过期规则（永久）；
+# Tag 由 data-collector complete 阶段服务端打标，未打标对象等同永久（禁止绕过 complete 直写）
+add_expiry "hunter-rosbag" 30 "hunter-retention=regular"
 add_expiry "hunter-video" 90
 add_expiry "hunter-logs" 30
 # hunter-ota-packages / hunter-reports / hunter-scene-assets：永久，不设置过期规则

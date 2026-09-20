@@ -5,8 +5,9 @@ description = "远程操控：WebRTC 视频流转发、控制指令转发（20Hz
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.100,<1.0",
-    "uvicorn[standard]>=0.23",
+    "uvicorn[standard]>=0.23",      # [standard] 含 websockets（WS 端点运行时）
     "prometheus-client>=0.20,<1",
+    "PyJWT>=2.8,<3",                # WS 握手 JWT 验签（G-09，与 api-gateway 共享密钥）
 ]
 
 # 注意：hunter_common 由仓库统一安装（先执行 pip install -e "common/python"），

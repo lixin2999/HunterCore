@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIT_TARGETS: tuple[str, ...] = (
     "common/python",
     "tests",
+    "flink-jobs",
     "services/api-gateway",
     "services/scene-service",
     "services/data-collector",

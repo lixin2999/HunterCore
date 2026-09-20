@@ -3,8 +3,9 @@
 # - 显式 server.properties 模板 + 启动脚本（不依赖镜像默认魔法，配置可审查）
 # - 初始 SCRAM 超级用户通过 kafka-storage.sh format --add-scram 建立（KRaft 引导必需）
 # - auto.create.topics.enable=false：Topic 必须按 contracts/kafka 契约创建
-# - ssl.client.auth=requested：SASL_SSL + SCRAM 凭据认证；
-#   若需严格 mTLS(required)，应用侧需补 KAFKA_SSL_CERTFILE/KEYFILE 配置后再切换
+# - ssl.client.auth=required：严格 mTLS（设计文档 3.2.3 双向证书认证 / 14.2 车-云 SASL_SSL）；
+#   所有 SASL_SSL 客户端（车端与平台服务）必须出示客户端证书：
+#   应用侧经 KAFKA_SSL_CERTFILE/KEYFILE 配置（Secret 挂载，见 02-secret 与共享 ConfigMap）
 # ⚠ 资源/容量数值需与设计文档 15.2 节核对
 # =====================================================================
 apiVersion: v1
@@ -39,7 +40,7 @@ data:
     ssl.keystore.key=/etc/hunter/kafka-tls/tls.key
     ssl.truststore.type=PEM
     ssl.truststore.location=/etc/hunter/kafka-tls/ca.crt
-    ssl.client.auth=requested
+    ssl.client.auth=required
     ssl.endpoint.identification.algorithm=HTTPS
 
     log.dirs=/bitnami/kafka/data

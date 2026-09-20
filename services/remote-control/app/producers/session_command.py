@@ -148,5 +148,44 @@ class SessionCommandProducer:
         )
         return command_id
 
+    async def send_signal_relay(
+        self,
+        vehicle_id: str,
+        *,
+        session_id: str,
+        operator_id: str,
+        signal: dict[str, Any],
+    ) -> str:
+        """下发 WebRTC 信令中继（sdp/ice 帧 → 车端；G-09 signal 通道）。
+
+        command_type 取值经 RC_COMMAND_SIGNAL_RELAY_TYPE 配置注入（pending #17 同模式，
+        定稿后只改配置不改代码）；payload.signal 为 WS 上行帧原文（契约
+        x-hunter-websocket-contract.frames.signal）；车端→浏览器方向下行中继待
+        SRS 集成定稿（pending #10/#12）。投递失败 → 5001（路由层转 error 帧）。
+        """
+        settings = self._settings
+        command_id = str(uuid4())
+        envelope: dict[str, Any] = {
+            "command_id": command_id,
+            "type": settings.rc_signal_relay_command_type,
+            "issued_by": operator_id,
+            "issued_at": round(time.time(), 3),
+            "timeout_ms": settings.rc_session_command_timeout_ms,
+            "payload": {
+                "session_id": session_id,
+                "operator_id": operator_id,
+                "signal": signal,
+            },
+        }
+        await self._send(vehicle_id, envelope)
+        logger.info(
+            "rc_signal_relay_sent",
+            vehicle_id=vehicle_id,
+            session_id=session_id,
+            signal_type=signal.get("type"),
+            command_id=command_id,
+        )
+        return command_id
+
 
 __all__ = ["SessionCommandProducer"]

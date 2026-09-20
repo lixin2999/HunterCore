@@ -4,16 +4,17 @@
 设计文档未定义 —— 本实现全部经环境变量注入（禁止硬编码），默认子路径见 app/config.py，
 人工确认后仅需调整配置，无需改代码。
 错误语义：未配置连接地址 / 连接失败 / 超时 / 非 2xx / 响应结构非法 → 5001 服务不可用
-（契约 4.4 节第 2 步「Carla 管理 API 不可达/超时返回 5001」）。
+（契约 4.4 节第 2 步「Carla 管理 API 不可达/超时返回 5001」）；
+进度/结果查询（G-20①）中 Carla 返回 404 → 3001 资源不存在（实例不存在或已回收）。
 """
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-from hunter_common.exceptions import ServiceUnavailableError
+from hunter_common.exceptions import ResourceNotFoundError, ServiceUnavailableError
 from hunter_common.logging import get_logger
 
 logger = get_logger("app.repositories.carla")
@@ -34,6 +35,15 @@ class SimInstance:
     status: str
 
 
+@dataclass(frozen=True, slots=True)
+class SimInstanceSnapshot:
+    """仿真实例完整快照（G-20① 进度/结果查询：额外携带原始响应体供宽松透传）。"""
+
+    instance_id: str
+    status: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+
 class CarlaManagementClient:
     """Carla 管理 API 异步客户端（httpx，连接惰性创建 + 超时/重试 + 统一 5001）。"""
 
@@ -46,11 +56,15 @@ class CarlaManagementClient:
         scenario_path: str,
         timeout_seconds: float,
         max_retries: int,
+        get_path: str = "",
+        result_path: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._create_path = create_path
         self._query_path = query_path
         self._scenario_path = scenario_path
+        self._get_path = get_path
+        self._result_path = result_path
         self._timeout_seconds = timeout_seconds
         self._max_retries = max(0, max_retries)
         self._client: httpx.AsyncClient | None = None
@@ -124,6 +138,32 @@ class CarlaManagementClient:
         await self._request("POST", path, json_body=payload)
         logger.info("carla_scenario_submitted", sim_instance_id=instance_id)
 
+    async def get_instance(self, instance_id: str) -> SimInstanceSnapshot:
+        """⑥ 查询仿真实例进度快照（G-20①；Carla 404 → 3001，其余失败 → 5001）。"""
+        return await self._fetch_snapshot(self._get_path, instance_id)
+
+    async def get_result(self, instance_id: str) -> SimInstanceSnapshot:
+        """⑦ 查询仿真实例结果（G-20①；终态判定由服务层完成，此处仅取快照）。"""
+        return await self._fetch_snapshot(self._result_path, instance_id)
+
+    async def _fetch_snapshot(self, path_template: str, instance_id: str) -> SimInstanceSnapshot:
+        """GET 实例子资源并解析快照（响应体非对象 → 5001；404 → 3001）。"""
+        path = path_template.format(sim_instance_id=instance_id)
+        response = await self._request("GET", path, allow_not_found=True)
+        if response.status_code == 404:
+            raise ResourceNotFoundError(
+                f"仿真实例不存在或已回收：{instance_id}",
+                details={"sim_instance_id": instance_id},
+            )
+        body = self._json_body(response, path)
+        if not isinstance(body, dict):
+            logger.error("carla_instance_snapshot_not_object", path=path)
+            raise ServiceUnavailableError(
+                "Carla 管理 API 响应非法", details={"path": path}
+            )
+        status = str(body.get("status") or "running")
+        return SimInstanceSnapshot(instance_id=instance_id, status=status, data=body)
+
     # ---------- 内部：请求与解析 ----------
 
     async def _request(
@@ -133,8 +173,9 @@ class CarlaManagementClient:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        allow_not_found: bool = False,
     ) -> httpx.Response:
-        """发送请求（超时 + 有限重试）；任何失败统一映射 5001（依赖服务不可用）。"""
+        """发送请求（超时 + 有限重试）；失败统一映射 5001；``allow_not_found`` 时 404 原样返回。"""
         if not self._base_url:
             raise ServiceUnavailableError(
                 "Carla 管理 API 未配置", details={"env": "CARLA_MANAGEMENT_ENDPOINT"}
@@ -155,6 +196,8 @@ class CarlaManagementClient:
                     await asyncio.sleep(_RETRY_BACKOFF_SECONDS * attempt)
                 continue
             if response.status_code >= 400:
+                if allow_not_found and response.status_code == 404:
+                    return response
                 logger.error("carla_error_response", path=path, status_code=response.status_code)
                 raise ServiceUnavailableError(
                     f"Carla 管理 API 返回 {response.status_code}", details={"path": path}
@@ -188,4 +231,4 @@ class CarlaManagementClient:
         )
 
 
-__all__ = ["ACTIVE_STATUSES", "CarlaManagementClient", "SimInstance"]
+__all__ = ["ACTIVE_STATUSES", "CarlaManagementClient", "SimInstance", "SimInstanceSnapshot"]

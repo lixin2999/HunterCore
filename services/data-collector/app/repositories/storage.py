@@ -3,8 +3,9 @@
 对应 data-analytics 的 repositories/storage.py 模式：同步 boto3 调用经
 asyncio.to_thread 包装为异步，禁止在事件循环内做阻塞 IO（异步优先原则）。
 
-生命周期一致性：桶生命周期（30/90/永久）由 infra/docker/minio-init Job 配置，
-本模块只做对象操作（契约 x-hunter-file-upload-flow）。
+生命周期一致性：桶级生命周期规则由 MinIO 初始化脚本配置（G-12 后 hunter-rosbag
+按对象 Tag hunter-retention 区分，Tag 由本模块 ``put_object_tags`` 在 complete 阶段打标，
+契约 x-hunter-file-upload-flow.tagging）。
 
 完整性校验（审查 R2 修复）：``stream_hashes`` 单次流式计算对象真实 size/MD5/SHA-256，
 是 complete 阶段「size_bytes / md5 / sha256 三者一致」契约判定的唯一数据来源
@@ -25,6 +26,8 @@ from app.config import settings
 _STREAM_CHUNK_SIZE = 1024 * 1024
 #: 对象不存在（MinIO 可能返回 404 / NoSuchKey / NotFound）
 _NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+#: hunter-rosbag 生命周期归类 Tag 键（G-12，contracts/database/object-storage.yaml lifecycle.tagging）
+ROSBAG_RETENTION_TAG_KEY = "hunter-retention"
 
 
 class MinioStorage:
@@ -183,6 +186,20 @@ class MinioStorage:
             next_marker = items[-1]["object_key"]
         return items, truncated, next_marker
 
+    # ---------- 生命周期归类打标（G-12） ----------
+
+    def put_object_tags(self, bucket: str, key: str, retention: str) -> None:
+        """打生命周期归类 Tag ``hunter-retention=<retention>``（仅 hunter-rosbag，G-12）。
+
+        未打标对象等同永久保留（S3 tag 过滤器无法表达无 Tag），因此打标失败
+        必须阻断 sensor_file 发布（调用侧转 5001），禁止静默降级。
+        """
+        self._client.put_object_tagging(
+            Bucket=bucket,
+            Key=key,
+            Tagging={"TagSet": [{"Key": ROSBAG_RETENTION_TAG_KEY, "Value": retention}]},
+        )
+
     # ---------- 分片合并 / 中止 ----------
 
     def complete_multipart_upload(
@@ -232,4 +249,4 @@ def _build_sync_client() -> Any:
     )
 
 
-__all__ = ["MinioStorage", "get_storage"]
+__all__ = ["ROSBAG_RETENTION_TAG_KEY", "MinioStorage", "get_storage"]

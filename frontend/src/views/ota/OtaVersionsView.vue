@@ -2,11 +2,13 @@
 /**
  * OTA 版本仓库（ota-service.yaml）
  *
- * 契约流程：
+ * 契约流程（G-18② 审核流）：
  * 1. POST /api/v1/ota/versions（附录 D 限流 5 QPS/用户）→ 返回 version + upload（预签名，1 小时）
  * 2. 前端本地计算 package_md5 + package_sha256（utils/hash.ts）后按分包 PUT 上传
- * 3. POST /api/v1/ota/versions/{version_id}/publish → 服务端校验（失败 6001/6002）
- * 4. POST /api/v1/ota/versions/{version_id}/deprecate → 弃用/下线（不可删除，保证审计）
+ * 3. POST .../submit-testing（draft → testing，服务端校验包已直传）
+ * 4. POST .../submit-review（testing → reviewing）；审核驳回走 .../reject-review（回退 draft）
+ * 5. POST .../publish（审核批准，前置仅 reviewing → 服务端校验，失败 6001/6002）
+ * 6. POST /api/v1/ota/versions/{version_id}/deprecate → 弃用/下线（不可删除，保证审计）
  * 注意：release_type 契约未定义 enum（pending #2），前端仅原样展示，不做分支判断。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -17,6 +19,9 @@ import {
   deprecateOtaVersion,
   listOtaVersions,
   publishOtaVersion,
+  rejectOtaVersionReview,
+  submitOtaVersionReview,
+  submitOtaVersionTesting,
 } from '@/api/ota'
 import { putToPresignedUrl } from '@/api/request'
 import StatusTag from '@/components/common/StatusTag.vue'
@@ -154,13 +159,68 @@ async function submitCreate(): Promise<void> {
         : 1
     const created = await createOtaVersion({ ...createForm, part_count: partCount })
     await uploadPackage(created.upload)
-    ElMessage.success(`版本已创建并上传完成（${created.version.version_name}），请执行「发布」以完成完整性校验`)
+    ElMessage.success(`版本已创建并上传完成（${created.version.version_name}），请依次执行「提测 → 提审 → 发布」`)
     createVisible.value = false
     await load()
   } catch (error) {
     ElMessage.error(error instanceof HunterApiError ? error.message : '版本创建失败')
   } finally {
     submitting.value = false
+  }
+}
+
+/* ------------------------- G-18② 审核流（提测/提审/驳回） ------------------------- */
+
+async function handleSubmitTesting(row: OtaVersionItem): Promise<void> {
+  try {
+    await submitOtaVersionTesting(row.version_id)
+    ElMessage.success(`版本 ${row.version_name} 已提交测试`)
+    await load()
+  } catch (error) {
+    // 6001 = 升级包尚未直传（先完成上传再提测）
+    ElMessage.error(error instanceof HunterApiError ? error.message : '提交测试失败')
+  }
+}
+
+async function handleSubmitReview(row: OtaVersionItem): Promise<void> {
+  let summary = ''
+  try {
+    const result = await ElMessageBox.prompt(
+      '测试完成后提交审核，等待审核批准（发布）或驳回。可附测试结论摘要（仅审计留痕）：',
+      '提交审核',
+      { inputPattern: /^.{0,512}$/, inputErrorMessage: '摘要最长 512 字符', inputPlaceholder: '如：5 台实车验证 72h 无异常' },
+    )
+    summary = result.value ?? ''
+  } catch {
+    return
+  }
+  try {
+    await submitOtaVersionReview(row.version_id, summary ? { test_summary: summary } : {})
+    ElMessage.success(`版本 ${row.version_name} 已提交审核`)
+    await load()
+  } catch (error) {
+    ElMessage.error(error instanceof HunterApiError ? error.message : '提交审核失败')
+  }
+}
+
+async function handleRejectReview(row: OtaVersionItem): Promise<void> {
+  let reason = ''
+  try {
+    const result = await ElMessageBox.prompt(
+      '驳回后版本回退草稿（可重新上传包体并再次提测/提审）。请输入驳回原因（必填）：',
+      '审核驳回',
+      { inputPattern: /.+/, inputErrorMessage: '请填写驳回原因' },
+    )
+    reason = result.value
+  } catch {
+    return
+  }
+  try {
+    await rejectOtaVersionReview(row.version_id, { reason })
+    ElMessage.success('已驳回，版本回退草稿')
+    await load()
+  } catch (error) {
+    ElMessage.error(error instanceof HunterApiError ? error.message : '驳回失败')
   }
 }
 
@@ -180,7 +240,7 @@ const publishChecks = computed(() => {
 
 async function handlePublish(row: OtaVersionItem): Promise<void> {
   try {
-    const data = await publishOtaVersion(row.version_id, { note: '控制台发布' })
+    const data = await publishOtaVersion(row.version_id, { note: '控制台审核批准' })
     publishResult.value = data.checks as unknown as Record<string, boolean>
     ElMessage.success(`版本 ${data.version_code} 已发布（${formatTime(data.release_time)}）`)
     await load()
@@ -283,10 +343,38 @@ onMounted(load)
       <el-table-column label="SHA-256" min-width="180" show-overflow-tooltip>
         <template #default="{ row }">{{ row.package_sha256 }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="230" fixed="right">
+      <el-table-column label="操作" width="260" fixed="right">
         <template #default="{ row }">
+          <!-- G-18② 审核流：draft → 提测；testing → 提审；reviewing → 驳回/发布（审核批准） -->
           <el-button
             v-if="row.status === 'draft'"
+            v-permission="PERMISSIONS.otaExecute"
+            link
+            type="primary"
+            @click="handleSubmitTesting(row)"
+          >
+            提测
+          </el-button>
+          <el-button
+            v-if="row.status === 'testing'"
+            v-permission="PERMISSIONS.otaExecute"
+            link
+            type="primary"
+            @click="handleSubmitReview(row)"
+          >
+            提审
+          </el-button>
+          <el-button
+            v-if="row.status === 'reviewing'"
+            v-permission="PERMISSIONS.otaExecute"
+            link
+            type="warning"
+            @click="handleRejectReview(row)"
+          >
+            驳回
+          </el-button>
+          <el-button
+            v-if="row.status === 'reviewing'"
             v-permission="PERMISSIONS.otaExecute"
             link
             type="success"

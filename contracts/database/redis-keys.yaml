@@ -43,14 +43,14 @@ keys:
   - pattern: "session:{user_id}"
     type: "String"
     value: "JWT Access Token 字符串（原样存储）"
-    ttl_seconds: 7200
-    ttl_source: "系统约束第 8 条（2 小时）；与 HunterBaseConfig.jwt_access_token_expire_minutes=120 一致"
+    ttl_seconds: 1800
+    ttl_source: "G-04 决策①（前端 Token 存 localStorage 的收紧措施）：由系统约束第 8 条原值 2 小时收紧为 30 分钟；与 HunterBaseConfig.jwt_access_token_expire_minutes=30 一致"
     owner_service: api-gateway
     writers: [api-gateway]
     readers: [api-gateway]
     lifecycle: "登录成功写入；刷新 Token 时覆盖；登出时 DEL，同时将 Access Token 加入黑名单直至其自然过期"
     sensitive: true
-    ops: ["SET key value EX 7200", "GET", "EXISTS", "DEL"]
+    ops: ["SET key value EX 1800", "GET", "EXISTS", "DEL"]
     refs: ["contracts/openapi/api-gateway.yaml（POST /api/v1/user/login、POST /api/v1/user/logout）"]
 
   # ---------------------------------------------------------------- 2
@@ -71,13 +71,18 @@ keys:
       - {name: vehicle_id, type: string, source: "键名占位符冗余（便于 HGETALL 直取）", status: required}
       - {name: status, type: "enum(车辆状态 8 态)", source: "health.status（受控词表见 contracts/database/enums.md）", status: required}
       - {name: battery_soc, type: "int 0..100", source: "telemetry.chassis.battery_soc（OTA 升级门禁 ≥50%）", status: required}
-      - {name: vehicle_state, type: string, source: "telemetry.chassis.vehicle_state（升级门禁 P 档静止判定）", status: required}
+      - {name: vehicle_state, type: string, source: "telemetry.chassis.vehicle_state（底盘状态字；非 P 档判定）", status: required}
+      - {name: gear, type: "enum(P/R/N/D)", source: "health.gear（G-08 决策①；OTA 升级/回滚门禁 P 档静止权威判定；车端排期上报，未上报则缺数据即拒绝）", status: pending}
+      - {name: free_storage_mb, type: integer, source: "health.free_storage_mb（G-08 决策①；OTA 存储门禁 ≥2048MB；车端排期上报）", status: pending}
       - {name: updated_at, type: "epoch seconds", source: "health.timestamp（陈旧判定依据）", status: required}
       - {name: network_latency_ms, type: number, source: "health.system.network_latency_ms", status: pending}
       - {name: cpu_usage, type: "number 0..100", source: "health.system.cpu_usage", status: pending}
       - {name: gpu_usage, type: "number 0..100", source: "health.system.gpu_usage", status: pending}
       - {name: memory_usage_mb, type: integer, source: "health.system.memory_usage_mb", status: pending}
       - {name: velocity, type: number, source: "telemetry.chassis.velocity（操控接管前速度判定 ≤2.0 m/s）", status: pending}
+      - {name: lat, type: "number -90..90（WGS84 度）", source: "health.lat（G-11 地理围栏接管门禁判定输入；车端排期上报，未上报则配置围栏的车辆拒绝创建会话——安全默认）", status: pending}
+      - {name: lng, type: "number -180..180（WGS84 度）", source: "health.lng（G-11；与 lat 成对，缺一即视为无定位）", status: pending}
+      - {name: lat_lng_at, type: "epoch seconds", source: "data-collector 写入 lat/lng 同批携带的写入时刻（G-11；remote-control 围栏判定新鲜度依据，超 VEHICLE_OFFLINE_THRESHOLD_SECONDS 视为定位陈旧）", status: pending}
       - {name: control_mode, type: string, source: "telemetry.chassis.control_mode", status: pending}
       - {name: fault_code, type: integer, source: "telemetry.chassis.fault_code（故障态判定）", status: pending}
     refs:
@@ -195,7 +200,7 @@ keys:
 #   1) 各服务 openapi 的 x-hunter-service.redis_keys 声明的键 ∈ 本文件 keys[].pattern
 #   2) 声明中的 type / ttl_seconds 与本文件一致
 #   3) 声明键的服务 ∈ 本文件 writers ∪ readers
-#   4) 8 个受控键的 TTL 与系统约束第 8 条一致：session 7200 / rate_limit 60 /
+#   4) 8 个受控键的 TTL 与声明一致：session 1800（G-04① 收紧，原第 8 条 7200）/ rate_limit 60 /
 #      ota:progress 86400 / cache:scene 3600 / vehicle:* 与 rc:session 不过期（null）
 # =====================================================================
 cross_check:

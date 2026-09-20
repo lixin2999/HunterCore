@@ -6,6 +6,14 @@
 -- =====================================================================
 
 -- ---------- vehicle_svc.vehicles：车辆台账 ----------
+-- G-11（设计文档 8.4.2 地理围栏）fence_json 结构（NULL = 未配置围栏不校验）：
+--   {"type":"circle"  "center_lat":f  "center_lng":f  "radius_m":f}
+--   {"type":"polygon"  "points":[[lat lng] ...]  "closed":true}
+--   可选 max_speed_mps：围栏内限速（设计文档建议 2.0）
+--   越界处置（G-11 定稿）：平台在创建远程会话时校验车辆 GPS 位置（health.lat/lng，
+--   车端排期上报；配置了围栏但定位缺失/非法围栏 → 拒绝接管 3003——安全默认）；
+--   运行期越界由车端执行自动减速/停车兜底（18 事件词表不含 fence_violation，平台侧
+--   事件上报需词表扩展，见 remote-control 契约 pending #22）
 CREATE TABLE IF NOT EXISTS vehicle_svc.vehicles (
     vehicle_id       TEXT        PRIMARY KEY,   -- 车辆唯一标识（如 HUNTER-001）= 设备证书 CommonName = Kafka 消息 key
     vehicle_name     TEXT        NOT NULL,
@@ -18,10 +26,11 @@ CREATE TABLE IF NOT EXISTS vehicle_svc.vehicles (
     last_online_time TIMESTAMPTZ,                               -- 遥测/心跳最近上报时间
     register_time    TIMESTAMPTZ NOT NULL DEFAULT now(),
     device_cert_sn   TEXT,                                      -- X.509 设备证书序列号
+    fence_json       JSONB,                                     -- G-11 地理围栏定义（结构见上方注释；NULL = 未配置）
     description      TEXT
 );
 COMMENT ON TABLE vehicle_svc.vehicles IS
-    '车辆台账；status 取值见设计文档“车辆状态定义”（8 态，不可新增/更改）';
+    '车辆台账；status 取值见设计文档“车辆状态定义”（8 态，不可新增/更改）；fence_json 见 G-11/设计文档 8.4.2';
 
 -- 设备证书序列号唯一（部分唯一索引：允许未签发证书的车辆先登记）
 CREATE UNIQUE INDEX IF NOT EXISTS uq_vehicles_device_cert_sn
@@ -40,10 +49,16 @@ CREATE TABLE IF NOT EXISTS user_svc.users (
     phone           TEXT,
     status          TEXT        NOT NULL DEFAULT 'enabled'
         CHECK (status IN ('enabled', 'disabled', 'locked')),  -- ⚠ 需核对：locked 用于登录失败锁定
+    -- G-06（设计文档 14.1 弱口令防护）：首登/重置后强制改密；默认管理员初始化置 true
+    must_change_password BOOLEAN NOT NULL DEFAULT false,
+    -- G-23（设计文档 3.2.2/14.1 MFA 双因素）：TOTP 因子；密钥须应用层加密后存储，
+    --   禁止在日志/接口/序列化输出中明文出现（契约 orm-mapping：字段不参与 to_dict）
+    mfa_enabled     BOOLEAN     NOT NULL DEFAULT false,
+    totp_secret     TEXT,                                    -- 加密后的 TOTP 密钥（BASE32 明文禁止入库）
     create_time     TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_login_time TIMESTAMPTZ
 );
-COMMENT ON TABLE user_svc.users IS '平台用户；password_hash 使用 bcrypt，禁止在日志/接口中输出';
+COMMENT ON TABLE user_svc.users IS '平台用户；password_hash 使用 bcrypt，禁止在日志/接口中输出；must_change_password/mfa 字段见 G-06/G-23';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_users_username ON user_svc.users (username);
 -- 邮箱唯一（大小写不敏感，且允许为空）

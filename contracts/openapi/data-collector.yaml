@@ -66,7 +66,7 @@ tags:
   - name: telemetry
     description: 遥测数据查询（时序表 vehicle_telemetry，保留 90 天）
   - name: events
-    description: 车辆事件查询与告警确认（events 表，18 种类型 / 3 级等级）
+    description: 车辆事件查询与告警确认（events 表，19 种类型 / 3 级等级）
   - name: files
     description: 文件上传管理（MinIO 预签名直传 + 完整性校验 + 下载预签名）
   - name: ops
@@ -145,7 +145,7 @@ paths:
         查询 `data_collector.events`。默认按 `event_time DESC`（命中
         `idx_events_vehicle_time` / `idx_events_type_time`）；`acknowledged=false` 时命中
         未确认部分索引 `idx_events_unacknowledged`（告警中心默认视图）。
-        事件类型（18 种）与等级（3 级）为受控词表，阈值见 contracts/database/enums.md，
+        事件类型（19 种）与等级（3 级）为受控词表，阈值见 contracts/database/enums.md，
         代码不得放宽或新增。
       operationId: listEvents
       parameters:
@@ -462,7 +462,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        控制台用户 JWT Access Token（2 小时），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
+        控制台用户 JWT Access Token（30 分钟，G-04① 收紧），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
         载荷结构（3.2.2 节）：`sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` /
         `iss="hunter-platform"` / `jti`。服务侧按 RBAC 资源域 `data`（action ∈ create/read/execute）复核。
         校验失败映射：Token 缺失/无效 → 1001；Token 过期 → 1003；权限不足 → 1002。
@@ -878,8 +878,8 @@ components:
     # ---------- 事件（events 表；受控词表来源 contracts/database/enums.md） ----------
     EventType:
       type: string
-      description: 事件类型（18 种，受控词表；触发阈值不可更改，见 contracts/database/enums.md 第 3 节）
-      enum: [harsh_acceleration, harsh_braking, harsh_turning, over_speed, collision_warning,
+      description: 事件类型（19 种，受控词表；触发阈值不可更改，见 contracts/database/enums.md 第 3 节；G-22② 新增 collision_pre_warning）
+      enum: [harsh_acceleration, harsh_braking, harsh_turning, over_speed, collision_pre_warning, collision_warning,
              manual_takeover, emergency_stop, battery_low, battery_critical, communication_loss,
              sensor_fault, perception_fault, planning_fault, control_fault, ota_start, ota_success,
              ota_failed, ota_rollback]
@@ -997,6 +997,15 @@ components:
           pattern: "^[0-9a-f]{64}$"
           nullable: true
           description: "可选：文件 SHA-256（上传前声明，供 complete 阶段预校验）"
+        retention:
+          type: string
+          enum: [regular, event]
+          default: regular
+          description: |
+            生命周期归类声明（G-12，仅 hunter-rosbag 消费）：
+            事件数据包必须显式声明 event（永久保留）；缺省 regular（30 天过期）。
+            服务端在 complete 阶段据此打对象 Tag hunter-retention=<retention>，
+            见 contracts/database/object-storage.yaml buckets[hunter-rosbag].lifecycle.tagging
 
     FilePresignPart:
       type: object
@@ -1073,6 +1082,11 @@ components:
           items: { $ref: "#/components/schemas/CompletedPart" }
           description: "分片 ETag 列表（method=multipart 时必传，用于合并对象）"
         timestamp: { type: number, description: "上传完成时间（Unix epoch 秒，车端时间）" }
+        retention:
+          type: string
+          enum: [regular, event]
+          default: regular
+          description: "生命周期归类（G-12）：与 presign 声明一致，服务端以此打 Tag hunter-retention=<retention>；事件包必须显式 event"
 
     FileCompleteData:
       type: object
@@ -1162,7 +1176,7 @@ x-hunter-service:
   minio_buckets: [hunter-raw-data, hunter-rosbag, hunter-video]
   minio_bucket_lifecycle:
     hunter-raw-data: "30 天自动删除（传感器原始数据：点云/图像）"
-    hunter-rosbag: "事件数据永久，常规 30 天"
+    hunter-rosbag: "按对象 Tag 区分：hunter-retention=regular 30 天过期；hunter-retention=event 永久（G-12，见 object-storage.yaml）"
     hunter-video: "90 天（远程操控录像；车端触发上传的视频片段）"
   redis_keys:
     - pattern: "vehicle:status:{vehicle_id}"
@@ -1279,6 +1293,7 @@ x-hunter-file-upload-flow:
     - "3) 车辆直传 MinIO（不经平台转发，支持 Range / 分片；单车带宽 ≤ 10 Mbps）"
     - "4) 车辆上报完成：POST /api/v1/data/files/complete（size_bytes + md5 + sha256；分片上传附 parts[].etag）"
     - "5) 服务端校验完整性（三者必须全部一致；不匹配返回 6001）"
+    - "5.5) hunter-rosbag 对象：校验通过后、发布 sensor_file 前，服务端 put_object_tagging 打 Tag hunter-retention=<retention>（打标失败返回 5001 且不通知下游）"
     - "6) 登记元信息并投递 Kafka sensor_file（⚠ 无 DB 元信息表，见 x-hunter-pending-confirmation #2）"
   naming: "{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}"
   naming_rules:
@@ -1306,6 +1321,15 @@ x-hunter-file-upload-flow:
     on_failure_http_status: 422
     note: "⚠ 附录 A 无通用文件校验错误码，复用 6001（原语义：OTA 包校验失败）"
   bandwidth_limit_mbps_per_vehicle: 10
+  tagging:
+    applies_to_bucket: hunter-rosbag
+    key: hunter-retention
+    values: [regular, event]
+    declared_by: "车端在 presign/complete 请求 retention 字段声明（默认 regular；事件包必须显式 event）"
+    applied_by: "服务端 complete 阶段：完整性校验通过后、sensor_file 发布前 put_object_tagging（禁止车端直打 Tag）"
+    on_failure: "打标失败 → 5001（ServiceUnavailableError），不发布 sensor_file 通知"
+    untagged_semantics: "未打标对象等同永久保留（S3 tag 过滤器无法表达无 Tag）→ 禁止绕过 complete 直写 hunter-rosbag"
+    reference: "contracts/database/object-storage.yaml buckets[hunter-rosbag].lifecycle"
   notify_topic: sensor_file
   notify_schema: contracts/kafka/schemas/sensor_file.schema.json
 
@@ -1343,6 +1367,7 @@ x-hunter-event-contract:
     harsh_braking: warning
     harsh_turning: warning
     over_speed: critical
+    collision_pre_warning: warning
     collision_warning: critical
     manual_takeover: info
     emergency_stop: critical
@@ -1358,7 +1383,7 @@ x-hunter-event-contract:
     ota_failed: critical
     ota_rollback: warning
   thresholds:
-    note: "阈值不可更改（如 harsh_acceleration a>3m/s²、collision_warning TTC<1.5s、battery_low SOC<20%、communication_loss 遥测中断>10s）；来源见 enums.md 第 3 节，本服务不重算阈值（仅存储车端上报事件）"
+    note: "阈值不可更改（如 harsh_acceleration a>3m/s²、collision_pre_warning TTC<3.0s、collision_warning TTC<1.5s、battery_low SOC<20%、communication_loss 遥测中断>10s）；来源见 enums.md 第 3 节，本服务不重算阈值（仅存储车端上报事件）"
   acknowledge:
     fields: [acknowledged, acknowledged_by, acknowledge_time]
     acknowledged_by_source: "网关注入的 X-User-Id（禁止请求体指定，防伪造）"

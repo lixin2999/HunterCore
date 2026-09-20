@@ -149,7 +149,7 @@ EXPECTED_VEHICLE_TOPICS: dict[str, tuple[int, str, str]] = {
 #: Redis 受控键契约（键模式 → (类型, TTL 秒)；None = 不过期）——来源：系统关键约束第 8 条
 #: 改动需同步 contracts/database/redis-keys.yaml 与各服务 x-hunter-service.redis_keys 声明
 EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
-    "session:{user_id}": ("String", 7200),
+    "session:{user_id}": ("String", 1800),  # G-04① 收紧（原系统关键约束第 8 条 7200）
     "vehicle:status:{vehicle_id}": ("Hash", None),
     "vehicle:online:set": ("Set", None),
     "rate_limit:{ip}:{api}": ("String", 60),
@@ -162,7 +162,7 @@ EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
 #: MinIO Bucket 契约（名称 → 过期天数；None = 永久）——来源：系统关键约束第 7 条（名称不可更改）
 EXPECTED_BUCKETS: dict[str, int | None] = {
     "hunter-raw-data": 30,
-    "hunter-rosbag": 30,  # 前缀级规则：regular/ 30 天，events/ 永久（见 EXPECTED_ROSBAG_PREFIX_DAYS）
+    "hunter-rosbag": 30,  # Tag 级规则（G-12）：hunter-retention=regular 30 天，event 永久（见 EXPECTED_ROSBAG_TAG_DAYS）
     "hunter-video": 90,
     "hunter-ota-packages": None,
     "hunter-reports": None,
@@ -170,8 +170,11 @@ EXPECTED_BUCKETS: dict[str, int | None] = {
     "hunter-scene-assets": None,
 }
 
-#: hunter-rosbag 前缀级生命周期（前缀 → 过期天数；None = 无过期规则 = 永久）
-EXPECTED_ROSBAG_PREFIX_DAYS: dict[str, int | None] = {"regular/": 30, "events/": None}
+#: hunter-rosbag Tag 级生命周期（G-12：对象 Tag 选择器 → 过期天数；None = 无过期规则 = 永久）
+EXPECTED_ROSBAG_TAG_DAYS: dict[str, int | None] = {
+    "hunter-retention=regular": 30,
+    "hunter-retention=event": None,
+}
 
 #: 预签名 URL 有效期（系统关键约束第 7 条：上传 1 小时 / 下载 15 分钟）
 EXPECTED_PRESIGN_TTL: dict[str, int] = {
@@ -481,7 +484,7 @@ def check_enum_contract(ddl: dict[str, Any]) -> None:
                 f"仅DDL={sorted(declared - enum_values)} 仅代码={sorted(enum_values - declared)}"
             )
     if len(failures) == before:
-        ok(f"受控词表一致（{len(expected)} 处 CHECK ↔ StrEnum，含 18 种事件类型/9 态 OTA 状态机）")
+        ok(f"受控词表一致（{len(expected)} 处 CHECK ↔ StrEnum，含 19 种事件类型/9 态 OTA 状态机）")
 
     # 事件类型 → 等级映射完整性（data-collector 落库前校验依据）
     mapping = db_enums.EVENT_LEVEL_BY_TYPE
@@ -1086,13 +1089,13 @@ def check_redis_keys() -> None:
 
 
 def expected_expiry_rules() -> dict[str, list[tuple[int, str | None]]]:
-    """由契约基准值推导 MinIO 生命周期期望（bucket → [(过期天数, 前缀), ...]）。"""
+    """由契约基准值推导 MinIO 生命周期期望（bucket → [(过期天数, 选择器), ...]）。"""
     rules: dict[str, list[tuple[int, str | None]]] = {
         name: ([] if days is None else [(days, None)]) for name, days in EXPECTED_BUCKETS.items()
     }
-    # hunter-rosbag 为前缀级规则（events/ 无过期规则 → 永久）
+    # hunter-rosbag 为 Tag 级规则（G-12：hunter-retention=event 无过期规则 → 永久）
     rules["hunter-rosbag"] = [
-        (days, prefix) for prefix, days in EXPECTED_ROSBAG_PREFIX_DAYS.items() if days is not None
+        (days, tag) for tag, days in EXPECTED_ROSBAG_TAG_DAYS.items() if days is not None
     ]
     return rules
 
@@ -1145,11 +1148,11 @@ def check_object_storage() -> None:
                 fail(f"Bucket {name}: 永久保留但声明 expire_days={lifecycle.get('expire_days')}")
         elif mode == "mixed":
             rules = {
-                str(rule.get("prefix")): rule.get("expire_days")
+                str(rule.get("tags")): rule.get("expire_days")
                 for rule in lifecycle.get("rules") or []
             }
-            if rules != EXPECTED_ROSBAG_PREFIX_DAYS:
-                fail(f"Bucket {name}: 前缀生命周期 {rules} != {EXPECTED_ROSBAG_PREFIX_DAYS}")
+            if rules != EXPECTED_ROSBAG_TAG_DAYS:
+                fail(f"Bucket {name}: Tag 生命周期 {rules} != {EXPECTED_ROSBAG_TAG_DAYS}")
         else:
             fail(f"Bucket {name}: 非法生命周期 mode={mode}")
         if not (entry.get("writers") and entry.get("readers")):
@@ -1180,8 +1183,8 @@ def check_object_storage() -> None:
                 f"{rel}: create_bucket 集合 {sorted(set(created))} != 契约 {sorted(EXPECTED_BUCKETS)}"
             )
         actual: dict[str, list[tuple[int, str | None]]] = {}
-        for bucket, days, prefix in MINIO_ADD_EXPIRY_RE.findall(text):
-            actual.setdefault(bucket, []).append((int(days), prefix or None))
+        for bucket, days, selector in MINIO_ADD_EXPIRY_RE.findall(text):
+            actual.setdefault(bucket, []).append((int(days), selector or None))
         for bucket, rules in expected_rules.items():
             if sorted(actual.get(bucket, [])) != sorted(rules):
                 fail(

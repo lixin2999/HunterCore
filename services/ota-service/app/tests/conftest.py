@@ -274,6 +274,24 @@ class FakeTaskRepository:
     async def save(self, session: Any, task: OtaTask) -> None:
         self.rows[task.task_id] = task
 
+    async def list_for_scheduler(self, *, now: float) -> list[tuple[UUID, OtaTaskStatus]]:
+        """调度器候选（与真实仓储 list_for_scheduler 口径一致，create_time 升序）：
+
+        running 任务 + 到点的 scheduled 任务（created|pending_approval 且 start_time <= now）。
+        """
+        out: list[tuple[UUID, OtaTaskStatus]] = []
+        for task in sorted(self.rows.values(), key=lambda t: t.create_time):
+            schedule = task.schedule or {}
+            due_scheduled = (
+                task.status in (OtaTaskStatus.CREATED, OtaTaskStatus.PENDING_APPROVAL)
+                and schedule.get("mode") == "scheduled"
+                and schedule.get("start_time") is not None
+                and float(schedule["start_time"]) <= now
+            )
+            if task.status == OtaTaskStatus.RUNNING or due_scheduled:
+                out.append((task.task_id, task.status))
+        return out
+
 
 class FakeRecordRepository:
     """ota_records 仓储内存实现（唯一索引 (task_id, vehicle_id) 幂等语义）。"""
@@ -409,6 +427,12 @@ class FakeVehicleReader:
 
     async def is_online(self, vehicle_id: str) -> bool:
         return vehicle_id in self.online
+
+    async def get_status_many(self, vehicle_ids: list[str]) -> dict[str, dict[str, Any] | None]:
+        return {vid: self.status.get(vid) for vid in vehicle_ids}
+
+    async def is_online_many(self, vehicle_ids: list[str]) -> dict[str, bool]:
+        return {vid: vid in self.online for vid in vehicle_ids}
 
 
 # ---------- 数据工厂 ----------

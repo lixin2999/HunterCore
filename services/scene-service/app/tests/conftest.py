@@ -66,7 +66,10 @@ def scene_env() -> Iterator[SimpleNamespace]:
     app.state.scene_service = scene_service
     app.state.template_service = SceneTemplateService(settings)
     app.state.export_service = SceneExportService(scene_service, storage, settings)
-    app.state.simulation_service = SceneSimulationService(scene_service, carla, settings)
+    # G-20①：注入 storage 以便产物预签名（与 main.py lifespan 装配一致）
+    app.state.simulation_service = SceneSimulationService(
+        scene_service, carla, settings, storage=storage
+    )
     app.state.db = SimpleNamespace(check_connection=lambda: asyncio.sleep(0, result=True))
     app.state.redis = SimpleNamespace(ping=lambda: asyncio.sleep(0, result=True))
     state = SimpleNamespace(

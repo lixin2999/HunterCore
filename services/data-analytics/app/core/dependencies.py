@@ -15,6 +15,7 @@ from hunter_common.exceptions import (
     PermissionDeniedError,
     ServiceUnavailableError,
 )
+from hunter_common.internal_auth import verify_identity_headers
 from hunter_common.logging import get_trace_id
 
 from app.config import Settings, settings
@@ -59,6 +60,13 @@ def current_user_id(request: Request) -> str:
     user_id = request.headers.get("X-User-Id")
     if not user_id:
         raise AuthenticationError()
+    # G-02：配置 GATEWAY_HMAC_SECRET 后验身份头签名（防集群内伪造）；未配置（dev/test）跳过保持兼容
+    if settings.gateway_hmac_secret and not verify_identity_headers(
+        settings.gateway_hmac_secret,
+        request.headers,
+        max_age_seconds=settings.gateway_identity_max_age_s,
+    ):
+        raise AuthenticationError(message="未认证：身份头签名缺失或无效（X-Internal-MAC 校验失败）")
     return user_id
 
 

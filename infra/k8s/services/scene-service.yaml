@@ -27,6 +27,9 @@ data:
   CARLA_INSTANCE_CREATE_PATH: "/api/v1/instances"
   CARLA_INSTANCE_QUERY_PATH: "/api/v1/instances"
   CARLA_SCENARIO_SUBMIT_PATH: "/api/v1/instances/{sim_instance_id}/scenario"
+  # G-20① 仿真进度/结果查询子路径（无状态代理，契约 x-hunter-simulation-flow ⑥⑦）
+  CARLA_INSTANCE_GET_PATH: "/api/v1/instances/{sim_instance_id}"
+  CARLA_INSTANCE_RESULT_PATH: "/api/v1/instances/{sim_instance_id}/result"
   CARLA_REQUEST_TIMEOUT_SECONDS: "5"
   CARLA_REQUEST_MAX_RETRIES: "1"
   # 场景约束与缓存（SCENE_DETAIL_CACHE_TTL_SECONDS 与 Redis Key 契约同源 = 3600）

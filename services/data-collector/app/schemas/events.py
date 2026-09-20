@@ -19,7 +19,7 @@ class EventItem(BaseModel):
 
     event_id: int = Field(description="events.event_id（BIGSERIAL）")
     vehicle_id: str = Field(description="events.vehicle_id（逻辑外键 → vehicle_svc.vehicles）")
-    event_type: EventType = Field(description="事件类型（18 种受控词表）")
+    event_type: EventType = Field(description="事件类型（19 种受控词表）")
     event_level: EventLevel = Field(description="事件等级（由事件类型决定）")
     event_time: float = Field(
         description="事件发生时间（Unix epoch 秒，车端时间；非入库时间）"

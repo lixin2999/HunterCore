@@ -95,8 +95,8 @@ SEGMENT_SCHEMA_BY_FIELD: dict[str, str] = {
 
 #: 5.4 节预处理流程步骤数（解析 → 校验 → 对齐 → 清洗 → enrichment → 序列化写入）
 EXPECTED_PIPELINE_STEPS = 6
-#: 5.5 节文件上传流程步骤数（请求上传 → 预签名 → 直传 → 完成通知 → 校验 → 登记）
-EXPECTED_UPLOAD_STEPS = 6
+#: 5.5 节文件上传流程步骤数（请求上传 → 预签名 → 直传 → 完成通知 → 校验 → rosbag 打标（G-12）→ 登记）
+EXPECTED_UPLOAD_STEPS = 7
 #: 车辆维度限流（附录 D，不可放宽）
 EXPECTED_VEHICLE_LIMITS: dict[str, int] = {
     "kafka_telemetry_msg_per_sec": 100,
@@ -309,11 +309,11 @@ def test_telemetry_query_contract_matches_timeseries_ddl(contract: dict[str, Any
 
 
 def test_event_type_enum_matches_controlled_vocabulary(contract: dict[str, Any]) -> None:
-    """事件类型枚举必须等于受控词表（18 种，阈值不可更改）。"""
+    """事件类型枚举必须等于受控词表（19 种，阈值不可更改；G-22② 新增 collision_pre_warning）。"""
     schemas = contract["components"]["schemas"]
     declared = set(schemas["EventType"]["enum"])
     assert declared == {event_type.value for event_type in EventType}
-    assert len(declared) == 18
+    assert len(declared) == 19
     assert set(schemas["EventLevel"]["enum"]) == {level.value for level in EventLevel}
 
 
@@ -356,7 +356,7 @@ def test_acknowledge_uses_server_side_identity(contract: dict[str, Any]) -> None
 # 三、5.4 预处理 / 5.5 文件上传 / Kafka 参与度
 # =====================================================================
 def test_upload_flow_matches_5_5(contract: dict[str, Any]) -> None:
-    """5.5 节上传流程 6 步 + 命名规范 + 分片上传 + 完整性校验齐备。"""
+    """5.5 节上传流程 7 步（含 G-12 打标）+ 命名规范 + 分片上传 + 完整性校验齐备。"""
     flow = contract["x-hunter-file-upload-flow"]
     assert len(flow["steps"]) == EXPECTED_UPLOAD_STEPS
     joined = "\n".join(flow["steps"])
@@ -366,6 +366,16 @@ def test_upload_flow_matches_5_5(contract: dict[str, Any]) -> None:
     assert any("禁止指定路径" in rule for rule in flow["naming_rules"]), "必须禁止客户端指定对象路径"
     assert flow["presign"]["max_part_count"] == 10000
     assert flow["integrity"]["checks"] == ["size_bytes", "md5", "sha256"]
+    # G-12：hunter-rosbag 生命周期按对象 Tag 区分，服务端 complete 阶段打标
+    tagging = flow["tagging"]
+    assert tagging["applies_to_bucket"] == "hunter-rosbag"
+    assert tagging["key"] == "hunter-retention"
+    assert tagging["values"] == ["regular", "event"]
+    assert "put_object_tagging" in tagging["applied_by"]
+    for schema_name in ("FilePresignRequest", "FileCompleteRequest"):
+        retention = contract["components"]["schemas"][schema_name]["properties"]["retention"]
+        assert retention["enum"] == ["regular", "event"], schema_name
+        assert retention["default"] == "regular", schema_name
 
 
 def test_presign_expiry_and_buckets_match_minio_contract(contract: dict[str, Any]) -> None:

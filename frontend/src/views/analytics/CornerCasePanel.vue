@@ -68,7 +68,7 @@ async function load(): Promise<void> {
   }
 }
 
-/** 触发事件类型展示（trigger_event_type 采用 18 种事件词表） */
+/** 触发事件类型展示（trigger_event_type 采用 19 种事件词表） */
 function eventTypeLabel(value: string | null | undefined): string {
   if (!value) {
     return '-'

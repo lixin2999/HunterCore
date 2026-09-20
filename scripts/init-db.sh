@@ -68,7 +68,10 @@ HunterCore 数据库初始化脚本
   sudo bash /opt/hunter-edge/scripts/init-db.sh --admin-password 'HunterEdge#2026'
 
 说明：
-  · 不传口令参数时使用 sql/init-data.sql 内置默认口令（Hunter@2025），首次登录后必须修改；
+  · G-06（设计文档 14.1）：不再提供内置已知口令；口令来源优先级：
+      --admin-password / --admin-password-hash > .env 的 ADMIN_PASSWORD（gen-passwords.sh 随机生成）；
+    三者均缺失时 admin 以「禁用 + 占位哈希 + 强制改密」创建，需运维重置口令后启用；
+  · 无论何种路径，admin.must_change_password=true，首次登录强制修改口令；
   · 幂等：可重复执行（表/schema 用 IF NOT EXISTS，初始数据用 ON CONFLICT DO NOTHING）。
 EOF
 }
@@ -177,7 +180,11 @@ main() {
     return 1
   fi
   env_file="${ENV_FILE_ARG:-${HUNTER_ENV_FILE:-${APP_DIR}/.env}}"
+  # CLI 口令参数优先于 .env（load_env 会导出 .env 变量，先暂存再恢复）
+  local cli_admin_password="$ADMIN_PASSWORD" cli_admin_password_hash="$ADMIN_PASSWORD_HASH"
   load_env "$env_file" || return 1
+  if [ -n "$cli_admin_password" ]; then ADMIN_PASSWORD="$cli_admin_password"; fi
+  if [ -n "$cli_admin_password_hash" ]; then ADMIN_PASSWORD_HASH="$cli_admin_password_hash"; fi
   HUNTER_ENV_FILE="$env_file"
   export HUNTER_ENV_FILE
   if ! require_env POSTGRES_USER POSTGRES_DB; then
@@ -218,7 +225,7 @@ main() {
     hash="$ADMIN_PASSWORD_HASH"
     log_info "使用 --admin-password-hash 注入 admin 口令哈希"
   elif [ -n "$ADMIN_PASSWORD" ]; then
-    log_info "为 admin 生成 bcrypt(12) 口令哈希（明文不落日志）"
+    log_info "为 admin 生成 bcrypt(12) 口令哈希（明文不落日志；来源 CLI 或 .env ADMIN_PASSWORD）"
     hash="$(hash_admin_password "$ADMIN_PASSWORD")" || return 1
   fi
   if [ -n "$hash" ]; then
@@ -233,7 +240,8 @@ main() {
       -v "admin_password_hash=${hash}" || return 1
     log_warn "admin 口令已按自定义值注入；请立即登录并确认权限（密文不落日志）"
   else
-    log_info "未指定 admin 口令：使用 init-data.sql 内置默认口令（首次登录必须修改）"
+    log_warn "未指定 admin 口令（G-06）：init-data.sql 不携带已知口令，admin 将以「禁用 + 占位哈希」创建；"
+    log_warn "  启用方式：psql -v admin_password_hash=\"<bcrypt>\" 重跑本脚本，或运维后台重置并置 status=enabled"
     apply_sql "$C_POSTGRES" "$POSTGRES_USER" "$POSTGRES_DB" "${sql_dir}/init-data.sql" || return 1
   fi
 

@@ -439,6 +439,45 @@ async def test_health_consumer_writes_read_model() -> None:
 
     assert redis.hashes[status_key("HUNTER-001")]["status"] == "auto_driving"
     assert redis.sets[ONLINE_SET_KEY] == {"HUNTER-001"}
+    # G-08：health 顶层 gear / free_storage_mb 透传至读模型（OTA 门禁数据源）
+    assert redis.hashes[status_key("HUNTER-001")]["gear"] == "D"
+    assert redis.hashes[status_key("HUNTER-001")]["free_storage_mb"] == "8192"
+    # G-11：契约 examples[0] 含 lat/lng → 成对写入且携带写入时刻 lat_lng_at（围栏新鲜度依据）
+    status = redis.hashes[status_key("HUNTER-001")]
+    assert status["lat"] == "31.230416" and status["lng"] == "121.473701"
+    assert abs(float(status["lat_lng_at"]) - time.time()) < 5.0
+
+
+async def test_health_consumer_omits_lat_lng_when_not_paired() -> None:
+    """G-11：lat/lng 缺任一则三个字段全不写（禁止伪造定位/单独陈旧时间戳参与围栏门禁）。"""
+    redis = FakeRedisHash()
+    consumer = HealthIngestConsumer(make_settings(), VehicleStatusWriter(redis))
+    payload = load_schema("health")["examples"][0] | {"timestamp": NOW}
+    payload.pop("lng")
+
+    await consumer.process(payload, topic="hunter.HUNTER-001.health")
+
+    status = redis.hashes[status_key("HUNTER-001")]
+    assert "lat" not in status
+    assert "lng" not in status
+    assert "lat_lng_at" not in status
+    assert status["status"] == "auto_driving"  # 核心字段仍正常写入
+
+
+async def test_health_consumer_omits_gear_when_absent() -> None:
+    """G-08：车端未上报 gear/free_storage_mb 时不写入该 field（禁止伪造默认值）。"""
+    redis = FakeRedisHash()
+    consumer = HealthIngestConsumer(make_settings(), VehicleStatusWriter(redis))
+    payload = load_schema("health")["examples"][0] | {"timestamp": NOW}
+    payload.pop("gear")
+    payload.pop("free_storage_mb")
+
+    await consumer.process(payload, topic="hunter.HUNTER-001.health")
+
+    status = redis.hashes[status_key("HUNTER-001")]
+    assert "gear" not in status
+    assert "free_storage_mb" not in status
+    assert status["status"] == "auto_driving"  # 核心字段仍正常写入
 
 
 async def test_event_consumer_persists_and_publishes_event_raw() -> None:

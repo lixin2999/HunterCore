@@ -24,11 +24,11 @@ CREATE TABLE IF NOT EXISTS ota_svc.ota_versions (
     changelog         JSONB       NOT NULL DEFAULT '{}'::jsonb,
     applicable_models TEXT[]      NOT NULL DEFAULT ARRAY['HUNTER_SE']::TEXT[],
     status            TEXT        NOT NULL DEFAULT 'draft'
-        CHECK (status IN ('draft', 'published', 'deprecated', 'disabled')),  -- ⚠ 需核对
+        CHECK (status IN ('draft', 'testing', 'reviewing', 'published', 'deprecated', 'disabled')),  -- G-18② 定稿（§7.2.2 审核流六态）
     release_time      TIMESTAMPTZ
 );
 COMMENT ON TABLE ota_svc.ota_versions IS
-    'OTA 版本仓库；发布前必须完成 SHA-256 校验 + RSA-2048 验签 + version_code 单调性检查';
+    'OTA 版本仓库；状态机 draft→testing→reviewing→published→deprecated/disabled（G-18②）；发布前必须完成 SHA-256 校验 + RSA-2048 验签 + version_code 单调性检查';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_ota_versions_version_code
     ON ota_svc.ota_versions (version_code);

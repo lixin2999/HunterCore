@@ -1,0 +1,127 @@
+# =====================================================================
+# ⚠ 开发/联调覆盖文件【模板】（G-03 硬闸：生产部署包不再携带生效的 override）
+#   启用方式：cp docker-compose.override.yml.example docker-compose.override.yml，
+#             并在执行 install/health-check 前 export HUNTER_ALLOW_OVERRIDE=1（需书面豁免登记）；
+#   生产部署：不得存在 docker-compose.override.yml（install.sh step_7/step_11 与 health-check ⑪ 会拦截）。
+#
+# 覆盖内容（仅开发便利，不改变拓扑与容器名）：
+#   1) Python 服务：ENVIRONMENT=dev / DEBUG=true，挂载源码热重载（uvicorn --reload --workers 1）
+#   2) 资源 limits 下调（笔记本可跑）
+#   3) 中间件端口全部改绑 0.0.0.0（本机工具直连调试；生产仅 127.0.0.1）
+#   4) Kafka 内部监听放宽为 PLAINTEXT（免 SCRAM 便于本地脚本；⚠ 生产必须 SASL_SSL）
+#   5) 业务服务端口显式暴露到宿主机，方便绕过网关单独调试
+# =====================================================================
+
+x-dev-env: &dev-env
+  ENVIRONMENT: dev
+  DEBUG: "true"
+  LOG_LEVEL: DEBUG
+
+services:
+  # ---------- 中间件：端口对全网卡开放（开发便利） ----------
+  postgres:
+    ports:
+      - "5432:5432"
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  zookeeper:
+    ports:
+      - "2181:2181"
+
+  kafka:
+    environment:
+      # 开发放宽：内部监听走 PLAINTEXT（业务服务需同步把 KAFKA_SECURITY_PROTOCOL 设为 PLAINTEXT）
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,BROKER:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+
+  minio:
+    ports:
+      - "9000:9000"
+      # 开发体验：LAN 直接浏览器访问 Console；生产禁止启用本 override（G-07 基线为仅 127.0.0.1 绑定）
+      - "9001:9001"
+
+  srs:
+    ports:
+      - "1935:1935"
+      - "8000:8000/udp"
+      - "9090:9090"
+
+  flink-jm:
+    ports:
+      - "8088:8081"
+
+  # ---------- 业务服务：源码热重载 + 降配 + 端口暴露 ----------
+  api-gateway:
+    environment: *dev-env
+    command: ["-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload", "--workers", "1"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./services/api-gateway/app:/app/app
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+
+  scene-service:
+    environment: *dev-env
+    command: ["-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8081", "--reload", "--workers", "1"]
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./services/scene-service/app:/app/app
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+
+  data-collector:
+    environment: *dev-env
+    command: ["-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8082", "--reload", "--workers", "1"]
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./services/data-collector/app:/app/app
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
+
+  data-analytics:
+    environment: *dev-env
+    command: ["-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8083", "--reload", "--workers", "1"]
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./services/data-analytics/app:/app/app
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
+
+  ota-service:
+    environment: *dev-env
+    command: ["-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8084", "--reload", "--workers", "1"]
+    ports:
+      - "8084:8084"
+    volumes:
+      - ./services/ota-service/app:/app/app
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+
+  remote-control:
+    environment: *dev-env
+    command: ["-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8085", "--reload", "--workers", "1"]
+    ports:
+      - "8085:8085"
+    volumes:
+      - ./services/remote-control/app:/app/app
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }

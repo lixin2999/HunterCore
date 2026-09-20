@@ -1,6 +1,10 @@
-"""版本仓库业务服务（版本查询 / 创建 / 发布五项校验 / 退役）。
+"""版本仓库业务服务（版本查询 / 创建 / G-18② 审核流 / 发布五项校验 / 退役）。
 
-契约：POST /versions（两步式预签名直传）、POST /versions/{id}/publish（唯一发布门禁：
+契约：POST /versions（两步式预签名直传）、G-18② 审核流（§7.2.2）：
+POST /versions/{id}/submit-testing（draft → testing，校验包已直传）、
+POST /versions/{id}/submit-review（testing → reviewing）、
+POST /versions/{id}/reject-review（reviewing → draft）；
+POST /versions/{id}/publish（审核批准：唯一发布门禁，前置仅 reviewing：
 单次流式 size/MD5/SHA-256 + RSA-2048 验签 + version_code 单调递增，x-hunter-ota-security）、
 POST /versions/{id}/deprecate（published 之外 → 3003；running/paused 任务引用 → 3003）。
 """
@@ -37,6 +41,7 @@ from app.schemas.versions import (
     OtaVersionList,
     OtaVersionPublishChecks,
     OtaVersionPublishData,
+    OtaVersionRejectReviewRequest,
     OtaVersionUploadInfo,
     OtaVersionUploadPart,
 )
@@ -195,16 +200,82 @@ class VersionService:
         )
 
 
-    # ---------- 发布（两步式第 2 步，唯一发布门禁） ----------
+    # ---------- G-18② 审核流（设计文档 §7.2.2：提测 / 提审 / 驳回） ----------
 
-    async def publish_version(
-        self, version_id: UUID, note: str | None, user_id: str
-    ) -> OtaVersionPublishData:
-        """发布：五项校验全部通过才置 published（6001/6002/6003），非 draft → 3003。"""
+    async def submit_testing(self, version_id: UUID, user_id: str) -> OtaVersionDetail:
+        """提交测试：draft 且升级包已直传（HeadObject 非空）→ testing；包缺失 → 6001；其余 → 3003。"""
         row = await self._require_version(version_id)
         if row.status != OtaVersionStatus.DRAFT:
             raise ResourceStateConflictError(
                 details={"current_status": row.status.value, "allowed_status": ["draft"]}
+            )
+        object_key = self._object_key_of(row)
+        metadata = await asyncio.to_thread(
+            self._storage.head_object, self._settings.minio_bucket_ota_packages, object_key
+        )
+        if metadata is None or metadata["size_bytes"] <= 0:
+            raise OtaPackageChecksumError(
+                message="升级包对象不存在（6001），请先完成预签名直传再提交测试",
+                details={"field": "object_key", "expected": object_key, "actual": None},
+            )
+        await self._repository.set_status(version_id, status=OtaVersionStatus.TESTING)
+        logger.info(
+            "ota_version_submitted_testing",
+            user_id=user_id,
+            version_id=str(version_id),
+            object_key=object_key,
+            trace_id=get_trace_id(),
+        )
+        return await self.get_version(version_id)
+
+    async def submit_review(
+        self, version_id: UUID, test_summary: str | None, user_id: str
+    ) -> OtaVersionDetail:
+        """提交审核：testing → reviewing（test_summary 仅审计留痕，不落 DB 列，pending #20）。"""
+        row = await self._require_version(version_id)
+        if row.status != OtaVersionStatus.TESTING:
+            raise ResourceStateConflictError(
+                details={"current_status": row.status.value, "allowed_status": ["testing"]}
+            )
+        await self._repository.set_status(version_id, status=OtaVersionStatus.REVIEWING)
+        logger.info(
+            "ota_version_submitted_review",
+            user_id=user_id,
+            version_id=str(version_id),
+            test_summary=test_summary,
+            trace_id=get_trace_id(),
+        )
+        return await self.get_version(version_id)
+
+    async def reject_review(
+        self, version_id: UUID, payload: OtaVersionRejectReviewRequest, user_id: str
+    ) -> OtaVersionDetail:
+        """审核驳回：reviewing → draft（可重新直传后再次提测/提审；reason 审计留痕）。"""
+        row = await self._require_version(version_id)
+        if row.status != OtaVersionStatus.REVIEWING:
+            raise ResourceStateConflictError(
+                details={"current_status": row.status.value, "allowed_status": ["reviewing"]}
+            )
+        await self._repository.set_status(version_id, status=OtaVersionStatus.DRAFT)
+        logger.info(
+            "ota_version_review_rejected",
+            user_id=user_id,
+            version_id=str(version_id),
+            reason=payload.reason,
+            trace_id=get_trace_id(),
+        )
+        return await self.get_version(version_id)
+
+    # ---------- 发布（审核批准，唯一发布门禁） ----------
+
+    async def publish_version(
+        self, version_id: UUID, note: str | None, user_id: str
+    ) -> OtaVersionPublishData:
+        """发布（审核批准）：五项校验全部通过才置 published（6001/6002/6003），非 reviewing → 3003。"""
+        row = await self._require_version(version_id)
+        if row.status != OtaVersionStatus.REVIEWING:
+            raise ResourceStateConflictError(
+                details={"current_status": row.status.value, "allowed_status": ["reviewing"]}
             )
         bucket = self._settings.minio_bucket_ota_packages
         object_key = self._object_key_of(row)

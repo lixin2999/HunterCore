@@ -11,6 +11,8 @@ from hunter_common.logging import get_logger, get_trace_id
 from hunter_common.responses import error_response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.services.geofence import GeofenceRejectedError
+
 logger = get_logger("app.core.error_handlers")
 
 #: 业务错误码 -> HTTP 状态码映射（响应体统一为 ApiResponse 五字段格式）
@@ -25,10 +27,18 @@ HTTP_STATUS_BY_CODE: dict[int, int] = {
 }
 
 
-def _unified_json(code: int, message: str) -> JSONResponse:
-    """按错误码映射 HTTP 状态，响应体为统一格式（request_id 复用链路 trace_id）。"""
+def _unified_json(
+    code: int, message: str, *, data: Mapping[str, object] | None = None
+) -> JSONResponse:
+    """按错误码映射 HTTP 状态，响应体为统一格式（request_id 复用链路 trace_id）。
+
+    ``data`` 仅对契约明确携带结构化结果的异常开放（G-11 围栏 3003）；
+    其余业务异常的 details 只进日志不进响应（防泄露驱动报错/约束名等内部信息）。
+    """
     status = HTTP_STATUS_BY_CODE.get(code, 500)
-    payload = error_response(code, message, request_id=get_trace_id() or None)
+    payload = error_response(
+        code, message, data=dict(data) if data is not None else None, request_id=get_trace_id() or None
+    )
     return JSONResponse(status_code=status, content=payload.model_dump())
 
 
@@ -61,6 +71,21 @@ def _unified_http_json(
 
 def register_exception_handlers(app: FastAPI) -> None:
     """注册全局异常处理：业务异常 / 参数校验异常 / 未预期异常 / HTTP 层异常（404/405）。"""
+
+    @app.exception_handler(GeofenceRejectedError)
+    async def _geofence_handler(
+        request: Request, exc: GeofenceRejectedError
+    ) -> JSONResponse:
+        # G-11：围栏拒绝的 details（reason/distance_m）按契约透传响应 data；
+        # Starlette 按异常类 MRO 就近命中本处理器（优先于 HunterBaseException）
+        logger.warning(
+            "geofence_exception",
+            code=exc.code,
+            message=exc.message,
+            path=request.url.path,
+            **exc.details,
+        )
+        return _unified_json(exc.code, exc.message, data=exc.details)
 
     @app.exception_handler(HunterBaseException)
     async def _hunter_handler(request: Request, exc: HunterBaseException) -> JSONResponse:

@@ -29,7 +29,9 @@ info:
       `TEST` 自检失败 → `ROLLBACK → ROLLED_BACK`（或 `FAILED`）
     - 升级任务（`ota_tasks.status`）：
       `created → pending_approval → running → paused → succeeded / failed / canceled`
-    - 版本（`ota_versions.status`）：`draft → published → deprecated / disabled`
+    - 版本（`ota_versions.status`，G-18② §7.2.2 审核流）：
+      `draft → testing → reviewing → published → deprecated / disabled`；
+      `reviewing` 审核驳回回退 `draft`；发布（publish）前置状态仅 `reviewing`
   contact:
     name: HunterCore Platform Team
   license:
@@ -43,7 +45,7 @@ servers:
 
 tags:
   - name: versions
-    description: OTA 版本仓库（创建 + 预签名上传 / 发布校验验签 / 废弃停用）
+    description: OTA 版本仓库（创建 + 预签名上传 / 提交测试 / 提审与驳回 / 发布校验验签 / 废弃停用）
   - name: tasks
     description: 升级任务与灰度发布（创建 / 启动 / 暂停 / 恢复 / 取消 / A/B 回滚）
   - name: records
@@ -72,7 +74,7 @@ paths:
         - name: status
           in: query
           required: false
-          description: 按版本状态过滤（draft / published / deprecated / disabled）
+          description: 按版本状态过滤（draft / testing / reviewing / published / deprecated / disabled）
           schema: { $ref: "#/components/schemas/OtaVersionStatus" }
         - name: release_type
           in: query
@@ -177,12 +179,115 @@ paths:
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/ota/versions/{version_id}/submit-testing:
+    post:
+      tags: [versions]
+      summary: 提交测试（draft → testing，校验升级包已直传）
+      description: |
+        G-18② 审核流第 1 步（设计文档 §7.2.2）：草稿版本声明包体已直传完成，进入测试态。
+
+        - 服务端 HeadObject 校验对象键（hunter-ota-packages）存在且非空；对象不存在 → 6001
+          （提示先完成预签名直传，发布时仍会全量复验，本校验仅为前置门禁）
+        - 当前状态非 `draft` → 3003
+        - 审计：user_id / version_id / object_key / trace_id
+      operationId: submitOtaVersionTesting
+      parameters:
+        - $ref: "#/components/parameters/VersionIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 已进入 testing（返回版本详情）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaVersionDetailResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/versions/{version_id}/submit-review:
+    post:
+      tags: [versions]
+      summary: 提交审核（testing → reviewing）
+      description: |
+        G-18② 审核流第 2 步：测试完成后提交审核，等待审核批准（publish）或驳回（reject-review）。
+
+        - 当前状态非 `testing` → 3003
+        - `test_summary` 可选，仅写入审计日志（不新增 DB 列；审核元数据持久化
+          见 x-hunter-pending-confirmation #20）
+        - 审计：user_id / version_id / test_summary / trace_id
+      operationId: submitOtaVersionReview
+      parameters:
+        - $ref: "#/components/parameters/VersionIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaVersionSubmitReviewRequest" }
+      responses:
+        "200":
+          description: 已进入 reviewing（返回版本详情）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaVersionDetailResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/ota/versions/{version_id}/reject-review:
+    post:
+      tags: [versions]
+      summary: 审核驳回（reviewing → draft，回退返工）
+      description: |
+        G-18② 审核流驳回：审核不通过回退 `draft`，可重新上传包体并再次走提测/提审
+        （`version_name` / `version_code` 不变）。
+
+        - 当前状态非 `reviewing` → 3003
+        - `reason` 必填（1~512 字符，审计留痕）
+        - 审计：user_id / version_id / reason / trace_id
+      operationId: rejectOtaVersionReview
+      parameters:
+        - $ref: "#/components/parameters/VersionIdPath"
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtaVersionRejectReviewRequest" }
+      responses:
+        "200":
+          description: 已回退 draft（返回版本详情）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OtaVersionDetailResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "404": { $ref: "#/components/responses/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /api/v1/ota/versions/{version_id}/publish:
     post:
       tags: [versions]
-      summary: 发布 OTA 版本（SHA-256 校验 + RSA-2048 验签 + version_code 单调性门禁）
+      summary: 发布 OTA 版本（审核批准：SHA-256 校验 + RSA-2048 验签 + version_code 单调性门禁）
       description: |
-        版本仓库第 2 步，也是**唯一的发布门禁**（`ota_versions` 表注释：发布前必须完成
+        审核批准（G-18② 审核流终点），也是**唯一的发布门禁**（`ota_versions` 表注释：发布前必须完成
         SHA-256 校验 + RSA-2048 验签 + version_code 单调性检查）：
 
         1. 从 MinIO `hunter-ota-packages` 读取对象做**单次流式校验**（包大小 / MD5 / SHA-256
@@ -191,7 +296,9 @@ paths:
            `OTA_SIGNATURE_PUBLIC_KEY`，私钥仅存于发布方 CI/KMS → 失败返回 6002）；
         3. `version_code` 单调递增门禁：必须大于**同 `applicable_models` 范围已发布版本的最大
            `version_code`**，否则返回 6003（防回滚）；
-        4. 全部通过后 `draft → published` 并写入 `release_time`；非 `draft` 状态重复发布 → 3003。
+        4. 全部通过后 `reviewing → published` 并写入 `release_time`；非 `reviewing` 状态 → 3003
+           （G-18② 前置门禁：必须先经 `POST /versions/{id}/submit-testing` 与
+           `POST /versions/{id}/submit-review` 进入审核态，本端点即审核批准的技术门禁）。
 
         审计：发布动作写结构化审计日志（user_id / version_id / version_code / package_sha256 /
         校验结论 / trace_id），日志脱敏（禁止输出签名私钥与 MinIO 密钥）。
@@ -756,7 +863,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        控制台用户 JWT Access Token（2 小时），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
+        控制台用户 JWT Access Token（30 分钟，G-04① 收紧），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
         载荷结构（3.2.2 节）：`sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` /
         `iss="hunter-platform"` / `jti`。服务侧按 RBAC 资源域 `ota` 复核：
         `read`（版本/任务/记录查询）、`create`（创建版本与任务）、`execute`（启动/暂停/恢复/终止/回滚/退役）。
@@ -1080,8 +1187,10 @@ components:
     # ---------- 枚举（取值域严格对齐 DDL 03_ota.sql 与车端状态机，禁止新增） ----------
     OtaVersionStatus:
       type: string
-      description: 版本状态（DDL CHECK 约束，不可更改）
-      enum: [draft, published, deprecated, disabled]
+      description: |
+        版本状态（DDL CHECK 约束，不可更改）。G-18② 审核流六态：
+        draft → testing → reviewing → published → deprecated / disabled（驳回回退 draft）。
+      enum: [draft, testing, reviewing, published, deprecated, disabled]
 
     OtaReleaseType:
       type: string
@@ -1354,6 +1463,28 @@ components:
           required: [data]
           properties:
             data: { $ref: "#/components/schemas/OtaVersionPublishData" }
+
+    OtaVersionSubmitReviewRequest:
+      type: object
+      description: |
+        提交审核请求（G-18②；可省略请求体）。test_summary 仅写入审计日志，不落 DB 列
+        （审核元数据持久化见 x-hunter-pending-confirmation #20）。
+      properties:
+        test_summary:
+          type: string
+          maxLength: 512
+          description: 测试结论摘要（审计留痕，禁止含密钥/证书内容）
+
+    OtaVersionRejectReviewRequest:
+      type: object
+      required: [reason]
+      description: 审核驳回请求（G-18②；reviewing → draft，回退原因必留痕）
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: 驳回原因（审计留痕，必填）
 
     OtaVersionDeprecateRequest:
       type: object
@@ -1912,6 +2043,7 @@ x-hunter-service:
     - OTA_PACKAGE_VERIFY_SHA256
     - OTA_PACKAGE_VERIFY_SIGNATURE
     - OTA_ROLLOUT_TICK_SECONDS
+    - ROLLOUT_SCHEDULER_ENABLED
     - OTA_TASK_MAX_TARGET_VEHICLES
     - KAFKA_BOOTSTRAP_SERVERS
     - KAFKA_SECURITY_PROTOCOL
@@ -1976,6 +2108,7 @@ x-hunter-service:
     OTA_CANARY_OBSERVE_HOURS: 24
     OTA_CANARY_MIN_SUCCESS_RATE: 0.95
     OTA_ROLLOUT_TICK_SECONDS: 60
+    ROLLOUT_SCHEDULER_ENABLED: true
     OTA_TASK_MAX_TARGET_VEHICLES: 1000
     OTA_OFFLINE_FALLBACK_ENABLED: false
     PRESIGNED_UPLOAD_EXPIRE_SECONDS: 3600
@@ -2007,6 +2140,8 @@ x-hunter-service:
       note: "RSA-2048 验签开关，默认 true；生产禁止置 false，见 x-hunter-pending-confirmation #17"
     - env: OTA_ROLLOUT_TICK_SECONDS
       note: "灰度调度器扫描周期（观察窗口到期判定 + 批次推进）"
+    - env: ROLLOUT_SCHEDULER_ENABLED
+      note: "灰度自动调度器总开关（x-hunter-canary-rollout.scheduler），默认 true；单机/测试环境可置 false 关闭后台循环，由调用方直接驱动 scheduler_tick"
   forbidden_hardcode: "URL / 密钥 / 端口 / 阈值 / 频率一律走环境变量或 ConfigMap，禁止硬编码（规则 16）"
   performance:
     targets:
@@ -2039,7 +2174,10 @@ x-hunter-endpoints:
     - { operationId: listOtaVersions,        method: GET,  path: "/api/v1/ota/versions",                     rbac: "ota:read",    source: derived }
     - { operationId: createOtaVersion,       method: POST, path: "/api/v1/ota/versions",                     rbac: "ota:create",  source: "附录 D 明列（POST /api/v1/ota/versions）", rate_limit: "5 QPS/用户" }
     - { operationId: getOtaVersion,          method: GET,  path: "/api/v1/ota/versions/{version_id}",       rbac: "ota:read",    source: derived }
-    - { operationId: publishOtaVersion,      method: POST, path: "/api/v1/ota/versions/{version_id}/publish",   rbac: "ota:execute", source: derived, note: "性能例外；网关超时 ≥300s" }
+    - { operationId: submitOtaVersionTesting, method: POST, path: "/api/v1/ota/versions/{version_id}/submit-testing", rbac: "ota:execute", source: "G-18② 设计文档 §7.2.2 审核流" }
+    - { operationId: submitOtaVersionReview,  method: POST, path: "/api/v1/ota/versions/{version_id}/submit-review",  rbac: "ota:execute", source: "G-18② 设计文档 §7.2.2 审核流" }
+    - { operationId: rejectOtaVersionReview,  method: POST, path: "/api/v1/ota/versions/{version_id}/reject-review", rbac: "ota:execute", source: "G-18② 设计文档 §7.2.2 审核流" }
+    - { operationId: publishOtaVersion,      method: POST, path: "/api/v1/ota/versions/{version_id}/publish",   rbac: "ota:execute", source: derived, note: "性能例外；网关超时 ≥300s；G-18② 前置状态改为 reviewing（审核批准）" }
     - { operationId: deprecateOtaVersion,    method: POST, path: "/api/v1/ota/versions/{version_id}/deprecate", rbac: "ota:execute", source: derived }
     - { operationId: listOtaTasks,           method: GET,  path: "/api/v1/ota/tasks",                       rbac: "ota:read",    source: derived }
     - { operationId: createOtaTask,          method: POST, path: "/api/v1/ota/tasks",                       rbac: "ota:create",  source: derived }
@@ -2130,7 +2268,7 @@ x-hunter-kafka:
   forbidden: "禁止新增 Topic、禁止修改分区/acks/retention、禁止以 PLAINTEXT 连接任何环境"
 
 x-hunter-version-upload-flow:
-  note: "两步式：先建草稿拿预签名地址（不经过服务端，避免 GB 级包体打满 API 网关），再直传 MinIO，最后发布校验。"
+  note: "两步式：先建草稿拿预签名地址（不经过服务端，避免 GB 级包体打满 API 网关），再直传 MinIO，经提测/提审（G-18②）后发布校验。"
   steps:
     - step: 1
       action: "POST /api/v1/ota/versions"
@@ -2141,13 +2279,19 @@ x-hunter-version-upload-flow:
       detail: "part_count=1 用 upload_url；>1 用 parts[] 分片并支持断点续传"
       ttl_seconds: 3600
     - step: 3
+      action: "POST /api/v1/ota/versions/{version_id}/submit-testing"
+      server_side: "HeadObject 校验包已直传（不存在 → 6001）；draft → testing（G-18②）"
+    - step: 4
+      action: "POST /api/v1/ota/versions/{version_id}/submit-review"
+      server_side: "testing → reviewing（可选 test_summary 写审计日志；审核驳回走 reject-review 回退 draft）（G-18②）"
+    - step: 5
       action: "POST /api/v1/ota/versions/{version_id}/publish"
       server_side:
         - "读取 MinIO 对象做**单次流式** MD5 + SHA-256 + 长度校验（不整包入内存）→ 不匹配 6001"
         - "RSA-2048 验签（RSASSA-PKCS1-v1_5 + SHA-256；公钥 OTA_SIGNATURE_PUBLIC_KEY）→ 失败 6002"
         - "version_code 单调递增门禁（同 applicable_models 范围已发布最大值）→ 失败 6003"
-        - "全部通过：draft → published + 写 release_time"
-    - step: 4
+        - "全部通过：reviewing → published + 写 release_time（非 reviewing → 3003，G-18②）"
+    - step: 6
       action: "GET /api/v1/ota/versions/{version_id} 或列表"
       detail: "返回即时签发的 15 分钟下载预签名地址 package_download_url（支持 Range 分片下载）"
   object_key_pattern: "hunter-core/ota/{model}/{version_name}/{version_code}/package.tar.gz（例：hunter-core/ota/HUNTER_SE/V1.2.0/10200/package.tar.gz）"
@@ -2178,9 +2322,11 @@ x-hunter-canary-rollout:
     rounding: "小规模车队（< 20 台）按 ceil(percent × total) 取整且至少 1 台，末批补足剩余车辆（⚠ 待确认，见 x-hunter-pending-confirmation #14）"
     batch_advance: "仅当「观察窗口已结束」且「成功率 ≥ 阈值」同时满足才推进；禁止人工跳批（见 x-hunter-pending-confirmation #3）"
   scheduler:
+    enabled_env: ROLLOUT_SCHEDULER_ENABLED
     tick_seconds_env: OTA_ROLLOUT_TICK_SECONDS
     concurrency_control: "以 PostgreSQL 行锁（SELECT ... FOR UPDATE on ota_tasks）+ 状态机校验保证单任务只被推进一次；**不新增 Redis key**（Redis key 命名受契约约束）"
-    actions_per_tick: "推进批次 / 到期置 succeeded / 成功率不达标置 paused + 发 alert_event"
+    actions_per_tick: "到点启动 scheduled 首批 / 推进批次（观察 24h 且成功率 ≥95%）/ 末批达标置 succeeded / 成功率不达标置 paused"
+    halt_signaling: "成功率不达标暂停时以 CRITICAL 日志告警（本服务不生产 alert_event——生产者唯一为 data-analytics，见 contracts/kafka；跨服务事件下发属 data-analytics 职责）"
   state_machine:
     - { from: created,          to: running,   trigger: "POST /tasks/{task_id}/start（首批 5% 放行）" }
     - { from: pending_approval, to: running,   trigger: "POST /tasks/{task_id}/start（审批通过后）" }
@@ -2218,9 +2364,9 @@ x-hunter-ota-security:
     - "version_code 单调递增（平台发布门禁 + 车端校验双保险）"
     - "A/B 分区：刷写非活动分区，TEST 自检失败回退原分区（车端自动）；平台人工回滚仅对 SUCCESS 记录下发 ota_rollback 指令"
   authorization:
-    authn: "JWT Access Token（2h）+ Refresh Token（7d），网关校验后注入 X-User-Id / X-Roles / X-Trace-Id"
+    authn: "JWT Access Token（30min，G-04①）+ Refresh Token（7d），网关校验后注入 X-User-Id / X-Roles / X-Trace-Id"
     rbac_resource: "ota"
-    actions: ["read（查询版本/任务/记录）", "create（创建版本/任务）", "execute（发布/退役/启动/暂停/恢复/终止/回滚）"]
+    actions: ["read（查询版本/任务/记录）", "create（创建版本/任务）", "execute（提测/提审/驳回/发布/退役/启动/暂停/恢复/终止/回滚）"]
     error_mapping: "Token 缺失/无效 → 1001；Token 过期 → 1003；权限不足 → 1002"
     data_scope: "按车辆/项目数据权限过滤（用户仅可操作授权车辆的目标清单）"
   transport:
@@ -2236,6 +2382,9 @@ x-hunter-ota-security:
     sink: "结构化 JSON 审计日志（hunter-logs 30 天）"
     events:
       - { operation: "POST /versions",            fields: [user_id, version_name, version_code, object_key, trace_id] }
+      - { operation: "POST /versions/{id}/submit-testing", fields: [user_id, version_id, object_key, trace_id] }
+      - { operation: "POST /versions/{id}/submit-review",  fields: [user_id, version_id, test_summary, trace_id] }
+      - { operation: "POST /versions/{id}/reject-review",  fields: [user_id, version_id, reason, trace_id] }
       - { operation: "POST /versions/{id}/publish", fields: [user_id, version_id, version_code, package_sha256, checks, trace_id] }
       - { operation: "POST /versions/{id}/deprecate", fields: [user_id, version_id, status, reason, trace_id] }
       - { operation: "POST /tasks",              fields: [user_id, task_id, target_version_id, vehicle_count, trace_id] }
@@ -2280,7 +2429,7 @@ x-hunter-pending-confirmation:
   items:
     - id: 1
       question: "设计文档 §12.5（OTA 模块）原文未随仓库提供，无法逐条比对端点/字段/批次规则"
-      contract_decision: "按模块职责表、网关路由表、附录 D 限流、附录 A 错误码、第 8/9 章 Kafka 与 DDL、第 14/15 章状态机与安全约束，推导 15 个业务端点（+3 个运维端点 /healthz /readyz /metrics）与全部请求/响应字段（见 x-hunter-endpoints.items 及各 operation 的推导说明）"
+      contract_decision: "按模块职责表、网关路由表、附录 D 限流、附录 A 错误码、第 8/9 章 Kafka 与 DDL、第 14/15 章状态机与安全约束，推导 18 个业务端点（含 G-18② 审核流新增 3 端点；+3 个运维端点 /healthz /readyz /metrics）与全部请求/响应字段（见 x-hunter-endpoints.items 及各 operation 的推导说明）"
       impact: "Step 3/4（schemas / routers）实现范围；若 §12.5 原文与推导存在差异（路径、字段名、批次取整、状态名）需回改契约 + schema + migration"
     - id: 2
       question: "release_type 取值域（DDL 注释仅写「正式/灰度/补丁」，未给英文枚举）"
@@ -2354,3 +2503,7 @@ x-hunter-pending-confirmation:
       question: "OTA_OFFLINE_FALLBACK_ENABLED：Redis 中无某车辆 vehicle:status 读模型数据时，是否放行升级"
       contract_decision: "契约默认 **false = 缺门禁数据即拒绝**（计入 blocked[] 并给 reason，安全默认值，与 K8s 生产 ConfigMap 一致）；仅 DEBUG 联调可显式置 true，生产禁止"
       impact: "升级门禁严格性（false 更安全但可能因读模型缺失导致大量 blocked）；对齐 data-collector 写读模型的时效性后确认，若确认放行需补审计字段"
+    - id: 20
+      question: "G-18② 审核流元数据持久化：提审人/审核人/驳回原因当前仅写结构化审计日志（hunter-logs 30 天），ota_versions 表无 reviewed_by / reject_reason 列；另未强制「提审人与发布人不得为同一人」（职责分离）"
+      contract_decision: "最小闭环：审核元数据只进审计日志，不加 DB 列（避免未经确认的 DDL 变更，规则 7）；职责分离不做硬校验"
+      impact: "版本详情无法直接展示审核链路（需查审计日志，且受 #15 保留期冲突影响）；若确认需落库，须新增列（DDL + migration + OtaVersionItem 字段 + 前端展示）并在 publish 增加审核人比对门禁"

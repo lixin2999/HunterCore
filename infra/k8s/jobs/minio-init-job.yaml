@@ -39,17 +39,17 @@ data:
       echo "[minio-init] bucket ready: $1"
     }
 
-    # add_expiry <bucket> <days> [prefix]
+    # add_expiry <bucket> <days> [tags]（G-12：rosbag 按对象 Tag 而非前缀区分生命周期）
     add_expiry() {
-      local bucket="$1" days="$2" prefix="${3:-}"
-      if [ -n "$prefix" ]; then
+      local bucket="$1" days="$2" tags="${3:-}"
+      if [ -n "$tags" ]; then
         # shellcheck disable=SC2086
-        mc ${MC_OPTS} ilm rule add --expire-days "$days" --prefix "$prefix" "$ALIAS/$bucket" >/dev/null
+        mc ${MC_OPTS} ilm rule add --expire-days "$days" --tags "$tags" "$ALIAS/$bucket" >/dev/null
       else
         # shellcheck disable=SC2086
         mc ${MC_OPTS} ilm rule add --expire-days "$days" "$ALIAS/$bucket" >/dev/null
       fi
-      echo "[minio-init] lifecycle: $bucket expire ${days}d${prefix:+ (prefix=$prefix)}"
+      echo "[minio-init] lifecycle: $bucket expire ${days}d${tags:+ (tags=$tags)}"
     }
 
     # 启用 SSE-S3 默认加密（数据安全：MinIO 服务端加密）
@@ -73,8 +73,9 @@ data:
 
     # ---- 生命周期规则 ----
     add_expiry "hunter-raw-data" 30
-    # rosbag 约定：常规数据在 regular/ 前缀（30 天）；事件数据在 events/ 前缀（永久）
-    add_expiry "hunter-rosbag" 30 "regular/"
+    # rosbag 约定（G-12）：按对象 Tag hunter-retention 区分；regular → 30 天，event → 永久（不设规则）；
+    # Tag 由 data-collector complete 阶段服务端打标，未打标对象等同永久（禁止绕过 complete 直写）
+    add_expiry "hunter-rosbag" 30 "hunter-retention=regular"
     add_expiry "hunter-video" 90
     add_expiry "hunter-logs" 30
     # hunter-ota-packages / hunter-reports / hunter-scene-assets：永久，不设过期规则

@@ -1,6 +1,6 @@
 """ORM 模型：采集接入（data_collector）。
 
-- ``Event``：车辆事件（18 种类型 / 3 级等级，阈值见 contracts/database/enums.md）
+- ``Event``：车辆事件（19 种类型 / 3 级等级，阈值见 contracts/database/enums.md）
 - ``VehicleTelemetry``：车辆遥测时序（hypertable，按天分块、保留 90 天）
 
 对应契约：contracts/database/ddl/04_events.sql、ddl/05_timeseries.sql。

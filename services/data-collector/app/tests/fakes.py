@@ -48,6 +48,10 @@ class FakeMinioStorage:
         self.multipart_sessions: dict[str, list[dict[str, Any]]] = {}
         self.aborted_sessions: list[tuple[str, str, str]] = []
         self.list_calls: list[dict[str, Any]] = []
+        #: 对象键 → 生命周期归类 Tag（G-12，put_object_tags 记录）
+        self.tags: dict[tuple[str, str], str] = {}
+        #: 非空时 put_object_tags 抛出该异常（验证打标失败阻断发布）
+        self.tag_fail_with: Exception | None = None
         self._upload_seq = 0
 
     # ---------- 测试辅助 ----------
@@ -122,6 +126,12 @@ class FakeMinioStorage:
         ]
         next_marker = page[-1] if truncated and page else None
         return items, truncated, next_marker
+
+    def put_object_tags(self, bucket: str, key: str, retention: str) -> None:
+        """记录生命周期归类 Tag（G-12；可经 tag_fail_with 注入失败）。"""
+        if self.tag_fail_with is not None:
+            raise self.tag_fail_with
+        self.tags[(bucket, key)] = retention
 
     def complete_multipart_upload(
         self, bucket: str, key: str, upload_id: str, parts: list[dict[str, Any]]

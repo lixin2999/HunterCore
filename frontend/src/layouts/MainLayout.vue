@@ -1,17 +1,20 @@
 <script setup lang="ts">
 /**
- * 主布局：侧边菜单 + 顶栏 + 内容区
+ * 主布局：侧边菜单 + 顶栏 + 内容区 + G-06 首登强制改密弹窗
  *
  * 权限：菜单项按 meta.permission 过滤（服务端下发权限编码，见 constants/permissions.ts）；
  *      隐藏菜单仅影响展示，真实鉴权由网关 + 服务端 RBAC 执行。
+ * G-06：profile.must_change_password=true 时展示不可关闭的改密对话框（仅可退出登录）。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import type { FormInstance, FormRules } from 'element-plus'
 
 import { APP_TITLE } from '@/constants'
 import { PERMISSIONS, ROLE_LABELS } from '@/constants/permissions'
 import { useUserStore } from '@/stores/user'
+import { HunterApiError } from '@/utils/error-code'
 
 interface MenuItem {
   /** 路由名（子菜单首项） */
@@ -85,6 +88,59 @@ async function handleLogout(): Promise<void> {
   await userStore.logout()
   await router.push({ name: 'login' })
 }
+
+// =====================================================================
+// G-06 首登强制改密（must_change_password=true 时弹出，不可关闭）
+// =====================================================================
+const pwdFormRef = ref<FormInstance>()
+const pwdSubmitting = ref(false)
+const pwdForm = reactive({ oldPassword: '', newPassword: '', confirmPassword: '' })
+
+/** 契约 ChangePasswordRequest.new_password pattern 的前端等价校验 */
+function validateStrength(_rule: unknown, value: string, callback: (err?: Error) => void): void {
+  if (value.length < 8 || value.length > 128) {
+    callback(new Error('口令长度需为 8–128 位'))
+  } else if (!(/[a-z]/.test(value) && /[A-Z]/.test(value) && /\d/.test(value))) {
+    callback(new Error('需包含大写字母、小写字母与数字'))
+  } else {
+    callback()
+  }
+}
+
+const pwdRules: FormRules = {
+  oldPassword: [{ required: true, message: '请输入当前口令', trigger: 'blur' }],
+  newPassword: [{ required: true, validator: validateStrength, trigger: 'blur' }],
+  confirmPassword: [
+    { required: true, message: '请再次输入新口令', trigger: 'blur' },
+    {
+      validator: (_rule, value: string, callback: (err?: Error) => void) =>
+        value === pwdForm.newPassword ? callback() : callback(new Error('两次输入不一致')),
+      trigger: 'blur',
+    },
+  ],
+}
+
+async function handleSubmitChangePassword(): Promise<void> {
+  const form = pwdFormRef.value
+  if (!form) return
+  try {
+    await form.validate()
+  } catch {
+    return
+  }
+  pwdSubmitting.value = true
+  try {
+    await userStore.changePassword({ old_password: pwdForm.oldPassword, new_password: pwdForm.newPassword })
+    ElMessage.success('口令修改成功')
+    Object.assign(pwdForm, { oldPassword: '', newPassword: '', confirmPassword: '' })
+  } catch (err) {
+    // 1001 = 旧口令错误（统一认证失败）；其余展示服务端 message
+    const tip = err instanceof HunterApiError && err.code === 1001 ? '当前口令不正确' : (err as Error).message
+    ElMessage.error(tip)
+  } finally {
+    pwdSubmitting.value = false
+  }
+}
 </script>
 
 <template>
@@ -134,6 +190,35 @@ async function handleLogout(): Promise<void> {
         </router-view>
       </el-main>
     </el-container>
+
+    <!-- G-06 首登强制改密：不可关闭（无关闭按钮/点击遮罩不取消），仅可改密或退出 -->
+    <el-dialog
+      :model-value="userStore.mustChangePassword"
+      title="首次登录须修改口令"
+      width="420px"
+      :close-on-click-modal="false"
+      :close-on-press-escape="false"
+      :show-close="false"
+    >
+      <p class="layout__pwd-hint">
+        为保障账号安全，初始化口令必须修改后才能继续使用系统（设计文档 14.1 节）。
+      </p>
+      <el-form ref="pwdFormRef" :model="pwdForm" :rules="pwdRules" label-position="top">
+        <el-form-item label="当前口令" prop="oldPassword">
+          <el-input v-model="pwdForm.oldPassword" type="password" show-password autocomplete="current-password" />
+        </el-form-item>
+        <el-form-item label="新口令" prop="newPassword">
+          <el-input v-model="pwdForm.newPassword" type="password" show-password autocomplete="new-password" />
+        </el-form-item>
+        <el-form-item label="确认新口令" prop="confirmPassword">
+          <el-input v-model="pwdForm.confirmPassword" type="password" show-password autocomplete="new-password" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="handleLogout">退出登录</el-button>
+        <el-button type="primary" :loading="pwdSubmitting" @click="handleSubmitChangePassword">确认修改</el-button>
+      </template>
+    </el-dialog>
   </el-container>
 </template>
 
@@ -188,5 +273,11 @@ async function handleLogout(): Promise<void> {
 .layout__main {
   background: #f5f7fa;
   padding: 16px;
+}
+
+.layout__pwd-hint {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
 }
 </style>

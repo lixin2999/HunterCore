@@ -24,6 +24,8 @@ from app.schemas.versions import (
     OtaVersionListResponse,
     OtaVersionPublishRequest,
     OtaVersionPublishResponse,
+    OtaVersionRejectReviewRequest,
+    OtaVersionSubmitReviewRequest,
 )
 from app.services.versions import VersionService
 
@@ -117,10 +119,64 @@ async def get_ota_version(
 
 
 @router.post(
+    "/versions/{version_id}/submit-testing",
+    operation_id="submitOtaVersionTesting",
+    response_model=OtaVersionDetailResponse,
+    summary="提交测试（G-18② 审核流：draft → testing，校验升级包已直传）",
+    responses={**_COMMON_ERRORS},
+)
+async def submit_ota_version_testing(
+    version_id: Annotated[UUID, Path(description="版本 ID")],
+    service: Annotated[VersionService, Depends(get_version_service)],
+    user_id: Annotated[str, Depends(require_execute_permission)],
+) -> OtaVersionDetailResponse:
+    """HeadObject 校验包已直传（不存在 → 6001）；非 draft → 3003。"""
+    data = await service.submit_testing(version_id, user_id)
+    return OtaVersionDetailResponse(data=data, request_id=trace_request_id())
+
+
+@router.post(
+    "/versions/{version_id}/submit-review",
+    operation_id="submitOtaVersionReview",
+    response_model=OtaVersionDetailResponse,
+    summary="提交审核（G-18② 审核流：testing → reviewing）",
+    responses={**_COMMON_ERRORS},
+)
+async def submit_ota_version_review(
+    version_id: Annotated[UUID, Path(description="版本 ID")],
+    service: Annotated[VersionService, Depends(get_version_service)],
+    user_id: Annotated[str, Depends(require_execute_permission)],
+    payload: OtaVersionSubmitReviewRequest | None = None,
+) -> OtaVersionDetailResponse:
+    """提审（test_summary 仅审计留痕）；非 testing → 3003。"""
+    test_summary = payload.test_summary if payload is not None else None
+    data = await service.submit_review(version_id, test_summary, user_id)
+    return OtaVersionDetailResponse(data=data, request_id=trace_request_id())
+
+
+@router.post(
+    "/versions/{version_id}/reject-review",
+    operation_id="rejectOtaVersionReview",
+    response_model=OtaVersionDetailResponse,
+    summary="审核驳回（G-18② 审核流：reviewing → draft，回退返工）",
+    responses={**_COMMON_ERRORS},
+)
+async def reject_ota_version_review(
+    version_id: Annotated[UUID, Path(description="版本 ID")],
+    payload: OtaVersionRejectReviewRequest,
+    service: Annotated[VersionService, Depends(get_version_service)],
+    user_id: Annotated[str, Depends(require_execute_permission)],
+) -> OtaVersionDetailResponse:
+    """驳回回退 draft（可重新直传后再提测/提审）；非 reviewing → 3003。"""
+    data = await service.reject_review(version_id, payload, user_id)
+    return OtaVersionDetailResponse(data=data, request_id=trace_request_id())
+
+
+@router.post(
     "/versions/{version_id}/publish",
     operation_id="publishOtaVersion",
     response_model=OtaVersionPublishResponse,
-    summary="发布 OTA 版本（SHA-256 校验 + RSA-2048 验签 + version_code 单调性门禁）",
+    summary="发布 OTA 版本（审核批准：SHA-256 校验 + RSA-2048 验签 + version_code 单调性门禁）",
     responses={
         429: {"description": "建议限流 2 QPS（x-hunter-rate-limits.recommended）+ Retry-After"},
         **_COMMON_ERRORS,
@@ -132,7 +188,7 @@ async def publish_ota_version(
     user_id: Annotated[str, Depends(version_publish_user)],
     payload: OtaVersionPublishRequest | None = None,
 ) -> OtaVersionPublishResponse:
-    """发布（长耗时：单次流式 size/MD5/SHA-256 + RSA-2048 验签 + 防回滚门禁 → published）。"""
+    """发布（前置仅 reviewing，G-18②）：长耗时单次流式 size/MD5/SHA-256 + RSA-2048 验签 + 防回滚门禁 → published。"""
     note = payload.note if payload is not None else None
     data = await service.publish_version(version_id, note, user_id)
     return OtaVersionPublishResponse(data=data, request_id=trace_request_id())

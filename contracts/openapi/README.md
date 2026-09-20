@@ -41,19 +41,21 @@
 
 ## 场景服务契约要点（scene-service.yaml）
 
-- **业务端点**（设计文档 12.2 节，不可增删）：`GET/POST /api/v1/scene`、`GET/PUT/DELETE /api/v1/scene/{scene_id}`、
-  `GET /api/v1/scene/templates`、`POST /api/v1/scene/{scene_id}/duplicate|publish|run`、`POST /api/v1/scene/export`
+- **业务端点**（设计文档 12.2 节 + 决策 G-20① 新增，共 12 个）：`GET/POST /api/v1/scene`、`GET/PUT/DELETE /api/v1/scene/{scene_id}`、
+  `GET /api/v1/scene/templates`、`POST /api/v1/scene/{scene_id}/duplicate|publish|run`、`POST /api/v1/scene/export`、
+  `GET /api/v1/scene/simulations/{sim_instance_id}`（进度）与 `…/result`（结果，仅终态；产物预签名 15 分钟）
 - **数据结构**：`SceneMeta`（7 个元信息字段 → `scene_svc.scenes` 列）+ `SceneConfig`（`map/ego_vehicle/weather/actors/events/success_criteria/duration`
   → `config_json`）合并即 4.2.2 节完整结构；顶层字段映射见 `x-hunter-scene-config-contract`
 - **状态机**：`draft → published → archived`（`x-hunter-lifecycle`）；仅 `draft` 可编辑，`published` 可下发，删除仅限 `draft/archived`
 - **导出**：4.3 节两种格式（`carla_scenariorunner_xml` / `openscenario_1_2`），产物落 MinIO `hunter-scene-assets`，
   下载预签名 15 分钟（`x-hunter-export`）
 - **仿真下发**：4.4 节 7 步流程 + `sim_instance_id`（`x-hunter-simulation-flow`）；Carla 管理 API 地址走环境变量
-  `CARLA_MANAGEMENT_ENDPOINT`（禁止硬编码）
+  `CARLA_MANAGEMENT_ENDPOINT`（禁止硬编码）；步骤⑥⑦按决策 G-20① 经仿真查询端点实现（无状态代理，
+  子路径 `CARLA_INSTANCE_GET_PATH`/`CARLA_INSTANCE_RESULT_PATH` 环境变量化；平台不落库实例状态）
 - **Kafka**：`x-hunter-kafka` 声明不生产任何 Topic，仅消费 `analytics_result`
   （消费组 `scene-service-analytics-result`，实车场景自动提取 4.5 节）
-- **⚠ 待核对项**：`scene_type` 编码值（4.2.1 只给两级结构）、仿真进度/结果端点缺口（4.4 第 6/7 步）、
-  `archived` 无归档端点、导出返回形式、`version` 递增策略 —— 全量见契约 `x-hunter-pending-confirmation`（12 项）
+- **⚠ 待核对项**：`scene_type` 编码值（4.2.1 只给两级结构）、~~仿真进度/结果端点缺口~~（已决策 G-20① 交付）、
+  `archived` 无归档端点、导出返回形式、`version` 递增策略 —— 全量见契约 `x-hunter-pending-confirmation`（12 项，#2 已决策）
 
 ## 数据采集契约要点（data-collector.yaml）
 
@@ -64,7 +66,7 @@
 - **数据结构**：遥测查询响应（`TelemetrySample` + 六段嵌套）与 5.3.3 节消息结构逐字段一致，
   由 `data_collector.vehicle_telemetry` 扁平列重组（映射见 `x-hunter-telemetry-query-contract`，
   查询必须带 `vehicle_id` + 时间区间，保留 90 天）；事件模型一一对应 `events` 表列
-  （18 种类型 / 3 级等级取 `EVENT_LEVEL_BY_TYPE`，确认写 `acknowledged*` 三列且幂等）
+  （19 种类型 / 3 级等级取 `EVENT_LEVEL_BY_TYPE`，确认写 `acknowledged*` 三列且幂等）
 - **5.4 预处理**：6 步（解析 → 校验 → 时间对齐 → 清洗 → enrichment → 序列化写入），
   失败转 DLQ `{topic}.dlq`；入库延迟 ≤1s、时序写入 ≥10000 点/秒、单车 ≤100 msg/s
 - **5.5 文件上传**：请求上传 → 预签名（上传 1h / 下载 15min + Range）→ 直传 → 完成通知 →
@@ -92,10 +94,10 @@
   算法性能监控 / 碰撞风险评估 / 数据质量监控）；阈值 14 项全部环境变量化并在 K8s ConfigMap 注入，
   与「事件类型定义」（`EVENT_LEVEL_BY_TYPE`）机器可检一致；数据质量监控消费 `telemetry_raw`，
   其余消费 `telemetry_clean`
-- **告警契约**：`alert_event` 消息 Schema 已补全（`alert_type` 18 种受控类型、`level` 必须等于
+- **告警契约**：`alert_event` 消息 Schema 已补全（`alert_type` 19 种受控类型、`level` 必须等于
   `EVENT_LEVEL_BY_TYPE[alert_type]`、`source_job` 取 5 个实时作业、`rule` 回带阈值）；6.2.3 节
-  「TTC < 3.0s 预警（warning）」与受控词表 `collision_warning`(critical) 的等级冲突已显式登记
-  （不新增类型、不放宽等级 → 3.0s 预警走 `analytics_result`）
+  「TTC < 3.0s 预警（warning）」与受控词表 `collision_warning`(critical) 的等级冲突已**新增事件类型
+  `collision_pre_warning`（warning，TTC<3.0s）消解**（G-22②，词表 18→19；两档均投 `alert_event`）
 - **6.3 离线作业**：`x-hunter-offline-jobs` 定义 7 个 Spark 作业与 cron（日报/评估每日、覆盖率与挖掘每周、
   月报每月，UTC）；6.3.3 节控制性能阈值（速度 RMSE < 0.2 m/s、转向 RMSE < 0.02 rad、超调 < 10%、
   调节时间 < 2s）在契约、响应 Schema、作业定义三处一致
@@ -110,23 +112,26 @@
   4 个 `data-analytics-*` 消费组），生产 `analytics_result` + `alert_event`
 - **⚠ 待核对项**：报告/Case 元信息缺表、报告异步语义与状态枚举、TTC 等级冲突、`alert_event` 消费方落位、
   数据质量阈值与落位、算法指标窗口与感知真值来源、Corner Case 参数、Redis 状态读取归属、
-  12.4 节缺规划质量/数据质量端点、看板入库延迟来源、查询跨度上限、消费组契约修正 ——
-  全量见契约 `x-hunter-pending-confirmation`（12 项）
+  12.4 节缺规划质量/数据质量端点、看板入库延迟来源、查询跨度上限、消费组契约修正、over_speed 限速来源（G-13） ——
+  全量见契约 `x-hunter-pending-confirmation`（13 项）
 
 ## OTA 管理契约要点（ota-service.yaml）
 
-- **业务端点**（15 个，推导清单 —— 设计文档 §12.5 原文未随仓库提供）：
+- **业务端点**（18 个，含 G-18② 审核流新增 3 端点 —— 设计文档 §12.5 原文未随仓库提供）：
   版本仓库 `GET /api/v1/ota/versions`、`POST /api/v1/ota/versions`、`GET /api/v1/ota/versions/{version_id}`、
+  `POST /api/v1/ota/versions/{version_id}/submit-testing|submit-review|reject-review`（G-18②）、
   `POST /api/v1/ota/versions/{version_id}/publish`、`POST /api/v1/ota/versions/{version_id}/deprecate`；
   升级任务 `GET /api/v1/ota/tasks`、`POST /api/v1/ota/tasks`、`GET /api/v1/ota/tasks/{task_id}`、
   `POST /api/v1/ota/tasks/{task_id}/start|pause|resume|cancel|rollback`；升级记录
   `GET /api/v1/ota/tasks/{task_id}/records`、`GET /api/v1/ota/vehicles/{vehicle_id}/records`
   （推导依据逐条登记在 `x-hunter-endpoints.items`）
+- **版本审核流（G-18②，设计文档 §7.2.2）**：`draft → testing（submit-testing，HeadObject 校验包已直传）→
+  reviewing（submit-review）→ published（publish 审核批准）`；驳回 `reject-review` 回退 `draft`；非前置态 → 3003
 - **版本上传两步式（`x-hunter-version-upload-flow`）**：建草稿（`draft`）→ 服务端签发 1 小时上传预签名地址 → 客户端直传
   MinIO `hunter-ota-packages` → `publish` 由服务端**单次流式**校验；对象键
   `hunter-core/ota/{model}/{version_name}/{version_code}/package.tar.gz`（服务端生成，禁止客户端指定）
-- **发布门禁（唯一）**：`publish` 依次校验 包长/MD5/SHA-256（→ 6001）→ RSA-2048 验签 `RSASSA-PKCS1-v1_5 + SHA-256`
-  （→ 6002）→ `version_code` 同 `applicable_models` 范围单调递增（→ 6003），全部通过才 `draft → published` + 写 `release_time`；
+- **发布门禁（唯一，审核批准）**：`publish`（前置仅 `reviewing`）依次校验 包长/MD5/SHA-256（→ 6001）→ RSA-2048 验签 `RSASSA-PKCS1-v1_5 + SHA-256`
+  （→ 6002）→ `version_code` 同 `applicable_models` 范围单调递增（→ 6003），全部通过才 `reviewing → published` + 写 `release_time`；
   该项为**长耗时操作**，已在 `x-hunter-service.performance.exceptions` 登记为性能例外（网关超时 ≥300s，见 pending #9）
 - **灰度发布（`x-hunter-canary-rollout`）**：4 批 `5% → 20% → 50% → 100%`，每批观察 24h，成功率 ≥0.95 才推进
   （`SUCCESS / (SUCCESS + FAILED + ROLLED_BACK)`）；< 0.95 立即 `paused` + 告警 `alert_event`（人工只能 rollback / cancel）；
@@ -140,11 +145,12 @@
   不消费 `command_result`、不生产 `broadcast.command`（pending #12）；车端连接强制 SASL_SSL + SCRAM-SHA-512
 - **数据访问边界**：写 `ota_svc.ota_versions / ota_tasks / ota_records`（禁止 DELETE）；不跨 schema；不新增 Redis 键模式
   （写 `ota:progress:{task_id}`，只读 `vehicle:status:{vehicle_id}` / `vehicle:online:set`）
-- **⚠ 待核对项**（全量 19 项见契约 `x-hunter-pending-confirmation`）：§12.5 原文缺失、
+- **⚠ 待核对项**（全量 20 项见契约 `x-hunter-pending-confirmation`）：§12.5 原文缺失、
   `release_type` 取值域、跳批策略、分片上传语义、回滚目标、观察窗口顺延、`ota_notify` 时延目标、车端是否直连 REST、
   publish 网关超时与异步化、publish 限流建议值、DLQ Topic 登记、`command_result` / `broadcast` 归属、
-  升级包大小上限、小车队批次取整、审计保留期、灰度停用通道、安全开关、vehicle-service 依赖、门禁数据缺失放行 ——
-  全量见契约 `x-hunter-pending-confirmation`（19 项）
+  升级包大小上限、小车队批次取整、审计保留期、灰度停用通道、安全开关、vehicle-service 依赖、门禁数据缺失放行、
+  审核元数据持久化与职责分离（G-18②） ——
+  全量见契约 `x-hunter-pending-confirmation`（20 项）
 
 ## 远程操控契约要点（remote-control.yaml）
 

@@ -29,6 +29,7 @@
         "harsh_braking",
         "harsh_turning",
         "over_speed",
+        "collision_pre_warning",
         "collision_warning",
         "manual_takeover",
         "emergency_stop",

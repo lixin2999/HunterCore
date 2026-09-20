@@ -24,7 +24,7 @@
 -- 执行：
 --   $ docker exec -i hunter-postgres psql -U hunter -d hunter_core -v ON_ERROR_STOP=1 \
 --         < /opt/hunter-edge/sql/init-data.sql
---   注入自定义管理员口令哈希（推荐）：
+--   注入自定义管理员口令哈希（推荐，G-06 后为必选路径）：
 --   $ docker exec -i hunter-postgres psql -U hunter -d hunter_core -v ON_ERROR_STOP=1 \
 --         -v admin_password_hash="<bcrypt hash>" < /opt/hunter-edge/sql/init-data.sql
 -- =====================================================================
@@ -33,13 +33,16 @@
 
 -- ---------------------------------------------------------------------
 -- 0. 管理员初始口令哈希（bcrypt，12 轮）
---    默认值对应初始口令：Hunter@2025   ⚠ 首次登录后必须立即修改（运维手册第 7 节）
+--    ⚠ G-06（设计文档 14.1）：不再内置已知初始口令（历史 Hunter@2025 已废弃）。
+--   必须经 psql -v admin_password_hash="<bcrypt hash>" 注入（install/init-db 自动生成随机口令）；
+--   未注入时 admin 以「不可登录占位哈希 + disabled + 强制改密」创建，防止已知口令上线。
 --    外部可用 psql -v admin_password_hash="<bcrypt hash>" 覆盖（生成方式见第四章）
 -- ---------------------------------------------------------------------
 \if :{?admin_password_hash}
 \echo '[init-data] 使用外部传入的 admin_password_hash（psql -v）'
 \else
-\set admin_password_hash '$2b$12$qHFHgpgPj8xmaTKiEZeoH.M07c7X6GieJbijX1Uv4NnU3Uw7vCfeW'
+\echo '[init-data] ⚠ 未传入 admin_password_hash：admin 将以禁用+占位哈希创建（G-06：不携带已知口令），需运维重置口令后启用'
+\set admin_password_hash 'G06-NO-DEFAULT-PASSWORD-RESET-REQUIRED'
 \endif
 
 -- ---------------------------------------------------------------------
@@ -124,10 +127,21 @@ ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------
 -- 4. 默认管理员（user_svc.users + user_roles）
---    ⚠ 初始口令 Hunter@2025 属"已知初始值"：首次登录后必须立即修改，并在修改前限制暴露面
+--    ⚠ G-06：不内置已知口令；哈希由 psql -v 注入（占位哈希 → disabled 不可登录）；
+--   无论何种路径创建，must_change_password 恒为 true（首次登录强制改密，前端/网关拦截）
 -- ---------------------------------------------------------------------
-INSERT INTO user_svc.users (username, password_hash, real_name, email, phone, status)
-VALUES ('admin', :'admin_password_hash', '系统管理员', NULL, NULL, 'enabled')
+INSERT INTO user_svc.users (username, password_hash, real_name, email, phone, status, must_change_password)
+VALUES (
+    'admin',
+    :'admin_password_hash',
+    '系统管理员', NULL, NULL,
+    -- 仅合法 bcrypt 哈希（$2a$/$2b$/$2y$ 前缀）才直接启用；占位哈希保持 disabled
+    CASE WHEN :'admin_password_hash' LIKE '$2a$%'
+           OR :'admin_password_hash' LIKE '$2b$%'
+           OR :'admin_password_hash' LIKE '$2y$%'
+         THEN 'enabled' ELSE 'disabled' END,
+    true
+)
 ON CONFLICT DO NOTHING;
 
 INSERT INTO user_svc.user_roles (user_id, role_id)

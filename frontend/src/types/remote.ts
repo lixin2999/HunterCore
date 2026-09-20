@@ -324,8 +324,10 @@ export interface WsControlFrame {
     target_velocity: number
     /** 限幅 ±RC_MAX_STEER_RAD（服务端截断，pending #18） */
     target_steer: number
-    /** 挡位（D/N/R） */
+    /** 挡位（D/N/R；G-10 已契约化，服务端验词后透传 Kafka control.gear，词表 P/R/N/D） */
     gear: 'D' | 'N' | 'R'
+    /** 归一化制动请求 0~1（G-10 可选；当前前端不传，estop 由服务端置 1.0） */
+    brake?: number
   }
 }
 

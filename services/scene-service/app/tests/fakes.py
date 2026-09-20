@@ -14,9 +14,13 @@ from uuid import UUID, uuid4
 
 from hunter_common.database.enums import SceneStatus
 from hunter_common.database.models import Scene
-from hunter_common.exceptions import ResourceAlreadyExistsError, ServiceUnavailableError
+from hunter_common.exceptions import (
+    ResourceAlreadyExistsError,
+    ResourceNotFoundError,
+    ServiceUnavailableError,
+)
 
-from app.repositories.carla import SimInstance
+from app.repositories.carla import SimInstance, SimInstanceSnapshot
 
 #: 默认创建者（与契约 creator 的 uuid 语义一致）
 DEFAULT_CREATOR = UUID("11111111-1111-4111-8111-111111111111")
@@ -279,7 +283,7 @@ class InMemorySceneStorage:
 
 
 class FakeCarlaClient:
-    """CarlaManagementClient 替身（记录创建/下发调用；可注入不可用 → 5001）。"""
+    """CarlaManagementClient 替身（记录创建/下发调用；可注入不可用 → 5001、404 → 3001）。"""
 
     def __init__(self, *, instance_id: str = "sim-0001", status: str = "running") -> None:
         self.instance_id = instance_id
@@ -288,6 +292,9 @@ class FakeCarlaClient:
         self.submitted: list[tuple[str, dict[str, Any]]] = []
         self.active: dict[str, SimInstance] = {}
         self.unavailable = False
+        # G-20① 进度/结果查询替身数据：instance_id → 原始响应体（未登记时 404 → 3001）
+        self.progress: dict[str, dict[str, Any]] = {}
+        self.results: dict[str, dict[str, Any]] = {}
 
     async def create_instance(
         self, *, scene_id: str, scene_name: str, scene_config: dict[str, Any]
@@ -308,6 +315,32 @@ class FakeCarlaClient:
         if self.unavailable:
             raise ServiceUnavailableError("Carla 管理 API 不可达")
         self.submitted.append((instance_id, payload))
+
+    async def get_instance(self, instance_id: str) -> SimInstanceSnapshot:
+        if self.unavailable:
+            raise ServiceUnavailableError("Carla 管理 API 不可达")
+        body = self.progress.get(instance_id)
+        if body is None:
+            raise ResourceNotFoundError(
+                f"仿真实例不存在或已回收：{instance_id}",
+                details={"sim_instance_id": instance_id},
+            )
+        return SimInstanceSnapshot(
+            instance_id=instance_id, status=str(body.get("status") or "running"), data=body
+        )
+
+    async def get_result(self, instance_id: str) -> SimInstanceSnapshot:
+        if self.unavailable:
+            raise ServiceUnavailableError("Carla 管理 API 不可达")
+        body = self.results.get(instance_id)
+        if body is None:
+            raise ResourceNotFoundError(
+                f"仿真实例不存在或已回收：{instance_id}",
+                details={"sim_instance_id": instance_id},
+            )
+        return SimInstanceSnapshot(
+            instance_id=instance_id, status=str(body.get("status") or "running"), data=body
+        )
 
     async def close(self) -> None:
         return None

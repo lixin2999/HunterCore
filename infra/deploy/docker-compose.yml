@@ -66,8 +66,10 @@ x-business-env: &business-env
   MINIO_SECURE: ${MINIO_SECURE:-false}
   # JWT / 认证
   JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+  # G-02：网关→后端身份头 HMAC 签名密钥（网关与 5 个后端服务共用；≥ 32 字节随机串）
+  GATEWAY_HMAC_SECRET: ${GATEWAY_HMAC_SECRET}
   JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
-  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-120}
+  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-30}  # G-04① 收紧（原设计文档 120 = 2h）
   JWT_REFRESH_TOKEN_EXPIRE_DAYS: ${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-7}
 
 # 业务服务通用挂载：Kafka 契约目录只读（标量锚点，供各服务 volumes 列表项引用）
@@ -188,6 +190,9 @@ services:
       KAFKA_CFG_SSL_KEY_PASSWORD: ${KAFKA_SSL_PASSWORD}
       KAFKA_CFG_SSL_TRUSTSTORE_LOCATION: /opt/bitnami/kafka/config/certs/kafka.truststore.jks
       KAFKA_CFG_SSL_TRUSTSTORE_PASSWORD: ${KAFKA_SSL_PASSWORD}
+      # 严格 mTLS（G-01，设计文档 3.2.3/14.2）：EXTERNAL(SASL_SSL, 车端 9093) 强制客户端证书；
+      # 车端证书由 gen-kafka-certs.sh 签发（kafka-client.p12）；仅本地联调可临时降为 requested（需书面豁免）
+      KAFKA_CFG_SSL_CLIENT_AUTH: ${KAFKA_SSL_CLIENT_AUTH:-required}
       KAFKA_CFG_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""    # 开发放宽主机名校验；生产按证书 SAN 收紧
       # 保留与分区（内部 Topic 单独由 init-kafka.sh 按契约覆盖）
       KAFKA_CFG_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-168}

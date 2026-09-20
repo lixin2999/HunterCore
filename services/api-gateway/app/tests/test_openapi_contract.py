@@ -54,12 +54,13 @@ EXPECTED_ENDPOINT_LIMITS: dict[tuple[str, str], int] = {
     ("GET", "/api/v1/data/telemetry"): 20,
 }
 
-#: 网关自持端点（认证 4 个 + 运维探针 3 个）；探针端点已在 app/routers/health.py 实现
+#: 网关自持端点（认证 5 个 + 运维探针 3 个）；探针端点已在 app/routers/health.py 实现
 EXPECTED_PATHS: set[str] = {
     "/api/v1/user/login",
     "/api/v1/user/refresh",
     "/api/v1/user/logout",
     "/api/v1/user/me",
+    "/api/v1/user/change-password",
     "/healthz",
     "/readyz",
     "/metrics",
@@ -238,9 +239,9 @@ def test_login_public_but_session_endpoints_require_bearer(
 
 
 def test_token_ttl_matches_security_contract(contract: dict[str, Any]) -> None:
-    """Access Token 2h / Refresh Token 7d（设计文档 14.1 节）。"""
+    """Access Token 30min（G-04① 收紧）/ Refresh Token 7d（设计文档 14.1 节）。"""
     props = contract["components"]["schemas"]["TokenPair"]["properties"]
-    assert props["expires_in"]["example"] == 7200
+    assert props["expires_in"]["example"] == 1800
     assert props["refresh_expires_in"]["example"] == 604800
     assert props["token_type"]["enum"] == ["Bearer"]
 
@@ -254,6 +255,11 @@ def test_password_fields_are_write_only(contract: dict[str, Any]) -> None:
         is True
     )
     assert schemas["TokenPair"]["properties"]["refresh_token"]["writeOnly"] is True
+    # G-06 改密请求两个口令字段同样 writeOnly
+    change_props = schemas["ChangePasswordRequest"]["properties"]
+    assert change_props["old_password"]["writeOnly"] is True
+    assert change_props["new_password"]["writeOnly"] is True
+    assert set(schemas["ChangePasswordRequest"]["required"]) == {"old_password", "new_password"}
 
 
 # =====================================================================
@@ -263,7 +269,7 @@ def test_gateway_routes_match_route_table(contract: dict[str, Any]) -> None:
     routes = contract["x-hunter-gateway-routes"]["routes"]
     assert tuple(route["prefix"] for route in routes) == EXPECTED_ROUTE_PREFIXES
     headers = contract["x-hunter-gateway-routes"]["route_headers"]["headers"]
-    assert headers == ["X-User-Id", "X-Roles", "X-Trace-Id"]
+    assert headers == ["X-User-Id", "X-Roles", "X-Trace-Id", "X-Identity-Timestamp", "X-Internal-MAC"]
 
 
 def test_proxy_routes_target_correct_service_ports(contract: dict[str, Any]) -> None:

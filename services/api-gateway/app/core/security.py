@@ -2,7 +2,7 @@
 
 JWT 载荷契约（设计文档 3.2.2 节）：``sub``(user_id) / ``username`` / ``roles`` /
 ``permissions`` / ``iat`` / ``exp`` / ``iss="hunter-platform"`` / ``jti``。
-Access Token 2h、Refresh Token 7d（安全机制；与 HunterBaseConfig 默认值一致）。
+Access Token 30min、Refresh Token 7d（G-04 决策①收紧 Access TTL；与 HunterBaseConfig 默认值一致）。
 
 Refresh Token 轮换（防重放）：通过「Refresh Token 绑定其配对 Access Token 的 jti
 （``at_jti``）+ Redis ``session:{user_id}`` 存储当前 Access Token（redis-keys.yaml
@@ -69,7 +69,7 @@ def create_access_token(
     permissions: list[str],
     settings: Settings,
 ) -> tuple[str, str]:
-    """签发 Access Token（2h）；返回 (token, jti)。载荷见设计文档 3.2.2 节。"""
+    """签发 Access Token（30min，G-04①）；返回 (token, jti)。载荷见设计文档 3.2.2 节。"""
     now = _now()
     ttl_seconds = settings.jwt_access_token_expire_minutes * 60
     jti = str(uuid.uuid4())

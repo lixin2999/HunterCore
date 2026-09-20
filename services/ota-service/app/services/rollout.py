@@ -211,10 +211,32 @@ def build_task_progress(
     )
 
 
+def derive_scheduler_action(rollout: OtaRolloutView) -> str:
+    """灰度自动调度器单任务决策（纯函数，基于 build_rollout_view 结果）。
+
+    返回：
+    - ``halt``：当前批成功率 < 门禁 → 任务置 paused（人工介入）；
+    - ``succeed``：末批（100%）已过观察窗且达标 → 任务置 succeeded；
+    - ``advance``：当前批已过观察窗且达标且非末批 → 推进下一批；
+    - ``none``：其余（进行中/观察中/未开始）→ 本轮不动作。
+    """
+    current = next((b for b in rollout.batches if b.batch_no == rollout.current_batch), None)
+    if current is None:
+        return "none"
+    if current.status == OtaBatchStatus.HALTED:
+        return "halt"
+    if current.status == OtaBatchStatus.PASSED:
+        if current.batch_no >= rollout.total_batches:
+            return "succeed"
+        return "advance"
+    return "none"
+
+
 __all__ = [
     "allocate_batches",
     "build_rollout_view",
     "build_task_progress",
     "canonical_strategy",
+    "derive_scheduler_action",
     "resolve_strategy",
 ]

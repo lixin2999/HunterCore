@@ -47,7 +47,7 @@ cat contracts/database/ddl/05_timeseries.sql > infra/deploy/sql/timescaledb.sql
 | `.env.example` | ✅ 已交付（133 个变量，口令为 CHANGE_ME_*） |
 | `scripts/*.sh`（12 个：common/install/gen-passwords/gen-kafka-certs/init-db/init-kafka/init-minio/health-check/daily-check/backup/uninstall/collect-logs） | ✅ 已交付（位于仓库根 `scripts/`，部署时映射至 `/opt/hunter-edge/scripts/`，见下表） |
 | `docker-compose.yml` | ✅ 已交付（单机生产编排：中间件 + Flink + SRS + 6 业务服务 + web-portal；变量名对齐 pydantic-settings，健康检查用 `/healthz`，distroless 探针用 `python3 -c`；容器名与 `scripts/common.sh` 的 `C_*` 一致） |
-| `docker-compose.override.yml` | ✅ 已交付（开发覆盖：源码热重载 / 降配 / 端口开放；⚠ 生产须删除或 `docker compose -f docker-compose.yml` 显式忽略） |
+| `docker-compose.override.yml.example` | ✅ 已交付为【模板】（G-03 硬闸）：开发覆盖（源码热重载/降配/端口开放）；生产包不含生效 override，install/health-check 检测到即拦截；联调需手动改名为 `docker-compose.override.yml` 并 `export HUNTER_ALLOW_OVERRIDE=1`（书面豁免） |
 | `config/srs.conf` | ✅ 已交付（SRS 5.0：RTMP 1935 / WebRTC 8000udp / HTTP-API·WHEP 9090；部署前须将 `rtc_server.candidate` 改为真实 SERVER_IP） |
 | `frontend/Dockerfile`、`frontend/.dockerignore` | ✅ 已交付（多阶段：node:20 构建 → nginx:1.25 托管；nginx.conf 由 compose 挂载，不烘焙进镜像） |
 | `config/flink-conf.yaml`、`certs/README.md` | ⛔ **待交付**（后续批次；Flink 参数当前经 compose `FLINK_PROPERTIES` 注入） |

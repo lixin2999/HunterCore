@@ -78,8 +78,8 @@ OTA_STATE_MACHINE: tuple[str, ...] = (
 OTA_ROLLBACK_PATH: tuple[str, ...] = ("TEST", "ROLLBACK", "ROLLED_BACK")
 
 # ---------------------------------------------------------------- Redis TTL（第 8 条）
-#: 用户会话 TTL（秒，2 小时）
-SESSION_TTL_SECONDS: int = 7200
+#: 用户会话 TTL（秒，30 分钟；G-04① 收紧，原第 8 条 7200）
+SESSION_TTL_SECONDS: int = 1800
 #: 场景配置缓存 TTL（秒，1 小时）
 SCENE_CACHE_TTL_SECONDS: int = 3600
 #: OTA 进度 Hash TTL（秒，任务结束后 1 天）
@@ -108,12 +108,14 @@ BENCH_TIMESERIES_POINTS: int = int(os.getenv("HUNTER_BENCH_TIMESERIES_POINTS", "
 BENCH_KAFKA_MIN_MSGS_PER_S: float = float(os.getenv("HUNTER_BENCH_KAFKA_MIN_MSGS_PER_S", "300"))
 
 # ---------------------------------------------------------------- 事件类型定义（第 13 条）
-#: 18 种事件：event_type → event_level + 触发阈值（阈值与等级不可更改，测试不得放宽）
+#: 19 种事件：event_type → event_level + 触发阈值（阈值与等级不可更改，测试不得放宽）
+#: G-22② 新增 collision_pre_warning（warning，TTC<3.0s），与 collision_warning（critical，TTC<1.5s）分级
 EVENT_RULES: dict[str, dict[str, Any]] = {
     "harsh_acceleration": {"level": "warning", "metric": "acceleration", "threshold": 3.0, "unit": "m/s^2"},
     "harsh_braking": {"level": "warning", "metric": "deceleration", "threshold": 3.0, "unit": "m/s^2"},
     "harsh_turning": {"level": "warning", "metric": "yaw_rate", "threshold": 0.8, "unit": "rad/s"},
     "over_speed": {"level": "critical", "metric": "speed_over_limit_ratio", "threshold": 1.1, "unit": ""},
+    "collision_pre_warning": {"level": "warning", "metric": "ttc", "threshold": 3.0, "unit": "s", "comparator": "lt"},
     "collision_warning": {"level": "critical", "metric": "ttc", "threshold": 1.5, "unit": "s", "comparator": "lt"},
     "manual_takeover": {"level": "info", "metric": None, "threshold": None, "unit": ""},
     "emergency_stop": {"level": "critical", "metric": None, "threshold": None, "unit": ""},
@@ -177,7 +179,7 @@ SOURCES: dict[str, str] = {
     "PRESIGN_DOWNLOAD_TTL_SECONDS": "contracts/database/object-storage.yaml#presign_policy",
     "TELEMETRY_RETENTION_DAYS": "contracts/database/ddl/05_timeseries.sql（保留 90 天）",
     "TIMESERIES_CHUNK_INTERVAL_DAYS": "contracts/database/ddl/05_timeseries.sql（chunk_time_interval=1 day）",
-    "EVENT_RULES": "系统关键约束第 13 条（事件类型定义：18 种 + 触发阈值/等级）",
+    "EVENT_RULES": "系统关键约束第 13 条（事件类型定义：19 种 + 触发阈值/等级；G-22② 新增 collision_pre_warning）",
     "EVENT_LEVELS": "contracts/database/ddl/04_events.sql（event_level CHECK IN info/warning/critical）",
     "VEHICLE_STATES": "系统关键约束第 12 条（车辆状态定义，8 种）",
     "INTERNAL_TOPIC_ROUTING": "系统关键约束第 4 条（平台内部 Topic：telemetry_raw/event_raw/sensor_file）",

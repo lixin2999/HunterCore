@@ -17,7 +17,7 @@
 | `ddl/01_core.sql` | `vehicles`（车辆台账）；`users` / `roles` / `permissions` / `user_roles` / `role_permissions`（RBAC 五表） | vehicle_svc / user_svc |
 | `ddl/02_scene.sql` | `scenes`（场景库，含软删除 `deleted_at`） | scene_svc |
 | `ddl/03_ota.sql` | `ota_versions` / `ota_tasks` / `ota_records` | ota_svc |
-| `ddl/04_events.sql` | `events`（18 种事件类型 + 3 级事件等级） | data_collector |
+| `ddl/04_events.sql` | `events`（19 种事件类型 + 3 级事件等级） | data_collector |
 | `ddl/05_timeseries.sql` | `vehicle_telemetry`、`algorithm_metrics`（hypertable：按天分块 + 90 天保留） | data_collector / data_analytics |
 | `er.md` | ER 关系说明、跨 schema 访问例外、字段类型约定、与设计文档的差异清单 | — |
 | `orm-mapping.md` | ORM 关系映射契约（16 条 relationship + lazy 策略白名单）、Repository 契约（13 个 Repository + 专属方法双向校验）、排序 spec 与默认排序、事务/错误码/读取上限/显式加载语义、服务层收敛路径 | — |
@@ -59,7 +59,7 @@ pytest common/python/tests/test_repositories.py -q
 
 - 各服务独立 schema，禁止跨服务直查（`er.md` 列出唯一例外：时序库只读分析账号）
 - `vehicle_telemetry` / `algorithm_metrics`：`chunk_time_interval = 1 day`，保留 90 天
-- 受控词表（车辆状态 8 态、事件类型 18 种、事件等级 3 级、OTA 状态机 9 态、算法模块 3 种）必须与
+- 受控词表（车辆状态 8 态、事件类型 19 种、事件等级 3 级、OTA 状态机 9 态、算法模块 3 种）必须与
   `hunter_common/database/enums.py` 完全一致，禁止在业务代码中硬编码字符串
 - ORM relationship 必须显式声明异步安全 lazy 策略（`selectin` / `raise_on_sql`，见 `orm-mapping.md` 第 1 节），
   禁止隐式 `lazy="select"`；跨 schema 逻辑外键**不建** relationship（走 REST 补全）

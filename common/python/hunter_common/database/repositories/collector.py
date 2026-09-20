@@ -35,7 +35,7 @@ TELEMETRY_CONFLICT_COLUMNS: tuple[str, ...] = ("time", "vehicle_id")
 
 
 class EventRepository(BaseRepository[Event]):
-    """车辆事件读写（18 种事件类型 / 3 级等级）。"""
+    """车辆事件读写（19 种事件类型 / 3 级等级）。"""
 
     model = Event
     #: 事件列表默认排序：事件时间倒序（车端时间，非入库时间）

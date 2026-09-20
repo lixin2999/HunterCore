@@ -33,7 +33,7 @@ async def list_events(
     service: Annotated[EventService, Depends(get_event_service)],
     _user_id: Annotated[str, Depends(require_read_permission)],
     vehicle_id: Annotated[str | None, Query(pattern=VEHICLE_ID_PATTERN, description="车辆标识（可选）")] = None,
-    event_type: Annotated[EventType | None, Query(description="事件类型（18 种受控词表）")] = None,
+    event_type: Annotated[EventType | None, Query(description="事件类型（19 种受控词表）")] = None,
     event_level: Annotated[EventLevel | None, Query(description="事件等级")] = None,
     acknowledged: Annotated[bool | None, Query(description="确认状态过滤（可选）")] = None,
     start_time: Annotated[float | None, Query(ge=0, description="时间区间起点（成对出现，可选）")] = None,

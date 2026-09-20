@@ -23,6 +23,7 @@ from hunter_common.redis import RedisManager
 
 from app.config import Settings
 from app.schemas.common import SessionEndReason
+from app.services.metrics import HEARTBEAT_TIMEOUT_TOTAL
 from app.services.session_service import (
     FIELD_LAST_HEARTBEAT_AT,
     FIELD_SESSION_ID,
@@ -86,6 +87,10 @@ class SessionReaper:
             )
             if closed:
                 ended.append(session_id)
+                # 心跳超时结束计数（契约 x-hunter-observability：heartbeat_timeout 指标）
+                HEARTBEAT_TIMEOUT_TOTAL.labels(
+                    vehicle_id=key.removeprefix("rc:session:")
+                ).inc()
         return ended
 
     async def start(self) -> None:

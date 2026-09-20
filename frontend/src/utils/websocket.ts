@@ -9,6 +9,18 @@
  * - 上行超频（>25Hz）会被服务端丢弃，控制指令必须由调用方按 50ms 节流（constants RC_LIMITS）。
  */
 import { WS_CLOSE_CODES } from '@/types/remote'
+import { WS_JWT_SUBPROTOCOL } from '@/constants/remote'
+import { getAccessToken } from '@/utils/storage'
+
+/**
+ * WS 握手子协议 offer（契约 remote-control pending #20 决策①：hunter-jwt 子协议承载 Token）
+ * 双值形态 `hunter-jwt, <token>`，服务端验签后回显 `hunter-jwt`；
+ * 非浏览器客户端可用 Authorization 头，浏览器禁止查询串明文携带 Token。
+ */
+export function hunterJwtProtocols(): string[] {
+  const token = getAccessToken()
+  return token ? [WS_JWT_SUBPROTOCOL, token] : [WS_JWT_SUBPROTOCOL]
+}
 
 /** 不重连的关闭码（正常关闭 / 认证失败 / 终态 / 被替代） */
 const TERMINAL_CLOSE_CODES: readonly number[] = [1000, 1008, 4001, 4003, 4008, 4010]

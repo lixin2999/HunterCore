@@ -33,6 +33,10 @@ data:
   KAFKA_SECURITY_PROTOCOL: "SASL_SSL"
   KAFKA_SASL_MECHANISM: "SCRAM-SHA-512"
   KAFKA_SSL_CAFILE: "/etc/hunter/kafka-tls/ca.crt"
+  # 严格 mTLS（G-01，设计文档 3.2.3/14.2）：broker ssl.client.auth=required，
+  # 客户端证书/私钥由 hunter-kafka-tls Secret 同挂载点提供（创建见 infra/k8s/README.md）
+  KAFKA_SSL_CERTFILE: "/etc/hunter/kafka-tls/client.crt"
+  KAFKA_SSL_KEYFILE: "/etc/hunter/kafka-tls/client.key"
   KAFKA_PRODUCER_ACKS: "all"
   KAFKA_COMPRESSION_TYPE: "lz4"                 # 对齐车端生产者配置
   KAFKA_LINGER_MS: "5"
@@ -50,5 +54,5 @@ data:
 
   # ---------- 认证与安全（JWT 密钥本体在 Secret） ----------
   JWT_ALGORITHM: "HS256"
-  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: "120"        # Access Token 2h
+  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: "30"         # Access Token 30min（G-04① 收紧，原 2h）
   JWT_REFRESH_TOKEN_EXPIRE_DAYS: "7"            # Refresh Token 7d

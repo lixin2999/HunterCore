@@ -33,12 +33,17 @@ class EventLevel(StrEnum):
 
 
 class EventType(StrEnum):
-    """事件类型（18 种；events.event_type）。触发阈值不可更改（设计文档：事件类型定义）。"""
+    """事件类型（19 种；events.event_type）。触发阈值不可更改（设计文档：事件类型定义）。
+
+    决策 G-22②：新增 `collision_pre_warning`（warning，TTC < 3.0s），与
+    `collision_warning`（critical，TTC < 1.5s）分级，解决 6.2.3 节 3.0s 预警与受控词表等级冲突。
+    """
 
     HARSH_ACCELERATION = "harsh_acceleration"
     HARSH_BRAKING = "harsh_braking"
     HARSH_TURNING = "harsh_turning"
     OVER_SPEED = "over_speed"
+    COLLISION_PRE_WARNING = "collision_pre_warning"
     COLLISION_WARNING = "collision_warning"
     MANUAL_TAKEOVER = "manual_takeover"
     EMERGENCY_STOP = "emergency_stop"
@@ -90,9 +95,15 @@ class SceneStatus(StrEnum):
 
 
 class OtaVersionStatus(StrEnum):
-    """OTA 版本状态（ota_versions.status）⚠ 取值域需与设计文档核对。"""
+    """OTA 版本状态（ota_versions.status）：设计文档 7.2.2 审核流（G-18 决策②）。
+
+    状态机：draft → testing → reviewing → published → deprecated / disabled；
+    reviewing 审核驳回回退 draft；发布（publish/approve）前置状态为 reviewing。
+    """
 
     DRAFT = "draft"
+    TESTING = "testing"
+    REVIEWING = "reviewing"
     PUBLISHED = "published"
     DEPRECATED = "deprecated"
     DISABLED = "disabled"
@@ -153,6 +164,7 @@ EVENT_LEVEL_BY_TYPE: Final[dict[str, EventLevel]] = {
     EventType.HARSH_BRAKING: EventLevel.WARNING,
     EventType.HARSH_TURNING: EventLevel.WARNING,
     EventType.OVER_SPEED: EventLevel.CRITICAL,
+    EventType.COLLISION_PRE_WARNING: EventLevel.WARNING,
     EventType.COLLISION_WARNING: EventLevel.CRITICAL,
     EventType.MANUAL_TAKEOVER: EventLevel.INFO,
     EventType.EMERGENCY_STOP: EventLevel.CRITICAL,

@@ -4,6 +4,8 @@
 - 预签名：Bucket↔data_type 映射（1002）、服务端命名规范、multipart 分片地址；
 - 上传完成：路径归属（1002）、对象缺失（3001）、size/MD5/SHA-256 三类校验（6001）、
   multipart 合并与合并失败回滚（2001）、sensor_file 投递载荷、Kafka 故障（5001）；
+- 生命周期归类打标（G-12）：hunter-rosbag 按 retention 打 Tag、非 rosbag 不打标、
+  打标失败 5001 且不发布 sensor_file；
 - 清单：车辆前缀隔离、limit+1 截断与 next_marker 游标、预签名下载地址。
 
 **关键回归（审查 R2）**：完整性校验必须基于「对象真实内容摘要」——
@@ -368,6 +370,67 @@ async def test_complete_multipart_requires_upload_id_and_parts_together() -> Non
         await service.complete(payload, user_id=USER_ID)
     assert exc.value.code == 2001
     assert storage.aborted_sessions == []  # 参数校验失败发生在合并之前，无需回滚
+
+
+# ---------------------------------------------------------------------------
+# complete：生命周期归类打标（G-12）
+# ---------------------------------------------------------------------------
+async def test_complete_rosbag_tags_regular_by_default() -> None:
+    """hunter-rosbag 缺省归类 regular：校验通过后打 Tag hunter-retention=regular。"""
+    service, storage, producer = make_service()
+    key = object_key(FileDataType.ROSBAG)
+    storage.put(ROSBAG_BUCKET, key, CONTENT)
+    payload = complete_payload(key, CONTENT, bucket=UploadBucket.ROSBAG)
+    data = await service.complete(payload, user_id=USER_ID)
+    assert data.verified is True
+    assert storage.tags == {(ROSBAG_BUCKET, key): "regular"}
+    assert len(producer.published) == 1
+
+
+async def test_complete_rosbag_event_retention_tagged_event() -> None:
+    """事件包显式声明 retention=event → 打 Tag hunter-retention=event（永久保留）。"""
+    service, storage, _ = make_service()
+    key = object_key(FileDataType.ROSBAG)
+    storage.put(ROSBAG_BUCKET, key, CONTENT)
+    payload = complete_payload(key, CONTENT, bucket=UploadBucket.ROSBAG, retention="event")
+    await service.complete(payload, user_id=USER_ID)
+    assert storage.tags[(ROSBAG_BUCKET, key)] == "event"
+
+
+async def test_complete_non_rosbag_bucket_skips_tagging() -> None:
+    """打标义务仅限 hunter-rosbag（其余 Bucket 为整桶生命周期规则）。"""
+    service, storage, _ = make_service()
+    key = object_key()
+    storage.put(RAW_BUCKET, key, CONTENT)
+    await service.complete(complete_payload(key, CONTENT), user_id=USER_ID)
+    assert storage.tags == {}
+
+
+async def test_complete_tagging_failure_blocks_publish_5001() -> None:
+    """G-12 核心约束：打标失败 → 5001 且不发布 sensor_file（未打标等同永久，禁止静默降级）。"""
+    service, storage, producer = make_service()
+    key = object_key(FileDataType.ROSBAG)
+    storage.put(ROSBAG_BUCKET, key, CONTENT)
+    storage.tag_fail_with = RuntimeError("MinIO 不可用")
+    payload = complete_payload(key, CONTENT, bucket=UploadBucket.ROSBAG)
+    with pytest.raises(ServiceUnavailableError) as exc:
+        await service.complete(payload, user_id=USER_ID)
+    assert exc.value.code == 5001
+    assert exc.value.details["retention"] == "regular"
+    assert producer.published == []
+
+
+async def test_complete_integrity_failure_precedes_tagging() -> None:
+    """校验不通过（6001）时不得打标：打标仅在完整性校验之后发生。"""
+    service, storage, _ = make_service()
+    key = object_key(FileDataType.ROSBAG)
+    storage.put(ROSBAG_BUCKET, key, CONTENT)
+    payload = complete_payload(
+        key, CONTENT, bucket=UploadBucket.ROSBAG, sha256=hashlib.sha256(b"other").hexdigest()
+    )
+    with pytest.raises(OtaPackageChecksumError):
+        await service.complete(payload, user_id=USER_ID)
+    assert storage.tags == {}
 
 
 # ---------------------------------------------------------------------------

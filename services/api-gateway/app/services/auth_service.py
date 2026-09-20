@@ -5,10 +5,10 @@
 - IP 锁定（14.5 节）：失败计数键 ``rate_limit:{ip}:login-fail``（复用契约键模式
   ``rate_limit:{ip}:{api}``，{api} 槽位=login-fail）；锁定期间返回 429 + Retry-After
 - 会话（redis-keys.yaml 第 1 条）：``session:{user_id}`` = Access Token 原样存储，
-  TTL 7200s；登录写入 / 刷新覆盖 / 登出 DEL（撤销语义见 core/auth.py 模块注释）
-- MFA(TOTP)：``user_svc.users`` 无 TOTP 密文字段（数据库契约未定义），当前全部
-  账号视为未启用 MFA，按契约「账号未启用 MFA 时忽略」处理；启用 MFA 前必须先
-  扩展数据库契约（contracts/database/ddl/01_core.sql）与 OpenAPI 契约
+  TTL 1800s（G-04① 收紧）；登录写入 / 刷新覆盖 / 登出 DEL（撤销语义见 core/auth.py 模块注释）
+- MFA(TOTP)：G-23 已在数据库契约增 `users.mfa_enabled` / `users.totp_secret` 字段，
+  但 TOTP 签发/校验流程（含密钥加密存储）尚未实现，当前仍按契约
+  「账号未启用 MFA 时忽略」处理；启用前需同步实现校验逻辑与前端绑定流程
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from uuid import UUID
 from hunter_common.database.enums import UserStatus
 from hunter_common.exceptions import (
     AuthenticationError,
+    InvalidParameterError,
     ServiceUnavailableError,
     TokenExpiredError,
 )
@@ -31,10 +32,17 @@ from app.core.security import (
     create_refresh_token,
     decode_access_token_ignoring_expiry,
     decode_refresh_token,
+    hash_password,
     verify_password,
 )
 from app.repositories.user_repository import UserRepository
-from app.schemas.auth import LoginRequest, RefreshTokenRequest, TokenPair, UserProfile
+from app.schemas.auth import (
+    ChangePasswordRequest,
+    LoginRequest,
+    RefreshTokenRequest,
+    TokenPair,
+    UserProfile,
+)
 
 logger = get_logger("app.services.auth_service")
 
@@ -90,13 +98,14 @@ class AuthService:
         permissions = await self._users.get_permission_codes(user.user_id)
         # 6) 更新 last_login_time（契约 login description 明确要求）
         await self._users.touch_last_login(user.user_id)
-        # 7) 签发 Token 对 + 写会话（redis-keys 第 1 条：SET session:{user_id} EX 7200）
+        # 7) 签发 Token 对 + 写会话（redis-keys 第 1 条：SET session:{user_id} EX 1800，G-04①）
         pair = await self._issue_pair(
             user_id=str(user.user_id),
             username=user.username,
             real_name=user.real_name,
             roles=roles,
             permissions=permissions,
+            must_change_password=bool(getattr(user, "must_change_password", False)),
         )
         await self._reset_failures(client_ip)  # 成功后清零失败计数
         logger.info(
@@ -137,6 +146,7 @@ class AuthService:
             real_name=user.real_name,
             roles=roles,
             permissions=permissions,
+            must_change_password=bool(getattr(user, "must_change_password", False)),
         )
         logger.info("auth_token_refreshed", user_id=user_id)
         return pair
@@ -163,23 +173,52 @@ class AuthService:
     async def me(self, claims: dict[str, Any]) -> UserProfile:
         """当前用户：JWT 解析结果（sub/username/roles/permissions）+ 用户资料。
 
-        ``real_name`` 取自 DB（JWT 载荷无该字段）；DB 异常时降级为 None 并告警
-        （JWT 已严格校验，资料字段仅展示用途，不打断会话查询；契约允许 503，
-        这里选择部分降级以保证可用性 —— 需人工确认，见 README 待确认项）。
+        ``real_name`` / ``must_change_password`` 取自 DB（JWT 载荷无该字段）；DB 异常时
+        降级为 None/False 并告警（JWT 已严格校验，资料字段仅展示用途，不打断会话
+        查询；契约允许 503，这里选择部分降级以保证可用性 —— 需人工确认，见 README 待确认项）。
         """
         user_id = str(claims["sub"])
         real_name: str | None = None
+        must_change_password = False
         try:
-            real_name = await self._users.get_real_name(UUID(user_id))
+            flags = await self._users.get_security_flags(UUID(user_id))
+            if flags is not None:
+                real_name, must_change_password = flags
         except Exception:  # noqa: BLE001 - 展示字段降级（JWT 已严格校验，不打断会话查询）
-            logger.warning("me_real_name_lookup_degraded", user_id=user_id)
+            logger.warning("me_profile_lookup_degraded", user_id=user_id)
         return UserProfile(
             user_id=UUID(user_id),
             username=str(claims.get("username") or ""),
             real_name=real_name,
             roles=list(claims.get("roles") or []),
             permissions=list(claims.get("permissions") or []),
+            must_change_password=must_change_password,
         )
+
+    # =================================================================
+    # 修改密码（POST /api/v1/user/change-password；G-06 首登强制改密）
+    # =================================================================
+    async def change_password(
+        self, claims: dict[str, Any], payload: ChangePasswordRequest
+    ) -> None:
+        """改密：验旧口令（错 → 1001）→ 强度由 schema 保证 → 更新哈希并复位标志。
+
+        新口令与旧口令相同返回 2001（避免无意义轮换假成功）；当前会话不强制撤销
+        （契约 change-password description 明确）。
+        """
+        user_id = str(claims["sub"])
+        user = await self._get_user_by_id(UUID(user_id))
+        if user is None or user.status is not UserStatus.ENABLED:
+            raise AuthenticationError  # 用户已删除/禁用/锁定 → 重新登录（1001）
+        if not verify_password(payload.old_password, user.password_hash):
+            logger.warning("auth_change_password_bad_old_password", user_id=user_id)
+            raise AuthenticationError  # 统一 1001，不区分原因（防枚举/探测）
+        if payload.new_password == payload.old_password:
+            raise InvalidParameterError("新口令不能与当前口令相同")
+        await self._users.change_password(
+            user.user_id, hash_password(payload.new_password, rounds=self._settings.password_bcrypt_rounds)
+        )
+        logger.info("auth_password_changed", user_id=user_id)
 
     # =================================================================
     # 内部方法
@@ -203,6 +242,7 @@ class AuthService:
         real_name: str | None,
         roles: list[str],
         permissions: list[str],
+        must_change_password: bool = False,
     ) -> TokenPair:
         """签发 Access+Refresh 并写会话（会话强依赖：写失败 → 503，不发半截会话）。"""
         cfg = self._settings
@@ -220,7 +260,7 @@ class AuthService:
             await self._redis.set(
                 session_key(user_id),
                 access_token,
-                expire_seconds=cfg.jwt_access_token_expire_minutes * 60,  # 2h（redis-keys 第 1 条）
+                expire_seconds=cfg.jwt_access_token_expire_minutes * 60,  # 30min（redis-keys 第 1 条，G-04①）
             )
         except Exception as exc:
             logger.error("session_write_failed", user_id=user_id)
@@ -228,7 +268,7 @@ class AuthService:
         return TokenPair(
             access_token=access_token,
             refresh_token=refresh_token,
-            expires_in=cfg.jwt_access_token_expire_minutes * 60,          # 7200
+            expires_in=cfg.jwt_access_token_expire_minutes * 60,          # 1800（G-04①）
             refresh_expires_in=cfg.jwt_refresh_token_expire_days * 86400,  # 604800
             user=UserProfile(
                 user_id=UUID(user_id),
@@ -236,6 +276,7 @@ class AuthService:
                 real_name=real_name,
                 roles=roles,
                 permissions=permissions,
+                must_change_password=must_change_password,
             ),
         )
 

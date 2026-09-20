@@ -33,6 +33,7 @@ data:
   PRESIGNED_DOWNLOAD_EXPIRE_SECONDS: "900"
   # 灰度调度与网络判定（观察窗口到期扫描周期；遥测中断阈值同源 communication_loss）
   OTA_ROLLOUT_TICK_SECONDS: "60"
+  ROLLOUT_SCHEDULER_ENABLED: "true"        # 灰度自动调度器总开关（到点启 scheduled、推进/暂停/完成）
   OTA_OFFLINE_THRESHOLD_SECONDS: "10"
   OTA_OFFLINE_FALLBACK_ENABLED: "false"     # 生产：门禁读模型缺失即拒绝（联调可置 true）
   OTA_TASK_MAX_TARGET_VEHICLES: "1000"

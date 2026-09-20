@@ -191,3 +191,26 @@ async def test_upstream_error_response_passthrough(
     finally:
         app.state.http_client = None
         reset_circuit_breakers()
+
+
+async def test_identity_headers_signed_when_hmac_secret_configured(
+    client: AsyncClient,
+    fake_redis: FakeRedis,
+    mock_backend: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G-02：配置 GATEWAY_HMAC_SECRET 后转发头附 X-Internal-MAC + 时间戳，
+    签名可被后端验证；客户端伪造的签名字段一律被覆盖。"""
+    from hunter_common.internal_auth import verify_identity_headers
+
+    secret = "gw-hmac-secret-32-bytes-long-xxxxx"
+    monkeypatch.setattr(settings, "gateway_hmac_secret", secret)
+    headers = await _authorized_headers(fake_redis)
+    headers["X-Internal-MAC"] = "forged-mac"          # 伪造签名字段必须被覆盖
+    headers["X-Identity-Timestamp"] = "9999999999"
+    resp = await client.get("/api/v1/scene/scenes", headers=headers)
+    assert resp.status_code == 200
+    sent = mock_backend["headers"]
+    assert sent["x-internal-mac"] != "forged-mac"
+    assert sent["x-identity-timestamp"]
+    assert verify_identity_headers(secret, sent)

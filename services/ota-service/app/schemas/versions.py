@@ -33,7 +33,9 @@ class OtaVersionItem(BaseModel):
     signature: str = Field(description="RSA-2048 签名（base64）")
     changelog: dict[str, object] = Field(default_factory=dict, description="变更说明（JSONB）")
     applicable_models: list[str] = Field(min_length=1, description="适用车型")
-    status: OtaVersionStatus = Field(description="版本状态（draft/published/deprecated/disabled）")
+    status: OtaVersionStatus = Field(
+        description="版本状态（G-18② 审核流六态：draft/testing/reviewing/published/deprecated/disabled）"
+    )
     release_time: float | None = Field(default=None, description="发布时间（Unix epoch 秒；draft 为 null）")
     package_download_url: str | None = Field(
         default=None, description="即时签发的下载预签名地址（15 分钟，支持 Range 分片下载）"
@@ -177,6 +179,27 @@ class OtaVersionPublishResponse(OtaApiResponse):
     data: OtaVersionPublishData | None = None
 
 
+class OtaVersionSubmitReviewRequest(BaseModel):
+    """提交审核请求（契约 OtaVersionSubmitReviewRequest；可省略请求体，G-18②）。
+
+    test_summary 仅写入审计日志，不落 DB 列（审核元数据持久化 → 契约 pending #20）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    test_summary: str | None = Field(
+        default=None, max_length=512, description="测试结论摘要（审计留痕，禁止含密钥/证书内容）"
+    )
+
+
+class OtaVersionRejectReviewRequest(BaseModel):
+    """审核驳回请求（契约 OtaVersionRejectReviewRequest；reviewing → draft，G-18②）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=512, description="驳回原因（审计留痕，必填）")
+
+
 class OtaVersionDeprecateRequest(BaseModel):
     """废弃/停用请求（契约 OtaVersionDeprecateRequest；目标状态仅 deprecated / disabled）。"""
 
@@ -203,6 +226,8 @@ __all__ = [
     "OtaVersionPublishData",
     "OtaVersionPublishRequest",
     "OtaVersionPublishResponse",
+    "OtaVersionRejectReviewRequest",
+    "OtaVersionSubmitReviewRequest",
     "OtaVersionUploadInfo",
     "OtaVersionUploadPart",
 ]

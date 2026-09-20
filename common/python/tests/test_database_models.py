@@ -171,7 +171,7 @@ def test_enum_check_values_match_python_enums() -> None:
     assert ddl_enum_values("vehicle_svc.vehicles", "status") == {v.value for v in VehicleStatus}
     assert ddl_enum_values("scene_svc.scenes", "status") == {s.value for s in SceneStatus}
     assert ddl_enum_values("data_collector.events", "event_type") == {t.value for t in EventType}
-    assert len(EventType) == 18, "事件类型必须为 18 种（阈值不可更改）"
+    assert len(EventType) == 19, "事件类型必须为 19 种（阈值不可更改；G-22② 新增 collision_pre_warning）"
     assert ddl_enum_values("data_collector.events", "event_level") == {e.value for e in EventLevel}
     assert ddl_enum_values("ota_svc.ota_records", "status") == {s.value for s in OtaStatus}
     assert ddl_enum_values("ota_svc.ota_records", "phase") == {s.value for s in OtaStatus}

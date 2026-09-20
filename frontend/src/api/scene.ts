@@ -19,6 +19,8 @@ import type {
   SceneTemplateListData,
   SceneType,
   SceneUpsertRequest,
+  SimulationProgress,
+  SimulationResult,
 } from '@/types/scene'
 
 /** 场景列表（GET /api/v1/scene） */
@@ -72,4 +74,14 @@ export function exportScenes(payload: SceneExportRequest): Promise<SceneExportDa
 /** 下发到 Carla 仿真（POST /api/v1/scene/{scene_id}/run） */
 export function runScene(sceneId: string, payload: SceneRunRequest = {}): Promise<SceneRunData> {
   return request<SceneRunData>({ url: `/scene/${sceneId}/run`, method: 'post', data: payload })
+}
+
+/** 查询仿真实例进度（GET /api/v1/scene/simulations/{sim_instance_id}，决策 G-20①；建议轮询） */
+export function getSimulationProgress(simInstanceId: string): Promise<SimulationProgress> {
+  return request<SimulationProgress>({ url: `/scene/simulations/${simInstanceId}`, method: 'get' })
+}
+
+/** 查询仿真实例结果（GET …/simulations/{sim_instance_id}/result，G-20①；非终态 3003） */
+export function getSimulationResult(simInstanceId: string): Promise<SimulationResult> {
+  return request<SimulationResult>({ url: `/scene/simulations/${simInstanceId}/result`, method: 'get' })
 }

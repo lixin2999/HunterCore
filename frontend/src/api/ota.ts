@@ -25,6 +25,8 @@ import type {
   OtaVersionListQuery,
   OtaVersionPublishData,
   OtaVersionPublishRequest,
+  OtaVersionRejectReviewRequest,
+  OtaVersionSubmitReviewRequest,
 } from '@/types/ota'
 
 /* ------------------------------- 版本仓库 ------------------------------- */
@@ -44,7 +46,39 @@ export function createOtaVersion(payload: OtaVersionCreateRequest): Promise<OtaV
   return request<OtaVersionCreateData>({ url: '/ota/versions', method: 'post', data: payload })
 }
 
-/** 发布版本（POST /api/v1/ota/versions/{version_id}/publish，完整性/签名校验失败返回 6001/6002） */
+/** 提交测试（G-18②：POST /api/v1/ota/versions/{version_id}/submit-testing，包未直传 → 6001） */
+export function submitOtaVersionTesting(versionId: string): Promise<OtaVersionItem> {
+  return request<OtaVersionItem>({
+    url: `/ota/versions/${versionId}/submit-testing`,
+    method: 'post',
+  })
+}
+
+/** 提交审核（G-18②：POST /api/v1/ota/versions/{version_id}/submit-review） */
+export function submitOtaVersionReview(
+  versionId: string,
+  payload: OtaVersionSubmitReviewRequest = {},
+): Promise<OtaVersionItem> {
+  return request<OtaVersionItem>({
+    url: `/ota/versions/${versionId}/submit-review`,
+    method: 'post',
+    data: payload,
+  })
+}
+
+/** 审核驳回（G-18②：POST /api/v1/ota/versions/{version_id}/reject-review，reason 必填） */
+export function rejectOtaVersionReview(
+  versionId: string,
+  payload: OtaVersionRejectReviewRequest,
+): Promise<OtaVersionItem> {
+  return request<OtaVersionItem>({
+    url: `/ota/versions/${versionId}/reject-review`,
+    method: 'post',
+    data: payload,
+  })
+}
+
+/** 发布版本（前置仅 reviewing，G-18② 审核批准；完整性/签名校验失败返回 6001/6002） */
 export function publishOtaVersion(
   versionId: string,
   payload: OtaVersionPublishRequest = {},

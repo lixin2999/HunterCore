@@ -5,7 +5,8 @@
   对象路径含 `{timestamp}_{seq}` 段防覆盖（p1 已确认），seq 为秒内自增计数器；
 - complete：head_object 定位对象 → **流式重算 size/MD5/SHA-256**（三者必须与声明值全部一致，
   任一不符 → 6001 / HTTP 422，审查 R2 修复）→ multipart 先合并分片再校验 →
-  发布 sensor_file（key=vehicle_id，载荷契约固定）；
+  hunter-rosbag 对象打生命周期归类 Tag（G-12，hunter-retention=regular|event，
+  打标失败 → 5001 不通知下游）→ 发布 sensor_file（key=vehicle_id，载荷契约固定）；
 - list：prefix 列举 + marker 游标分页，即时签发 15 分钟下载 URL。
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ from hunter_common.exceptions import (
     OtaPackageChecksumError,
     PermissionDeniedError,
     ResourceNotFoundError,
+    ServiceUnavailableError,
 )
 
 from app.config import settings
@@ -173,7 +175,8 @@ class FileService:
         2. multipart：先合并分片（缺 upload_id/parts → 2001，非法会话中止并回滚）；
         3. head_object：对象不存在 → 3001；
         4. 流式重算 size/md5/sha256 与声明值三者一致（任一不符 → 6001，HTTP 422）；
-        5. 校验通过发布 sensor_file（key=vehicle_id；Kafka 故障 → 5001）。
+        5. hunter-rosbag：校验通过后打 Tag hunter-retention=<retention>（G-12，失败 → 5001）；
+        6. 校验通过发布 sensor_file（key=vehicle_id；Kafka 故障 → 5001）。
         """
         self._validate_vehicle_prefix(
             vehicle_id=payload.vehicle_id, bucket=payload.bucket.value, object_key=payload.object_key
@@ -196,6 +199,7 @@ class FileService:
                 )
             )
         await self._verify_integrity(payload, metadata)
+        await self._apply_retention_tag(payload)
 
         data_type = self._resolve_data_type(payload)
         await self._producer.publish(
@@ -318,6 +322,31 @@ class FileService:
                 message="SHA-256 校验失败（6001）",
                 details={"field": "sha256", "expected": payload.sha256, "actual": sha256_hex},
             )
+
+    async def _apply_retention_tag(self, payload: FileCompleteRequest) -> None:
+        """生命周期归类打标（G-12，x-hunter-file-upload-flow.tagging；仅 hunter-rosbag）。
+
+        完整性校验通过后、sensor_file 发布前打 Tag ``hunter-retention=<retention>``；
+        未打标对象等同永久保留（S3 tag 过滤器无法表达无 Tag），打标失败必须
+        阻断发布（5001），禁止静默降级。
+        """
+        if payload.bucket.value != settings.minio_bucket_rosbag:
+            return
+        try:
+            await asyncio.to_thread(
+                self._storage.put_object_tags,
+                payload.bucket.value,
+                payload.object_key,
+                payload.retention,
+            )
+        except Exception as exc:
+            raise ServiceUnavailableError(
+                message="rosbag 生命周期打标失败，已阻断 sensor_file 发布（G-12）",
+                details={
+                    "object_key": payload.object_key,
+                    "retention": payload.retention,
+                },
+            ) from exc
 
     @staticmethod
     def _resolve_data_type(payload: FileCompleteRequest) -> str:

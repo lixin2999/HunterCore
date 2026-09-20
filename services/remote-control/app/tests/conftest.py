@@ -12,10 +12,13 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import json
+import time
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
 from typing import Any
 
+import jwt as pyjwt
 import pytest
 from httpx import ASGITransport, AsyncClient
 from hunter_common.exceptions import ServiceUnavailableError
@@ -25,9 +28,11 @@ from app.core.dependencies import OperatorContext
 from app.main import app
 from app.producers.remote_control import RemoteControlFrameProducer
 from app.producers.session_command import SessionCommandProducer
+from app.services.geofence import GeofenceChecker
 from app.services.history_service import HistoryService
 from app.services.session_service import SessionService
 from app.services.vehicle_view import VehicleViewReader
+from app.services.ws_hub import WsHub
 
 ADMIN_ID = "11111111-1111-4111-8111-111111111111"
 OPERATOR_ID = "22222222-2222-4222-8222-222222222222"
@@ -75,12 +80,21 @@ class FakeRedis:
 
     # ---------- 会话 Hash / 读模型 ----------
     async def hset(
-        self, key: str, mapping: dict[str, str] | None = None, **kwargs: Any
+        self,
+        key: str,
+        field: str | None = None,
+        value: str | None = None,
+        mapping: dict[str, str] | None = None,
+        **kwargs: Any,
     ) -> int:
+        """与 redis-py hset 语义对齐：支持 (key, field, value) 与 mapping/kwargs 两形态。"""
         hash_map: dict[str, str] = self.store.setdefault(key, {})
-        hash_map.update(mapping or {})
-        hash_map.update(kwargs)
-        return len(mapping or {})
+        updated: dict[str, str] = dict(mapping or {})
+        updated.update(kwargs)
+        if field is not None:
+            updated[field] = str(value)
+        hash_map.update(updated)
+        return len(updated)
 
     async def hget(self, key: str, field: str) -> str | None:
         value = self.store.get(key)
@@ -89,6 +103,17 @@ class FakeRedis:
     async def hgetall(self, key: str) -> dict[str, str]:
         value = self.store.get(key)
         return dict(value) if isinstance(value, dict) else {}
+
+    async def hexists(self, key: str, field: str) -> bool:
+        value = self.store.get(key)
+        return isinstance(value, dict) and field in value
+
+    async def hincrby(self, key: str, field: str, amount: int = 1) -> int:
+        """Hash 字段原子自增（WS seq/计数；与 redis-py hincrby 语义一致）。"""
+        hash_map: dict[str, str] = self.store.setdefault(key, {})
+        current = int(hash_map.get(field, "0") or 0)
+        hash_map[field] = str(current + amount)
+        return current + amount
 
     async def delete(self, *keys: str) -> int:
         removed = 0
@@ -208,6 +233,14 @@ class FakeFrameProducer(RemoteControlFrameProducer):
             )
         self.frames.append(("stop", vehicle_id, kwargs))
 
+    async def send_control_frame(self, vehicle_id: str, **kwargs: Any) -> None:
+        """WS 20Hz 控制帧替身（记录 seq/限幅后目标值；fail 模拟投递失败 → 5001）。"""
+        if self.fail:
+            raise ServiceUnavailableError(
+                message="远程操控指令通道不可用（Kafka 投递失败）"
+            )
+        self.frames.append(("control", vehicle_id, kwargs))
+
 
 class FakeCommandProducer(SessionCommandProducer):
     """SessionCommandProducer 替身（记录 session_start/end 信令；fail 模拟投递失败）。"""
@@ -231,6 +264,31 @@ class FakeCommandProducer(SessionCommandProducer):
             )
         self.commands.append(("rc_session_end", vehicle_id, kwargs))
         return "cmd-end"
+
+    async def send_signal_relay(self, vehicle_id: str, **kwargs: Any) -> str:
+        """WebRTC 信令中继替身（G-09；command_type 取值域定稿前以配置名登记）。"""
+        if self.fail:
+            raise ServiceUnavailableError(
+                message="车辆指令通道不可用（Kafka 投递失败）"
+            )
+        self.commands.append((settings.rc_signal_relay_command_type, vehicle_id, kwargs))
+        return "cmd-signal"
+
+
+class FakeFenceRepo:
+    """VehicleFenceRepository 替身（G-11；vehicle_id → fence_json 映射，默认无围栏）。
+
+    真实 repo 在 DB 故障时抛 ServiceUnavailableError（5001），替身用 fail 开关复现。
+    """
+
+    def __init__(self) -> None:
+        self.fences: dict[str, dict[str, Any]] = {}
+        self.fail = False
+
+    async def get_fence(self, vehicle_id: str) -> dict[str, Any] | None:
+        if self.fail:
+            raise ServiceUnavailableError(message="读取车辆围栏配置失败")
+        return self.fences.get(vehicle_id)
 
 
 def seed_vehicle(
@@ -259,6 +317,31 @@ def make_operator(
     return OperatorContext(user_id=user_id, roles=frozenset(roles))
 
 
+def make_ws_token(
+    user_id: str = OPERATOR_ID,
+    roles: tuple[str, ...] = ("operator",),
+    *,
+    expires_in: float = 300.0,
+) -> str:
+    """签发 WS 握手用 Access Token（与 api-gateway 同密钥/算法/issuer，G-09 信任模型）。"""
+    now = int(time.time())
+    return pyjwt.encode(
+        {
+            "sub": user_id,
+            "username": f"user-{user_id[:8]}",
+            "roles": list(roles),
+            "permissions": [],
+            "iat": now,
+            "exp": now + int(expires_in),
+            "iss": settings.jwt_issuer,
+            "jti": str(uuid.uuid4()),
+            "typ": "access",
+        },
+        settings.jwt_secret_key,
+        algorithm=settings.jwt_algorithm,
+    )
+
+
 # ---------- 夹具 ----------
 class _State(SimpleNamespace):
     """app.state 聚合（测试断言用）。"""
@@ -279,6 +362,11 @@ def rc_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[_State]:
     seed_vehicle(fake_redis, VEHICLE_OFFLINE, online=False, status="offline")
 
     vehicle_view = VehicleViewReader(fake_redis, settings)
+    # G-11 围栏门禁（默认全部车辆未配置围栏 → 行为与 G-11 前一致；用例经 state.fence_repo 配置）
+    fence_repo = FakeFenceRepo()
+    geofence = GeofenceChecker(
+        fence_repo=fence_repo, redis=fake_redis, settings=settings
+    )
     session_service = SessionService(
         redis=fake_redis,
         vehicle_view=vehicle_view,
@@ -286,6 +374,7 @@ def rc_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[_State]:
         command_producer=command,
         storage=storage,
         settings=settings,
+        geofence=geofence,
     )
     history_service = HistoryService(storage=storage, settings=settings)
 
@@ -299,6 +388,9 @@ def rc_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[_State]:
     app.state.command_producer = command
     app.state.session_service = session_service
     app.state.history_service = history_service
+    # WS 连接注册表（G-09：路由/command_result 消费者共用，与 lifespan 装配结构一致）
+    ws_hub = WsHub()
+    app.state.ws_hub = ws_hub
 
     state = _State(
         redis=fake_redis,
@@ -307,6 +399,9 @@ def rc_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[_State]:
         command=command,
         session_service=session_service,
         history_service=history_service,
+        ws_hub=ws_hub,
+        fence_repo=fence_repo,
+        geofence=geofence,
     )
     try:
         yield state
@@ -318,6 +413,7 @@ def rc_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[_State]:
         app.state.command_producer = None
         app.state.session_service = None
         app.state.history_service = None
+        app.state.ws_hub = None
 
 
 @pytest.fixture()
@@ -348,6 +444,7 @@ __all__ = [
     "FakeVideoStorage",
     "client",
     "make_operator",
+    "make_ws_token",
     "rc_env",
     "seed_vehicle",
 ]

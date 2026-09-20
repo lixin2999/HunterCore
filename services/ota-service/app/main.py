@@ -43,6 +43,7 @@ from app.routers import records, tasks, versions
 from app.routers.health import router as health_router
 from app.services.gates import VehicleStateReader
 from app.services.records import RecordService
+from app.services.scheduler import RolloutScheduler
 from app.services.tasks import TaskService
 from app.services.versions import VersionService
 
@@ -66,6 +67,29 @@ class RedisVehicleStateReader:
     async def is_online(self, vehicle_id: str) -> bool:
         """SISMEMBER vehicle:online:set。"""
         return bool(await self._redis.client.sismember("vehicle:online:set", vehicle_id))
+
+    async def get_status_many(self, vehicle_ids: list[str]) -> dict[str, dict[str, str] | None]:
+        """批量 HGETALL（pipeline，单次往返；G-14 批次批量取数）；空 Hash → None。"""
+        if not vehicle_ids:
+            return {}
+        pipe = self._redis.client.pipeline(transaction=False)
+        for vehicle_id in vehicle_ids:
+            pipe.hgetall(f"vehicle:status:{vehicle_id}")
+        raw = await pipe.execute()
+        return {
+            vehicle_id: (dict(mapping) if mapping else None)
+            for vehicle_id, mapping in zip(vehicle_ids, raw, strict=True)
+        }
+
+    async def is_online_many(self, vehicle_ids: list[str]) -> dict[str, bool]:
+        """批量 SISMEMBER（pipeline，单次往返；G-14 批次批量取数）。"""
+        if not vehicle_ids:
+            return {}
+        pipe = self._redis.client.pipeline(transaction=False)
+        for vehicle_id in vehicle_ids:
+            pipe.sismember("vehicle:online:set", vehicle_id)
+        raw = await pipe.execute()
+        return {vehicle_id: bool(value) for vehicle_id, value in zip(vehicle_ids, raw, strict=True)}
 
 
 @asynccontextmanager
@@ -115,8 +139,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.ota_status_consumer = consumer
         consumer_task = asyncio.create_task(consumer.run(), name="ota-status-consumer")
 
+    # 灰度自动调度器（x-hunter-canary-rollout.scheduler；ROLLOUT_SCHEDULER_ENABLED=false 可关）
+    scheduler_task: asyncio.Task[None] | None = None
+    if settings.rollout_scheduler_enabled:
+        scheduler = RolloutScheduler(app.state.task_service, settings)
+        app.state.rollout_scheduler = scheduler
+        scheduler_task = asyncio.create_task(scheduler.run(), name="rollout-scheduler")
+
     logger.info("service_started", service=settings.service_name, port=settings.api_port)
     yield
+    if scheduler_task is not None:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("rollout_scheduler_stop_failed")
     if consumer_task is not None:
         consumer_task.cancel()
         try:

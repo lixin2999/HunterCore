@@ -487,7 +487,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        网关校验的 JWT Access Token（2h；Refresh Token 7d）。
+        网关校验的 JWT Access Token（30min，G-04① 收紧；Refresh Token 7d）。
         网关透传 `X-User-Id` / `X-Roles` / `X-Request-ID`（服务侧二次校验角色与资源域 `remote`，
         见 `x-hunter-control-safety.authorization`）；**禁止**用查询串 / 请求体传递 Token。
 
@@ -1392,9 +1392,9 @@ x-hunter-websocket-contract:
     failure: "握手阶段直接以 HTTP 4xx 拒绝（不进入帧循环）：1001 / 1003 / 1002 / 3001 / 7001"
   frames:
     control_uplink:
-      - { type: control,   direction: "browser→platform", frequency: "20Hz（50ms）", fields: "session_id, seq, timestamp, control{target_velocity, target_steer, gear}" }
+      - { type: control,   direction: "browser→platform", frequency: "20Hz（50ms）", fields: "session_id, seq, timestamp, control{target_velocity, target_steer, gear?, brake?}", note: "G-10：gear（P/R/N/D）与 brake（0-1）为可选上行字段，平台限幅/验词后透传 Kafka；control.mode 不接受上行（平台侧预留字段，防注入）" }
       - { type: heartbeat, direction: "browser→platform", interval_s: 10, fields: "session_id, timestamp" }
-      - { type: estop,     direction: "browser→platform", fields: "session_id, reason", note: "紧急停车：立即下发 target_velocity=0 并按 x-hunter-control-channel.emergency 收敛会话" }
+      - { type: estop,     direction: "browser→platform", fields: "session_id, reason", note: "紧急停车：立即下发 target_velocity=0 并按 x-hunter-session-lifecycle.end_convergence 收敛会话（先安全后清理；车端 >500ms 无指令自动减速为兜底）" }
     control_downlink:
       - { type: ack,    direction: "platform→browser", fields: "session_id, seq, ack_latency_ms, vehicle_state", note: "来源 Kafka hunter.{vehicle_id}.command_result；受契约限制按 (session_id, seq) 时序近似关联（remote_control 无 command_id，见 x-hunter-control-channel.ack.correlation）" }
       - { type: status, direction: "platform→browser", fields: "status, degraded_reasons[], control_stats, video_stats", frequency: "1Hz 或状态变更时" }
@@ -1428,6 +1428,27 @@ x-hunter-session-heartbeat:
   metrics: "hunter_remote_control_heartbeat_timeout_total{vehicle_id}"
   pending: "⚠ 30s/60s 派生阈值见 x-hunter-pending-confirmation #4"
 
+x-hunter-geofence:
+  source: "设计文档 8.4.2（地理围栏）+ G-11 落地；围栏定义存 vehicle_svc.vehicles.fence_json（DDL 见 contracts/database/ddl/01_core.sql）"
+  fence_schema:
+    circle: '{"type":"circle","center_lat":<number -90..90>,"center_lng":<number -180..180>,"radius_m":<number >0>}'
+    polygon: '{"type":"polygon","points":[[lat,lng],...],"closed":true}'
+    optional: "max_speed_mps（围栏内限速，建议 2.0；平台侧仅作展示与登记，限速执行在车端）"
+    null_semantics: "fence_json IS NULL = 未配置 → 创建会话不做围栏校验（行为与 G-11 前完全一致）"
+  position_source: "Redis vehicle:status:{vehicle_id} 的 lat/lng/lat_lng_at 字段（写方 data-collector，来源 health.lat/lng——G-11 新增顶层可选字段，随值携带写入时刻 lat_lng_at；车端排期见 pending #22；遥测 localization 为地图坐标系 x/y，不可用作全球定位）"
+  check_point: "POST /session 创建链路（可控性判定之后、互斥锁获取之前）；仅创建时校验，不在会话期轮询（运行期兜底见下）"
+  verdict_rules:
+    - "未配置围栏 → 直接放行（零额外开销，不读 Redis 定位字段）"
+    - "配置围栏 + lat/lng 齐全且新鲜（lat_lng_at 距现在 ≤ VEHICLE_OFFLINE_THRESHOLD_SECONDS）且围栏内 → 放行"
+    - "配置围栏但 lat/lng 缺失/非数/超出值域/定位陈旧（lat_lng_at 超阈或不可解析） → 拒绝 3003，data.reason=position_unavailable（安全默认，同 G-08 OTA 门禁缺数据即拒绝）"
+    - "围栏 JSON 结构非法（type 未知/字段缺失）→ 拒绝 3003，data.reason=fence_malformed（配置错误不得默许放行）"
+    - "位置在围栏外 → 拒绝 3003，data.reason=outside_geofence，data 携带 {distance_m / 围栏摘要}；**禁止新增错误码**（复用 3003 资源状态冲突 409 语义）"
+  runtime_violation: "会话期越界由**车端**执行自动减速/停车（系统约束第 15 条超时/围栏双兜底）；平台侧 1Hz 实时围栏监控需 SessionEndReason/事件词表扩展（fence_violation），见 pending #22，定稿前禁止实现自动结束会话"
+  geometry: "circle 用 haversine 大圆距离；polygon 用射线法（含自交多边形保守处理）；地球半径 6371008.8m"
+  metrics: "hunter_remote_control_geofence_rejected_total{reason=\"outside_geofence|position_unavailable|fence_malformed\"}（Counter，接管拒绝次数）"
+  audit: "围栏拒绝事件记结构化日志（vehicle_id/operator_id/reason/位置摘要），不新增事件 Topic 消息（词表限制）"
+  db_access: "本服务首次将 PG 纳入创建链路（只读 vehicle_svc.vehicles.fence_json 单列）；DB 不可用 → 5001（创建失败不留脏状态），与 redis-keys 跨 schema 只读例外同步登记见 pending #22"
+
 x-hunter-control-channel:
   source: "系统约束第 4/15 条 + contracts/kafka/schemas/remote_control.schema.json + contracts/kafka/topics.yaml（producer: remote-control）"
   transport: "浏览器 --WS(20Hz)--> remote-control --Kafka(20Hz)--> 车端（AGX Orin）"
@@ -1442,7 +1463,7 @@ x-hunter-control-channel:
     retention: "7 天"
     schema: "contracts/kafka/schemas/remote_control.schema.json"
   message_mapping:
-    note: "WS 上行帧 → Kafka 消息字段一一映射；**不得新增字段**（schema additionalProperties=false）"
+    note: "WS 上行帧 → Kafka 消息字段映射；**字段集以 schema 为准不得自增**（additionalProperties=false）；G-10 已将 brake/gear/mode 契约化为 control 可选字段，boot/stop 帧 type/video/reason 扩展同步收对（含补发 vehicle_id）"
     fields:
       vehicle_id: "取自会话（rc:session:{vehicle_id}）"
       timestamp: "服务端生成时间（Unix epoch 秒，含毫秒）"
@@ -1451,8 +1472,11 @@ x-hunter-control-channel:
       operator_id: "JWT sub（操作员用户 ID）"
       control.target_velocity: "限幅到 [-RC_MAX_SPEED_MPS, +RC_MAX_SPEED_MPS]（默认 ±2.0 m/s）；服务端截断，不依赖车端裁剪"
       control.target_steer: "底盘转角量程标定值待确认 → 按 RC_MAX_STEER_RAD 限幅（pending #18）"
+      control.gear: "G-10：WS 上行透传（词表 P/R/N/D 与 health.schema.json 一致；WS 层非法词 → 2001 error 帧拒帧，生产侧词表二次防御丢键）；未携带则不写键（无换挡请求）；车端消费排期 pending #21"
+      control.brake: "G-10：归一化制动请求 0~1（WS 上行越界 → 2001 error 帧拒帧，生产侧截断 0~1 二次防御；estop 零速帧固定 1.0）；车端比例制动映射 pending #21"
+      control.mode: "G-10 预留：平台侧字段，不接受 WS 上行；值域未与车端定稿（pending #21），当前实现恒不下发"
       heartbeat: "控制量无变化时仍以 20Hz 发送，heartbeat=true 维持链路与超时保护计时"
-    ws_only: "WS 上行帧仅使用上述字段（不新增 gear 等未契约化字段）；前端附加字段由平台侧丢弃"
+    ws_only: "WS 上行帧仅使用上述字段（type/timestamp/seq/operator_id 等平台侧字段不接受前端伪造）；未契约化键由平台侧丢弃"
   ack:
     topic: "hunter.{vehicle_id}.command_result"
     consumer_group: "remote-control-command-result（contracts/kafka/consumer-groups.yaml 已登记，零改动）"
@@ -1622,9 +1646,11 @@ x-hunter-websocket-routes:
       security_protocol: "WSS（TLS 1.3）"
       auth: "JWT（握手阶段校验）"
       auth_detail: |
-        本服务实现按 `Authorization: Bearer <token>` 头读取；网关侧「传送方式（Authorization 头 /
-        Sec-WebSocket-Protocol / 首帧认证）」待人工确认（api-gateway 契约同标注），见
-        `x-hunter-pending-confirmation` #20。**禁止查询串明文携带 Token**。
+        传送方式已定稿（见 x-hunter-pending-confirmation #20，决策①）：浏览器经
+        `Sec-WebSocket-Protocol` 子协议承载——`hunter-jwt, <token>` 双值形态（服务端回显
+        `hunter-jwt`）或 `hunter-jwt.<token>` 单值形态（回显原值）；非浏览器客户端支持
+        `Authorization: Bearer <token>` 头。**禁止查询串明文携带 Token**。
+        实现：services/remote-control/app/core/ws_auth.py。
       constraints:
         - "控制指令 20Hz（50ms 间隔）；>500ms 未收到指令，车辆自动减速停车"
         - "远程操控最高速度 2.0 m/s（可配置）；视频 720p@30fps、H.264 硬编码、码率 2048–4096 kbps、关键帧间隔 1s"
@@ -1635,7 +1661,7 @@ x-hunter-websocket-routes:
   media_plane: "WebRTC 媒体（SRTP/UDP）**不经** api-gateway / Ingress，须在 K8s 单独暴露 UDP（见 x-hunter-video-contract.transport.udp_exposure）"
 
 x-hunter-kafka:
-  source: "contracts/kafka/topics.yaml + consumer-groups.yaml + schemas/*.schema.json（本服务相关条目均已登记，**本契约零改动**）"
+  source: "contracts/kafka/topics.yaml + consumer-groups.yaml + schemas/*.schema.json（G-10 已修订 remote_control.schema.json：control 增可选 brake/gear/mode，顶层契约化 type/video/reason；其余条目零改动）"
   produces:
     - topic: "hunter.{vehicle_id}.remote_control"
       direction: platform_to_vehicle
@@ -1648,7 +1674,7 @@ x-hunter-kafka:
       linger_ms: 5
       batch_size: 16384
       retries: 3
-      purpose: "控制指令（target_velocity / target_steer / heartbeat）"
+      purpose: "控制指令（target_velocity / target_steer / heartbeat；G-10 可选 brake / gear / mode；boot/stop 帧另携 type / video / reason）"
     - topic: "hunter.{vehicle_id}.command"
       direction: platform_to_vehicle
       schema: "schemas/command.schema.json"
@@ -1702,7 +1728,7 @@ x-hunter-error-status-map:
     - { code: 2002, http: 422, meaning: "参数缺失（vehicle_id 等必填缺失）" }
     - { code: 3001, http: 404, meaning: "资源不存在（会话已结束/不存在、录像或 sidecar 缺失、车辆不存在）" }
     - { code: 3002, http: 409, meaning: "资源已存在（保留：本服务无唯一键写入场景，仅当采纳 pending #1 建表后启用）" }
-    - { code: 3003, http: 409, meaning: "资源状态冲突（如会话处于 connecting 尚不可结束、录像未封存完成）" }
+    - { code: 3003, http: 409, meaning: "资源状态冲突（如会话处于 connecting 尚不可结束、录像未封存完成；G-11 另用于地理围栏接管拒绝：围栏外/缺定位/非法围栏，data.reason 区分，见 x-hunter-geofence）" }
     - { code: 4001, http: 409, meaning: "车辆不在线（vehicle:online:set 不含该车）" }
     - { code: 4002, http: 409, meaning: "车辆忙（OTA 中 / 充电中 / fault / emergency）" }
     - { code: 5000, http: 500, meaning: "服务器内部错误（未预期异常；响应不含堆栈，细节入日志）" }
@@ -1738,6 +1764,7 @@ x-hunter-observability:
       - "hunter_remote_control_command_latency_seconds（Histogram，桶 0.01/0.05/0.1/0.2/0.5；目标 P95 ≤ 0.1）"
       - "hunter_remote_control_video_e2e_latency_seconds（Histogram，桶 0.05/0.1/0.2/0.5/1；目标 P95 ≤ 0.2）"
       - "hunter_remote_control_frame_dropped_total{reason}（Counter，over_frequency|backpressure）"
+      - "hunter_remote_control_geofence_rejected_total{reason}（Counter，G-11 围栏接管拒绝：outside_geofence|position_unavailable|fence_malformed）"
       - "hunter_remote_control_heartbeat_timeout_total{vehicle_id}（Counter）"
       - "hunter_remote_control_archive_failed_total{stage=\"video|sidecar\"}（Counter）"
       - "hunter_remote_control_rate_limited_total{endpoint}（Counter）"
@@ -1862,8 +1889,9 @@ x-hunter-pending-confirmation:
       decision_needed: "确认粘性路由实现（Ingress session affinity / 网关一致性哈希）与重连窗口（建议 ≤10s）；是否需要在车端增加『平台心跳丢失』上报通道（如 event/health 主题）"
     - id: 15
       title: "WS 子路径 /control 与 /signal 的拆分"
-      status: open
+      status: decided
       current: "契约推导：控制指令与 WebRTC 信令分两条 WS 连接（职责隔离、限流与权限不同）"
+      decision: "① 维持拆分定稿：/control（remote:execute，20Hz 指令/心跳/estop）与 /signal（remote:create，sdp/ice 中继）；已实现于 services/remote-control/app/routers/websocket.py，网关/前端封装同步"
       blocking: true
       files: [contracts/openapi/remote-control.yaml, contracts/openapi/api-gateway.yaml]
       decision_needed: "确认拆分或合并为单连接（单连接可减少握手开销但权限/限流粒度变粗）；定稿后同步网关契约与前端封装"
@@ -1897,8 +1925,23 @@ x-hunter-pending-confirmation:
       decision_needed: "确认 profile 与 level（影响浏览器兼容性与弱网表现）；定稿后写入 VideoConfig 与车端编码配置"
     - id: 20
       title: "WS 握手 JWT 的传送方式"
-      status: open
+      status: decided
       current: "本服务实现按 Authorization: Bearer 头读取；网关契约同项待确认（Authorization 头 / Sec-WebSocket-Protocol / 首帧认证）"
+      decision: "① 子协议 hunter-jwt 承载（浏览器唯一可行方案）：`hunter-jwt, <token>` 双值或 `hunter-jwt.<token>` 单值，服务端相应回显；非浏览器客户端兼容 `Authorization: Bearer` 头；禁止查询串；前端已按 protocols: ['hunter-jwt', token] 实现，服务端 ws_auth.py + 测试 test_websocket.py"
       blocking: true
       files: [contracts/openapi/api-gateway.yaml, contracts/openapi/remote-control.yaml, frontend/src/api]
       decision_needed: "选定后同步前端封装与网关实现；**任何方案都禁止查询串明文携带 Token**"
+    - id: 21
+      title: "G-10 新字段的车端消费排期与 mode 值域定稿"
+      status: open
+      current: "remote_control.schema.json 已契约化 control.brake（0~1）/ control.gear（P/R/N/D）/ control.mode（预留）与顶层 type/video/reason；平台侧已下发（gear/brake 透传、estop brake=1.0、boot/stop 帧收对含补发 vehicle_id）；旧固件车端对未识别键的行为待确认"
+      blocking: false
+      files: [contracts/kafka/schemas/remote_control.schema.json, services/remote-control/app/producers/remote_control.py]
+      decision_needed: "与车端确认：① brake 比例制动脉冲映射与 gear 换挡执行语义（旧固件是否安全忽略未知键）；② control.mode 值域（如 remote_precision/remote_default）定稿后平台侧才开始下发；③ boot/stop 帧 type/video/reason 解析改造排期（收对前旧帧格式已登记为已发布行为）"
+    - id: 22
+      title: "G-11 地理围栏的车端 GPS 排期与运行期越界收敛语义"
+      status: open
+      current: "平台侧已落地创建会话围栏门禁（x-hunter-geofence：fence_json + health.lat/lng → 3003 拒绝）；health.lat/lng 为顶层可选字段需车端排期上报（同 G-08 模式，未上报前配置围栏的车辆无法接管）；运行期越界仅车端兜底，平台不自动结束会话"
+      blocking: false
+      files: [contracts/kafka/schemas/health.schema.json, contracts/database/ddl/01_core.sql, services/remote-control/app/services/geofence.py]
+      decision_needed: "① 车端 GPS（health.lat/lng）上报排期；② 运行期平台侧越界收敛是否扩展 SessionEndReason（如 fence_violation）与 18 事件词表（动全局受控词表需评审，G-22 同模式）；③ remote-control 直读 vehicle_svc.vehicles 是否改经未来车辆台账 API 收敛（G-17 /data/vehicles 同期考虑）"

@@ -77,10 +77,15 @@ CREATE TABLE IF NOT EXISTS vehicle_svc.vehicles (
     last_online_time TIMESTAMPTZ,                               -- 遥测/心跳最近上报时间
     register_time    TIMESTAMPTZ NOT NULL DEFAULT now(),
     device_cert_sn   TEXT,                                      -- X.509 设备证书序列号
+    -- G-11（设计文档 8.4.2 地理围栏）：车辆电子围栏定义（NULL = 未配置不校验）；
+    --   circle/polygon 两型 + 可选 max_speed_mps；越界处置：平台创建会话时校验 GPS 位置
+    --   （health.lat/lng，缺定位/非法围栏 → 拒绝接管 3003），运行期由车端自动减速停车兜底
+    --   （18 事件词表不含 fence_violation，见 remote-control 契约 pending #22）
+    fence_json       JSONB,
     description      TEXT
 );
 COMMENT ON TABLE vehicle_svc.vehicles IS
-    '车辆台账；status 取值见设计文档“车辆状态定义”（8 态，不可新增/更改）';
+    '车辆台账；status 取值见设计文档“车辆状态定义”（8 态，不可新增/更改）；fence_json 见 G-11/设计文档 8.4.2';
 
 -- 设备证书序列号唯一（部分唯一索引：允许未签发证书的车辆先登记）
 CREATE UNIQUE INDEX IF NOT EXISTS uq_vehicles_device_cert_sn
@@ -99,10 +104,16 @@ CREATE TABLE IF NOT EXISTS user_svc.users (
     phone           TEXT,
     status          TEXT        NOT NULL DEFAULT 'enabled'
         CHECK (status IN ('enabled', 'disabled', 'locked')),  -- ⚠ 需核对：locked 用于登录失败锁定
+    -- G-06（设计文档 14.1 弱口令防护）：首登/重置后强制改密；默认管理员初始化置 true
+    must_change_password BOOLEAN NOT NULL DEFAULT false,
+    -- G-23（设计文档 3.2.2/14.1 MFA 双因素）：TOTP 因子；密钥应用层加密后存储，
+    --   禁止在日志/接口输出（与 contracts/database/ddl/01_core.sql 同步）
+    mfa_enabled     BOOLEAN     NOT NULL DEFAULT false,
+    totp_secret     TEXT,                                    -- 加密后的 TOTP 密钥（BASE32 明文禁止入库）
     create_time     TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_login_time TIMESTAMPTZ
 );
-COMMENT ON TABLE user_svc.users IS '平台用户；password_hash 使用 bcrypt，禁止在日志/接口中输出';
+COMMENT ON TABLE user_svc.users IS '平台用户；password_hash 使用 bcrypt，禁止在日志/接口中输出；must_change_password/mfa 字段见 G-06/G-23';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_users_username ON user_svc.users (username);
 -- 邮箱唯一（大小写不敏感，且允许为空）
@@ -236,11 +247,11 @@ CREATE TABLE IF NOT EXISTS ota_svc.ota_versions (
     changelog         JSONB       NOT NULL DEFAULT '{}'::jsonb,
     applicable_models TEXT[]      NOT NULL DEFAULT ARRAY['HUNTER_SE']::TEXT[],
     status            TEXT        NOT NULL DEFAULT 'draft'
-        CHECK (status IN ('draft', 'published', 'deprecated', 'disabled')),  -- ⚠ 需核对
+        CHECK (status IN ('draft', 'testing', 'reviewing', 'published', 'deprecated', 'disabled')),  -- G-18② 定稿（§7.2.2 审核流六态）
     release_time      TIMESTAMPTZ
 );
 COMMENT ON TABLE ota_svc.ota_versions IS
-    'OTA 版本仓库；发布前必须完成 SHA-256 校验 + RSA-2048 验签 + version_code 单调性检查';
+    'OTA 版本仓库；状态机 draft→testing→reviewing→published→deprecated/disabled（G-18②）；发布前必须完成 SHA-256 校验 + RSA-2048 验签 + version_code 单调性检查';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_ota_versions_version_code
     ON ota_svc.ota_versions (version_code);
@@ -321,7 +332,7 @@ CREATE INDEX IF NOT EXISTS idx_ota_records_error_code
 -- HunterCore 数据库契约 — 04 事件
 -- schema：data_collector
 -- 来源：设计文档第 9 章；字段名、类型、约束不可更改
--- 约束：event_type 取值 = 设计文档“事件类型定义”（18 种，触发阈值不可更改）；
+-- 约束：event_type 取值 = 设计文档“事件类型定义”（19 种，触发阈值不可更改；G-22② 新增 collision_pre_warning）；
 --       event_level ∈ (info, warning, critical)
 -- =====================================================================
 
@@ -330,7 +341,7 @@ CREATE TABLE IF NOT EXISTS data_collector.events (
     vehicle_id       TEXT        NOT NULL,          -- 逻辑外键 → vehicle_svc.vehicles.vehicle_id
     event_type       TEXT        NOT NULL
         CHECK (event_type IN ('harsh_acceleration', 'harsh_braking', 'harsh_turning', 'over_speed',
-                              'collision_warning', 'manual_takeover', 'emergency_stop', 'battery_low',
+                              'collision_pre_warning', 'collision_warning', 'manual_takeover', 'emergency_stop', 'battery_low',
                               'battery_critical', 'communication_loss', 'sensor_fault', 'perception_fault',
                               'planning_fault', 'control_fault', 'ota_start', 'ota_success',
                               'ota_failed', 'ota_rollback')),

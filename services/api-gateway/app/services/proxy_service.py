@@ -24,6 +24,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 from hunter_common.exceptions import ResourceNotFoundError, ServiceUnavailableError
+from hunter_common.internal_auth import build_identity_headers
 from hunter_common.logging import get_logger, get_trace_id
 from starlette.background import BackgroundTask
 
@@ -54,6 +55,8 @@ _STRIPPED_REQUEST_HEADERS: Final[frozenset[str]] = _HOP_BY_HOP | {
     "x-user-id",
     "x-roles",
     "x-trace-id",
+    "x-identity-timestamp",  # G-02：身份头签名字段同样覆盖防伪造
+    "x-internal-mac",
     "x-request-id",
 }
 
@@ -222,9 +225,22 @@ class ProxyService:
                 continue
             headers[name] = value
         trace_id = get_trace_id()
-        headers["X-User-Id"] = str(claims["sub"])
-        headers["X-Roles"] = ",".join(str(role) for role in (claims.get("roles") or []))
-        headers["X-Trace-Id"] = trace_id
+        roles = ",".join(str(role) for role in (claims.get("roles") or []))
+        # G-02：配置了 GATEWAY_HMAC_SECRET 时身份头附 HMAC-SHA256 签名 + 时间戳
+        # （后端校验，防集群内伪造 X-User-Id 绕过 RBAC；未配置时仅注入明文头，行为与历史一致）
+        if self._settings.gateway_hmac_secret:
+            headers.update(
+                build_identity_headers(
+                    self._settings.gateway_hmac_secret,
+                    user_id=str(claims["sub"]),
+                    roles=roles,
+                    trace_id=trace_id,
+                )
+            )
+        else:
+            headers["X-User-Id"] = str(claims["sub"])
+            headers["X-Roles"] = roles
+            headers["X-Trace-Id"] = trace_id
         # X-Request-ID = trace_id（契约 info：链路追踪优先透传/生成 UUID）
         headers["X-Request-ID"] = trace_id
         return headers

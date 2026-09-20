@@ -75,9 +75,15 @@ buckets:
     purpose: "ROS Bag 文件（常规 + 事件）"
     lifecycle:
       mode: mixed
+      selector: tags  # G-12 定稿：过期规则按对象 Tag 匹配（前缀方案废弃，与 5.5 命名规范的冲突已消解）
       rules:
-        - {prefix: "regular/", expire_days: 30}
-        - {prefix: "events/", expire_days: null, note: "事件数据永久保留（无过期规则）"}
+        - {tags: "hunter-retention=regular", expire_days: 30}
+        - {tags: "hunter-retention=event", expire_days: null, note: "事件数据永久保留（不设过期规则）"}
+      tagging:
+        key: hunter-retention
+        values: [regular, event]
+        applied_by: "服务端：data-collector POST /files/complete 校验通过后 put_object_tagging（见其 x-hunter-file-upload-flow.tagging）；事件相关包必须由上传方在 presign/complete 显式声明 retention=event"
+        untagged_semantics: "S3 生命周期 tag 过滤器无法表达「无 Tag」→ 未打标对象不命中任何过期规则（等同永久）；因此禁止绕过 complete 流程直写 hunter-rosbag，存量打标由运维一次性任务补刷（见 pending #2 定稿说明）"
     sse: sse-s3
     writers: [data-collector, scene-service]
     readers: [data-analytics]
@@ -88,9 +94,9 @@ buckets:
         declared_in: "contracts/openapi/data-collector.yaml#x-hunter-file-upload-flow.naming（data_type=rosbag）"
       - pattern: "events/{...}"
         style: bucket_excluded
-        status: pending_confirmation
-        declared_in: "未在任何服务契约中定义（仅 init-buckets.sh 约定 events/ 前缀永久保留）→ 见 pending #2"
-    notes: "⚠ 既有冲突：5.5 命名规范不含 regular/ 段，而生命周期规则只对 regular/ 前缀生效 → 按当前命名上传的常规 rosbag 不匹配任何过期规则（永久占用）；事件数据必须落 events/ 才能避免 30 天误删。定稿前禁止实现（见 pending #2）"
+        status: deprecated_prefix_semantics  # G-12：events/ 前缀不再承担生命周期语义，归类改用 hunter-retention=event Tag；历史对象键不回写（引用关系以 events.data_file_url 为准）
+        declared_in: "历史约定（仅 init-buckets.sh 曾按 events/ 前缀永久保留）→ 已按 pending #2 定稿"
+    notes: "G-12 已修复：对象键沿用 5.5 命名规范（不含 regular/ 段，禁止为凑前缀改命名）；保留策略全部由 Tag 表达，常规 30 天 / 事件永久；旧版「不匹配任何过期规则→永久占用」缺陷的根因（前缀方案）已替换"
 
   # ---------------------------------------------------------------- 3
   - name: hunter-video
@@ -239,8 +245,8 @@ x-hunter-pending-confirmation:
       contract_decision: "统一为「不含 bucket」或「含 bucket」其一（推荐不含，bucket 由预签名请求的 bucket 字段承载）；统一前实现必须按各服务既有契约执行，禁止跨服务复用同一 key 模板"
     - id: 2
       question: "hunter-rosbag 前缀语义与 5.5 命名规范冲突：init-buckets.sh 仅对 regular/ 前缀配 30 天过期、events/ 永久；但命名规范（data-collector x-hunter-file-upload-flow.naming = {bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}）不含 regular/ 段，events/ 下的对象键结构在全部服务契约中也未定义"
-      impact: "阻塞（blocking）：按当前命名上传的常规 rosbag 不匹配任何过期规则（永久占用存储，成本与容量风险）；若为凑前缀把事件数据放 regular/ 则 30 天后被误删（丢失事故证据）"
-      contract_decision: "二选一：(a) 命名规范增加 regular/ 段并回填 data-collector 契约（推荐，与既有生命周期规则一致）；(b) 生命周期规则改为按 bucket 内全部对象过期（放弃 events/ 永久语义）。同时确认事件 rosbag 对象键模板并回填 data-collector（事件上传）与 data-analytics（事件取证读取）契约"
+      impact: "已定稿（G-12 修复；原为阻塞 blocking：常规 rosbag 不匹配过期规则永久占用，事件数据入 regular/ 会被 30 天误删）"
+      contract_decision: "定稿为方案 (c) 按 Tag 生命周期（原 (a)/(b) 均否决：(a) 改命名规范侵入车端上传链路且历史对象无法回填；(b) 放弃事件永久语义不可接受）：生命周期规则改为 hunter-retention=regular 30 天 / =event 永久（见 buckets[hunter-rosbag].lifecycle）；对象键沿用 5.5 命名规范不变；Tag 由 data-collector complete 阶段服务端打（put_object_tagging），retention 在 presign/complete 请求声明（默认 regular，事件包显式 event）；未打标对象等同永久，禁止绕过 complete 直写；存量对象补标由运维一次性任务执行（mc ilm + put-object-tagging，不在代码链路范围）"
     - id: 3
       question: "hunter-logs 对象键模板为契约推导（{service}/{yyyy}/{mm}/{dd}/{hour}.jsonl.gz 在设计文档中未明确；hunter-reports 键模板已由 data-analytics x-hunter-report-storage.object_layout 明确）"
       impact: "非阻塞：日志归档粒度/压缩策略待定，影响归档体积与检索方式（无需 DB 变更）"

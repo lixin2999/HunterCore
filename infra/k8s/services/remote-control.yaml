@@ -25,6 +25,8 @@ data:
   RC_HEARTBEAT_END_AFTER_S: "60"            # 无心跳持续 → 平台侧结束会话
   RC_SESSION_TTL_S: "21600"                 # 会话 Hash 硬 TTL 兜底（6h）
   RC_SESSION_REAPER_INTERVAL_S: "30"        # 守护对账周期
+  # 地理围栏接管门禁（G-11；新鲜度阈值与 data-collector VEHICLE_OFFLINE_THRESHOLD_SECONDS 同源）
+  RC_GEOFENCE_POSITION_MAX_AGE_S: "10"
   # 视频编码（AGX Orin NVENC 车端编码，云端仅转发）
   RC_VIDEO_WIDTH: "1280"
   RC_VIDEO_HEIGHT: "720"

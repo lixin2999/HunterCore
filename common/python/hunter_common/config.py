@@ -84,6 +84,11 @@ class HunterBaseConfig(BaseSettings):
     kafka_sasl_username: str | None = None
     kafka_sasl_password: str | None = None
     kafka_ssl_cafile: str | None = None
+    # 严格 mTLS（设计文档 3.2.3 车辆设备认证 / 14.2 车-云双向证书认证）：
+    # broker 侧 ssl.client.auth=required 后，所有 SASL_SSL/SSL 客户端必须出示客户端证书
+    kafka_ssl_certfile: str | None = None            # 客户端证书（PEM，K8s 挂载 /etc/hunter/kafka-tls/tls.crt）
+    kafka_ssl_keyfile: str | None = None             # 客户端私钥（PEM，挂载权限 600，禁止入日志/镜像层）
+    kafka_ssl_keypassword: str | None = None         # 私钥口令（仅 Secret 注入）
     # 生产者基准参数（对齐车端生产者配置：lz4 / linger.ms=5 / batch.size=16384 / retries=3）
     kafka_producer_acks: Literal["0", "1", "all"] = "all"
     kafka_compression_type: Literal["none", "gzip", "snappy", "lz4", "zstd"] = "lz4"
@@ -133,6 +138,11 @@ class HunterBaseConfig(BaseSettings):
     # 生产环境必须通过 K8s Secret 覆盖，禁止使用默认值上线（启动时强校验，见下）
     jwt_secret_key: str = "change-me-in-production"
 
+    # 网关→后端身份头 HMAC 签名密钥（G-02，见 hunter_common.internal_auth）；
+    # staging/prod 必填（启动 fail-fast），dev/test 未配置时跳过校验保持兼容
+    gateway_hmac_secret: str | None = None
+    gateway_identity_max_age_s: int = 300            # 签名时间戳防重放窗口（秒）
+
     #: JWT 密钥最小长度（HS256 密钥下限；PyJWT 对 <32 字节密钥发出告警）
     JWT_MIN_SECRET_BYTES: ClassVar[int] = 32
 
@@ -158,6 +168,15 @@ class HunterBaseConfig(BaseSettings):
             insecure.append("MINIO_SECRET_KEY")
         if self.kafka_sasl_password is not None and self.kafka_sasl_password in _DEV_DB_PASSWORDS:
             insecure.append("KAFKA_SASL_PASSWORD")
+        # G-02：生产环境身份头必须签名（网关与全部后端服务共享同一 Secret）
+        if not (self.gateway_hmac_secret or "").strip():
+            insecure.append("GATEWAY_HMAC_SECRET（网关身份头签名密钥，见 hunter_common.internal_auth）")
+        # 严格 mTLS（G-01）：broker 已切 ssl.client.auth=required，
+        # staging/prod 下 SSL/SASL_SSL 客户端缺证书/私钥即启动失败（连接后握手必被拒，fail-fast 更清晰）
+        if self.kafka_security_protocol in ("SSL", "SASL_SSL") and (
+            not self.kafka_ssl_certfile or not self.kafka_ssl_keyfile
+        ):
+            insecure.append("KAFKA_SSL_CERTFILE/KAFKA_SSL_KEYFILE（mTLS 客户端证书，设计文档 3.2.3/14.2）")
         if insecure:
             raise ValueError(
                 "生产环境（environment={}）检测到未覆盖的默认凭据：{}；"
@@ -167,5 +186,5 @@ class HunterBaseConfig(BaseSettings):
             )
         return self
     jwt_algorithm: str = "HS256"
-    jwt_access_token_expire_minutes: int = 120   # Access Token 2h（设计文档：安全机制）
+    jwt_access_token_expire_minutes: int = 30    # Access Token 30min（G-04 决策①收紧，原设计文档 2h）
     jwt_refresh_token_expire_days: int = 7       # Refresh Token 7d

@@ -192,6 +192,7 @@ data:
             "harsh_braking",
             "harsh_turning",
             "over_speed",
+            "collision_pre_warning",
             "collision_warning",
             "manual_takeover",
             "emergency_stop",
@@ -207,11 +208,11 @@ data:
             "ota_failed",
             "ota_rollback"
           ],
-          "description": "告警类型（受控词表：设计文档「事件类型定义」18 种，见 contracts/database/enums.md 第 3 节；禁止新增取值）"
+          "description": "告警类型（受控词表：设计文档「事件类型定义」19 种，见 contracts/database/enums.md 第 3 节；G-22② 新增 collision_pre_warning）"
         },
         "level": {
           "enum": ["info", "warning", "critical"],
-          "description": "告警等级；必须等于 EVENT_LEVEL_BY_TYPE[alert_type]（受控映射，代码不得放宽：harsh_acceleration/harsh_braking/harsh_turning/battery_low/ota_rollback=warning，over_speed/collision_warning/emergency_stop/battery_critical/communication_loss/*_fault/ota_failed=critical，manual_takeover/ota_start/ota_success=info）"
+          "description": "告警等级；必须等于 EVENT_LEVEL_BY_TYPE[alert_type]（受控映射，代码不得放宽：harsh_acceleration/harsh_braking/harsh_turning/battery_low/ota_rollback/collision_pre_warning=warning，over_speed/collision_warning/emergency_stop/battery_critical/communication_loss/*_fault/ota_failed=critical，manual_takeover/ota_start/ota_success=info）"
         },
         "source_job": {
           "enum": [
@@ -268,7 +269,7 @@ data:
             },
             "threshold": {
               "type": "number",
-              "description": "阈值（受控值：3.0 m/s²、0.5 s、0.8 rad/s、超速 1.1 倍、SOC 20%/10%、TTC 1.5 s、中断 10 s 等）"
+              "description": "阈值（受控值：3.0 m/s²、0.5 s、0.8 rad/s、超速 1.1 倍、SOC 20%/10%、TTC 1.5 s（critical）/ 3.0 s（pre-warning）、中断 10 s 等）"
             },
             "duration_seconds": {
               "type": "number",
@@ -395,6 +396,7 @@ data:
             "harsh_braking",
             "harsh_turning",
             "over_speed",
+            "collision_pre_warning",
             "collision_warning",
             "manual_takeover",
             "emergency_stop",
@@ -735,12 +737,13 @@ data:
           "type": "string",
           "enum": [
             "harsh_acceleration", "harsh_braking", "harsh_turning", "over_speed",
+            "collision_pre_warning",
             "collision_warning", "manual_takeover", "emergency_stop", "battery_low",
             "battery_critical", "communication_loss", "sensor_fault", "perception_fault",
             "planning_fault", "control_fault", "ota_start", "ota_success",
             "ota_failed", "ota_rollback"
           ],
-          "description": "事件类型（18 种，触发阈值不可更改）"
+          "description": "事件类型（19 种，触发阈值不可更改；G-22② 新增 collision_pre_warning）"
         },
         "event_level": {
           "type": "string",
@@ -786,7 +789,7 @@ data:
       "$schema": "http://json-schema.org/draft-07/schema#",
       "$id": "https://hunter-core.local/contracts/kafka/schemas/health.schema.json",
       "title": "HunterCore 系统健康消息 hunter.{vehicle_id}.health",
-      "description": "车辆系统健康数据（1Hz，acks=0）。生产者：车端；消费者：data-collector（写 Redis vehicle:status:{vehicle_id} / vehicle:online:set，不落明细表）。status 取值 = 车辆状态定义（8 态，不可更改）；system 段字段与遥测消息 system 段完全一致（复用采集代码）。⚠ 磁盘/服务进程等扩展健康字段待设计文档 5.3 节核对。",
+      "description": "车辆系统健康数据（1Hz，acks=0）。生产者：车端；消费者：data-collector（写 Redis vehicle:status:{vehicle_id} / vehicle:online:set，不落明细表）。status 取值 = 车辆状态定义（8 态，不可更改）；system 段字段与遥测消息 system 段完全一致（复用采集代码）。G-08（决策①）：新增 `gear`（底盘档位，OTA P 档静止门禁）与 `free_storage_mb`（磁盘可用空间，OTA 存储门禁）两个**顶层**可选字段（需车端排期上报；未上报时 data-collector 不写入该 field，OTA 门禁缺数据即拒绝，保持安全默认），不放入 system 段以维持与遥测 system 一致性。G-11（§8.4.2 地理围栏）：新增 `lat`/`lng` 顶层可选 GPS 定位字段（WGS84 度；围栏接管门禁判定输入；同模式需车端排期，未上报时配置了围栏的车辆拒绝创建会话——安全默认；遥测 localization 为地图坐标系 x/y，不承担全球定位语义）。",
       "type": "object",
       "additionalProperties": false,
       "required": ["vehicle_id", "timestamp", "status", "system"],
@@ -805,6 +808,28 @@ data:
           "enum": ["offline", "online_idle", "auto_driving", "remote_controlled",
                    "upgrading", "charging", "fault", "emergency"],
           "description": "车辆业务状态（8 态，不可新增/更改）"
+        },
+        "gear": {
+          "type": "string",
+          "enum": ["P", "R", "N", "D"],
+          "description": "底盘档位（G-08；OTA 升级/回滚门禁 P 档静止判定。可选：车端排期上报，未上报则门禁缺数据即拒绝）"
+        },
+        "free_storage_mb": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "车端磁盘可用空间 MB（G-08；OTA 存储门禁 ≥ 2048MB。可选：车端排期上报）"
+        },
+        "lat": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90,
+          "description": "GPS 纬度（WGS84 度；G-11 地理围栏判定输入。可选：车端排期上报；未上报则配置围栏的车辆拒绝接管——安全默认）"
+        },
+        "lng": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180,
+          "description": "GPS 经度（WGS84 度；G-11 地理围栏判定输入；与 lat 成对上报，缺一即视为无定位）"
         },
         "system": {
           "type": "object",
@@ -826,6 +851,10 @@ data:
           "vehicle_id": "HUNTER-001",
           "timestamp": 1724035201.0,
           "status": "auto_driving",
+          "gear": "D",
+          "free_storage_mb": 8192,
+          "lat": 31.230416,
+          "lng": 121.473701,
           "system": {
             "cpu_usage": 45.2, "gpu_usage": 62.8, "memory_usage_mb": 18500,
             "gpu_temp": 68.5, "cpu_temp": 65.2, "network_rssi": -65, "network_latency_ms": 45
@@ -1013,7 +1042,7 @@ data:
       "$schema": "http://json-schema.org/draft-07/schema#",
       "$id": "https://hunter-core.local/contracts/kafka/schemas/remote_control.schema.json",
       "title": "HunterCore 远程操控指令 hunter.{vehicle_id}.remote_control",
-      "description": "平台→车远程操控指令（20Hz，即 50ms 间隔，acks=all，key=vehicle_id）。生产者：remote-control；消费者：车端。安全约束：车端 >500ms 未收到控制指令必须自动减速停车；远程操控模式最高速度默认 2.0 m/s（可配置）；同一车辆同一时刻仅允许一名操作员（Redis rc:session:{vehicle_id} 互斥）。",
+      "description": "平台→车远程操控指令（20Hz，即 50ms 间隔，acks=all，key=vehicle_id）。生产者：remote-control；消费者：车端。安全约束：车端 >500ms 未收到控制指令必须自动减速停车；远程操控模式最高速度默认 2.0 m/s（可配置）；同一车辆同一时刻仅允许一名操作员（Redis rc:session:{vehicle_id} 互斥）。G-10 修订：control 段新增可选字段 brake/gear/mode（不加入 required，旧消息保持兼容）；顶层契约化 type/video/reason（收对会话 boot/stop 帧的既有扩展字段偏离，车端按 type+heartbeat 区分帧类别）。",
       "type": "object",
       "additionalProperties": false,
       "required": ["vehicle_id", "timestamp", "seq", "control"],
@@ -1022,6 +1051,11 @@ data:
           "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
           "description": "受控车辆（Kafka 消息 key）"
+        },
+        "type": {
+          "type": "string",
+          "const": "remote_control",
+          "description": "帧类型标识（G-10 契约化：控制/心跳/boot/stop 帧统一为 remote_control，车端据此 + heartbeat 区分帧类别；可选，未携带按控制帧处理）"
         },
         "timestamp": {
           "type": "number",
@@ -1056,13 +1090,55 @@ data:
             "target_steer": {
               "type": "number",
               "description": "目标前轮转角 rad（符号：正为左转，量程由底盘标定，服务端需做限幅）"
+            },
+            "brake": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "归一化制动请求 0~1（G-10 可选；常规控制帧省略，estop 零速帧固定 1.0；车端比例制动映射与消费排期见 remote-control.yaml pending #21）"
+            },
+            "gear": {
+              "type": ["string", "null"],
+              "enum": ["P", "R", "N", "D", null],
+              "description": "目标档位（G-10 可选；词表与 health.schema.json gear 一致；null = 无换挡请求，boot/stop 零值帧恒 null）"
+            },
+            "mode": {
+              "type": ["string", "null"],
+              "description": "操控模式标识（G-10 预留字段；值域未与车端定稿，见 pending #21；平台当前不下发，车端收到未识别值应忽略）"
             }
           }
         },
         "heartbeat": {
           "type": "boolean",
           "default": false,
-          "description": "心跳包标记：控制量无变化时仍以 20Hz 发送，用于保持操控链路与超时保护计时"
+          "description": "心跳包标记：控制量无变化时仍以 20Hz 发送，用于保持操控链路与超时保护计时；boot 帧 true / stop 帧 false（会话建立/释放通知，控制量恒零值）"
+        },
+        "video": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "视频配置/录像控制（G-10 契约化：仅 boot/stop 帧携带——boot 全量配置 + recording=true 起录像机，stop recording=false 停录像并进入封装上传；20Hz 控制帧不携带）",
+          "properties": {
+            "recording": {
+              "type": "boolean",
+              "description": "车端录像机起停请求（boot=true / stop=false）"
+            },
+            "webrtc_ready": {
+              "type": "boolean",
+              "description": "平台侧 WebRTC 通道就绪标记"
+            },
+            "width": { "type": "integer", "const": 1280 },
+            "height": { "type": "integer", "const": 720 },
+            "fps": { "type": "integer", "minimum": 1, "maximum": 30 },
+            "codec": { "type": "string", "const": "h264" },
+            "bitrate_kbps": { "type": "integer", "minimum": 2048, "maximum": 4096 },
+            "keyframe_interval_s": { "type": "integer", "const": 1 }
+          }
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "enum": ["operator_end", "heartbeat_timeout", "command_timeout", "video_lost",
+                   "vehicle_offline", "vehicle_fault", "admin_terminate", "server_shutdown", null],
+          "description": "会话结束原因（G-10 契约化：仅 stop 帧携带，取值 = SessionEndReason 受控词表，与 x-hunter-session-lifecycle 归档 sidecar.end_reason 一致）"
         }
       },
       "examples": [
@@ -1081,8 +1157,17 @@ data:
           "seq": 8802,
           "session_id": "9c8b7a65-4d3e-2f10-9a8b-7c6d5e4f3a2b",
           "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
-          "control": {"target_velocity": 1.2, "target_steer": 0.05},
+          "control": {"target_velocity": 1.2, "target_steer": 0.05, "gear": "D", "brake": 0.2},
           "heartbeat": true
+        },
+        {
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035200.223,
+          "seq": 8803,
+          "session_id": "9c8b7a65-4d3e-2f10-9a8b-7c6d5e4f3a2b",
+          "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
+          "control": {"target_velocity": 0.0, "target_steer": 0.0, "brake": 1.0, "gear": "N"},
+          "heartbeat": false
         }
       ]
     }

@@ -116,7 +116,7 @@ def trigger_events(
 ) -> list[str]:
     """阈值型事件判定（阈值来自「事件类型定义」，代码不得放宽/收严）。
 
-    仅覆盖可由遥测量直接判定的 8 类；语义型事件（manual_takeover/emergency_stop/
+    仅覆盖可由遥测量直接判定的 9 类；语义型事件（manual_takeover/emergency_stop/
     sensor_fault/perception_fault/planning_fault/control_fault/ota_*）由车端或平台任务
     判定后上报，本函数不自行发明触发条件。
     """
@@ -130,8 +130,12 @@ def trigger_events(
         events.append("harsh_turning")
     if velocity is not None and speed_limit and velocity / speed_limit > rules["over_speed"]["threshold"]:
         events.append("over_speed")
-    if ttc is not None and ttc < rules["collision_warning"]["threshold"]:
-        events.append("collision_warning")
+    if ttc is not None:
+        # G-22② TTC 双档分级：collision_warning（critical，<1.5s）/ collision_pre_warning（warning，1.5≤TTC<3.0s）
+        if ttc < rules["collision_warning"]["threshold"]:
+            events.append("collision_warning")
+        elif ttc < rules["collision_pre_warning"]["threshold"]:
+            events.append("collision_pre_warning")
     if battery_soc is not None:
         if battery_soc < rules["battery_critical"]["threshold"]:
             events.append("battery_critical")
@@ -434,7 +438,7 @@ def ota_progress_key(task_id: str) -> str:
 
 
 def session_key(user_id: str) -> str:
-    """用户会话 Redis 键（``session:{user_id}``，TTL 2 小时）。"""
+    """用户会话 Redis 键（``session:{user_id}``，TTL 30 分钟，G-04① 收紧）。"""
     pattern = contracts.redis_key("session:{user_id}")["pattern"]
     return pattern.replace("{user_id}", user_id)
 

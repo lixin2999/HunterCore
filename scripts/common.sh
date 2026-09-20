@@ -424,6 +424,25 @@ require_compose_file() {
   return 0
 }
 
+# require_no_production_override：生产降级硬闸（G-03，V1.15.0 风险⑩）
+# docker-compose.override.yml 会被 compose 自动静默合并（解除 TLS 强制/宿主机端口暴露/
+# 资源限制下调），等同生产环境无审批降级 —— staging/prod 存在即失败。
+# 本地联调可显式 HUNTER_ALLOW_OVERRIDE=1 放行（须登记书面豁免，见故障排查指南）
+require_no_production_override() {
+  local override="${APP_DIR}/docker-compose.override.yml"
+  if [ ! -f "$override" ]; then
+    return 0
+  fi
+  if [ "${HUNTER_ALLOW_OVERRIDE:-0}" = "1" ]; then
+    log_warn "存在 docker-compose.override.yml，已经 HUNTER_ALLOW_OVERRIDE=1 显式放行（仅限联调环境；生产须书面豁免并尽快移除）"
+    return 0
+  fi
+  log_error "硬闸（G-03）：检测到 ${override}"
+  log_error "compose 会静默合并其中的降级配置（TLS/端口/资源），禁止在生产部署包中保留 override"
+  log_error "处置：删除或改名该文件；确需联调请在受控环境显式 export HUNTER_ALLOW_OVERRIDE=1"
+  return 1
+}
+
 # container_running <container>：容器处于运行态返回 0
 container_running() {
   local state

@@ -16,7 +16,7 @@ cd services/scene-service
 uvicorn app.main:app --reload --port 8081
 ```
 
-## 接口实现（契约 12.2 节，10 个业务端点）
+## 接口实现（契约 12.2 节 10 个业务端点 + 决策 G-20① 新增 2 个，共 12 个）
 
 | 端点 | operationId | 实现要点 |
 |------|-------------|---------|
@@ -30,6 +30,8 @@ uvicorn app.main:app --reload --port 8081
 | `GET /api/v1/scene/templates` | listSceneTemplates | 内置模板清单（17 个叶子场景，实车回放无预置模板），分类/类型过滤 |
 | `POST /api/v1/scene/export` | exportScenes | Carla ScenarioRunner XML / OpenSCENARIO 1.2 → MinIO `hunter-scene-assets` + 预签名 900s |
 | `POST /api/v1/scene/{scene_id}/run` | runScene | 4.4 节 ①②③④⑤：校验 → 创建实例 → 下发配置 → 返回 sim_instance_id |
+| `GET /api/v1/scene/simulations/{sim_instance_id}` | getSimulationProgress | 4.4 节第⑥步（G-20①）：无状态代理 Carla，进度字段宽松透传，缺失置 null；RBAC scene:read |
+| `GET /api/v1/scene/simulations/{sim_instance_id}/result` | getSimulationResult | 4.4 节第⑦步（G-20①）：仅终态可查（非终态 3003）；object_key 产物换发预签名 900s；RBAC scene:read |
 
 运维端点：`GET /healthz`、`GET /readyz`、`GET /metrics`（契约 ops_endpoints）。
 
@@ -57,7 +59,7 @@ app/
 
 | 契约 | 内容 |
 |------|------|
-| `contracts/openapi/scene-service.yaml` | 10 个业务端点 + 会话/错误/分页组件 + `x-hunter-*` 机器可校验扩展字段 |
+| `contracts/openapi/scene-service.yaml` | 12 个业务端点（含 G-20① 仿真进度/结果查询）+ 会话/错误/分页组件 + `x-hunter-*` 机器可校验扩展字段 |
 | `contracts/kafka/schemas/analytics_result.schema.json` | 唯一消费消息（实车场景自动提取，4.5 节） |
 | `contracts/database/ddl/02_scene.sql` | `scene_svc.scenes`（元信息列 + `config_json`，软删除） |
 
@@ -67,14 +69,16 @@ app/
 ## 测试
 
 ```bash
-cd services/scene-service && pytest -q          # 100 项（契约 29 + 端点 42 + 服务层 15 + 消费者 10 + 健康探针 4）
+cd services/scene-service && pytest -q          # 108 项（契约 29 + 端点 50 + 服务层 15 + 消费者 10 + 健康探针 4）
 python -m pytest services/scene-service -q      # 仓库根目录同样可运行
 ```
 
 ## ⚠ 待人工确认（契约 `x-hunter-pending-confirmation`，12 项）
 
-`scene_type` 编码值、4.4 节第 6/7 步端点缺口、`archived` 无归档端点、导出返回形式与批量语义、
-`version` 递增策略、Carla 管理 API 键名与子路径（`CARLA_INSTANCE_*`/`CARLA_SCENARIO_SUBMIT_PATH`）与上限、
+`scene_type` 编码值、~~4.4 节第 6/7 步端点缺口~~（已决策 G-20①：仿真进度/结果查询端点已交付）、
+`archived` 无归档端点、导出返回形式与批量语义、
+`version` 递增策略、Carla 管理 API 键名与子路径（`CARLA_INSTANCE_*`，含 G-20① 新增的
+`CARLA_INSTANCE_GET_PATH`/`CARLA_INSTANCE_RESULT_PATH`）与上限、
 实车提取触发源（`analytics_result` vs `event_raw`）、模板数据来源（当前为内置静态清单）、weather 取值范围。
 实现侧已把上述决策点全部**环境变量化**，确认后仅调整配置即可，无需改代码。
 

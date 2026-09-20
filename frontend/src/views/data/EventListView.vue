@@ -49,7 +49,7 @@ const eventTotal = ref(0)
 const eventLoading = ref(false)
 const acknowledgingId = ref<number | null>(null)
 
-/** 事件类型选项（受控词表 18 种） */
+/** 事件类型选项（受控词表 19 种） */
 const eventTypeOptions = computed(() =>
   Object.entries(EVENT_TYPE_LABELS).map(([value, label]) => ({
     value,

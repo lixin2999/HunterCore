@@ -13,7 +13,7 @@ from uuid import UUID
 from hunter_common.database import DatabaseSessionManager
 from hunter_common.database.enums import OtaTaskStatus
 from hunter_common.database.models import OtaTask
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -97,5 +97,31 @@ class OtaTaskRepository:
         session.add(task)
         await session.flush()
 
+    async def list_for_scheduler(self, *, now: float) -> list[tuple[UUID, OtaTaskStatus]]:
+        """灰度调度候选批量取数（单次查询，G-14；避免逐任务轮询）：
 
-# ---- 后续方法（part 2 追加） ----
+        - ``running``：待评估「推进下一批 / 暂停 / 完成」；
+        - ``created|pending_approval`` 且 ``schedule.mode=scheduled`` 且 ``start_time <= now``：
+          到点待启动首批（契约 §start 第 5 步：scheduled 由服务内调度器到点执行）。
+
+        返回 ``(task_id, status)``；行锁与权威状态在各任务事务内以 ``get_for_update`` 重读，
+        此处仅为候选集（无并发推进风险，推进受行锁 + 状态机校验保护）。
+        """
+        running = OtaTask.status == OtaTaskStatus.RUNNING
+        due_scheduled = and_(
+            OtaTask.status.in_([OtaTaskStatus.CREATED, OtaTaskStatus.PENDING_APPROVAL]),
+            OtaTask.schedule["mode"].as_string() == "scheduled",
+            OtaTask.schedule["start_time"].as_float() <= now,
+        )
+        async with self._db.session() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(OtaTask.task_id, OtaTask.status).where(
+                            or_(running, due_scheduled)
+                        ).order_by(OtaTask.create_time.asc())
+                    )
+                )
+                .all()
+            )
+            return [(row.task_id, row.status) for row in rows]

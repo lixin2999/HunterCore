@@ -50,6 +50,11 @@ class Settings(HunterBaseConfig):
     # 副本崩溃/未走 DELETE 时残留会话会永久占用车辆互斥位（后续接管恒 7001）
     rc_session_ttl_s: int = 21600
 
+    # ---------- 地理围栏（G-11；契约 x-hunter-geofence） ----------
+    # GPS 定位新鲜度上限：vehicle:status.lat_lng_at 距今超过该值视为定位陈旧 → 3003 拒绝接管
+    # （与 data-collector VEHICLE_OFFLINE_THRESHOLD_SECONDS 同源，默认 10s；生产经 ConfigMap 对齐）
+    rc_geofence_position_max_age_s: int = 10
+
     # ---------- 会话信令（Kafka command 通道；pending #17 取值域未定稿，经配置注入） ----------
     rc_command_session_start_type: str = "rc_session_start"
     rc_command_session_end_type: str = "rc_session_end"
@@ -105,6 +110,23 @@ class Settings(HunterBaseConfig):
     rc_session_create_rate_limit_per_min: int = 1
     rate_limit_window_seconds: int = 60
 
+    # ---------- WS 控制/信令通道（G-09；契约 x-hunter-websocket-contract） ----------
+    # 握手 JWT 校验（网关签发 Access Token 共享 JWT_SECRET_KEY；issuer 与设计文档 3.2.2 一致）
+    jwt_issuer: str = "hunter-platform"
+    # 决策 G-24/#20①：浏览器经 Sec-WebSocket-Protocol 子协议承载 Token
+    # （"hunter-jwt, <token>" 或 "hunter-jwt.<token>"）；非浏览器客户端支持 Authorization 头
+    ws_jwt_subprotocol: str = "hunter-jwt"
+    ws_handshake_rate_limit_per_min: int = 60  # WS 握手 1 QPS/用户（契约 x-hunter-rate-limits）
+    ws_uplink_max_bytes: int = 8192            # 单帧上限（SDP 数 KB，超限丢弃防放大）
+
+    # ---------- command_result 回执消费（WS ack 下行；pending #16 近似关联，禁逐条精确） ----------
+    rc_command_result_group_id: str = "remote-control-command-result"
+    rc_command_result_subscribe_pattern: str = "^hunter\\..*\\.command_result$"
+    rc_command_result_consumer_enabled: bool = True
+
+    # ---------- 信令中继（浏览器→车端经 command topic；#17 模式经配置注入取值域） ----------
+    rc_signal_relay_command_type: str = "rc_signal_relay"
+
     # ---------- 角色集合属性 ----------
     @property
     def rc_read_role_set(self) -> set[str]:
@@ -144,6 +166,8 @@ class Settings(HunterBaseConfig):
             raise ValueError("rc_max_speed_mps 必须满足 0 < v ≤ 2.0（远程操控限速，不可上调）")
         if not 0 < self.rc_command_ack_timeout_ms <= 100:
             raise ValueError("rc_command_ack_timeout_ms 必须满足 0 < t ≤ 100ms")
+        if self.rc_max_command_rate_hz < self.rc_command_hz:
+            raise ValueError("rc_max_command_rate_hz 不得低于 rc_command_hz（超频丢弃阈值须 ≥ 标称帧率）")
         if self.rc_session_lock_ttl_s != 30:
             raise ValueError("rc_session_lock_ttl_s 固定为 30s（契约 x-hunter-control-safety）")
         if self.rc_heartbeat_interval_s != 10:

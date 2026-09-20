@@ -2,7 +2,7 @@
 
 契约依据：
 - Redis 键模式 ``session:{user_id}``（redis-keys.yaml 第 1 条）：String 值为
-  JWT Access Token 原样存储，TTL 7200s，owner/writer/reader = api-gateway
+  JWT Access Token 原样存储，TTL 1800s（G-04① 收紧），owner/writer/reader = api-gateway
 - 强依赖规则（redis-keys.yaml common_rules）：session 键不可用时必须返回
   HTTP 503 + code=5001，**禁止降级为无会话模式**
 - 撤销语义（redis-keys.yaml pending #6 选项②）：不引入黑名单键，以

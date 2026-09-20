@@ -29,8 +29,8 @@ API 网关：统一接入、JWT 认证鉴权、五级限流熔断、路由转发
 
 - **口令**：bcrypt 哈希（`user_svc.users.password_hash`；轮次 `PASSWORD_BCRYPT_ROUNDS=12`）
 - **JWT**（设计文档 3.2.2 节）：载荷 `sub/username/roles/permissions/iat/exp/iss/jti`；
-  Access 2h + Refresh 7d；算法白名单（`HS256`），`iss=hunter-platform`
-- **会话**：Redis `session:{user_id}` = Access Token 原样存储，TTL 7200s
+  Access 30min（G-04 决策①收紧，原 2h）+ Refresh 7d；算法白名单（`HS256`），`iss=hunter-platform`
+- **会话**：Redis `session:{user_id}` = Access Token 原样存储，TTL 1800s
   （redis-keys.yaml 第 1 条，owner=api-gateway）；**强依赖** —— Redis 不可用统一 503 + code=5001，禁止降级
 - **撤销语义**（redis-keys.yaml pending #6 选项②）：不引入黑名单键 —— 登录写入 / 刷新覆盖 /
   登出 DEL 会话；`get_current_user` 校验「会话存在且与当前 Token 全等」，旧 Token 即刻失效

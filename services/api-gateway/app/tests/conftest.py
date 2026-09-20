@@ -89,6 +89,7 @@ class FakeUserRepository:
         roles: list[str] | None = None,
         permissions: list[str] | None = None,
         real_name: str | None = None,
+        must_change_password: bool = False,
     ) -> UUID:
         user_id = uuid4()
         self.users[username] = {
@@ -100,6 +101,7 @@ class FakeUserRepository:
             "roles": list(roles or []),
             "permissions": list(permissions or []),
             "real_name": real_name,
+            "must_change_password": must_change_password,
         }
         return user_id
 
@@ -125,6 +127,18 @@ class FakeUserRepository:
     async def get_real_name(self, user_id: UUID) -> str | None:
         record = self._find(user_id)
         return record["real_name"] if record else None
+
+    async def get_security_flags(self, user_id: UUID) -> tuple[str | None, bool] | None:
+        record = self._find(user_id)
+        if record is None:
+            return None
+        return record["real_name"], bool(record["must_change_password"])
+
+    async def change_password(self, user_id: UUID, password_hash: str) -> None:
+        record = self._find(user_id)
+        assert record is not None
+        record["password_hash"] = password_hash
+        record["must_change_password"] = False
 
     def _find(self, user_id: UUID) -> dict[str, Any] | None:
         for record in self.users.values():
@@ -157,7 +171,7 @@ def make_access_token(
 
 async def seed_session(fake_redis: FakeRedis, token: str, user_id: str) -> None:
     """写入会话（登录等价物），供 get_current_user 严格校验使用。"""
-    await fake_redis.set(session_key(user_id), token, expire_seconds=7200)
+    await fake_redis.set(session_key(user_id), token, expire_seconds=1800)  # G-04①（30min）
 
 
 @pytest.fixture()

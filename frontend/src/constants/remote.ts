@@ -85,7 +85,8 @@ export const WS_SIGNAL_TYPES = {
 
 /**
  * WebSocket 子协议名（握手阶段以 Sec-WebSocket-Protocol 承载 JWT）
- * ⚠ 契约 pending #20：Token 传送方式（Authorization 头 / 子协议 / 首帧认证）待人工确认；
- * 浏览器无法自定义握手头，当前采用「子协议携带」方案，禁止查询串明文携带 Token。
+ * 契约 remote-control pending #20 已定稿（决策①）：浏览器以子协议承载——
+ * 双值形态 `hunter-jwt, <token>`（服务端回显 hunter-jwt），拼装见 utils/websocket
+ * hunterJwtProtocols()；非浏览器客户端可用 Authorization 头；禁止查询串明文携带 Token。
  */
 export const WS_JWT_SUBPROTOCOL = 'hunter-jwt'

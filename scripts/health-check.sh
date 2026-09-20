@@ -13,6 +13,7 @@
 #   ⑤ Redis：redis-cli PING        ⑥ Kafka：Topic 数 ≥6
 #   ⑦ MinIO：Bucket 数 ≥7          ⑧ 磁盘：/data 使用率（>85% WARN，>95% FAIL）
 #   ⑨ 内存使用率（>90% WARN）      ⑩ Kafka 消费积压：data-collector-telemetry LAG（>10000 WARN）
+#   ⑪ 配置漂移硬闸（G-03）：docker-compose.override.yml 存在即 FAIL（HUNTER_ALLOW_OVERRIDE=1 降为 WARN）
 #
 # 用法：
 #   sudo bash scripts/health-check.sh [选项]
@@ -398,8 +399,22 @@ check_kafka_lag() {
   return 0
 }
 
-# run_all_health_checks：执行全部 10 类检查（供 daily-check 与 main 复用）
+# ⑪ 配置漂移硬闸（G-03）：override 会被 compose 静默合并（TLS/端口/资源降级），生产禁止
+check_compose_override() {
+  local override="${APP_DIR}/docker-compose.override.yml"
+  if [ ! -f "$override" ]; then
+    record_result "PASS" "配置漂移（G-03）" "无 docker-compose.override.yml（生产编排未被静默降级）"
+  elif [ "${HUNTER_ALLOW_OVERRIDE:-0}" = "1" ]; then
+    record_result "WARN" "配置漂移（G-03）" "存在 override 且 HUNTER_ALLOW_OVERRIDE=1 放行（仅限联调，需书面豁免）"
+  else
+    record_result "FAIL" "配置漂移（G-03）" "存在 ${override}：compose 将静默合并降级配置，生产必须移除"
+  fi
+  return 0
+}
+
+# run_all_health_checks：执行全部 11 类检查（供 daily-check 与 main 复用）
 run_all_health_checks() {
+  check_compose_override
   check_containers
   check_http_endpoints
   check_databases

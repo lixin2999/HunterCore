@@ -114,7 +114,7 @@ psql_value() {
 extra_checks() {
   local critical_count connections max_conn restarts name dir size
 
-  # ② 最近 24 小时 critical 事件数（契约：18 种事件类型，阈值不可放宽）
+  # ② 最近 24 小时 critical 事件数（契约：19 种事件类型，阈值不可放宽）
   if docker inspect "hunter-postgres" >/dev/null 2>&1; then
     critical_count="$(psql_value "SELECT count(*) FROM data_collector.events WHERE event_level='critical' AND event_time > NOW() - INTERVAL '24 hours';")"
     if [ -z "$critical_count" ]; then

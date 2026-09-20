@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://hunter-core.local/contracts/kafka/schemas/remote_control.schema.json",
   "title": "HunterCore 远程操控指令 hunter.{vehicle_id}.remote_control",
-  "description": "平台→车远程操控指令（20Hz，即 50ms 间隔，acks=all，key=vehicle_id）。生产者：remote-control；消费者：车端。安全约束：车端 >500ms 未收到控制指令必须自动减速停车；远程操控模式最高速度默认 2.0 m/s（可配置）；同一车辆同一时刻仅允许一名操作员（Redis rc:session:{vehicle_id} 互斥）。",
+  "description": "平台→车远程操控指令（20Hz，即 50ms 间隔，acks=all，key=vehicle_id）。生产者：remote-control；消费者：车端。安全约束：车端 >500ms 未收到控制指令必须自动减速停车；远程操控模式最高速度默认 2.0 m/s（可配置）；同一车辆同一时刻仅允许一名操作员（Redis rc:session:{vehicle_id} 互斥）。G-10 修订：control 段新增可选字段 brake/gear/mode（不加入 required，旧消息保持兼容）；顶层契约化 type/video/reason（收对会话 boot/stop 帧的既有扩展字段偏离，车端按 type+heartbeat 区分帧类别）。",
   "type": "object",
   "additionalProperties": false,
   "required": ["vehicle_id", "timestamp", "seq", "control"],
@@ -11,6 +11,11 @@
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
       "description": "受控车辆（Kafka 消息 key）"
+    },
+    "type": {
+      "type": "string",
+      "const": "remote_control",
+      "description": "帧类型标识（G-10 契约化：控制/心跳/boot/stop 帧统一为 remote_control，车端据此 + heartbeat 区分帧类别；可选，未携带按控制帧处理）"
     },
     "timestamp": {
       "type": "number",
@@ -45,13 +50,55 @@
         "target_steer": {
           "type": "number",
           "description": "目标前轮转角 rad（符号：正为左转，量程由底盘标定，服务端需做限幅）"
+        },
+        "brake": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "归一化制动请求 0~1（G-10 可选；常规控制帧省略，estop 零速帧固定 1.0；车端比例制动映射与消费排期见 remote-control.yaml pending #21）"
+        },
+        "gear": {
+          "type": ["string", "null"],
+          "enum": ["P", "R", "N", "D", null],
+          "description": "目标档位（G-10 可选；词表与 health.schema.json gear 一致；null = 无换挡请求，boot/stop 零值帧恒 null）"
+        },
+        "mode": {
+          "type": ["string", "null"],
+          "description": "操控模式标识（G-10 预留字段；值域未与车端定稿，见 pending #21；平台当前不下发，车端收到未识别值应忽略）"
         }
       }
     },
     "heartbeat": {
       "type": "boolean",
       "default": false,
-      "description": "心跳包标记：控制量无变化时仍以 20Hz 发送，用于保持操控链路与超时保护计时"
+      "description": "心跳包标记：控制量无变化时仍以 20Hz 发送，用于保持操控链路与超时保护计时；boot 帧 true / stop 帧 false（会话建立/释放通知，控制量恒零值）"
+    },
+    "video": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "视频配置/录像控制（G-10 契约化：仅 boot/stop 帧携带——boot 全量配置 + recording=true 起录像机，stop recording=false 停录像并进入封装上传；20Hz 控制帧不携带）",
+      "properties": {
+        "recording": {
+          "type": "boolean",
+          "description": "车端录像机起停请求（boot=true / stop=false）"
+        },
+        "webrtc_ready": {
+          "type": "boolean",
+          "description": "平台侧 WebRTC 通道就绪标记"
+        },
+        "width": { "type": "integer", "const": 1280 },
+        "height": { "type": "integer", "const": 720 },
+        "fps": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "codec": { "type": "string", "const": "h264" },
+        "bitrate_kbps": { "type": "integer", "minimum": 2048, "maximum": 4096 },
+        "keyframe_interval_s": { "type": "integer", "const": 1 }
+      }
+    },
+    "reason": {
+      "type": ["string", "null"],
+      "enum": ["operator_end", "heartbeat_timeout", "command_timeout", "video_lost",
+               "vehicle_offline", "vehicle_fault", "admin_terminate", "server_shutdown", null],
+      "description": "会话结束原因（G-10 契约化：仅 stop 帧携带，取值 = SessionEndReason 受控词表，与 x-hunter-session-lifecycle 归档 sidecar.end_reason 一致）"
     }
   },
   "examples": [
@@ -70,8 +117,17 @@
       "seq": 8802,
       "session_id": "9c8b7a65-4d3e-2f10-9a8b-7c6d5e4f3a2b",
       "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
-      "control": {"target_velocity": 1.2, "target_steer": 0.05},
+      "control": {"target_velocity": 1.2, "target_steer": 0.05, "gear": "D", "brake": 0.2},
       "heartbeat": true
+    },
+    {
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035200.223,
+      "seq": 8803,
+      "session_id": "9c8b7a65-4d3e-2f10-9a8b-7c6d5e4f3a2b",
+      "operator_id": "0b6c1b7e-8f2a-4d3e-9a11-2b3c4d5e6f70",
+      "control": {"target_velocity": 0.0, "target_steer": 0.0, "brake": 1.0, "gear": "N"},
+      "heartbeat": false
     }
   ]
 }

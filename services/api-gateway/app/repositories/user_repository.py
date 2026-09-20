@@ -73,3 +73,28 @@ class UserRepository:
                 select(User.real_name).where(User.user_id == user_id)
             )
             return result.scalar_one_or_none()
+
+    async def get_security_flags(self, user_id: UUID) -> tuple[str | None, bool] | None:
+        """查询安全相关字段（real_name + G-06 首登强制改密标志；用户不存在返回 None）。
+
+        旧库未迁移时 `must_change_password` 可能为 None，降级为 False（不阻断 /me）。
+        """
+        async with self._db.session() as session:
+            result = await session.execute(
+                select(User.real_name, User.must_change_password).where(
+                    User.user_id == user_id
+                )
+            )
+            row = result.one_or_none()
+            if row is None:
+                return None
+            return row[0], bool(row[1])
+
+    async def change_password(self, user_id: UUID, password_hash: str) -> None:
+        """更新口令哈希并复位首登强制改密标志（G-06 /user/change-password 写路径）。"""
+        async with self._db.session() as session:
+            await session.execute(
+                update(User)
+                .where(User.user_id == user_id)
+                .values(password_hash=password_hash, must_change_password=False)
+            )

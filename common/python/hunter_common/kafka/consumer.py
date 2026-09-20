@@ -170,8 +170,17 @@ class KafkaConsumerManager:
                     "sasl.password": config.kafka_sasl_password,
                 }
             )
-        if config.kafka_security_protocol in ("SSL", "SASL_SSL") and config.kafka_ssl_cafile:
-            conf["ssl.ca.location"] = config.kafka_ssl_cafile
+        if config.kafka_security_protocol in ("SSL", "SASL_SSL"):
+            # 严格 mTLS（设计文档 3.2.3/14.2，G-01）：broker ssl.client.auth=required
+            # 时必须出示客户端证书/私钥，否则握手失败
+            if config.kafka_ssl_cafile:
+                conf["ssl.ca.location"] = config.kafka_ssl_cafile
+            if config.kafka_ssl_certfile:
+                conf["ssl.certificate.location"] = config.kafka_ssl_certfile
+            if config.kafka_ssl_keyfile:
+                conf["ssl.key.location"] = config.kafka_ssl_keyfile
+            if config.kafka_ssl_keypassword:
+                conf["ssl.key.password"] = config.kafka_ssl_keypassword
         return conf
 
     # ---------- 消费主循环 ----------

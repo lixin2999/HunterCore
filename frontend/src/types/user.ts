@@ -23,6 +23,14 @@ export interface LogoutRequest {
   refresh_token?: string | null
 }
 
+/** 改密请求（POST /api/v1/user/change-password；G-06 首登强制改密） */
+export interface ChangePasswordRequest {
+  /** 当前口令（writeOnly，仅提交不落盘） */
+  old_password: string
+  /** 新口令：≥8 位且含大写、小写、数字（契约 pattern） */
+  new_password: string
+}
+
 /** 用户档案（TokenPair.user 与 GET /api/v1/user/me 共用） */
 export interface UserProfile {
   user_id: string
@@ -32,6 +40,8 @@ export interface UserProfile {
   roles: string[]
   /** 资源动作权限串（如 scene:write、remote:execute） */
   permissions?: string[]
+  /** G-06 首登强制改密标志；true 时布局层弹改密对话框引导改密 */
+  must_change_password?: boolean
 }
 
 /** 令牌对（POST /api/v1/user/login|refresh 响应 data） */

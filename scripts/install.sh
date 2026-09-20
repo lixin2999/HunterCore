@@ -61,7 +61,7 @@ UFW_RULES=(
   "80/tcp:web-portal (Nginx)"
   "8080/tcp:api-gateway"
   "9000/tcp:MinIO S3 API"
-  "9001/tcp:MinIO Console"
+  # G-07：MinIO Console 不再对外（仅 127.0.0.1:9001，SSH 隧道访问），不检查/不开放 9001
   "9093/tcp:Kafka SASL_SSL (vehicle)"
   "1935/tcp:SRS RTMP"
   "8000/udp:SRS WebRTC"
@@ -959,6 +959,7 @@ step_7_start_middleware() {
   env_file="${ENV_FILE_ARG:-${HUNTER_ENV_FILE:-${APP_DIR}/.env}}"
   load_env "$env_file" || return 1
   require_compose_file || return 1
+  require_no_production_override || return 1   # G-03 硬闸：首个 compose 动作前拦截 override 降级
 
   # 7.1 PostgreSQL 15（含 TimescaleDB 扩展，契约单实例形态；docs/01 §1.4①⑧）
   hc_run_logged "启动 postgres" compose up -d postgres || return 1
@@ -1074,6 +1075,7 @@ step_11_start_services() {
   env_file="${ENV_FILE_ARG:-${HUNTER_ENV_FILE:-${APP_DIR}/.env}}"
   load_env "$env_file" || return 1
   require_compose_file || return 1
+  require_no_production_override || return 1   # G-03 硬闸（与 step_7 双保险）
 
   gateway_port="${API_GATEWAY_PORT:-8080}"
   scene_port="${SCENE_SERVICE_PORT:-8081}"
@@ -1145,16 +1147,14 @@ step_12_health_check() {
 # =====================================================================
 # Step 13：输出部署摘要
 # =====================================================================
-# 从 init-data.sql 提取默认管理员口令（初始值，登录后必须修改）
+# G-06：admin 初始口令展示（不再存在固定默认口令 Hunter@2025）：
+# 取 .env 的 ADMIN_PASSWORD（gen-passwords.sh 随机生成）；未生成时提示重置路径
 detect_admin_password() {
-  local sql="" pw=""
-  for sql in "${APP_DIR}/sql/init-data.sql" "${APP_DIR}/infra/deploy/sql/init-data.sql"; do
-    if [ -f "$sql" ]; then
-      pw="$(grep -oE '默认值对应初始口令：[^ 　]+' "$sql" | head -n1 | sed 's/.*：//' || true)"
-      break
-    fi
-  done
-  printf '%s' "${pw:-Hunter@2025}"
+  if [ -n "${ADMIN_PASSWORD:-}" ] && [ "${ADMIN_PASSWORD}" != "CHANGE_ME_ADMIN_PASSWORD" ]; then
+    printf '%s' "${ADMIN_PASSWORD}"
+  else
+    printf '%s' "（随机口令见 ${PASSWORDS_FILE:-passwords.txt} 的 ADMIN_PASSWORD；若未生成则 admin 为禁用态，需运维重置）"
+  fi
 }
 
 step_13_print_summary() {
@@ -1175,7 +1175,7 @@ step_13_print_summary() {
   printf '%s\n' "  Flink 控制台 : $(flink_ui_url)/   (仅 127.0.0.1，需 SSH 隧道)"
   printf '%s\n' "  SRS HTTP API : $(srs_health_url)   (仅 127.0.0.1)"
   printf '%s\n' "  Kafka 车端接 : ${server_ip}:9093 (SASL_SSL + SCRAM-SHA-512)"
-  printf '%s\n' "  默认管理员   : admin / ${admin_pass}   ⚠ 首次登录后必须立即修改"
+  printf '%s\n' "  默认管理员   : admin / ${admin_pass}   ⚠ G-06：无固定默认口令；首次登录强制改密"
   printf '%s\n' "----------------------------------------------------------"
   printf '%s\n' "  配置文件     : ${env_file}（600）、${APP_DIR}/config/（nginx/daemon）"
   printf '%s\n' "  口令清单     : ${PASSWORDS_FILE}（600，请立即离线保存）"
@@ -1187,7 +1187,7 @@ step_13_print_summary() {
   printf '%s\n' "    1) 登录前端修改 admin 口令，并创建业务账号/车辆台账（HUNTER-001 仅为验证车辆）"
   printf '%s\n' "    2) 运行健康检查与巡检：bash ${HEALTH_CHECK_SH} ｜ bash ${DAILY_CHECK_SH}"
   printf '%s\n' "    3) 车端接入：配置 Kafka SASL_SSL(9093) 客户端证书与 SCRAM 账号，Topic 前缀 hunter.{vehicle_id}.*"
-  printf '%s\n' "    4) 生产环境务必启用 HTTPS/WSS（域名 + TLS 1.3）与 MinIO Console 内网访问限制"
+  printf '%s\n' "    4) 生产环境务必启用 HTTPS/WSS（域名 + TLS 1.3）；MinIO Console 已绑 127.0.0.1，运维经 SSH 隧道访问"
   printf '%s\n' "${C_GREEN}==========================================================${C_RESET}"
   log_success "部署摘要已输出，完整日志：${LOG_FILE}"
 }

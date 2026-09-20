@@ -41,7 +41,7 @@ INGRESS = ROOT / "infra" / "k8s" / "ingress.yaml"
 DDL_SCENE = ROOT / "contracts" / "database" / "ddl" / "02_scene.sql"
 ENUMS_DOC = ROOT / "contracts" / "database" / "enums.md"
 
-#: 设计文档 12.2 节 scene-service 端点（方法大写 + 契约路径）
+#: 设计文档 12.2 节 scene-service 端点（方法大写 + 契约路径）+ 决策 G-20① 新增的仿真进度/结果查询
 EXPECTED_ENDPOINTS: set[tuple[str, str]] = {
     ("GET", "/api/v1/scene"),
     ("GET", "/api/v1/scene/{scene_id}"),
@@ -53,6 +53,8 @@ EXPECTED_ENDPOINTS: set[tuple[str, str]] = {
     ("POST", "/api/v1/scene/export"),
     ("POST", "/api/v1/scene/{scene_id}/run"),
     ("GET", "/api/v1/scene/templates"),
+    ("GET", "/api/v1/scene/simulations/{sim_instance_id}"),
+    ("GET", "/api/v1/scene/simulations/{sim_instance_id}/result"),
 }
 
 #: 运维端点（K8s 探针 / Prometheus 抓取）
@@ -229,7 +231,7 @@ def test_every_operation_declares_tags_and_success_response(contract: dict[str, 
 
 
 def test_business_endpoints_match_design_doc_12_2(contract: dict[str, Any]) -> None:
-    """业务端点必须与设计文档 12.2 节逐条一致（禁止擅自增删）。"""
+    """业务端点必须与设计文档 12.2 节逐条一致（G-20① 决策新增的仿真查询端点除外）。"""
     declared = {
         (method, path)
         for method, path, _ in iter_operations(contract)

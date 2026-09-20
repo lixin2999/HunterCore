@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from hunter_common.config import HunterBaseConfig
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 
 class Settings(HunterBaseConfig):
@@ -33,8 +33,10 @@ class Settings(HunterBaseConfig):
     ota_canary_stages: str = "5,20,50,100"
     ota_canary_observe_hours: int = 24
     ota_canary_min_success_rate: float = 0.95
-    # 灰度调度器扫描周期（观察窗口到期判定 + 批次推进）
+    # 灰度调度器扫描周期（观察窗口到期判定 + 批次推进；契约 OTA_ROLLOUT_TICK_SECONDS）
     ota_rollout_tick_seconds: int = 60
+    # 灰度自动调度器总开关（x-hunter-canary-rollout.scheduler；单机/测试可关闭，默认启用）
+    rollout_scheduler_enabled: bool = True
     # 单任务目标车辆上限（防误操作全量下发；超限 2001）
     ota_task_max_target_vehicles: int = 1000
 
@@ -48,6 +50,8 @@ class Settings(HunterBaseConfig):
     ota_offline_fallback_enabled: bool = False
 
     # ---------- 发布校验开关（x-hunter-ota-security：生产禁止关闭，仅 DEBUG 联调可关） ----------
+    # ⚠ G-05：staging/prod 下关闭任一开关或缺验签公钥 → 启动 fail-fast（见下方 model_validator），
+    #   杜绝“OTA_PACKAGE_VERIFY_* = false 上线 → 恶意/篡改升级包直推车端”路径
     ota_package_verify_sha256: bool = True
     ota_package_verify_signature: bool = True
     # RSA-2048 验签公钥（PEM；由 hunter-app-secrets 注入；私钥仅存发布方 CI/KMS）
@@ -105,6 +109,31 @@ class Settings(HunterBaseConfig):
                 "如需调整须先修改 contracts/openapi/ota-service.yaml"
             )
         return value
+
+    @model_validator(mode="after")
+    def _require_package_verification_in_production(self) -> Settings:
+        """G-05（x-hunter-ota-security，设计文档 7.2.4/14.3）：发布校验生产不可关闭。
+
+        staging/prod 下：SHA-256/签名验证任一被关或验签公钥缺失 → 启动即失败；
+        dev/test 保留关闭能力供联调（上传接口校验失败仅 2001，不阻断开发）。
+        """
+        if self.environment not in ("staging", "prod"):
+            return self
+        disabled: list[str] = []
+        if not self.ota_package_verify_sha256:
+            disabled.append("OTA_PACKAGE_VERIFY_SHA256=false")
+        if not self.ota_package_verify_signature:
+            disabled.append("OTA_PACKAGE_VERIFY_SIGNATURE=false")
+        if not self.ota_signature_public_key.strip():
+            disabled.append("OTA_SIGNATURE_PUBLIC_KEY 未注入（验签无公钥可用）")
+        if disabled:
+            raise ValueError(
+                "生产环境（environment={}）禁止降级升级包校验：{}；"
+                "校验开关仅允许在 dev/test 联调使用（契约 x-hunter-ota-security）".format(
+                    self.environment, "、".join(disabled)
+                )
+            )
+        return self
 
     @property
     def ota_read_role_set(self) -> frozenset[str]:

@@ -23,7 +23,7 @@ MINIO_K8S_INIT = ROOT / "infra" / "k8s" / "jobs" / "minio-init-job.yaml"
 
 #: Redis 受控键（键模式 → (类型, TTL 秒)；None = 不过期）——系统关键约束第 8 条
 EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
-    "session:{user_id}": ("String", 7200),
+    "session:{user_id}": ("String", 1800),  # G-04① 收紧（原系统约束第 8 条 7200）
     "vehicle:status:{vehicle_id}": ("Hash", None),
     "vehicle:online:set": ("Set", None),
     "rate_limit:{ip}:{api}": ("String", 60),
@@ -36,7 +36,7 @@ EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
 #: MinIO Bucket（名称 → 过期天数；None = 永久）——系统关键约束第 7 条（名称不可更改）
 EXPECTED_BUCKETS: dict[str, int | None] = {
     "hunter-raw-data": 30,
-    "hunter-rosbag": 30,  # 前缀级规则：regular/ 30 天、events/ 永久
+    "hunter-rosbag": 30,  # Tag 级规则（G-12）：hunter-retention=regular 30 天、event 永久
     "hunter-video": 90,
     "hunter-ota-packages": None,
     "hunter-reports": None,
@@ -44,8 +44,11 @@ EXPECTED_BUCKETS: dict[str, int | None] = {
     "hunter-scene-assets": None,
 }
 
-#: hunter-rosbag 前缀级生命周期（前缀 → 过期天数；None = 无过期规则）
-EXPECTED_ROSBAG_PREFIX_DAYS: dict[str, int | None] = {"regular/": 30, "events/": None}
+#: hunter-rosbag Tag 级生命周期（G-12：对象 Tag 选择器 → 过期天数；None = 无过期规则）
+EXPECTED_ROSBAG_TAG_DAYS: dict[str, int | None] = {
+    "hunter-retention=regular": 30,
+    "hunter-retention=event": None,
+}
 
 #: 预签名 URL 有效期（系统关键约束第 7 条：上传 1 小时 / 下载 15 分钟）
 EXPECTED_PRESIGN: dict[str, int] = {
@@ -133,11 +136,11 @@ def collect_presign_ttls(node: Any, in_presign: bool = False) -> list[int]:
 
 
 def parse_minio_script(text: str) -> tuple[set[str], dict[str, list[tuple[int, str | None]]]]:
-    """解析 MinIO 初始化脚本：create_bucket 集合 + add_expiry 规则（bucket → [(天数, 前缀)]）。"""
+    """解析 MinIO 初始化脚本：create_bucket 集合 + add_expiry 规则（bucket → [(天数, 选择器)]）。"""
     created = set(MINIO_CREATE_BUCKET_RE.findall(text))
     rules: dict[str, list[tuple[int, str | None]]] = {}
-    for bucket, days, prefix in MINIO_ADD_EXPIRY_RE.findall(text):
-        rules.setdefault(bucket, []).append((int(days), prefix or None))
+    for bucket, days, selector in MINIO_ADD_EXPIRY_RE.findall(text):
+        rules.setdefault(bucket, []).append((int(days), selector or None))
     return created, rules
 
 
@@ -146,7 +149,7 @@ def expected_expiry_rules() -> dict[str, list[tuple[int, str | None]]]:
         name: ([] if days is None else [(days, None)]) for name, days in EXPECTED_BUCKETS.items()
     }
     rules["hunter-rosbag"] = [
-        (days, prefix) for prefix, days in EXPECTED_ROSBAG_PREFIX_DAYS.items() if days is not None
+        (days, tag) for tag, days in EXPECTED_ROSBAG_TAG_DAYS.items() if days is not None
     ]
     return rules
 def test_redis_contract_keys_and_ttls_match_constraints() -> None:
@@ -230,8 +233,13 @@ def test_object_storage_bucket_contract_values() -> None:
             assert expected_days is None, name
             assert lifecycle["expire_days"] is None, name
         elif lifecycle["mode"] == "mixed":
-            rules = {str(rule["prefix"]): rule["expire_days"] for rule in lifecycle["rules"]}
-            assert rules == EXPECTED_ROSBAG_PREFIX_DAYS, name
+            rules = {str(rule["tags"]): rule["expire_days"] for rule in lifecycle["rules"]}
+            assert rules == EXPECTED_ROSBAG_TAG_DAYS, name
+            assert lifecycle.get("selector") == "tags", name
+            tagging = lifecycle.get("tagging") or {}
+            assert tagging.get("key") == "hunter-retention", name
+            assert set(tagging.get("values") or ()) == {"regular", "event"}, name
+            assert tagging.get("applied_by") and tagging.get("untagged_semantics"), name
         else:  # pragma: no cover - 契约已限定 mode 取值
             raise AssertionError(f"{name} 非法生命周期 mode={lifecycle['mode']}")
 
@@ -303,7 +311,8 @@ def test_storage_contracts_track_open_conflicts() -> None:
         for item in items:
             assert set(item) == {"id", "question", "impact", "contract_decision"}, f"{name}: {item}"
             assert item["impact"] and item["contract_decision"], f"{name} #{item['id']}"
-    # rosbag 前缀语义冲突（regular/ 30 天 vs 5.5 命名规范无该段）必须留痕且标记阻塞
+    # rosbag 前缀语义冲突必须留痕：原阻塞冲突已由 G-12 按 Tag 生命周期定稿（方案 c）
     items = storage_contract()["x-hunter-pending-confirmation"]["items"]
     rosbag = next(item for item in items if "rosbag" in item["question"])
     assert "regular/" in rosbag["question"] and "阻塞" in rosbag["impact"]
+    assert "hunter-retention" in rosbag["contract_decision"]

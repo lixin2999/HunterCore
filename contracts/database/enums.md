@@ -25,7 +25,7 @@
 | `warning` | 告警 | `EventLevel.WARNING` |
 | `critical` | 严重 | `EventLevel.CRITICAL` |
 
-## 3. 事件类型 `EventType`（events.event_type，18 种；触发阈值不可更改）
+## 3. 事件类型 `EventType`（events.event_type，19 种；触发阈值不可更改）
 
 | 值 | 等级 | 触发条件（设计文档） |
 |----|------|---------------------|
@@ -33,6 +33,7 @@
 | `harsh_braking` | warning | 减速度 > 3 m/s² |
 | `harsh_turning` | warning | 横摆角速度 > 0.8 rad/s |
 | `over_speed` | critical | 超速 > 10% |
+| `collision_pre_warning` | warning | TTC < 3.0 s（G-22② 新增：低一级的碰撞预警） |
 | `collision_warning` | critical | TTC < 1.5 s |
 | `manual_takeover` | info | 人工接管 |
 | `emergency_stop` | critical | 紧急停车 |
@@ -50,6 +51,9 @@
 
 > 等级映射由 `EventLevelForType`（`enums.py`）提供，落库前校验事件类型与等级组合；
 > 表中等级为契约值，任何代码放宽阈值或改等级视为契约违规。
+>
+> G-22② 决策：`collision_pre_warning`（warning，TTC<3.0s）与 `collision_warning`（critical，TTC<1.5s）
+> 分级，消解设计文档 6.2.3 节 3.0s 预警与旧受控词表的等级冲突（见 data-analytics 契约 pending #3 结案）。
 
 ## 4. OTA 状态机 `OtaStatus` / `OtaPhase`（ota_records.status / ota_records.phase / Kafka ota_status）
 
@@ -67,6 +71,21 @@
 | `ROLLBACK` | 回滚中（A/B 分区切回） | 否 |
 | `ROLLED_BACK` | 已回滚 | 是 |
 | `FAILED` | 升级失败 | 是 |
+
+车端升级状态（OtaStatus）之外，版本仓库另有独立状态机 `OtaVersionStatus`（ota_versions.status，
+G-18 决策②定稿，设计文档 §7.2.2 审核流）：
+
+流转（不可更改）：`draft → testing → reviewing → published → deprecated / disabled`；
+`reviewing` 审核驳回回退 `draft`；发布（publish）前置状态仅 `reviewing`。
+
+| 值 | 含义 | 是否终态 |
+|----|------|---------|
+| `draft` | 草稿（已创建待直传升级包） | 否 |
+| `testing` | 测试中（包已直传，待提交审核） | 否 |
+| `reviewing` | 审核中（待发布批准/驳回） | 否 |
+| `published` | 已发布（可被升级任务引用） | 否 |
+| `deprecated` | 已废弃（历史可查，不可再下发） | 是 |
+| `disabled` | 已停用（紧急止血，不可再下发） | 是 |
 
 ## 5. 算法模块 `MetricModule`（algorithm_metrics.module）
 
@@ -111,7 +130,7 @@
 |------|------|--------|
 | `scenes.scene_type` | TEXT，无 CHECK | 场景分类枚举值 |
 | `ota_versions.release_type` | TEXT，无 CHECK | 发布类型枚举值 |
-| `ota_versions.status` | CHECK：draft/published/deprecated/disabled | 是否与设计文档一致 |
+| `ota_versions.status` | 已定稿（G-18②）：CHECK 六值 draft/testing/reviewing/published/deprecated/disabled，见 §4 | — |
 | `data_collector.vehicle_telemetry.control_mode` | TEXT（遥测示例值 `CAN`） | 完整取值域 |
 | `data_collector.vehicle_telemetry.vehicle_state` | TEXT（遥测示例值 `NORMAL`，与车辆 8 态状态定义不同域） | 完整取值域 |
 

@@ -136,7 +136,12 @@ openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -out tls.crt -days 825 -extensions v3_req -extfile kafka-san.cnf
 
 kubectl -n hunter-core create secret generic hunter-kafka-tls \
-  --from-file=ca.crt=ca.crt --from-file=tls.crt=tls.crt --from-file=tls.key=tls.key
+  --from-file=ca.crt=ca.crt --from-file=tls.crt=tls.crt --from-file=tls.key=tls.key \
+  --from-file=client.crt=client.crt --from-file=client.key=client.key
+# mTLS（ssl.client.auth=required，G-01）：另用同一 CA 签发平台客户端证书（CN=hunter-platform-client）：
+#   openssl req -new -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=hunter-platform-client"
+#   openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 825
+# 各服务经共享 ConfigMap 的 KAFKA_SSL_CERTFILE/KEYFILE 指向挂载点 /etc/hunter/kafka-tls/client.{crt,key}
 
 # 3.3 MinIO 证书（SAN 含 minio.hunter-core.svc / minio-0..3.minio-headless）
 kubectl -n hunter-core create secret tls hunter-minio-tls \
@@ -238,7 +243,7 @@ broker 首次启动执行 `kafka-storage.sh format --add-scram` 时以
 | Kafka Pod `CrashLoopBackOff` | 证书 SAN 与 Pod DNS 不匹配、`KRAFT_CLUSTER_ID` 不一致、PVC 权限（fsGroup 1001） |
 | Kafka init Job 失败 | broker 未就绪（Job 内置 5 分钟等待）、SCRAM 凭据与 broker 初始用户不一致 |
 | MinIO init Job 失败 | 集群在线节点 < 3（纠删码可读阈值）；`MC_OPTS=--insecure` 仅用于自签证书 |
-| 服务连不上 Kafka | 应用需配置 `KAFKA_SSL_CAFILE`；如需严格 mTLS 需补 `KAFKA_SSL_CERTFILE/KEYFILE` 配置项 |
+| 服务连不上 Kafka | 严格 mTLS（`ssl.client.auth=required`）下需配 `KAFKA_SSL_CAFILE/CERTFILE/KEYFILE`（hunter-kafka-tls Secret 挂载），缺客户端证书会报 SSL 握手失败 |
 | 服务 `/readyz` 返回 503 | 数据库/Redis 不可达（内部 2s 超时保护），检查中间件与网络策略 |
 | 容器无 shell 无法排查 | 使用 `kubectl debug -it --image=busybox --target=<container>` 注入临时容器 |
 | Pod `ImagePullBackOff`（镜像名含 `{version}`） | 直接 apply 了 `infra/k8s/` 源清单；先 `python scripts/render_k8s.py --version <版本>` 再 apply `build/k8s/` |

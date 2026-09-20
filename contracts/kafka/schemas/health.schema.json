@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://hunter-core.local/contracts/kafka/schemas/health.schema.json",
   "title": "HunterCore 系统健康消息 hunter.{vehicle_id}.health",
-  "description": "车辆系统健康数据（1Hz，acks=0）。生产者：车端；消费者：data-collector（写 Redis vehicle:status:{vehicle_id} / vehicle:online:set，不落明细表）。status 取值 = 车辆状态定义（8 态，不可更改）；system 段字段与遥测消息 system 段完全一致（复用采集代码）。⚠ 磁盘/服务进程等扩展健康字段待设计文档 5.3 节核对。",
+  "description": "车辆系统健康数据（1Hz，acks=0）。生产者：车端；消费者：data-collector（写 Redis vehicle:status:{vehicle_id} / vehicle:online:set，不落明细表）。status 取值 = 车辆状态定义（8 态，不可更改）；system 段字段与遥测消息 system 段完全一致（复用采集代码）。G-08（决策①）：新增 `gear`（底盘档位，OTA P 档静止门禁）与 `free_storage_mb`（磁盘可用空间，OTA 存储门禁）两个**顶层**可选字段（需车端排期上报；未上报时 data-collector 不写入该 field，OTA 门禁缺数据即拒绝，保持安全默认），不放入 system 段以维持与遥测 system 一致性。G-11（§8.4.2 地理围栏）：新增 `lat`/`lng` 顶层可选 GPS 定位字段（WGS84 度；围栏接管门禁判定输入；同模式需车端排期，未上报时配置了围栏的车辆拒绝创建会话——安全默认；遥测 localization 为地图坐标系 x/y，不承担全球定位语义）。",
   "type": "object",
   "additionalProperties": false,
   "required": ["vehicle_id", "timestamp", "status", "system"],
@@ -21,6 +21,28 @@
       "enum": ["offline", "online_idle", "auto_driving", "remote_controlled",
                "upgrading", "charging", "fault", "emergency"],
       "description": "车辆业务状态（8 态，不可新增/更改）"
+    },
+    "gear": {
+      "type": "string",
+      "enum": ["P", "R", "N", "D"],
+      "description": "底盘档位（G-08；OTA 升级/回滚门禁 P 档静止判定。可选：车端排期上报，未上报则门禁缺数据即拒绝）"
+    },
+    "free_storage_mb": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "车端磁盘可用空间 MB（G-08；OTA 存储门禁 ≥ 2048MB。可选：车端排期上报）"
+    },
+    "lat": {
+      "type": "number",
+      "minimum": -90,
+      "maximum": 90,
+      "description": "GPS 纬度（WGS84 度；G-11 地理围栏判定输入。可选：车端排期上报；未上报则配置围栏的车辆拒绝接管——安全默认）"
+    },
+    "lng": {
+      "type": "number",
+      "minimum": -180,
+      "maximum": 180,
+      "description": "GPS 经度（WGS84 度；G-11 地理围栏判定输入；与 lat 成对上报，缺一即视为无定位）"
     },
     "system": {
       "type": "object",
@@ -42,6 +64,10 @@
       "vehicle_id": "HUNTER-001",
       "timestamp": 1724035201.0,
       "status": "auto_driving",
+      "gear": "D",
+      "free_storage_mb": 8192,
+      "lat": 31.230416,
+      "lng": 121.473701,
       "system": {
         "cpu_usage": 45.2, "gpu_usage": 62.8, "memory_usage_mb": 18500,
         "gpu_temp": 68.5, "cpu_temp": 65.2, "network_rssi": -65, "network_latency_ms": 45

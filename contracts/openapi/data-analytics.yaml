@@ -23,11 +23,11 @@
 #    禁止擅自新增端点 / 字段 / Topic / 错误码 / 阈值）：
 #   1) 报告与 Corner Case 元信息无 DB 表（contracts/database 无 reports 表）
 #   2) 报告生成必为异步（PDF/HTML 渲染远超 P95 ≤ 200ms）→ 报告状态枚举与查询语义待确认
-#   3) 6.2.3 节「TTC < 3.0s 碰撞预警(warning)」与受控词表 collision_warning(critical) 等级冲突
+#   3) 【已消解 G-22②】6.2.3 节「TTC < 3.0s 碰撞预警(warning)」与 collision_warning(critical) 等级冲突→新增事件类型 collision_pre_warning（warning，TTC<3.0s）分级
 #   4) 告警消费方（platform-alert-event）落位服务待定
 #   5) 数据质量监控（6.2.5）阈值与结果落位未定义
 #   6) 感知精度评估的「真值」来源（人工标注 / 仿真真值）未定义
-#   全量清单见文末 x-hunter-pending-confirmation（12 项）
+#   全量清单见文末 x-hunter-pending-confirmation（13 项）
 # =====================================================================
 openapi: 3.0.3
 
@@ -501,7 +501,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        控制台用户 JWT Access Token（2 小时），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
+        控制台用户 JWT Access Token（30 分钟，G-04① 收紧），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
         载荷结构（3.2.2 节）：`sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` /
         `iss="hunter-platform"` / `jti`。服务侧按 RBAC 资源域 `analytics`（action ∈ read/execute）复核：
         查询类端点需 `analytics:read`，报告生成需 `analytics:execute`。
@@ -1035,7 +1035,7 @@ components:
         by_type:
           type: object
           additionalProperties: { type: integer }
-          description: 按事件类型分布（18 种受控类型）
+          description: 按事件类型分布（19 种受控类型）
 
     DashboardData:
       type: object
@@ -1351,7 +1351,7 @@ components:
         trigger_event_type:
           type: string
           nullable: true
-          description: 关联的受控事件类型（18 种之一，如 harsh_braking / collision_warning；无则为 null）
+          description: 关联的受控事件类型（19 种之一，如 harsh_braking / collision_warning / collision_pre_warning；无则为 null）
         description:
           type: string
           nullable: true
@@ -1435,7 +1435,7 @@ x-hunter-service:
   minio_buckets: [hunter-reports, hunter-rosbag, hunter-raw-data]
   minio_bucket_lifecycle:
     hunter-reports: "永久保留（分析报告，6.5 节）"
-    hunter-rosbag: "事件数据永久，常规 30 天"
+    hunter-rosbag: "按对象 Tag 区分：hunter-retention=regular 30 天过期；event 永久（G-12）"
     hunter-raw-data: "30 天自动删除"
   redis_keys:
     note: "仅读取既有键（Redis Key 设计不可更改，禁止新增键模式）"
@@ -1623,6 +1623,7 @@ x-hunter-realtime-jobs:
           level: critical
       outputs: [alert_event]
       note: "阈值与等级取自「事件类型定义」（contracts/database/enums.md 第 3 节），代码不得放宽或改等级"
+      input_note: "over_speed 需要限速输入：telemetry.schema.json 无 speed_limit 字段（来源见 pending #13）；无限速输入时作业跳过该规则（禁止自造默认限速），可选环境变量 ALERT_OVER_SPEED_LIMIT_MPS 注入固定限速"
 
     - name: algorithm_performance_monitor
       section: "6.2 节（算法性能监控）"
@@ -1647,9 +1648,9 @@ x-hunter-realtime-jobs:
       logic:
         - "TTC = d / v_rel（d 为本车与前方目标距离，v_rel 为相对速度，仅 v_rel > 0 时有效）"
         - "TTC < ALERT_COLLISION_TTC_CRITICAL_SECONDS(1.5s) → alert_type=collision_warning（critical，投 alert_event）"
-        - "TTC < ALERT_COLLISION_TTC_WARNING_SECONDS(3.0s) → 预警：写 analytics_result(result_type=metric, metrics.min_ttc) 与 algorithm_metrics"
+        - "ALERT_COLLISION_TTC_WARNING_SECONDS(1.5s≤TTC<3.0s) → alert_type=collision_pre_warning（warning，投 alert_event）；同时写 analytics_result(result_type=metric, metrics.min_ttc) 与 algorithm_metrics"
       outputs: [alert_event, analytics_result, algorithm_metrics]
-      conflict_note: "⚠ 6.2.3 节 3.0s 预警（warning）与受控词表 collision_warning=critical 冲突：契约不新增事件类型、不放宽等级，故 3.0s 预警不投 alert_event（见 pending #3）"
+      conflict_note: "✓ 冲突已消解（G-22②）：新增事件类型 collision_pre_warning（warning，TTC<3.0s），与 collision_warning（critical，TTC<1.5s）分级；两档均投 alert_event（见 pending #3 结案）"
 
     - name: data_quality_monitor
       section: "6.2.5"
@@ -1709,7 +1710,7 @@ x-hunter-realtime-jobs:
     - name: ALERT_COLLISION_TTC_WARNING_SECONDS
       value: 3.0
       unit: s
-      source: "6.2.3 节：TTC < 3.0s 碰撞预警（⚠ 等级冲突见 pending #3）"
+      source: "6.2.3 节：TTC < 3.0s 碰撞预警（G-22② 已新增 collision_pre_warning，等级冲突已消解）"
     - name: ALGORITHM_METRICS_WINDOW_SECONDS
       value: 60
       unit: s
@@ -1993,6 +1994,7 @@ x-hunter-alert-contract:
       harsh_braking: warning
       harsh_turning: warning
       over_speed: critical
+      collision_pre_warning: warning
       collision_warning: critical
       manual_takeover: info
       emergency_stop: critical
@@ -2010,7 +2012,7 @@ x-hunter-alert-contract:
   emitted_types:
     - "vehicle_state_monitor → communication_loss"
     - "driving_anomaly_detection → harsh_acceleration / harsh_braking / harsh_turning / over_speed / battery_low / battery_critical"
-    - "collision_risk_assessment → collision_warning"
+    - "collision_risk_assessment → collision_warning（TTC<1.5s、critical） / collision_pre_warning（1.5s≤TTC<3.0s、warning）"
     - "algorithm_performance_monitor / data_quality_monitor → 不投 alert_event（指标类输出，见各作业 outputs）"
   not_emitted:
     - "manual_takeover / emergency_stop / *_fault / ota_* ：由车端上报（hunter.{vehicle_id}.event → data-collector），平台侧不重算"
@@ -2147,8 +2149,8 @@ x-hunter-pending-confirmation:
 
     - id: 3
       question: "6.2.3 节「TTC < 3.0s 碰撞预警(warning)」与受控词表 collision_warning(critical) 等级冲突"
-      contract_decision: "不放宽受控词表、不新增事件类型：alert_event.level 必须 = EVENT_LEVEL_BY_TYPE[alert_type]；3.0s 预警改写入 analytics_result(result_type=metric, metrics.min_ttc) 与 algorithm_metrics，不投 alert_event"
-      impact: "告警条数与前端告警中心口径；若设计文档确认 3.0s 必须告警，需先在 enums.md/DDL CHECK/ORM 扩展事件类型（或新增告警等级域）再实现"
+      contract_decision: "【已结案 G-22②】新增独立事件类型 collision_pre_warning（warning，TTC<3.0s），与 collision_warning（critical，TTC<1.5s）分级；两档均投 alert_event（collision_pre_warning 已同步入 enums.md/DDL CHECK/ORM/event+alert_event+analytics_result schema/data-collector+data-analytics 契约）"
+      impact: "事件受控词表由 18 种扩展为 19 种（全局契约）；Flink collision_risk_assessment 作业按 TTC 双档分发；告警中心新增 warning 级碰撞预警展示"
 
     - id: 4
       question: "alert_event 消费方「告警处理」落位服务（consumer-groups.yaml 的 platform-alert-event 标注待定）"
@@ -2194,3 +2196,8 @@ x-hunter-pending-confirmation:
       question: "consumer-groups.yaml 的 data-analytics 消费组契约修正（原 data-analytics-telemetry 订阅 telemetry_raw 且声明生产 telemetry_clean，与 topics.yaml「telemetry_clean 生产者 = data-collector」冲突；原 data-analytics-telemetry-clean 与之重复消费同一 Topic）"
       contract_decision: "按 6.2 节作业输入归并为 4 组：telemetry_clean → data-analytics-telemetry（4 作业）、telemetry_raw → data-analytics-telemetry-raw（数据质量监控）、event_raw → data-analytics-events、sensor_file → data-analytics-sensor-file；不再声明本服务生产 telemetry_clean"
       impact: "实时分析作业的 Topic 订阅与消费位点（独立 offset 才可对比原始/清洗数据）；若设计文档另有归属（如 data-analytics 负责清洗）需回改 topics.yaml 与两侧契约"
+
+    - id: 13
+      question: "over_speed 规则的限速数据来源（6.2.2 节「速度 > 限速 × 1.1」，但 telemetry.schema.json 无 speed_limit/道路限速字段，亦无地图/限速服务契约）"
+      contract_decision: "实现不擅自引入数据源：driving_anomaly_detection 无限速输入时跳过 over_speed 规则（禁止自造默认限速）；过渡期可选环境变量 ALERT_OVER_SPEED_LIMIT_MPS 注入固定限速（x-hunter-realtime-jobs driving_anomaly_detection.input_note）"
+      impact: "over_speed 告警默认不产出（6.2.2 六条规则实际生效五条）；确认来源（车端上报字段 / 地图服务 / 运营配置）后需扩 telemetry Schema 或新增查询依赖并回改契约"

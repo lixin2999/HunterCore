@@ -1,6 +1,7 @@
-"""统一认证路由（契约 paths：/api/v1/user/login|refresh|logout|me）。
+"""统一认证路由（契约 paths：/api/v1/user/login|refresh|logout|me|change-password）。
 
-- operationId 与契约一致（userLogin / userRefreshToken / userLogout / getCurrentUser）
+- operationId 与契约一致（userLogin / userRefreshToken / userLogout / getCurrentUser /
+  userChangePassword）
 - response_model 为契约响应 schema（ApiResponseTokenPair / ApiResponseUserProfile /
   ApiResponseEmpty；统一五字段）
 - 错误映射遵循 x-hunter-error-status-map：1001→401、1003→401、2001→422、
@@ -21,6 +22,7 @@ from app.schemas.auth import (
     ApiResponseEmpty,
     ApiResponseTokenPair,
     ApiResponseUserProfile,
+    ChangePasswordRequest,
     LoginRequest,
     LogoutRequest,
     RefreshTokenRequest,
@@ -124,3 +126,27 @@ async def get_current_user_profile(
     """当前用户（JWT 解析结果 + 用户资料；前端渲染菜单与 v-permission 依据）。"""
     profile = await service.me(claims)
     return success_response(data=profile)
+
+
+@router.post(
+    "/change-password",
+    operation_id="userChangePassword",
+    summary="修改密码（G-06 首登强制改密）",
+    response_model=ApiResponseEmpty,
+    responses={
+        401: {"description": "1001 未认证（旧口令错误/会话失效，统一响应不区分原因）"},
+        422: {"description": "2001 参数错误（新口令强度不符/与旧口令相同）"},
+        500: {"description": "5000 服务器内部错误"},
+    },
+)
+async def user_change_password(
+    payload: ChangePasswordRequest,
+    claims: Annotated[dict[str, Any], Depends(get_current_user)],
+    service: Annotated[AuthService, Depends(get_auth_service)],
+) -> ApiResponseEmpty:
+    """修改密码（G-06：初始化账号 must_change_password=true，首登必须改密）。
+
+    口令明文仅经 TLS 传输，不落日志（字段 writeOnly）；成功后复位标志。
+    """
+    await service.change_password(claims, payload)
+    return success_response(data=None)

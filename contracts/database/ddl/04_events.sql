@@ -2,7 +2,7 @@
 -- HunterCore 数据库契约 — 04 事件
 -- schema：data_collector
 -- 来源：设计文档第 9 章；字段名、类型、约束不可更改
--- 约束：event_type 取值 = 设计文档“事件类型定义”（18 种，触发阈值不可更改）；
+-- 约束：event_type 取值 = 设计文档“事件类型定义”（19 种，触发阈值不可更改；G-22② 新增 collision_pre_warning）；
 --       event_level ∈ (info, warning, critical)
 -- =====================================================================
 
@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS data_collector.events (
     vehicle_id       TEXT        NOT NULL,          -- 逻辑外键 → vehicle_svc.vehicles.vehicle_id
     event_type       TEXT        NOT NULL
         CHECK (event_type IN ('harsh_acceleration', 'harsh_braking', 'harsh_turning', 'over_speed',
-                              'collision_warning', 'manual_takeover', 'emergency_stop', 'battery_low',
+                              'collision_pre_warning', 'collision_warning', 'manual_takeover', 'emergency_stop', 'battery_low',
                               'battery_critical', 'communication_loss', 'sensor_fault', 'perception_fault',
                               'planning_fault', 'control_fault', 'ota_start', 'ota_success',
                               'ota_failed', 'ota_rollback')),

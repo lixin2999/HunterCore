@@ -167,7 +167,7 @@ def test_event_schema_enums_match_code_contract() -> None:
     schema = load_schema("event.schema.json")
     assert set(schema["properties"]["event_type"]["enum"]) == {t.value for t in EventType}
     assert set(schema["properties"]["event_level"]["enum"]) == {level.value for level in EventLevel}
-    assert len(schema["properties"]["event_type"]["enum"]) == 18
+    assert len(schema["properties"]["event_type"]["enum"]) == 19
 
 
 def test_ota_status_schema_matches_state_machine() -> None:
@@ -188,11 +188,24 @@ def test_health_schema_status_matches_vehicle_states() -> None:
 
 
 def test_remote_control_schema_safety_constraints() -> None:
-    """远程操控安全约束：20Hz + 速度上限 2.0 m/s + 序号单调 + 心跳标记。"""
+    """远程操控安全约束：20Hz + 速度上限 2.0 m/s + 序号单调 + 心跳标记 + G-10 可选控制量。"""
+    jsonschema = pytest.importorskip("jsonschema")
     schema = load_schema("remote_control.schema.json")
     assert schema["properties"]["control"]["properties"]["target_velocity"]["maximum"] == 2.0
     assert schema["properties"]["heartbeat"]["default"] is False
     assert "seq" in schema["required"]
+    # G-10：brake/gear/mode 契约化为 control 可选字段（required 不变，旧消息保持兼容）
+    assert set(schema["properties"]["control"]["required"]) == {"target_velocity", "target_steer"}
+    control = schema["properties"]["control"]["properties"]
+    assert {"brake", "gear", "mode"} <= set(control)
+    assert (control["brake"]["minimum"], control["brake"]["maximum"]) == (0, 1)
+    # gear 词表必须与 health.schema.json 一致（同一底盘档位受控词表）
+    health = load_schema("health.schema.json")
+    assert {g for g in control["gear"]["enum"] if g is not None} == set(health["properties"]["gear"]["enum"])
+    # 顶层 type/video/reason 已契约化（boot/stop 帧收对，additionalProperties=false 仍成立）
+    assert {"type", "video", "reason"} <= set(schema["properties"])
+    for example in schema["examples"]:
+        jsonschema.validate(example, schema)
     topics = load_yaml(KAFKA_DIR / "topics.yaml")
     vehicle = {entry["name"]: entry for entry in topics["vehicle_topics"]}
     assert vehicle["hunter.{vehicle_id}.remote_control"]["frequency"] == "20Hz"
@@ -241,7 +254,7 @@ def test_analytics_result_schema_matches_scene_extraction_contract() -> None:
     properties = schema["properties"]
 
     assert set(properties["result_type"]["enum"]) == {"metric", "corner_case", "report"}
-    # 触发事件类型必须取自受控词表（contracts/database/enums.md 第 3 节，18 种）
+    # 触发事件类型必须取自受控词表（contracts/database/enums.md 第 3 节，19 种）
     trigger_enum = set(properties["trigger_event_type"]["enum"])
     assert trigger_enum <= {event_type.value for event_type in EventType}
     assert {"harsh_braking", "collision_warning", "manual_takeover"} <= trigger_enum, (

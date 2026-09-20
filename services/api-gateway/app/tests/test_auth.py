@@ -17,6 +17,7 @@ LOGIN = "/api/v1/user/login"
 REFRESH = "/api/v1/user/refresh"
 LOGOUT = "/api/v1/user/logout"
 ME = "/api/v1/user/me"
+CHANGE_PASSWORD = "/api/v1/user/change-password"
 RESPONSE_FIELDS = {"code", "message", "data", "request_id", "timestamp"}
 
 
@@ -34,7 +35,7 @@ async def test_login_success_returns_token_pair(
     assert body["code"] == 0
     data = body["data"]
     assert data["token_type"] == "Bearer"
-    assert data["expires_in"] == 7200           # Access 2h（契约 example 7200）
+    assert data["expires_in"] == 1800           # Access 30min（契约 example 1800，G-04①）
     assert data["refresh_expires_in"] == 604800  # Refresh 7d（契约 example 604800）
     user = data["user"]
     assert user["username"] == "admin"
@@ -274,3 +275,99 @@ async def test_refresh_after_logout_rejected(client: AsyncClient) -> None:
     resp = await client.post(REFRESH, json={"refresh_token": data["refresh_token"]})
     assert resp.status_code == 401
     assert resp.json()["code"] == 1003
+
+
+# =====================================================================
+# G-06 首登强制改密（must_change_password 贯穿 + /user/change-password）
+# =====================================================================
+async def test_login_returns_must_change_password_flag(
+    client: AsyncClient, fake_users: FakeUserRepository
+) -> None:
+    """初始化账号登录：TokenPair.user.must_change_password=true（前端据此引导改密）。"""
+    fake_users.add_user(
+        username="bootstrap_admin", password="Init@12345", roles=["admin"],
+        must_change_password=True,
+    )
+    resp = await client.post(LOGIN, json={"username": "bootstrap_admin", "password": "Init@12345"})
+    assert resp.status_code == 200
+    user = resp.json()["data"]["user"]
+    assert user["must_change_password"] is True
+    # 存量账号默认 False（不影响普通用户）
+    normal = await client.post(LOGIN, json={"username": "admin", "password": "Admin@12345"})
+    assert normal.json()["data"]["user"]["must_change_password"] is False
+
+
+async def test_me_returns_must_change_password(client: AsyncClient) -> None:
+    """/me 从 DB 读标志（非 JWT 载荷；改密后复查可验证复位）。"""
+    login = await client.post(LOGIN, json={"username": "admin", "password": "Admin@12345"})
+    headers = {"Authorization": f"Bearer {login.json()['data']['access_token']}"}
+    resp = await client.get(ME, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["data"]["must_change_password"] is False
+
+
+async def test_change_password_flow(client: AsyncClient, fake_users: FakeUserRepository) -> None:
+    """首登改密全流程：旧口令错误 1001 → 强度不符 422 → 相同口令 422 → 成功后
+    新口令可登录、标志复位、旧口令失效；当前会话不强制撤销。"""
+    fake_users.add_user(
+        username="bootstrap_admin", password="Init@12345", roles=["admin"],
+        must_change_password=True,
+    )
+    login = await client.post(LOGIN, json={"username": "bootstrap_admin", "password": "Init@12345"})
+    assert login.json()["data"]["user"]["must_change_password"] is True
+    headers = {"Authorization": f"Bearer {login.json()['data']['access_token']}"}
+
+    # 旧口令错误 → 1001（统一认证失败，不泄露原因）
+    bad_old = await client.post(
+        CHANGE_PASSWORD, headers=headers,
+        json={"old_password": "Wrong@12345", "new_password": "NewPass@12345"},
+    )
+    assert bad_old.status_code == 401
+    assert bad_old.json()["code"] == 1001
+
+    # 新口令强度不符（无大写）→ 422 + 2001
+    weak = await client.post(
+        CHANGE_PASSWORD, headers=headers,
+        json={"old_password": "Init@12345", "new_password": "alllowercase1"},
+    )
+    assert weak.status_code == 422
+    assert weak.json()["code"] == 2001
+
+    # 新旧相同 → 422 + 2001
+    same = await client.post(
+        CHANGE_PASSWORD, headers=headers,
+        json={"old_password": "Init@12345", "new_password": "Init@12345"},
+    )
+    assert same.status_code == 422
+    assert same.json()["code"] == 2001
+
+    # 改密成功：data=null，五字段统一响应
+    ok = await client.post(
+        CHANGE_PASSWORD, headers=headers,
+        json={"old_password": "Init@12345", "new_password": "NewPass@12345"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["code"] == 0
+    assert ok.json()["data"] is None
+
+    # 当前会话未强制撤销（契约：改密不强制重登；/me 仍为改密后标志 False）
+    me_after = await client.get(ME, headers=headers)
+    assert me_after.status_code == 200
+    assert me_after.json()["data"]["must_change_password"] is False
+
+    # 新口令可登录且标志复位；旧口令失效（注意：单值会话下重新登录会覆盖旧 Token）
+    relogin = await client.post(LOGIN, json={"username": "bootstrap_admin", "password": "NewPass@12345"})
+    assert relogin.status_code == 200
+    assert relogin.json()["data"]["user"]["must_change_password"] is False
+    stale = await client.post(LOGIN, json={"username": "bootstrap_admin", "password": "Init@12345"})
+    assert stale.status_code == 401
+
+
+async def test_change_password_without_token_401(client: AsyncClient) -> None:
+    """未携带 Bearer → 401 + 1001（契约 security: bearerAuth）。"""
+    resp = await client.post(
+        CHANGE_PASSWORD,
+        json={"old_password": "Admin@12345", "new_password": "NewPass@12345"},
+    )
+    assert resp.status_code == 401
+    assert resp.json()["code"] == 1001

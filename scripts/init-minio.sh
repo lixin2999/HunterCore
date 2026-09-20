@@ -7,7 +7,7 @@
 #
 #   Bucket                生命周期
 #   hunter-raw-data       30 天自动删除（传感器原始数据：点云/图像）
-#   hunter-rosbag         常规数据 regular/ 前缀 30 天；事件数据 events/ 前缀永久（不设规则）
+#   hunter-rosbag         按对象 Tag 区分（G-12）：hunter-retention=regular 30 天；event 永久（不设规则）
 #   hunter-video          90 天（远程操控录像）
 #   hunter-ota-packages   永久（版本管理）
 #   hunter-reports        永久（分析报告）
@@ -43,10 +43,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE_ARG=""
 SKIP_LIFECYCLE=0
 EXPECTED_BUCKETS=7
-# Bucket 定义（名称:过期天数:前缀）—— 天数 0 表示永久（不设生命周期规则）
+# Bucket 定义（名称:过期天数:选择器）—— 天数 0 表示永久（不设生命周期规则）；
+# 选择器为对象 Tag 表达式（hunter-retention=...），不带选择器的为整桶规则
 BUCKET_SPECS=(
   "hunter-raw-data:30:"
-  "hunter-rosbag:30:regular/"
+  "hunter-rosbag:30:hunter-retention=regular"
   "hunter-video:90:"
   "hunter-ota-packages:0:"
   "hunter-reports:0:"
@@ -60,7 +61,7 @@ HunterCore MinIO Bucket 初始化脚本
 
 用途：
   创建 7 个契约 Bucket 并设置生命周期规则（名称与生命周期不可更改）：
-    hunter-raw-data(30d) hunter-rosbag(regular/ 30d) hunter-video(90d)
+    hunter-raw-data(30d) hunter-rosbag(Tag hunter-retention=regular 30d) hunter-video(90d)
     hunter-logs(30d) hunter-ota-packages(永久) hunter-reports(永久) hunter-scene-assets(永久)
 
 用法：
@@ -133,16 +134,16 @@ has_lifecycle_rule() {
   esac
 }
 
-# add_expiry <bucket> <days> [prefix]
+# add_expiry <bucket> <days> [tags]（G-12：rosbag 按对象 Tag 而非前缀区分生命周期）
 add_expiry() {
-  local bucket="$1" days="$2" prefix="${3:-}"
+  local bucket="$1" days="$2" tags="${3:-}"
   if has_lifecycle_rule "$bucket"; then
     log_info "生命周期规则已存在，跳过（幂等）：${bucket}"
     return 0
   fi
-  if [ -n "$prefix" ]; then
-    if minio_mc ilm rule add --expire-days "$days" --prefix "$prefix" "local/${bucket}" >/dev/null 2>&1; then
-      log_success "已设置生命周期：${bucket} 前缀 ${prefix} → ${days} 天过期"
+  if [ -n "$tags" ]; then
+    if minio_mc ilm rule add --expire-days "$days" --tags "$tags" "local/${bucket}" >/dev/null 2>&1; then
+      log_success "已设置生命周期：${bucket} Tag ${tags} → ${days} 天过期"
       return 0
     fi
   else
@@ -151,8 +152,8 @@ add_expiry() {
       return 0
     fi
   fi
-  log_error "设置生命周期失败：${bucket}（${days} 天${prefix:+, prefix=${prefix}}）"
-  log_error "可手工重试：mc ilm rule add --expire-days ${days}${prefix:+ --prefix ${prefix}} local/${bucket}"
+  log_error "设置生命周期失败：${bucket}（${days} 天${tags:+, tags=${tags}}）"
+  log_error "可手工重试：mc ilm rule add --expire-days ${days}${tags:+ --tags ${tags}} local/${bucket}"
   return 1
 }
 
@@ -160,7 +161,7 @@ add_expiry() {
 # 主流程
 # =====================================================================
 main() {
-  local env_file spec bucket days prefix failed=0 bucket_count
+  local env_file spec bucket days tags failed=0 bucket_count
   parse_args "$@"
   hc_log_begin
 
@@ -209,12 +210,12 @@ main() {
     for spec in "${BUCKET_SPECS[@]}"; do
       bucket="${spec%%:*}"
       days="$(printf '%s' "$spec" | cut -d: -f2)"
-      prefix="$(printf '%s' "$spec" | cut -d: -f3)"
+      tags="$(printf '%s' "$spec" | cut -d: -f3)"
       if [ "$days" = "0" ]; then
         log_info "永久保留（不设规则）：${bucket}"
         continue
       fi
-      if ! add_expiry "$bucket" "$days" "$prefix"; then
+      if ! add_expiry "$bucket" "$days" "$tags"; then
         failed=$((failed + 1))
       fi
     done
@@ -237,7 +238,7 @@ main() {
     return 1
   fi
   log_success "MinIO Bucket 与生命周期规则初始化完成"
-  log_warn "hunter-rosbag 的 events/ 前缀为永久保留（不设规则），regular/ 前缀 30 天自动过期"
+  log_warn "hunter-rosbag 按对象 Tag 区分（G-12）：hunter-retention=regular 30 天过期；event/未打标为永久（禁止绕过 data-collector complete 直写）"
   log_warn "预签名 URL 有效期：上传 1 小时 / 下载 15 分钟（由服务侧配置，不在此设置）"
   return 0
 }

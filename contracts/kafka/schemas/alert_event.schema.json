@@ -34,6 +34,7 @@
         "harsh_braking",
         "harsh_turning",
         "over_speed",
+        "collision_pre_warning",
         "collision_warning",
         "manual_takeover",
         "emergency_stop",
@@ -49,11 +50,11 @@
         "ota_failed",
         "ota_rollback"
       ],
-      "description": "告警类型（受控词表：设计文档「事件类型定义」18 种，见 contracts/database/enums.md 第 3 节；禁止新增取值）"
+      "description": "告警类型（受控词表：设计文档「事件类型定义」19 种，见 contracts/database/enums.md 第 3 节；G-22② 新增 collision_pre_warning）"
     },
     "level": {
       "enum": ["info", "warning", "critical"],
-      "description": "告警等级；必须等于 EVENT_LEVEL_BY_TYPE[alert_type]（受控映射，代码不得放宽：harsh_acceleration/harsh_braking/harsh_turning/battery_low/ota_rollback=warning，over_speed/collision_warning/emergency_stop/battery_critical/communication_loss/*_fault/ota_failed=critical，manual_takeover/ota_start/ota_success=info）"
+      "description": "告警等级；必须等于 EVENT_LEVEL_BY_TYPE[alert_type]（受控映射，代码不得放宽：harsh_acceleration/harsh_braking/harsh_turning/battery_low/ota_rollback/collision_pre_warning=warning，over_speed/collision_warning/emergency_stop/battery_critical/communication_loss/*_fault/ota_failed=critical，manual_takeover/ota_start/ota_success=info）"
     },
     "source_job": {
       "enum": [
@@ -110,7 +111,7 @@
         },
         "threshold": {
           "type": "number",
-          "description": "阈值（受控值：3.0 m/s²、0.5 s、0.8 rad/s、超速 1.1 倍、SOC 20%/10%、TTC 1.5 s、中断 10 s 等）"
+          "description": "阈值（受控值：3.0 m/s²、0.5 s、0.8 rad/s、超速 1.1 倍、SOC 20%/10%、TTC 1.5 s（critical）/ 3.0 s（pre-warning）、中断 10 s 等）"
         },
         "duration_seconds": {
           "type": "number",

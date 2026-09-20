@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from fastapi import Depends, Header, Request
 from hunter_common.exceptions import AuthenticationError, PermissionDeniedError
+from hunter_common.internal_auth import verify_identity_headers
 from hunter_common.logging import get_trace_id
 from hunter_common.redis import RedisManager
 
@@ -42,6 +43,7 @@ class OperatorContext:
 
 
 def _require_forwarded_auth(
+    request: Request,
     x_user_id: Annotated[
         str | None,
         Header(alias="X-User-Id", description="api-gateway 注入的已认证用户 ID（JWT sub）"),
@@ -54,6 +56,13 @@ def _require_forwarded_auth(
     """校验网关转发认证头（缺失 → 1001，而非 FastAPI 层 422）。"""
     if not x_user_id or not x_roles:
         raise AuthenticationError(message="未认证：缺少网关注入的 X-User-Id / X-Roles 请求头")
+    # G-02：配置 GATEWAY_HMAC_SECRET 后验身份头签名（防集群内伪造）；未配置（dev/test）跳过保持兼容
+    if settings.gateway_hmac_secret and not verify_identity_headers(
+        settings.gateway_hmac_secret,
+        request.headers,
+        max_age_seconds=settings.gateway_identity_max_age_s,
+    ):
+        raise AuthenticationError(message="未认证：身份头签名缺失或无效（X-Internal-MAC 校验失败）")
     roles = frozenset(role.strip() for role in x_roles.split(",") if role.strip())
     return OperatorContext(user_id=x_user_id, roles=roles)
 

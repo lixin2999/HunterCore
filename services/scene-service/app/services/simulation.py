@@ -1,9 +1,11 @@
-"""场景下发服务（4.4 节 7 步流程的第 1-5 步）。
+"""场景下发服务（4.4 节 7 步流程的第 1-5 步 + ⑥⑦ 查询，决策 G-20①）。
 
 ① 校验配置完整性 + 状态必须 ``published`` → ② 调用 Carla 管理 API 创建仿真实例（失败 5001）→
 ③ 下发场景配置 JSON（``param_overrides`` 白名单深合并）→ ④ Carla 加载地图/参与者/环境 →
 ⑤ 返回 ``sim_instance_id``，状态置 ``running``。
-⑥ 进度监控 / ⑦ 结果保存设计文档未定义端点（契约待确认 #2），本服务不实现、不臆造。
+⑥ 进度监控 / ⑦ 结果查询（G-20①）：无状态代理 Carla 管理 API，平台不落库实例状态；
+Carla 404 → 3001，不可达/响应非法 → 5001；结果仅终态可查（非终态 → 3003），
+产物 object_key 落 hunter-scene-assets 时换发预签名下载 URL（15 分钟，与 4.3 节一致）。
 并行规则（契约 runScene）：同场景已有进行中实例时，``sim_config.allow_parallel=false`` → 3003；
 ``true`` → 复用该实例（不重复创建；此时参数覆盖不再下发，回显为空并记 warning）。
 """
@@ -13,16 +15,23 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from hunter_common.exceptions import InvalidParameterError, ResourceStateConflictError
+from hunter_common.exceptions import (
+    InvalidParameterError,
+    ResourceStateConflictError,
+    ServiceUnavailableError,
+)
 from hunter_common.logging import get_logger
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.repositories.carla import CarlaManagementClient
+from app.repositories.carla import ACTIVE_STATUSES, CarlaManagementClient, SimInstanceSnapshot
 from app.schemas.scene import (
     SceneConfig,
     SceneRunData,
     SceneRunRequest,
+    SimulationArtifact,
+    SimulationProgress,
+    SimulationResult,
     SimulationStatus,
 )
 from app.services.scenes import SceneService
@@ -103,11 +112,17 @@ class SceneSimulationService:
     """场景下发服务（4.4 节；Carla 不可达统一 5001）。"""
 
     def __init__(
-        self, scenes: SceneService, carla: CarlaManagementClient, settings: Settings
+        self,
+        scenes: SceneService,
+        carla: CarlaManagementClient,
+        settings: Settings,
+        storage: Any | None = None,
     ) -> None:
         self._scenes = scenes
         self._carla = carla
         self._settings = settings
+        # 产物预签名用 SceneStorageService（可为 None：未装配时 artifacts 不换发 URL，仅回 object_key）
+        self._storage = storage
 
     async def run_scene(self, scene_id: UUID, payload: SceneRunRequest | None) -> SceneRunData:
         """下发场景到 Carla 仿真并返回仿真实例信息（4.4 节第 1-5 步）。"""
@@ -179,6 +194,143 @@ class SceneSimulationService:
                 f"场景时长超过上限 {limit}s",
                 details={"duration": config.duration, "limit": limit},
             )
+
+    # ---------- ⑥⑦ 仿真进度/结果查询（G-20①，无状态代理） ----------
+
+    async def get_progress(self, sim_instance_id: str) -> SimulationProgress:
+        """查询仿真实例进度（Carla 404 → 3001 已在仓储层处理；字段宽松透传）。"""
+        snapshot = await self._carla.get_instance(sim_instance_id)
+        return SimulationProgress(
+            sim_instance_id=snapshot.instance_id,
+            scene_id=self._as_scene_id(snapshot.data),
+            status=self._as_status(snapshot.status),
+            progress_percent=self._as_number(snapshot.data, ("progress_percent", "progress")),
+            current_time_s=self._as_number(snapshot.data, ("current_time_s", "elapsed_s")),
+            total_time_s=self._as_number(snapshot.data, ("total_time_s", "duration")),
+            message=self._as_text(snapshot.data, ("message", "detail")),
+            updated_at=self._as_datetime(snapshot.data, ("updated_at", "last_update")),
+        )
+
+    async def get_result(self, sim_instance_id: str) -> SimulationResult:
+        """查询仿真实例结果；非终态（pending/running）→ 3003 结果未就绪。"""
+        snapshot = await self._carla.get_result(sim_instance_id)
+        status = self._as_status(snapshot.status)
+        if status.value in ACTIVE_STATUSES:
+            raise ResourceStateConflictError(
+                f"仿真仍在进行（{status.value}），结果未就绪",
+                details={"sim_instance_id": sim_instance_id, "status": status.value},
+            )
+        return SimulationResult(
+            sim_instance_id=snapshot.instance_id,
+            scene_id=self._as_scene_id(snapshot.data),
+            status=status,
+            success=self._as_bool(snapshot.data, ("success",)),
+            success_criteria_result=self._as_object(snapshot.data, ("success_criteria_result",)),
+            message=self._as_text(snapshot.data, ("message", "failure_reason")),
+            artifacts=await self._build_artifacts(snapshot),
+            started_at=self._as_datetime(snapshot.data, ("started_at",)),
+            finished_at=self._as_datetime(snapshot.data, ("finished_at", "ended_at")),
+        )
+
+    async def _build_artifacts(self, snapshot: SimInstanceSnapshot) -> list[SimulationArtifact]:
+        """解析产物清单；object_key 落 hunter-scene-assets 时换发预签名 URL（15 分钟）。"""
+        raw = snapshot.data.get("artifacts") or snapshot.data.get("files") or []
+        if not isinstance(raw, list):
+            logger.warning(
+                "carla_artifacts_shape_unknown", sim_instance_id=snapshot.instance_id
+            )
+            return []
+        artifacts: list[SimulationArtifact] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or entry.get("file_name") or "").strip()
+            if not name:
+                continue
+            object_key = entry.get("object_key") or entry.get("key")
+            size_bytes = entry.get("size_bytes") if isinstance(entry.get("size_bytes"), int) else None
+            download_url: str | None = None
+            expires_in: int | None = None
+            if object_key and self._storage is not None:
+                try:
+                    download_url = await self._storage.presign_download(str(object_key))
+                    expires_in = self._storage.presign_expire_seconds
+                except ServiceUnavailableError:
+                    # 预签名失败降级：仍返回产物元信息，不阻断结果查询
+                    logger.warning(
+                        "carla_artifact_presign_failed",
+                        sim_instance_id=snapshot.instance_id,
+                        object_key=str(object_key),
+                    )
+            artifacts.append(
+                SimulationArtifact(
+                    name=name,
+                    object_key=str(object_key) if object_key else None,
+                    size_bytes=size_bytes,
+                    download_url=download_url,
+                    expires_in=expires_in,
+                )
+            )
+        return artifacts
+
+    # ---------- 内部：Carla 响应宽松解析（⚠ API 形状待确认 #9） ----------
+
+    @staticmethod
+    def _as_scene_id(data: dict[str, Any]) -> UUID | None:
+        raw = data.get("scene_id")
+        if not raw:
+            return None
+        try:
+            return UUID(str(raw))
+        except ValueError:
+            logger.warning("carla_scene_id_invalid", scene_id=str(raw))
+            return None
+
+    @staticmethod
+    def _as_number(data: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+        return None
+
+    @staticmethod
+    def _as_bool(data: dict[str, Any], keys: tuple[str, ...]) -> bool | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, bool):
+                return value
+        return None
+
+    @staticmethod
+    def _as_text(data: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:512]
+        return None
+
+    @staticmethod
+    def _as_object(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any] | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, dict):
+                return value
+        return None
+
+    @staticmethod
+    def _as_datetime(data: dict[str, Any], keys: tuple[str, ...]) -> datetime | None:
+        for key in keys:
+            value = data.get(key)
+            if not value:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(value))
+            except ValueError:
+                logger.warning("carla_timestamp_unparsable", key=key, value=str(value))
+                return None
+            return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        return None
 
     @staticmethod
     def _as_status(raw: str) -> SimulationStatus:
