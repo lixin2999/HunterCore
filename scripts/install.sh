@@ -767,6 +767,52 @@ ensure_required_secret_vars() {
   return "$need_fix"
 }
 
+# REQUIRED_CONFIG_VARS：部署必需的非口令配置变量（格式 VAR=default_value）
+# 变量缺失或值为空时直接填充默认值（与 infra/deploy/.env.example 对齐）；CORS_ORIGINS 特殊处理
+REQUIRED_CONFIG_VARS=(
+  "VERSION=0.1.0"
+  "KAFKA_SASL_USER=hunter-client"
+  "KAFKA_SASL_VEHICLE_USER=hunter-vehicle"
+  "MINIO_ROOT_USER=hunter-admin"
+  "POSTGRES_USER=hunter"
+  "POSTGRES_DB=hunter_core"
+)
+
+# ensure_required_config_vars <env_file>：补全缺失或空值的必需非口令配置变量
+# 返回 0 = 全部正常（无需 gen-passwords.sh）；返回 1 = CORS_ORIGINS 被设为占位符（需 gen-passwords.sh 处理）
+ensure_required_config_vars() {
+  local env_file="$1" kv var val default need_gen=0
+  for kv in "${REQUIRED_CONFIG_VARS[@]}"; do
+    var="${kv%%=*}"
+    default="${kv#*=}"
+    if ! grep -qE "^${var}=" "$env_file"; then
+      printf '%s=%s\n' "$var" "$default" >>"$env_file"
+      log_info "必需配置变量 ${var} 在 .env 中不存在，已填充默认值：${default}"
+    else
+      val="$(grep -E "^${var}=" "$env_file" | head -n1 | sed -E 's/^[^=]+=//' | sed -E 's/[[:space:]]*#.*$//' | tr -d '[:space:]')"
+      if [ -z "$val" ]; then
+        sed -i -E "s|^(${var}=)[^#]*(#.*)?\$|\1${default} \2|" "$env_file"
+        log_info "必需配置变量 ${var} 值为空，已填充默认值：${default}"
+      fi
+    fi
+  done
+  # CORS_ORIGINS：缺失/空值时设为 CHANGE_ME_* 占位（gen-passwords.sh 将根据 SERVER_IP 替换为 http://<SERVER_IP>）
+  local cors_val=""
+  if grep -qE '^CORS_ORIGINS=' "$env_file"; then
+    cors_val="$(grep -E '^CORS_ORIGINS=' "$env_file" | head -n1 | sed -E 's/^[^=]+=//' | sed -E 's/[[:space:]]*#.*$//' | tr -d '[:space:]')"
+  fi
+  if [ -z "$cors_val" ]; then
+    if grep -qE '^CORS_ORIGINS=' "$env_file"; then
+      sed -i -E 's|^(CORS_ORIGINS=)[^#]*(#.*)?$|\1CHANGE_ME_FRONTEND_ORIGIN \2|' "$env_file"
+    else
+      printf 'CORS_ORIGINS=CHANGE_ME_FRONTEND_ORIGIN\n' >>"$env_file"
+    fi
+    log_info "CORS_ORIGINS 缺失或为空，已设为 CHANGE_ME_* 占位（将由 gen-passwords.sh 更新为 http://<SERVER_IP>）"
+    need_gen=1
+  fi
+  return "$need_gen"
+}
+
 # set_env_var_value <file> <VAR> <value>：就地替换 .env 中变量值（保留行尾注释，幂等）
 set_env_var_value() {
   local file="$1" var="$2" value="$3"
@@ -863,12 +909,16 @@ step_4_gen_config() {
     log_success "已复制仓库模板：infra/deploy/.env.example → ${example}"
   fi
 
-  # 4.2 .env 生成（幂等：已存在则仅补全缺失/空值口令变量；CRLF 一律归一为 LF）
+  # 4.2 .env 生成（幂等：已存在则仅补全缺失/空值配置变量和口令；CRLF 一律归一为 LF）
   if [ -f "$env_file" ]; then
     hc_normalize_env_file "$env_file" || return 1
-    # 补全缺失或空值的必需口令变量（修复问题：.env 从旧模板/手动创建时可能不含 KAFKA_SSL_PASSWORD 等）
-    if ! ensure_required_secret_vars "$env_file"; then
-      log_info "检测到 ${env_file} 中有口令变量缺失或为空，调用 gen-passwords.sh 补全随机口令"
+    # 补全缺失/空值的非口令配置变量（直接填默认值；CORS_ORIGINS 设为占位符由 gen-passwords.sh 处理）
+    local _need_gen=0
+    ensure_required_config_vars "$env_file" || _need_gen=1
+    # 补全缺失/空值的必需口令变量（设为 CHANGE_ME_* 占位符）
+    ensure_required_secret_vars "$env_file" || _need_gen=1
+    if [ "$_need_gen" -eq 1 ]; then
+      log_info "检测到 ${env_file} 中有变量需要补全，调用 gen-passwords.sh 生成随机口令并替换占位符"
       if [ -f "$GEN_PASSWORDS_SH" ]; then
         local -a gp_args_fix=()
         if [ -n "$OPT_IP" ]; then
@@ -883,7 +933,7 @@ step_4_gen_config() {
         generate_env_inline "$env_file" || return 1
       fi
     else
-      log_info ".env 已存在且口令完整（${env_file}），跳过生成（幂等）"
+      log_info ".env 已存在且配置完整（${env_file}），跳过生成（幂等）"
       log_info "如需重新生成全部口令：bash ${GEN_PASSWORDS_SH} --force"
     fi
   else

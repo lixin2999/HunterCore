@@ -107,7 +107,7 @@ services:
     deploy:
       resources:
         limits: { cpus: "2", memory: 4G }      # 生产建议 4C/8Gi 并配置主从流复制
-        requests: { cpus: "1", memory: 2G }
+        reservations: { cpus: "1", memory: 2G }  # compose 规范仅支持 limits/reservations（requests 为 K8s 术语，compose v2 不支持）
     # ⚠ 数据库结构由 scripts/init-db.sh 应用 infra/deploy/sql/{schema,timescaledb,init-data}.sql（勿依赖镜像内 init 脚本）
 
   # ---------- 2. Redis 7（会话/缓存/分布式锁/限流；AOF 持久化） ----------
