@@ -115,16 +115,16 @@ require_typed_confirmation() {
 
 # stop_and_remove_compose：停止并删除容器、网络（-v 同时删除匿名卷）
 stop_and_remove_compose() {
-  if [ ! -f "${APP_DIR}/docker-compose.yml" ]; then
-    log_warn "未找到 ${APP_DIR}/docker-compose.yml：跳过 compose 清理（容器可能需手工删除）"
+  if [ ! -f "${APP_DIR}/docker-compose.yml" ] && [ ! -f "${APP_DIR}/infra/deploy/docker-compose.yml" ]; then
+    log_warn "未找到 ${APP_DIR}/docker-compose.yml 或 infra/deploy/docker-compose.yml：跳过 compose 清理（容器可能需手工删除）"
     return 0
   fi
-  log_info "执行 docker compose down -v（停止并删除容器/网络）"
-  if (cd "$APP_DIR" && docker compose down -v --remove-orphans); then
+  log_info "执行 compose down -v（停止并删除容器/网络）"
+  if compose down -v --remove-orphans; then
     log_success "compose 资源已清理"
     return 0
   fi
-  log_warn "docker compose down 返回非 0：请手工核对 docker ps -a | grep hunter"
+  log_warn "compose down 返回非 0：请手工核对 docker ps -a | grep hunter"
   return 0
 }
 

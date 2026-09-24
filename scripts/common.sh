@@ -34,6 +34,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # APP_DIR：应用根目录 —— 服务器上脚本位于 ${APP_DIR}/scripts
 APP_DIR="${HUNTER_APP_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+# HC_COMPOSE_ARGS：docker compose 的 -f / --project-directory 参数
+# 设计意图：当 APP_DIR 是 git 仓根目录（含 infra/deploy/）时，优先使用生产编排（含业务服务 build 段），
+# 避免误用根目录的开发版 docker-compose.yml（导致 Step 6 "No services to build" 等问题）。
+# 纯部署包模式（无 infra/deploy/）则使用 APP_DIR 根目录的 docker-compose.yml，行为不变。
+HC_COMPOSE_ARGS=()
+if [ -f "${APP_DIR}/infra/deploy/docker-compose.yml" ]; then
+  HC_COMPOSE_ARGS=(-f "infra/deploy/docker-compose.yml" "--project-directory" ".")
+fi
 # DATA_DIR：有状态数据根目录（docs/01 §5）
 DATA_DIR="${HUNTER_DATA_DIR:-/data}"
 # LOG_DIR：宿主机侧日志目录；LOG_FILE：脚本日志文件（可用 hc_set_log_file 覆盖）
@@ -403,23 +412,30 @@ C_WEB="hunter-web"
 export C_POSTGRES C_TIMESCALE C_REDIS C_ZOOKEEPER C_KAFKA C_MINIO C_SRS \
   C_FLINK_JM C_FLINK_TM C_API_GATEWAY C_SCENE C_COLLECTOR C_ANALYTICS C_OTA C_REMOTE C_WEB
 
-# compose <args...>：在 APP_DIR 下执行 docker compose（编排文件固定为 ${APP_DIR}/docker-compose.yml）
+# compose <args...>：在 APP_DIR 下执行 docker compose（自动选择生产或部署包编排文件）
 compose() {
-  (cd "$APP_DIR" && docker compose "$@")
+  (cd "$APP_DIR" && docker compose ${HC_COMPOSE_ARGS[@]+"${HC_COMPOSE_ARGS[@]}"} "$@")
 }
 
 # compose_service_exists <service>：编排文件中是否存在该服务（用于可选组件，如独立 timescale）
 compose_service_exists() {
   local service="$1"
-  (cd "$APP_DIR" && docker compose config --services 2>/dev/null) | grep -Fxq "$service"
+  (cd "$APP_DIR" && docker compose ${HC_COMPOSE_ARGS[@]+"${HC_COMPOSE_ARGS[@]}"} config --services 2>/dev/null) | grep -Fxq "$service"
 }
 
-# require_compose_file：编排文件必须存在（infra/deploy/docker-compose.yml 属部署包其余批次）
+# require_compose_file：编排文件必须存在（仓库存放时使用 infra/deploy/，部署包模式使用根目录）
 require_compose_file() {
-  if [ ! -f "${APP_DIR}/docker-compose.yml" ]; then
-    log_error "编排文件缺失：${APP_DIR}/docker-compose.yml"
+  if [ ! -f "${APP_DIR}/docker-compose.yml" ] && \
+     [ ! -f "${APP_DIR}/infra/deploy/docker-compose.yml" ]; then
+    log_error "编排文件缺失：${APP_DIR}/docker-compose.yml 或 ${APP_DIR}/infra/deploy/docker-compose.yml"
     log_error "请先将部署包（infra/deploy/）完整复制到 ${APP_DIR}（docs/01 §5 目录结构、§7-①）"
     return 1
+  fi
+  # 提示：若使用 infra/deploy/ 生产编排，相对路径通过 --project-directory . 解析到 APP_DIR
+  if [ -f "${APP_DIR}/infra/deploy/docker-compose.yml" ]; then
+    log_info "使用生产编排文件：${APP_DIR}/infra/deploy/docker-compose.yml"
+  else
+    log_info "使用编排文件：${APP_DIR}/docker-compose.yml"
   fi
   return 0
 }

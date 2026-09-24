@@ -549,13 +549,22 @@ install_docker_engine() {
   log_success "Docker Engine 与 Compose v2 插件安装完成"
 }
 
-# 写入 /etc/docker/daemon.json（优先使用部署包 ${APP_DIR}/config/daemon.json；内容一致则不重启）
+# 写入 /etc/docker/daemon.json（优先顺序：部署包 config/ → 仓库 infra/deploy/config/ → 内置默认）
 write_daemon_json() {
-  local src="${APP_DIR}/config/daemon.json" tmp
-  tmp="$(mktemp)"
-  if [ -f "$src" ]; then
-    cp "$src" "$tmp"
+  local src="" tmp
+  # 检查顺序：APP_DIR/config/ > APP_DIR/infra/deploy/config/ > 内置默认
+  local candidate1="${APP_DIR}/config/daemon.json"
+  local candidate2="${APP_DIR}/infra/deploy/config/daemon.json"
+  if [ -f "$candidate1" ]; then
+    src="$candidate1"
     log_info "使用部署包配置：${src}"
+  elif [ -f "$candidate2" ]; then
+    src="$candidate2"
+    log_info "使用仓库配置：${src}（可复制至 ${candidate1} 添加国内镜像）"
+  fi
+  tmp="$(mktemp)"
+  if [ -n "$src" ]; then
+    cp "$src" "$tmp"
   else
     cat >"$tmp" <<'JSON'
 {
@@ -575,11 +584,11 @@ write_daemon_json() {
   "features": { "buildkit": true }
 }
 JSON
-    log_warn "未找到 ${src}，已写入内置默认 daemon.json（国内镜像加速可在 registry-mirrors 中补充）"
+    log_warn "未找到自定义 daemon.json（已检查 ${APP_DIR}/config/ 和 ${APP_DIR}/infra/deploy/config/），已写入内置默认配置（国内镜像加速请创建 ${APP_DIR}/config/daemon.json 并在 registry-mirrors 中填入加速器地址）"
   fi
   if command_exists jq && ! jq -e . <"$tmp" >/dev/null 2>&1; then
     rm -f "$tmp"
-    log_error "daemon.json 不是合法 JSON，拒绝写入（请检查 ${src}）"
+    log_error "daemon.json 不是合法 JSON，拒绝写入（请检查 ${src:-内置默认生成物}）"
     return 1
   fi
   if [ -f /etc/docker/daemon.json ] && cmp -s "$tmp" /etc/docker/daemon.json; then
@@ -657,6 +666,14 @@ step_2_install_docker() {
   fi
 
   write_daemon_json || return 1
+  # 国内镜像加速器检查（警告不阻断）
+  if command_exists jq; then
+    local _mirrors
+    _mirrors="$(jq -r '.["registry-mirrors"] // [] | length' /etc/docker/daemon.json 2>/dev/null || echo 0)"
+    if [ "${_mirrors:-0}" = "0" ]; then
+      log_warn "registry-mirrors 未配置（当前直连 Docker Hub）：中国大陆地区部署请提前在 ${APP_DIR}/config/daemon.json 中填入国内加速器地址，否则 Step 6/7 可能因镜像拉取超时而失败"
+    fi
+  fi
   systemctl is-active docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true
   ensure_hunter_net || return 1
   log_success "Docker 就绪：$(docker --version)"
@@ -709,6 +726,46 @@ step_3_prepare_dirs() {
 # Step 4：生成配置（.env 随机口令 + Nginx 配置）
 # =====================================================================
 PASSWORDS_FILE="${APP_DIR}/passwords.txt"
+
+# REQUIRED_SECRET_VARS：部署必需口令/密钥（缺失或空值时自动追加 CHANGE_ME_* 占位，再交 gen-passwords.sh 填充）
+# 与 infra/deploy/.env.example 中 CHANGE_ME_* 条目保持同步
+REQUIRED_SECRET_VARS=(
+  KAFKA_SSL_PASSWORD
+  KAFKA_SASL_PASSWORD
+  KAFKA_SASL_VEHICLE_PASSWORD
+  POSTGRES_PASSWORD
+  REDIS_PASSWORD
+  MINIO_ROOT_PASSWORD
+  MINIO_ACCESS_KEY
+  MINIO_SECRET_KEY
+  JWT_SECRET_KEY
+  GATEWAY_HMAC_SECRET
+  ADMIN_PASSWORD
+)
+
+# ensure_required_secret_vars <env_file>：检测并补全缺失或空值的必需口令变量
+# 返回 0 = 全部正常（无需调用 gen-passwords.sh）；返回 1 = 已追加/重置占位（需要 gen-passwords.sh 填充）
+ensure_required_secret_vars() {
+  local env_file="$1" var val need_fix=0
+  for var in "${REQUIRED_SECRET_VARS[@]}"; do
+    if ! grep -qE "^${var}=" "$env_file"; then
+      # 变量完全不存在：追加 CHANGE_ME_* 占位
+      printf '%s=CHANGE_ME_%s\n' "$var" "$var" >>"$env_file"
+      log_warn "必需口令变量 ${var} 在 .env 中不存在，已追加 CHANGE_ME_* 占位（将由 gen-passwords.sh 生成随机值）"
+      need_fix=1
+    else
+      # 变量存在：检查值是否为空（去除行尾注释后）
+      val="$(grep -E "^${var}=" "$env_file" | head -n1 | sed -E 's/^[^=]+=//' | sed -E 's/[[:space:]]*#.*$//' | tr -d '[:space:]')"
+      if [ -z "$val" ]; then
+        # 值为空：重置为 CHANGE_ME_* 占位
+        sed -i -E "s|^(${var}=)[^#]*(#.*)?\$|\1CHANGE_ME_${var} \2|" "$env_file"
+        log_warn "必需口令变量 ${var} 值为空，已重置为 CHANGE_ME_* 占位（将由 gen-passwords.sh 生成随机值）"
+        need_fix=1
+      fi
+    fi
+  done
+  return "$need_fix"
+}
 
 # set_env_var_value <file> <VAR> <value>：就地替换 .env 中变量值（保留行尾注释，幂等）
 set_env_var_value() {
@@ -806,11 +863,29 @@ step_4_gen_config() {
     log_success "已复制仓库模板：infra/deploy/.env.example → ${example}"
   fi
 
-  # 4.2 .env 生成（幂等：已存在则跳过口令生成；CRLF 一律归一为 LF）
+  # 4.2 .env 生成（幂等：已存在则仅补全缺失/空值口令变量；CRLF 一律归一为 LF）
   if [ -f "$env_file" ]; then
-    log_info ".env 已存在（${env_file}），跳过生成（幂等）"
-    log_info "如需重新生成全部口令：bash ${GEN_PASSWORDS_SH} --force"
     hc_normalize_env_file "$env_file" || return 1
+    # 补全缺失或空值的必需口令变量（修复问题：.env 从旧模板/手动创建时可能不含 KAFKA_SSL_PASSWORD 等）
+    if ! ensure_required_secret_vars "$env_file"; then
+      log_info "检测到 ${env_file} 中有口令变量缺失或为空，调用 gen-passwords.sh 补全随机口令"
+      if [ -f "$GEN_PASSWORDS_SH" ]; then
+        local -a gp_args_fix=()
+        if [ -n "$OPT_IP" ]; then
+          gp_args_fix+=(--ip "$OPT_IP")
+        fi
+        hc_run_logged "补全缺失口令" bash "$GEN_PASSWORDS_SH" "${gp_args_fix[@]}" || {
+          log_error "补全口令失败：请检查 openssl 可用性与 ${env_file} 可写权限"
+          return 1
+        }
+      else
+        log_warn "未找到 ${GEN_PASSWORDS_SH}，使用内置回退逻辑补全口令"
+        generate_env_inline "$env_file" || return 1
+      fi
+    else
+      log_info ".env 已存在且口令完整（${env_file}），跳过生成（幂等）"
+      log_info "如需重新生成全部口令：bash ${GEN_PASSWORDS_SH} --force"
+    fi
   else
     if [ ! -f "$example" ]; then
       log_error "缺少 .env 模板：${example}"
@@ -938,8 +1013,8 @@ step_6_build_images() {
 
   mkdir -p "$DEPLOY_LOG_DIR"
   local rc=0
-  log_info "执行 docker compose build --parallel（构建日志：${BUILD_LOG}）"
-  (cd "$APP_DIR" && docker compose build --parallel) 2>&1 | tee "$BUILD_LOG" || rc=$?
+  log_info "执行 compose build --parallel（构建日志：${BUILD_LOG}）"
+  compose build --parallel 2>&1 | tee "$BUILD_LOG" || rc=$?
   if [ "$rc" -ne 0 ]; then
     log_error "镜像构建失败（退出码 ${rc}），构建日志最后 50 行："
     tail -n 50 "$BUILD_LOG" >&2 || true
