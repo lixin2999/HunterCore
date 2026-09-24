@@ -25,9 +25,9 @@
 #   --no-minio-hint     不输出 MinIO mirror 提示
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/backup.sh
-#   sudo bash /opt/hunter-edge/scripts/backup.sh --retention 14
-#   # cron：0 2 * * * /opt/hunter-edge/scripts/backup.sh >> /var/log/hunter-edge/backups/cron.log 2>&1
+#   sudo bash /opt/hunter-core/scripts/backup.sh
+#   sudo bash /opt/hunter-core/scripts/backup.sh --retention 14
+#   # cron：0 2 * * * /opt/hunter-core/scripts/backup.sh >> /var/log/hunter-core/backups/cron.log 2>&1
 #
 # 日志：${LOG_DIR}/backups/backup-YYYYmmdd_HHMMSS.log
 # 依赖：common.sh（同目录）、容器 hunter-postgres（+ 可选 hunter-timescale/hunter-redis）
@@ -67,7 +67,7 @@ HunterCore 数据备份脚本
   --help              显示本帮助
   --retention <days>  保留天数（默认 .env BACKUP_RETENTION_DAYS=30）
   --dir <dir>         备份根目录（默认 .env BACKUP_DIR=/data/backups）
-  --env <file>        .env 路径（默认 /opt/hunter-edge/.env）
+  --env <file>        .env 路径（默认 /opt/hunter-core/.env）
   --no-minio-hint     不输出 MinIO mirror 提示
 
 示例：

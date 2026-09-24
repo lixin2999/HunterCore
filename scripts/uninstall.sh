@@ -23,8 +23,8 @@
 #   -y, --yes     非交互（⚠ 仍会要求输入 YES / DELETE-ALL 字样确认，以防误删）
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/uninstall.sh              # 交互式，保留数据
-#   sudo bash /opt/hunter-edge/scripts/uninstall.sh --all        # 彻底删除（强确认）
+#   sudo bash /opt/hunter-core/scripts/uninstall.sh              # 交互式，保留数据
+#   sudo bash /opt/hunter-core/scripts/uninstall.sh --all        # 彻底删除（强确认）
 #
 # 依赖：common.sh（同目录）、docker / docker compose（--all 时含 systemctl、apt）
 # 日期：2026-09-19  |  目标系统：Ubuntu 22.04 LTS
@@ -52,7 +52,7 @@ HunterCore 卸载脚本
 
 参数：
   --help        显示本帮助
-  --keep-data   保留 /data 数据与 /opt/hunter-edge 配置（默认）
+  --keep-data   保留 /data 数据与 /opt/hunter-core 配置（默认）
   --all         彻底删除（数据 + 配置 + Docker；需输入 DELETE-ALL 二次确认）
   --env <file>  .env 路径
   -y, --yes     非交互（仍强制输入 YES / DELETE-ALL 字样确认，防止误删）

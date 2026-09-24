@@ -21,8 +21,8 @@
 #   --env <file>              指定 .env 路径
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/init-db.sh
-#   sudo bash /opt/hunter-edge/scripts/init-db.sh --admin-password 'MyS3cure#2026'
+#   sudo bash /opt/hunter-core/scripts/init-db.sh
+#   sudo bash /opt/hunter-core/scripts/init-db.sh --admin-password 'MyS3cure#2026'
 #
 # 幂等：所有 SQL 使用 IF NOT EXISTS / ON CONFLICT DO NOTHING，可重复执行。
 # 依赖：common.sh（同目录）、容器 hunter-postgres（+ 可选 hunter-timescale）、宿主机 SQL 产物 ${APP_DIR}/sql/
@@ -61,11 +61,11 @@ HunterCore 数据库初始化脚本
   --help                     显示本帮助
   --admin-password <plain>   注入 admin 首次登录口令（本地 bcrypt(12)，需 python3-bcrypt 或 apache2-utils）
   --admin-password-hash <h>  直接注入 bcrypt 哈希（形如 $2b$12$...）
-  --env <file>               .env 路径（默认 /opt/hunter-edge/.env）
+  --env <file>               .env 路径（默认 /opt/hunter-core/.env）
 
 示例：
-  sudo bash /opt/hunter-edge/scripts/init-db.sh
-  sudo bash /opt/hunter-edge/scripts/init-db.sh --admin-password 'HunterEdge#2026'
+  sudo bash /opt/hunter-core/scripts/init-db.sh
+  sudo bash /opt/hunter-core/scripts/init-db.sh --admin-password 'HunterCore#2026'
 
 说明：
   · G-06（设计文档 14.1）：不再提供内置已知口令；口令来源优先级：

@@ -23,10 +23,10 @@
 --
 -- 执行：
 --   $ docker exec -i hunter-postgres psql -U hunter -d hunter_core -v ON_ERROR_STOP=1 \
---         < /opt/hunter-edge/sql/init-data.sql
+--         < /opt/hunter-core/sql/init-data.sql
 --   注入自定义管理员口令哈希（推荐，G-06 后为必选路径）：
 --   $ docker exec -i hunter-postgres psql -U hunter -d hunter_core -v ON_ERROR_STOP=1 \
---         -v admin_password_hash="<bcrypt hash>" < /opt/hunter-edge/sql/init-data.sql
+--         -v admin_password_hash="<bcrypt hash>" < /opt/hunter-core/sql/init-data.sql
 -- =====================================================================
 
 \set ON_ERROR_STOP on

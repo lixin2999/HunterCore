@@ -26,8 +26,8 @@
 #   --skip-lifecycle   仅创建 Bucket，不设置生命周期规则
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/init-minio.sh
-#   sudo bash /opt/hunter-edge/scripts/init-minio.sh --skip-lifecycle
+#   sudo bash /opt/hunter-core/scripts/init-minio.sh
+#   sudo bash /opt/hunter-core/scripts/init-minio.sh --skip-lifecycle
 #
 # 幂等：mb --ignore-existing；生命周期规则已存在则跳过（不重复添加）。
 # 依赖：common.sh（同目录）、容器 hunter-minio、镜像 minio/mc（可用 MINIO_MC_IMAGE 覆盖）
@@ -69,11 +69,11 @@ HunterCore MinIO Bucket 初始化脚本
 
 参数：
   --help            显示本帮助
-  --env <file>      .env 路径（默认 /opt/hunter-edge/.env）
+  --env <file>      .env 路径（默认 /opt/hunter-core/.env）
   --skip-lifecycle  仅创建 Bucket，不设置生命周期
 
 示例：
-  sudo bash /opt/hunter-edge/scripts/init-minio.sh
+  sudo bash /opt/hunter-core/scripts/init-minio.sh
   MINIO_MC_IMAGE=minio/mc:RELEASE.2024-06-13T16-39-23Z sudo bash scripts/init-minio.sh
 
 校验：

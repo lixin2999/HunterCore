@@ -21,8 +21,8 @@
 #   --critical-threshold N  critical 事件告警阈值（默认 10，超过则 WARN）
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/daily-check.sh
-#   # cron：0 7 * * * /opt/hunter-edge/scripts/daily-check.sh >> /var/log/hunter-edge/check/cron.log 2>&1
+#   sudo bash /opt/hunter-core/scripts/daily-check.sh
+#   # cron：0 7 * * * /opt/hunter-core/scripts/daily-check.sh >> /var/log/hunter-core/check/cron.log 2>&1
 #
 # 退出码：0 = 无 FAIL；2 = 存在 FAIL（WARN 不改变退出码）
 # 依赖：common.sh、health-check.sh（同目录，source 复用检查逻辑）
@@ -54,7 +54,7 @@ HunterCore 日常巡检脚本
 
 参数：
   --help                  显示本帮助
-  --env <file>            .env 路径（默认 /opt/hunter-edge/.env）
+  --env <file>            .env 路径（默认 /opt/hunter-core/.env）
   --lag-threshold N       Kafka 消费积压阈值（默认 10000）
   --critical-threshold N  24 小时 critical 事件告警阈值（默认 10）
 

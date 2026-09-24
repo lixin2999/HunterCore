@@ -20,12 +20,12 @@
 # 参数：
 #   --help         显示本帮助
 #   --ip <address>  覆盖 SERVER_IP（默认取 .env 的 SERVER_IP；占位值会报错）
-#   --out <dir>     证书输出目录（默认 .env 的 KAFKA_CERTS_DIR，即 /opt/hunter-edge/certs/kafka）
+#   --out <dir>     证书输出目录（默认 .env 的 KAFKA_CERTS_DIR，即 /opt/hunter-core/certs/kafka）
 #   --force         重新签发全部证书与 JKS（⚠ 需重启 Kafka 并更新车端证书）
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/gen-kafka-certs.sh --ip 192.168.1.10
-#   sudo bash /opt/hunter-edge/scripts/gen-kafka-certs.sh --force
+#   sudo bash /opt/hunter-core/scripts/gen-kafka-certs.sh --ip 192.168.1.10
+#   sudo bash /opt/hunter-core/scripts/gen-kafka-certs.sh --force
 #
 # 幂等：kafka.keystore.jks 与 kafka.truststore.jks 已存在则跳过（--force 除外）。
 # 权限：私钥/JKS/P12 = 600；证书（含 CA）= 644。
@@ -70,12 +70,12 @@ HunterCore Kafka SASL_SSL 证书生成脚本
 参数：
   --help          显示本帮助
   --ip <address>  覆盖 SERVER_IP（默认读 .env；占位值将直接报错退出）
-  --out <dir>     输出目录（默认 .env 的 KAFKA_CERTS_DIR=/opt/hunter-edge/certs/kafka）
+  --out <dir>     输出目录（默认 .env 的 KAFKA_CERTS_DIR=/opt/hunter-core/certs/kafka）
   --force         重新签发（覆盖现有证书；须重启 Kafka 并更新车端证书）
 
 示例：
   sudo bash scripts/gen-kafka-certs.sh --ip 192.168.1.10
-  sudo bash scripts/gen-kafka-certs.sh --out /opt/hunter-edge/certs/kafka
+  sudo bash scripts/gen-kafka-certs.sh --out /opt/hunter-core/certs/kafka
 
 签发后：
   · 校验 SAN：openssl x509 -in <dir>/broker-cert.pem -noout -ext subjectAltName

@@ -28,8 +28,8 @@
 #                       ⚠ 前置条件：broker 已存在可用的管理员 SCRAM 凭据（KAFKA_SASL_USER）
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/init-kafka.sh
-#   sudo bash /opt/hunter-edge/scripts/init-kafka.sh --scram-users
+#   sudo bash /opt/hunter-core/scripts/init-kafka.sh
+#   sudo bash /opt/hunter-core/scripts/init-kafka.sh --scram-users
 #
 # 幂等：--create --if-not-exists（已存在 Topic 不报错、不修改配置）。
 # 依赖：common.sh（同目录）、容器 hunter-kafka
@@ -68,12 +68,12 @@ HunterCore Kafka 内部 Topic 初始化脚本
 
 参数：
   --help          显示本帮助
-  --env <file>    .env 路径（默认 /opt/hunter-edge/.env）
+  --env <file>    .env 路径（默认 /opt/hunter-core/.env）
   --scram-users   额外创建/更新车端 SCRAM 账号（需 broker 已有可用管理员凭据）
 
 示例：
-  sudo bash /opt/hunter-edge/scripts/init-kafka.sh
-  sudo bash /opt/hunter-edge/scripts/init-kafka.sh --scram-users
+  sudo bash /opt/hunter-core/scripts/init-kafka.sh
+  sudo bash /opt/hunter-core/scripts/init-kafka.sh --scram-users
 
 校验：
   docker exec hunter-kafka kafka-topics.sh --bootstrap-server localhost:9092 --list

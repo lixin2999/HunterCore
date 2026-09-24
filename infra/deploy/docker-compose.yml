@@ -1,6 +1,6 @@
 # =====================================================================
 # HunterCore 单机生产部署包 — Docker Compose 编排（infra/deploy/docker-compose.yml）
-# 部署落位：复制到 ${APP_DIR}/docker-compose.yml（默认 /opt/hunter-edge/docker-compose.yml）
+# 部署落位：复制到 ${APP_DIR}/docker-compose.yml（默认 /opt/hunter-core/docker-compose.yml）
 # 驱动脚本：scripts/install.sh（step_6 构建 → step_7 中间件 → step_8~10 数据初始化 →
 #           step_11 业务服务 → step_12 健康检查）；容器名必须与 scripts/common.sh 的 C_* 常量一致。
 #

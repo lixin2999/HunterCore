@@ -77,7 +77,7 @@ HunterCore/
 
 | 脚本 | 用途 |
 |------|------|
-| `common.sh` | 公共库：结构化日志（终端 + `/var/log/hunter-edge-install.log`）、检查（root/端口/磁盘/等待）、`.env` 加载（CRLF 自动归一）、容器/Kafka/mc 辅助 |
+| `common.sh` | 公共库：结构化日志（终端 + `/var/log/hunter-core-install.log`）、检查（root/端口/磁盘/等待）、`.env` 加载（CRLF 自动归一）、容器/Kafka/mc 辅助 |
 | `install.sh` | 一键部署主脚本（13 步，幂等可续跑）：系统初始化 → Docker → 目录 → .env/证书 → 镜像 → 中间件 → DB/Kafka/MinIO 初始化 → 业务服务 → 健康检查 → 摘要 |
 | `gen-passwords.sh` | 生成 `.env` 强随机口令（幂等；`--force` 轮换）+ `passwords.txt`(600)，口令不入日志 |
 | `gen-kafka-certs.sh` | 生成 Kafka SASL_SSL 全套证书（CA/broker/client + JKS + P12），校验 SAN 含真实 SERVER_IP |
@@ -85,19 +85,19 @@ HunterCore/
 | `init-kafka.sh` | 创建 6 个契约 Topic（分区/保留时间校验），可选 `--scram-users` |
 | `init-minio.sh` | 创建 7 个 Bucket 与生命周期规则（30/90 天与永久） |
 | `health-check.sh` | 全栈健康检查（10 类，`[PASS]/[WARN]/[FAIL]`，退出码 0/1/2），可被其他脚本 source 复用 |
-| `daily-check.sh` | 日常巡检（复用健康检查 + critical 事件/DB 连接数/容器重启次数/容量），报告写入 `/var/log/hunter-edge/check/` |
+| `daily-check.sh` | 日常巡检（复用健康检查 + critical 事件/DB 连接数/容器重启次数/容量），报告写入 `/var/log/hunter-core/check/` |
 | `backup.sh` | 备份 PostgreSQL 全量 + 时序热数据 + 配置 + Redis RDB，按保留天数清理，输出 MinIO `mc mirror` 指引 |
 | `uninstall.sh` | 卸载（默认保留数据；`--all` 需输入 `DELETE-ALL`，含受保护路径护栏） |
 | `collect-logs.sh` | 日志与系统信息收集（`.env` 脱敏 + 残留明文口令自检） |
 
 ```bash
-# 部署（服务器上脚本位于 /opt/hunter-edge/scripts/）
-sudo bash /opt/hunter-edge/scripts/install.sh -y --ip <服务器IP>
+# 部署（服务器上脚本位于 /opt/hunter-core/scripts/）
+sudo bash /opt/hunter-core/scripts/install.sh -y --ip <服务器IP>
 # 运维
-bash /opt/hunter-edge/scripts/health-check.sh     # 健康检查（exit 0/1/2）
-bash /opt/hunter-edge/scripts/daily-check.sh      # 日常巡检（生成报告）
-bash /opt/hunter-edge/scripts/backup.sh           # 数据备份
-bash /opt/hunter-edge/scripts/collect-logs.sh     # 收集日志供排障
+bash /opt/hunter-core/scripts/health-check.sh     # 健康检查（exit 0/1/2）
+bash /opt/hunter-core/scripts/daily-check.sh      # 日常巡检（生成报告）
+bash /opt/hunter-core/scripts/backup.sh           # 数据备份
+bash /opt/hunter-core/scripts/collect-logs.sh     # 收集日志供排障
 ```
 
 ### 微服务内部结构（固定，不可更改）

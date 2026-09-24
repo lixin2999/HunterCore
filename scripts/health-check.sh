@@ -68,7 +68,7 @@ HunterCore 全栈健康检查脚本
 
 参数：
   --help             显示本帮助
-  --env <file>       .env 路径（默认 /opt/hunter-edge/.env）
+  --env <file>       .env 路径（默认 /opt/hunter-core/.env）
   --lag-threshold N  Kafka 消费积压告警阈值（默认 10000）
 
 示例：

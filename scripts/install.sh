@@ -15,20 +15,20 @@
 #   --help            显示本帮助
 #   --skip-docker     跳过 Docker 安装（已装 24.0+ 时使用；仍校验版本与 compose 插件）
 #   --skip-build      跳过镜像构建（镜像已存在且版本一致时使用）
-#   --env <file>      指定 .env 路径（默认 ${APP_DIR}/.env，即 /opt/hunter-edge/.env）
+#   --env <file>      指定 .env 路径（默认 ${APP_DIR}/.env，即 /opt/hunter-core/.env）
 #   --ip <address>    指定 SERVER_IP（默认自动探测 hostname -I 首个地址；写入 .env 与证书 SAN）
 #   --step <n>        从第 n 步开始执行（1-13，用于失败后续跑）
 #   -y, --yes         非交互模式：跳过所有确认
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/install.sh                 # 全流程交互式部署
-#   sudo bash /opt/hunter-edge/scripts/install.sh -y              # 全流程非交互（CI/自动化）
-#   sudo bash /opt/hunter-edge/scripts/install.sh --step 6 -y     # 镜像已改，从构建续跑
-#   sudo bash /opt/hunter-edge/scripts/install.sh --skip-docker --skip-build -y
+#   sudo bash /opt/hunter-core/scripts/install.sh                 # 全流程交互式部署
+#   sudo bash /opt/hunter-core/scripts/install.sh -y              # 全流程非交互（CI/自动化）
+#   sudo bash /opt/hunter-core/scripts/install.sh --step 6 -y     # 镜像已改，从构建续跑
+#   sudo bash /opt/hunter-core/scripts/install.sh --skip-docker --skip-build -y
 #
 # 关键路径（docs/01-部署概述与环境要求.md §1.2/§5）：
-#   应用根目录 /opt/hunter-edge（本脚本父目录：APP_DIR）
-#   数据根目录 /data、日志 /var/log/hunter-edge-install.log、部署日志 /var/log/hunter-edge/deploy/
+#   应用根目录 /opt/hunter-core（本脚本父目录：APP_DIR）
+#   数据根目录 /data、日志 /var/log/hunter-core-install.log、部署日志 /var/log/hunter-core/deploy/
 #
 # 依赖：common.sh（同目录）、gen-passwords.sh、gen-kafka-certs.sh、init-db.sh、
 #       init-kafka.sh、init-minio.sh、health-check.sh、${APP_DIR}/docker-compose.yml
@@ -69,7 +69,7 @@ UFW_RULES=(
 STEP_DESCRIPTIONS=(
   "系统初始化（apt/时区/主机名/hunter 用户/内核参数/关闭 swap/ufw）"
   "安装 Docker Engine 24.0+ 与 Compose v2 插件"
-  "准备数据与应用目录（/data、APP_DIR、/var/log/hunter-edge）"
+  "准备数据与应用目录（/data、APP_DIR、/var/log/hunter-core）"
   "生成配置（.env 随机口令、Nginx 配置）"
   "生成 Kafka SASL_SSL 证书（CA/broker/client/JKS）"
   "构建业务服务镜像（docker compose build --parallel）"
@@ -100,7 +100,7 @@ HunterCore 单机一键部署脚本
   --help            显示本帮助并退出
   --skip-docker     跳过 Docker 安装（已安装 24.0+ 时；仍校验版本与 compose v2 插件）
   --skip-build      跳过镜像构建（复用现有 hunter/* 镜像）
-  --env <file>      指定 .env 文件路径（默认 /opt/hunter-edge/.env）
+  --env <file>      指定 .env 文件路径（默认 /opt/hunter-core/.env）
   --ip <address>    指定 SERVER_IP（默认自动探测；影响 Kafka 9093 advertised 与证书 SAN）
   --step <n>        从第 n 步开始（1-13）
   -y, --yes         非交互模式（自动确认）
@@ -115,7 +115,7 @@ HunterCore 单机一键部署脚本
   前端 http://<SERVER_IP>/    API 网关 http://<SERVER_IP>:8080
   继续执行：bash scripts/health-check.sh（健康检查）、bash scripts/daily-check.sh（日常巡检）
 
-日志：/var/log/hunter-edge-install.log（完整输出）、/var/log/hunter-edge/deploy/build.log（构建日志）
+日志：/var/log/hunter-core-install.log（完整输出）、/var/log/hunter-core/deploy/build.log（构建日志）
 EOF
 }
 
@@ -396,21 +396,21 @@ step_1_system_init() {
     log_success "时区已设置为 Asia/Shanghai（原值：${tz_now:-unknown}）"
   fi
 
-  # 1.4 主机名 hunter-edge-server（docs/01 §6）
+  # 1.4 主机名 hunter-core-server（docs/01 §6）
   local host_now
   host_now="$(hostname)"
-  if [ "$host_now" = "hunter-edge-server" ]; then
-    log_info "主机名已为 hunter-edge-server，跳过（幂等）"
+  if [ "$host_now" = "hunter-core-server" ]; then
+    log_info "主机名已为 hunter-core-server，跳过（幂等）"
   else
-    hostnamectl set-hostname hunter-edge-server || {
+    hostnamectl set-hostname hunter-core-server || {
       log_error "设置主机名失败"
       return 1
     }
-    log_success "主机名已设置为 hunter-edge-server（原值：${host_now}）"
+    log_success "主机名已设置为 hunter-core-server（原值：${host_now}）"
   fi
-  if ! grep -qE "^127\.0\.1\.1[[:space:]]+hunter-edge-server" /etc/hosts; then
-    printf '127.0.1.1\thunter-edge-server\n' >>/etc/hosts
-    log_success "已在 /etc/hosts 补充 127.0.1.1 hunter-edge-server（避免主机名解析延迟）"
+  if ! grep -qE "^127\.0\.1\.1[[:space:]]+hunter-core-server" /etc/hosts; then
+    printf '127.0.1.1\thunter-core-server\n' >>/etc/hosts
+    log_success "已在 /etc/hosts 补充 127.0.1.1 hunter-core-server（避免主机名解析延迟）"
   fi
 
   # 1.5 创建服务运行用户 hunter（UID 1001，与 Kafka/MinIO 容器属主一致）

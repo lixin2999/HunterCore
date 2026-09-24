@@ -2,7 +2,7 @@
 # =====================================================================
 # HunterCore 单机部署脚本集 —— 公共库（被其他脚本 source，禁止直接执行）
 #
-# 用途：统一日志（终端 + /var/log/hunter-edge-install.log）、root 校验、命令/端口/磁盘检查、
+# 用途：统一日志（终端 + /var/log/hunter-core-install.log）、root 校验、命令/端口/磁盘检查、
 #       通用等待、.env 加载、容器与 Kafka CLI 辅助。所有部署脚本必须 source 本文件，
 #       禁止在各自脚本内重复实现日志与检查逻辑。
 #
@@ -10,16 +10,16 @@
 #       bash scripts/common.sh --help        # 查看本文件说明（本文件不执行实际动作）
 #
 # 关键路径（与 docs/01-部署概述与环境要求.md §1.2/§5、infra/deploy/README.md 一致）：
-#   应用根目录 APP_DIR = 脚本目录的上级目录（服务器上 = /opt/hunter-edge）
-#   数据根目录 /data、宿主机日志目录 /var/log/hunter-edge
-#   ⚠ 任务书中出现的 /opt/HunterCore、/var/log/hunter-core-install.log 与已落地文档冲突，
-#     本脚本集统一采用 /opt/hunter-edge；如需改基准，设置环境变量 HUNTER_APP_DIR 覆盖。
+#   应用根目录 APP_DIR = 脚本目录的上级目录（服务器上 = /opt/hunter-core）
+#   数据根目录 /data、宿主机日志目录 /var/log/hunter-core
+#   ⚠ 早期资料中曾使用 /opt/HunterCore 等写法；本脚本集统一采用 /opt/hunter-core，
+#     如需改基准，设置环境变量 HUNTER_APP_DIR 覆盖。
 #
 # 可覆盖的环境变量（均可选，便于本地/非 root 环境验证）：
 #   HUNTER_APP_DIR   应用根目录（默认 = SCRIPT_DIR 的上级）
 #   HUNTER_DATA_DIR  数据根目录（默认 /data）
-#   HUNTER_LOG_DIR   宿主机日志目录（默认 /var/log/hunter-edge）
-#   HUNTER_INSTALL_LOG 部署日志文件（默认 /var/log/hunter-edge-install.log）
+#   HUNTER_LOG_DIR   宿主机日志目录（默认 /var/log/hunter-core）
+#   HUNTER_INSTALL_LOG 部署日志文件（默认 /var/log/hunter-core-install.log）
 #   HC_LOG_TO_FILE   1=日志同时落盘（默认）0=仅终端
 #   NO_COLOR=1       禁用彩色输出（非交互终端亦自动禁用）
 #
@@ -37,8 +37,8 @@ APP_DIR="${HUNTER_APP_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 # DATA_DIR：有状态数据根目录（docs/01 §5）
 DATA_DIR="${HUNTER_DATA_DIR:-/data}"
 # LOG_DIR：宿主机侧日志目录；LOG_FILE：脚本日志文件（可用 hc_set_log_file 覆盖）
-LOG_DIR="${HUNTER_LOG_DIR:-/var/log/hunter-edge}"
-LOG_FILE="${HUNTER_INSTALL_LOG:-/var/log/hunter-edge-install.log}"
+LOG_DIR="${HUNTER_LOG_DIR:-/var/log/hunter-core}"
+LOG_FILE="${HUNTER_INSTALL_LOG:-/var/log/hunter-core-install.log}"
 # SCRIPT_DIR 下各脚本路径（供 install.sh 等调用兄弟脚本，避免硬编码文件名）
 GEN_PASSWORDS_SH="${SCRIPT_DIR}/gen-passwords.sh"
 GEN_KAFKA_CERTS_SH="${SCRIPT_DIR}/gen-kafka-certs.sh"
@@ -79,7 +79,7 @@ export C_BLUE C_GREEN C_YELLOW C_RED C_RESET HC_COLOR
 # ---------------------------------------------------------------------
 # 3. 日志：格式 `[YYYY-MM-DD HH:MM:SS] [LEVEL] message`，终端彩色 + 落盘无色
 # ---------------------------------------------------------------------
-# hc_set_log_file <path>：切换本进程日志文件（如 health-check.sh 写入 /var/log/hunter-edge/check/）
+# hc_set_log_file <path>：切换本进程日志文件（如 health-check.sh 写入 /var/log/hunter-core/check/）
 hc_set_log_file() {
   LOG_FILE="$1"
 }
@@ -255,7 +255,7 @@ confirm() {
 # ---------------------------------------------------------------------
 # hc_normalize_env_file <env_file>：把 CRLF 换行归一为 LF（幂等）
 #   背景：.env 若为 CRLF（Windows 编辑或直接从 Windows 工作区复制），sourcing 后变量值会带 \r，
-#         造成 "load_env 失败"、LOG_DIR 变成 "/var/log/hunter-edge\r" 等疑难故障，故在加载前自动修复。
+#         造成 "load_env 失败"、LOG_DIR 变成 "/var/log/hunter-core\r" 等疑难故障，故在加载前自动修复。
 hc_normalize_env_file() {
   local env_file="$1"
   [ -f "$env_file" ] || return 0
@@ -643,9 +643,9 @@ HunterCore 部署脚本公共库 common.sh（库文件，禁止直接执行）
 
 关键路径：
   SCRIPT_DIR=${SCRIPT_DIR}
-  APP_DIR=${APP_DIR}               # 服务器上应为 /opt/hunter-edge
+  APP_DIR=${APP_DIR}               # 服务器上应为 /opt/hunter-core
   DATA_DIR=${DATA_DIR}             # 默认 /data
-  LOG_FILE=${LOG_FILE}             # 默认 /var/log/hunter-edge-install.log
+  LOG_FILE=${LOG_FILE}             # 默认 /var/log/hunter-core-install.log
 
 可覆盖环境变量：HUNTER_APP_DIR、HUNTER_DATA_DIR、HUNTER_LOG_DIR、HUNTER_INSTALL_LOG、
                HUNTER_ENV_FILE（.env 路径）、HC_LOG_TO_FILE(0/1)、NO_COLOR(1)、

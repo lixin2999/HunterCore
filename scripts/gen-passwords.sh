@@ -23,8 +23,8 @@
 #   -y, --yes          非交互（--force 时跳过确认）
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/gen-passwords.sh --ip 192.168.1.10
-#   sudo bash /opt/hunter-edge/scripts/gen-passwords.sh --force -y      # 口令轮换
+#   sudo bash /opt/hunter-core/scripts/gen-passwords.sh --ip 192.168.1.10
+#   sudo bash /opt/hunter-core/scripts/gen-passwords.sh --force -y      # 口令轮换
 #
 # 依赖：common.sh（同目录）、openssl
 # 日期：2026-09-19  |  目标系统：Ubuntu 22.04 LTS
@@ -60,7 +60,7 @@ HunterCore 环境变量口令生成脚本
 参数：
   --help           显示本帮助
   --ip <address>   SERVER_IP（Kafka 9093 advertised / SRS WebRTC candidate / 证书 SAN 依赖）
-  --env <file>     .env 路径（默认 /opt/hunter-edge/.env）
+  --env <file>     .env 路径（默认 /opt/hunter-core/.env）
   --force          重新生成全部口令/密钥（覆盖现有值；需同步更新依赖方与车端配置）
   -y, --yes        非交互模式
 

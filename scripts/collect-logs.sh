@@ -7,7 +7,7 @@
 #   ② 系统信息：uname/lsb_release/free/df/docker info/docker compose ps/docker stats
 #   ③ 配置：config/ 目录 + 脱敏后的 .env（口令/密钥/Token 一律替换为 ***）
 #   ④ 系统日志：journalctl -u docker --since "24 hours ago" → logs/docker-system.log
-#   ⑤ 部署与运维日志：/var/log/hunter-edge*（安装日志、备份日志、巡检报告）尾部
+#   ⑤ 部署与运维日志：/var/log/hunter-core*（安装日志、备份日志、巡检报告）尾部
 #
 # ⚠ 脱敏说明：.env 中的 *PASSWORD*/*SECRET*/*KEY*/TOKEN 值会被替换为 ***；
 #   归档生成后会自检是否残留明文口令，如发现残留将给出告警（请勿直接外发）。
@@ -23,8 +23,8 @@
 #   --no-journal   不收集 journalctl 系统日志
 #
 # 示例：
-#   sudo bash /opt/hunter-edge/scripts/collect-logs.sh
-#   sudo bash /opt/hunter-edge/scripts/collect-logs.sh --tail 2000 --out /tmp/hc-debug.tar.gz
+#   sudo bash /opt/hunter-core/scripts/collect-logs.sh
+#   sudo bash /opt/hunter-core/scripts/collect-logs.sh --tail 2000 --out /tmp/hc-debug.tar.gz
 #
 # 依赖：common.sh（同目录）、docker / docker compose、tar、journalctl（可选）
 # 日期：2026-09-19  |  目标系统：Ubuntu 22.04 LTS
@@ -62,7 +62,7 @@ HunterCore 日志与系统信息收集脚本
   --help        显示本帮助
   --tail <n>    每个服务收集的日志行数（默认 500）
   --out <file>  输出路径（默认 /tmp/hunter-core-logs-YYYYmmdd_HHMMSS.tar.gz）
-  --env <file>  .env 路径（默认 /opt/hunter-edge/.env）
+  --env <file>  .env 路径（默认 /opt/hunter-core/.env）
   --no-journal  跳过 journalctl 系统日志（无 systemd 环境建议使用）
 
 示例：
@@ -73,7 +73,7 @@ HunterCore 日志与系统信息收集脚本
 归档结构：
   logs/<service>.log        容器日志（--no-color）
   logs/docker-system.log    journalctl -u docker（最近 24h）
-  logs/hunter-edge-*.log    部署/备份/巡检日志尾部
+  logs/hunter-core-*.log    部署/备份/巡检日志尾部
   system/*.txt              uname/lsb_release/free/df/docker info/compose ps/stats
   config/                   配置目录（nginx/daemon 等）
   config/.env.masked        脱敏后的环境变量文件

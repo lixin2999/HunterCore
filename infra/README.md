@@ -3,7 +3,7 @@
 | 目录 | 内容 |
 |------|------|
 | `docker/` | 本地开发 docker-compose 相关初始化脚本 + 各服务 Dockerfile 约定（builder `python:3.11-slim` → runner `gcr.io/distroless/python3-debian12:nonroot`） |
-| `deploy/` | **单机 docker compose 部署包**（→ `/opt/hunter-edge`）：Docker 守护进程配置、web-portal Nginx 配置、SQL 部署产物（`schema.sql` / `timescaledb.sql` / `init-data.sql`）、环境变量模板；映射与契约来源见 `deploy/README.md` |
+| `deploy/` | **单机 docker compose 部署包**（→ `/opt/hunter-core`）：Docker 守护进程配置、web-portal Nginx 配置、SQL 部署产物（`schema.sql` / `timescaledb.sql` / `init-data.sql`）、环境变量模板；映射与契约来源见 `deploy/README.md` |
 | `k8s/` | Kubernetes 部署清单：6 微服务（Deployment + Service + ConfigMap，镜像标签统一 `{version}` 占位符）、4 类有状态中间件（StatefulSet + PVC）、初始化 Job、Ingress、网络策略、HPA（min2/max5/CPU70%）、PDB |
 | `monitoring/` | Prometheus 采集与告警规则、Alertmanager 路由、Grafana 供给与 3 个看板、exporters、监控组件清单 |
 
