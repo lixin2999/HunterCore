@@ -619,6 +619,44 @@ ensure_hunter_net() {
   return 1
 }
 
+# ensure_docker_daemon_running：确保 dockerd 已启动且 API socket 可达（幂等）
+#   背景（两类典型故障）：
+#     A. apt 显示“已是最新版”或 snap→apt 迁移后，docker.service 从未启动；
+#        write_daemon_json 命中“内容未变化跳过重启”时也不会拉起。
+#     B. docker.socket 显示 active 但 /run/docker.sock 文件被删（如 snap remove 清理所致）：
+#        dockerd 持有旧 fd 成为无法接受连接的僵尸进程，此时 systemctl enable --now docker 是空操作，
+#        必须 restart 才能让 systemd 重新落盘 socket 文件并让 dockerd 重新绑定。
+#   若不在此显式探测 docker info，故障会推迟到 ensure_hunter_net 才暴露，且报为误导性的“网络创建失败”。
+ensure_docker_daemon_running() {
+  docker info >/dev/null 2>&1 && return 0
+
+  # 阶段 1：处理未启动（enable --now 幂等拉起 socket + service）
+  log_info "Docker API 不可达，尝试启动（docker.socket + docker.service）..."
+  systemctl enable --now docker.socket >/dev/null 2>&1 || true
+  systemctl reset-failed docker >/dev/null 2>&1 || true
+  systemctl enable --now docker >/dev/null 2>&1 ||
+    log_warn "systemctl enable --now docker 返回非 0（非 systemd 环境可忽略，继续探测）"
+  if wait_for "docker info >/dev/null 2>&1" "Docker 守护进程（/var/run/docker.sock）" 15 2; then
+    return 0
+  fi
+
+  # 阶段 2：处理僵尸 daemon（unit 显示 active 但 socket 文件缺失/ fd 失效）：强制重启重建
+  log_warn "dockerd 进程存在但 API 仍不可达（可能为 socket 文件被删的僵尸 daemon），重启 docker.socket + docker.service ..."
+  systemctl restart docker.socket docker.service >/dev/null 2>&1 ||
+    log_warn "systemctl restart docker.socket docker.service 返回非 0，继续探测"
+  if wait_for "docker info >/dev/null 2>&1" "Docker 守护进程（重启后，/var/run/docker.sock）" 20 2; then
+    return 0
+  fi
+
+  log_error "Docker 守护进程无法连接：/var/run/docker.sock 不可用，docker CLI 连不上 daemon"
+  log_error "请执行以下命令查看失败原因："
+  log_error "  systemctl status docker docker.socket --no-pager"
+  log_error "  journalctl -u docker -n 50 --no-pager"
+  log_error "  ls -l /run/docker.sock"
+  log_error "常见原因：① snap 版残留未清（snap remove docker 后需确认 apt 单元已 enable）；② 单元被 mask（systemctl unmask docker docker.socket）；③ /etc/docker/daemon.json 非法或 data-root 冲突"
+  return 1
+}
+
 step_2_install_docker() {
   local docker_version="" compose_version=""
   if command_exists docker; then
@@ -680,11 +718,11 @@ step_2_install_docker() {
     log_success "docker compose v2 插件安装完成"
   fi
 
-  systemctl enable --now docker >/dev/null 2>&1 || log_warn "systemctl enable --now docker 返回非 0（容器环境可能无 systemd）"
   if id -u hunter >/dev/null 2>&1; then
     usermod -aG docker hunter || log_warn "将 hunter 加入 docker 组失败（不阻塞部署）"
   fi
 
+  # 先写入 daemon.json（含镜像加速器/日志轮转）再启动守护进程，避免用旧配置起 daemon 后反复重启
   write_daemon_json || return 1
   # 国内镜像加速器检查（警告不阻断）
   if command_exists jq; then
@@ -694,7 +732,10 @@ step_2_install_docker() {
       log_warn "registry-mirrors 未配置（当前直连 Docker Hub）：中国大陆地区部署请提前在 ${APP_DIR}/config/daemon.json 中填入国内加速器地址，否则 Step 6/7 可能因镜像拉取超时而失败"
     fi
   fi
-  systemctl is-active docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true
+
+  # 关键：显式确认 dockerd 已启动且 API 可达（替代旧版 `|| true` 吞错）；失败即中断并给出 journalctl 排查指引
+  ensure_docker_daemon_running || return 1
+
   ensure_hunter_net || return 1
   log_success "Docker 就绪：$(docker --version)"
 }
