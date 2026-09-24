@@ -625,6 +625,26 @@ step_2_install_docker() {
     docker_version="$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
   fi
 
+  # snap Docker 检测：snap 版 dockerd 读取 /var/snap/docker/current/config/daemon.json
+  # 不读 /etc/docker/daemon.json，导致 registry-mirrors 和日志轮转配置均无法生效
+  if [ -n "$docker_version" ] && [ "$SKIP_DOCKER" -ne 1 ]; then
+    local _docker_root
+    _docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo)"
+    if [[ "$_docker_root" == /var/snap/docker* ]]; then
+      log_warn "检测到 snap 安装的 Docker（data-root=${_docker_root}）：不支持本部署方案"
+      log_warn "原因：snap 版 dockerd 读取 /var/snap/docker/*/config/daemon.json，写入 /etc/docker/daemon.json 的镜像加速器配置无效"
+      if [ "$ASSUME_YES" -eq 1 ]; then
+        log_info "非交互模式（-y）：自动移除 snap Docker 并切换至 apt 版本..."
+      else
+        printf '[确认] 移除 snap Docker 并安装官方 apt 版本？(y/N): '
+        read -r _ans
+        [[ "$_ans" =~ ^[Yy]$ ]] || { log_error "取消：请手动执行 sudo snap remove docker 后重跑 Step 2"; return 1; }
+      fi
+      snap remove docker >/dev/null 2>&1 || { log_error "snap remove docker 失败：请手动执行 sudo snap remove docker"; return 1; }
+      docker_version=""  # 清空版本号，强制走 apt 安装路径
+      log_success "已移除 snap Docker，继续 apt 安装..."
+    fi
+  fi
   if [ "$SKIP_DOCKER" -eq 1 ]; then
     log_info "已按 --skip-docker 跳过 Docker 安装步骤"
     if [ -z "$docker_version" ]; then

@@ -72,9 +72,9 @@ spec:
       terminationGracePeriodSeconds: 60   # 等待会话安全收敛（车辆减速停车）
       securityContext:
         runAsNonRoot: true
-        runAsUser: 65532
-        runAsGroup: 65532
-        fsGroup: 65532
+        runAsUser: 10001                    # python:3.12-slim appuser（原 distroless :nonroot）
+        runAsGroup: 10001
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       topologySpreadConstraints:
