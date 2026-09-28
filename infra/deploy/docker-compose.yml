@@ -183,11 +183,13 @@ services:
   # user:1001 下启动时 `cp server.properties` 报 Permission denied → broker 从未进入监听阶段。
   # 同样用 init 容器（root）把镜像默认配置拷到卷并 chown 1001，主容器挂卷覆盖 config 目录。
   # （证书挂在其下的 config/certs 子路径，不受覆盖影响。）
+  # ❗ 每次启动先清空卷并删除陈旧的 server.properties，避免上一轮 env 生成的旧文件被
+  #   bitnami 当作“已注入配置”复用（即使改了 advertised.listeners 也不生效）；清后由主容器按当前 env 重生。
   kafka-config-init:
     image: bitnami/kafka:3.6
     container_name: hunter-kafka-config-init
     user: root
-    command: ["sh", "-c", "cp -a /opt/bitnami/kafka/config/. /patch/ && chown -R 1001:1001 /patch"]
+    command: ["sh", "-c", "rm -rf /patch/* && cp -a /opt/bitnami/kafka/config/. /patch/ && rm -f /patch/server.properties && chown -R 1001:1001 /patch"]
     volumes:
       - ${DATA_DIR:-/data}/kafka-config:/patch
     restart: "no"
