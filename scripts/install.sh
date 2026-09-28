@@ -360,7 +360,7 @@ set_sysctl_conf_key() {
   log_success "已写入 ${key}=${value} 到 /etc/sysctl.conf"
 }
 
-# ensure_dir <dir> <owner> <mode>：创建目录并校正属主/权限（幂等）
+# ensure_dir <dir> <owner> <mode>：创建目录并校正属主/权限（幂等，用于宿主机自有目录）
 ensure_dir() {
   local dir="$1" owner="$2" mode="$3" current=""
   install -d -m "$mode" "$dir"
@@ -371,6 +371,23 @@ ensure_dir() {
   fi
   chmod "$mode" "$dir"
   return 0
+}
+
+# ensure_data_dir <dir> <owner> <mode>：仅用于「容器自管理属主」的数据目录（PG/Timescale/Redis/Kafka/ZK/MinIO）。
+#   · 目录为空：按给定属主/权限初始化（随后容器 entrypoint 仍会按镜像内 uid 校正）；
+#   · 目录非空：绝不从宿主机强制 chown/chmod。
+# 原因：容器运行 uid 依基础镜像而异——Alpine 版 timescale 的 postgres=uid 70、Debian 版 postgres=999、
+#   bitnami=1001。对已运行的数据目录强制改属主会与进程 uid 不一致，导致新建后端/checkpoint 读取
+#   数据文件报 "Permission denied"（pg_filenode.map、pg_control、pg_logical/snapshots），甚至 PANIC。
+ensure_data_dir() {
+  local dir="$1" owner="$2" mode="$3"
+  if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+    log_info "数据目录非空，属主交由容器内部管理，跳过 host 侧 chown/chmod：${dir}"
+    return 0
+  fi
+  install -d -m "$mode" "$dir"
+  chown "$owner" "$dir"
+  log_success "初始化数据目录属主/权限：${dir} → ${owner} ${mode}"
 }
 
 # =====================================================================
@@ -764,13 +781,14 @@ step_3_prepare_dirs() {
     install -d -m 0755 "${LOG_DIR}/${d}"
   done
 
-  # 属主（docs/01 §5）：PG/Timescale/Redis 容器 uid = 999；Kafka/ZooKeeper/MinIO = 1001
-  ensure_dir "${DATA_DIR}/postgresql" "999:999" "0755"
-  ensure_dir "${DATA_DIR}/timescale" "999:999" "0755"
-  ensure_dir "${DATA_DIR}/redis" "999:999" "0755"
-  ensure_dir "${DATA_DIR}/kafka" "1001:1001" "0755"
-  ensure_dir "${DATA_DIR}/zookeeper" "1001:1001" "0755"
-  ensure_dir "${DATA_DIR}/minio" "1001:1001" "0755"
+  # 数据目录属主交由容器内部管理（uid 依镜像而异：Alpine timescale 的 postgres=70、bitnami=1001、redis=999）
+  #   非空目录绝不全量 chown，避免与运行中进程 uid 冲突导致数据库 Permission denied/PANIC
+  ensure_data_dir "${DATA_DIR}/postgresql" "999:999" "0700"
+  ensure_data_dir "${DATA_DIR}/timescale" "999:999" "0700"
+  ensure_data_dir "${DATA_DIR}/redis" "999:999" "0755"
+  ensure_data_dir "${DATA_DIR}/kafka" "1001:1001" "0755"
+  ensure_data_dir "${DATA_DIR}/zookeeper" "1001:1001" "0755"
+  ensure_data_dir "${DATA_DIR}/minio" "1001:1001" "0755"
   ensure_dir "${DATA_DIR}/srs" "root:root" "0755"
   ensure_dir "${DATA_DIR}/flink" "root:root" "0755"
   ensure_dir "${DATA_DIR}/backups" "root:root" "0755"
@@ -780,7 +798,7 @@ step_3_prepare_dirs() {
   ensure_dir "${APP_DIR}/sql" "root:root" "0755"
   ensure_dir "${APP_DIR}/nginx" "root:root" "0755"
 
-  log_success "目录准备完成（属主：PG/Timescale/Redis=999:999，Kafka/ZK/MinIO=1001:1001，其余 root:root）"
+  log_success "目录准备完成（数据目录属主由容器管理，空目录初始化：PG/Timescale/Redis=999:999，Kafka/ZK/MinIO=1001:1001；srs/flink/backups 及 APP_DIR 子目录=root:root）"
 }
 
 # =====================================================================
