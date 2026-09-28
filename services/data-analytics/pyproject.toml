@@ -7,6 +7,8 @@ dependencies = [
     "fastapi>=0.100,<1.0",
     "uvicorn[standard]>=0.23",
     "prometheus-client>=0.20,<1",
+    "httpx>=0.27,<1",          # 运行时：data-collector 内部 HTTP 客户端（repositories/events|vehicles 顶层导入）
+    "aioboto3>=12,<14",        # 运行时：MinIO（S3）报告/评估文档只读访问（repositories/storage 惰性导入）
 ]
 
 # 注意：hunter_common 由仓库统一安装（先执行 pip install -e "common/python"），
