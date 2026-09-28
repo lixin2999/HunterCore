@@ -301,7 +301,8 @@ services:
       - "127.0.0.1:${SRS_HTTP_API_HOST_PORT:-9090}:9090"   # HTTP API / WHEP 信令（仅回环）
     volumes:
       - ./config/srs.conf:/usr/local/srs/conf/srs.conf:ro
-      - ${DATA_DIR:-/data}/srs:/usr/local/srs/objs
+      # ⚠ 禁止挂载到 /usr/local/srs/objs：该目录含镜像自带的 srs 二进制（command ./objs/srs），
+      #    空宿主机目录覆盖会清空二进制导致容器启动失败；日志走 console（见 config/srs.conf），由 docker logs 采集
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9090/api/v1/versions"]
       interval: 10s
