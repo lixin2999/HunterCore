@@ -179,6 +179,20 @@ services:
         limits: { cpus: "1", memory: 2G }
 
   # ---------- 4. Kafka 3.6（ZooKeeper 模式；内部 9092=SASL_PLAINTEXT，对外 9093=SASL_SSL） ----------
+  # 与 zookeeper 同类问题：新版 bitnami 镜像 /opt/bitnami/kafka/config 归 root 且不可写，
+  # user:1001 下启动时 `cp server.properties` 报 Permission denied → broker 从未进入监听阶段。
+  # 同样用 init 容器（root）把镜像默认配置拷到卷并 chown 1001，主容器挂卷覆盖 config 目录。
+  # （证书挂在其下的 config/certs 子路径，不受覆盖影响。）
+  kafka-config-init:
+    image: bitnami/kafka:3.6
+    container_name: hunter-kafka-config-init
+    user: root
+    command: ["sh", "-c", "cp -a /opt/bitnami/kafka/config/. /patch/ && chown -R 1001:1001 /patch"]
+    volumes:
+      - ${DATA_DIR:-/data}/kafka-config:/patch
+    restart: "no"
+    networks: [hunter-net]
+
   kafka:
     image: bitnami/kafka:3.6
     container_name: hunter-kafka
@@ -186,6 +200,8 @@ services:
     depends_on:
       zookeeper:
         condition: service_healthy
+      kafka-config-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BROKER_ID: ${KAFKA_BROKER_ID:-1}
       KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -224,6 +240,7 @@ services:
       - "${SERVER_IP}:${KAFKA_EXTERNAL_LISTEN_PORT:-9093}:9093"   # 车端 SASL_SSL 接入（需真实 SERVER_IP）
     volumes:
       - ${DATA_DIR:-/data}/kafka:/bitnami/kafka
+      - ${DATA_DIR:-/data}/kafka-config:/opt/bitnami/kafka/config
       - ./certs/kafka:/opt/bitnami/kafka/config/certs:ro
     healthcheck:
       # 内部监听为 SASL_PLAINTEXT，容器内 --list 需凭据；此处仅探活 broker 端口（就绪由此 + install.sh 双重判定）
