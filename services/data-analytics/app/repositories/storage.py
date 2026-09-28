@@ -51,7 +51,7 @@ class S3ObjectStorage:
 
     def __init__(self, settings: HunterBaseConfig, bucket: str) -> None:
         self._bucket = bucket
-        self._endpoint_url = f"{'https' if settings.minio_secure else 'http'}://{settings.minio_endpoint}"
+        self._endpoint_url = settings.minio_endpoint_url
         self._access_key = settings.minio_access_key
         self._secret_key = settings.minio_secret_key
         self._cm: Any | None = None

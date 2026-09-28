@@ -134,6 +134,18 @@ class HunterBaseConfig(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_secure: bool = False
 
+    @property
+    def minio_endpoint_url(self) -> str:
+        """boto3/aioboto3 的 endpoint_url 必须含 scheme。
+
+        共享配置（docker-compose business-env / k8s ConfigMap）以 ``host:port`` 形式下发
+        MINIO_ENDPOINT，直传 boto3 会抛 ``ValueError: Invalid endpoint``。此处按 minio_secure
+        统一补全 scheme；已含 scheme 则原样返回（与 scene-service.endpoint_url_for 同源规范）。
+        """
+        if "://" in self.minio_endpoint:
+            return self.minio_endpoint
+        return f"{'https' if self.minio_secure else 'http'}://{self.minio_endpoint}"
+
     # ---------- 认证与安全 ----------
     # 生产环境必须通过 K8s Secret 覆盖，禁止使用默认值上线（启动时强校验，见下）
     jwt_secret_key: str = "change-me-in-production"

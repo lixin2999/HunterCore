@@ -242,7 +242,7 @@ def _build_sync_client() -> Any:
 
     return boto3.client(
         "s3",
-        endpoint_url=settings.minio_endpoint,
+        endpoint_url=settings.minio_endpoint_url,
         aws_access_key_id=settings.minio_access_key,
         aws_secret_access_key=settings.minio_secret_key,
         region_name=settings.minio_region,
