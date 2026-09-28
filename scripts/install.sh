@@ -792,6 +792,13 @@ step_3_prepare_dirs() {
   ensure_dir "${DATA_DIR}/srs" "root:root" "0755"
   ensure_dir "${DATA_DIR}/flink" "root:root" "0755"
   ensure_dir "${DATA_DIR}/backups" "root:root" "0755"
+
+  # 业务服务本地 Kafka 磁盘缓冲目录：容器以非 root uid 10001（appuser）运行，bind 源必须由宿主预建并 chown 10001；
+  # 否则目录缺失时 Docker 会以 root 自动创建，导致 LocalDiskBuffer.mkdir 报 PermissionDenied 启动失败。
+  log_info "创建业务服务 Kafka 缓冲目录（属主 10001:10001，供非 root 容器写入）"
+  for d in api-gateway data-collector data-analytics ota-service remote-control scene-service; do
+    ensure_dir "${DATA_DIR}/kafka-buffer/${d}" "10001:10001" "0755"
+  done
   ensure_dir "${APP_DIR}/config" "root:root" "0755"
   ensure_dir "${APP_DIR}/scripts" "root:root" "0755"
   ensure_dir "${APP_DIR}/certs" "root:root" "0755"
