@@ -246,8 +246,9 @@ services:
       - ${DATA_DIR:-/data}/kafka-config:/opt/bitnami/kafka/config
       - ./certs/kafka:/opt/bitnami/kafka/config/certs:ro
     healthcheck:
-      # 内部监听为 SASL_PLAINTEXT，容器内 --list 需凭据；此处仅探活 broker 端口（就绪由此 + install.sh 双重判定）
-      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      # 内部监听为 SASL_PLAINTEXT，容器内 --list 需凭据；此处仅探活 broker 端口（就绪由此 + install.sh 双重判定）。
+      # ⚠ bitnami/kafka:3.6 镜像无 nc，且 /bin/sh=dash 不支持 /dev/tcp；故显式用 bash 探 9092。
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9092"]
       interval: 15s
       timeout: 10s
       retries: 5
