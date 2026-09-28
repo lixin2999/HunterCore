@@ -137,10 +137,26 @@ services:
         limits: { cpus: "1", memory: 2G }
 
   # ---------- 3. ZooKeeper 3.8（Kafka 协调；单机开发允许匿名，生产启用 SASL digest） ----------
+  # bitnamilegacy 新镜像 /opt/bitnami/zookeeper/conf 归 root 且不可写，user:1001 下
+  # setup 阶段 cp zoo.cfg 会 Permission denied；compose 无 fsGroup 等价物，
+  # 用 init 容器（root）拷贝默认配置到卷并 chown 1001，主容器挂卷覆盖 conf 目录
+  zookeeper-init:
+    image: bitnami/zookeeper:3.8
+    container_name: hunter-zookeeper-init
+    user: root
+    command: ["sh", "-c", "cp -a /opt/bitnami/zookeeper/conf/. /patch/ && chown -R 1001:1001 /patch"]
+    volumes:
+      - ${DATA_DIR:-/data}/zookeeper-conf:/patch
+    restart: "no"
+    networks: [hunter-net]
+
   zookeeper:
     image: bitnami/zookeeper:3.8
     container_name: hunter-zookeeper
     user: "1001:1001"          # bitnami 镜像非 root
+    depends_on:
+      zookeeper-init:
+        condition: service_completed_successfully
     environment:
       ALLOW_ANONYMOUS_LOGIN: "yes"    # ⚠ 生产启用认证：设为 no 并配 ZOO_ENABLE_AUTH/ZOO_SERVER_USERS/ZOO_SERVER_PASSWORDS
       TZ: ${TZ:-Asia/Shanghai}
@@ -148,6 +164,7 @@ services:
       - "127.0.0.1:2181:2181"
     volumes:
       - ${DATA_DIR:-/data}/zookeeper:/bitnami/zookeeper
+      - ${DATA_DIR:-/data}/zookeeper-conf:/opt/bitnami/zookeeper/conf
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 2181 || exit 1"]
       interval: 10s
