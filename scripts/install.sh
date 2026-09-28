@@ -1101,7 +1101,7 @@ step_5_gen_certs() {
       log_warn "broker 证书 SAN 未包含 ${SERVER_IP}：请执行 bash ${GEN_KAFKA_CERTS_SH} --force --ip ${SERVER_IP} 重新签发"
     fi
   fi
-  log_success "Kafka 证书生成完成：${cert_dir}（私钥与 JKS 权限 600）"
+  log_success "Kafka 证书生成完成：${cert_dir}（私钥 600；JKS 组 1001 可读 640）"
 }
 
 # =====================================================================
@@ -1140,6 +1140,30 @@ step_6_build_images() {
 # =====================================================================
 # Step 7：启动中间件（按依赖顺序 + 就绪等待）
 # =====================================================================
+# ensure_kafka_certs_readable <cert_dir>：保证 Kafka broker（容器 user 1001:1001）可读取 JKS。
+# 背景：compose 将 ./certs/kafka 只读挂入以 1001 运行的 kafka 容器；若 kafka.keystore.jks /
+# kafka.truststore.jks 仍为 root:root 0600（旧版 gen-kafka-certs.sh 产物），broker 加载 keystore
+# 会 Permission denied → SASL_SSL(EXTERNAL 9093) 监听初始化失败 → 整个 broker 起不来（连 INTERNAL 9092
+# 也不监听），Step 7 表现为“Kafka broker 在 90s 内未就绪”。幂等：仅在该文件存在且组不可读时修正。
+ensure_kafka_certs_readable() {
+  local cert_dir="${1:-${APP_DIR}/certs/kafka}" f gid="${KAFKA_CERT_GID:-1001}"
+  for f in "${cert_dir}/kafka.keystore.jks" "${cert_dir}/kafka.truststore.jks"; do
+    [ -f "$f" ] || continue
+    # 已对 GID 可读（group r）则跳过；否则 chgrp + 0640（组不存在则退回 0644）
+    if [ -r "$f" ] && stat -c '%a' "$f" 2>/dev/null | grep -qE '^0?[0-7][4-7][0-7]$'; then
+      continue
+    fi
+    if chgrp "$gid" "$f" 2>/dev/null; then
+      chmod 640 "$f"
+      log_success "已修正 Kafka JKS 权限（供 broker 1001 读取）：$f"
+    else
+      chmod 644 "$f"
+      log_warn "无法 chgrp $gid，已将 $f 置 0644（仅单机可接受）"
+    fi
+  done
+  return 0
+}
+
 step_7_start_middleware() {
   local env_file
   env_file="${ENV_FILE_ARG:-${HUNTER_ENV_FILE:-${APP_DIR}/.env}}"
@@ -1167,6 +1191,8 @@ step_7_start_middleware() {
     "Redis（AOF）" 30 || return 1
 
   # 7.4 ZooKeeper 3.8 + Kafka 3.6（内部 9092 / 外部 SASL_SSL 9093）
+  # 先幂等修正 JKS 权限（Step 5 命中“证书已存在”会跳过生成，存量 0600 需在此修复）
+  ensure_kafka_certs_readable "${KAFKA_CERTS_DIR:-${APP_DIR}/certs/kafka}"
   hc_run_logged "启动 zookeeper kafka" compose up -d zookeeper kafka || return 1
   wait_for "kafka_broker_ready ${C_KAFKA}" "Kafka broker（9092 内部 / 9093 车端 SASL_SSL）" 90 || return 1
 

@@ -28,7 +28,7 @@
 #   sudo bash /opt/hunter-core/scripts/gen-kafka-certs.sh --force
 #
 # 幂等：kafka.keystore.jks 与 kafka.truststore.jks 已存在则跳过（--force 除外）。
-# 权限：私钥/JKS/P12 = 600；证书（含 CA）= 644。
+# 权限：私钥/P12 = 600；broker 加载的 JKS（keystore/truststore）= 0640 且属组 1001（供 Kafka 容器读取）；证书（含 CA）= 644。
 # 依赖：common.sh（同目录）、openssl ≥1.1.1、keytool（openjdk-17-jre-headless）
 # 日期：2026-09-19  |  目标系统：Ubuntu 22.04 LTS
 # =====================================================================
@@ -50,6 +50,10 @@ LEAF_DAYS=3650
 CA_SUBJECT="/C=CN/O=HunterCore/CN=hunter-core-kafka-ca"
 BROKER_SUBJECT="/C=CN/O=HunterCore/CN=kafka"
 CLIENT_SUBJECT="/C=CN/O=HunterCore/CN=kafka-client"
+
+# Kafka broker 容器运行组（compose: user "1001:1001"）；JKS 须对该 GID 可读，
+# 否则 broker 加载 keystore 报 Permission denied → SASL_SSL 监听初始化失败 → 整个 broker 起不来。
+KAFKA_CERT_GID="${KAFKA_CERT_GID:-1001}"
 
 usage() {
   cat <<'EOF'
@@ -158,7 +162,20 @@ write_ext_file() {
   printf '%s\n' "$@" >"$path"
 }
 
-# import_keystore <p12> <jks> <storepass>：PKCS12 → JKS 密钥库（Java 17 下 JKS 为兼容格式）
+# broker_readable_jks <file>：让 Kafka broker（GID 1001）可读取 JKS —— chgrp + 0640；
+# 组不可用时退回 0644（口令保护的 keystore，单机可接受）。私钥 .pem 仍保持 0600。
+broker_readable_jks() {
+  local f="$1"
+  if chgrp "$KAFKA_CERT_GID" "$f" 2>/dev/null; then
+    chmod 640 "$f"
+  else
+    log_warn "无法 chgrp ${KAFKA_CERT_GID}（${f}）：退回 0644 以保证 broker 可读"
+    chmod 644 "$f"
+  fi
+  return 0
+}
+
+# import_keystore <p12> <jks> <storepass> <alias>：PKCS12 → JKS 密钥库（Java 17 下 JKS 为兼容格式）
 import_keystore() {
   local p12="$1" jks="$2" storepass="$3" alias="$4"
   rm -f "$jks"
@@ -305,8 +322,9 @@ main() {
     return 1
   }
   import_keystore "${cert_dir}/broker.p12" "${cert_dir}/kafka.keystore.jks" "$storepass" "hunter-kafka-broker" || return 1
-  chmod 600 "${cert_dir}/broker.p12" "${cert_dir}/kafka.keystore.jks"
-  log_success "已生成 kafka.keystore.jks（600，别名 hunter-kafka-broker）"
+  chmod 600 "${cert_dir}/broker.p12"
+  broker_readable_jks "${cert_dir}/kafka.keystore.jks"
+  log_success "已生成 kafka.keystore.jks（组 ${KAFKA_CERT_GID} 可读，别名 hunter-kafka-broker）"
 
   # ---------- 5) truststore（JKS，导入 CA） ----------
   log_info "构建 kafka.truststore.jks（导入 CA）"
@@ -317,8 +335,8 @@ main() {
     log_error "导入 truststore 失败：请检查 KAFKA_SSL_PASSWORD 是否正确"
     return 1
   }
-  chmod 600 "${cert_dir}/kafka.truststore.jks"
-  log_success "已生成 kafka.truststore.jks（600，别名 hunter-core-kafka-ca）"
+  broker_readable_jks "${cert_dir}/kafka.truststore.jks"
+  log_success "已生成 kafka.truststore.jks（组 ${KAFKA_CERT_GID} 可读，别名 hunter-core-kafka-ca）"
 
   # ---------- 6) 车端客户端 PKCS12（含密钥与证书链） ----------
   log_info "生成车端客户端 PKCS12：kafka-client.p12"
@@ -383,7 +401,7 @@ main() {
     log_warn "--force 已重新签发：必须重启 Kafka 容器（docker compose restart kafka）并更新车端证书，否则握手失败"
   fi
   log_warn "私钥与 JKS 严禁外传；车端仅分发 ca-cert.pem 与客户端证书/密钥（或 kafka-client.p12）"
-  log_success "证书生成完成（私钥/JKS/P12 权限 600，证书 644）"
+  log_success "证书生成完成（私钥/P12 600；JKS 组 1001 可读 640；证书 644）"
 }
 
 main "$@"
