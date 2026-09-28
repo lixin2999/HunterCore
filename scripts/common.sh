@@ -490,7 +490,10 @@ container_restart_count() {
 #   非 PLAINTEXT 时：先把 client.properties 写入容器内，再输出 "--command-config" 与路径
 kafka_auth_args() {
   local container="${1:-$C_KAFKA}"
-  local protocol="${KAFKA_INTERNAL_SECURITY_PROTOCOL:-PLAINTEXT}"
+  # 回退默认与 broker 实际监听对齐：infra/deploy/docker-compose.yml 将 INTERNAL(9092) 硬编码为 SASL_PLAINTEXT，
+  # 故即使 .env 未显式设置 KAFKA_INTERNAL_SECURITY_PROTOCOL，也必须按 SASL_PLAINTEXT 附带 --command-config，
+  # 否则 kafka-topics.sh 以明文连要求 SCRAM 的 broker，createTopics 会报 "Timed out waiting for a node assignment"。
+  local protocol="${KAFKA_INTERNAL_SECURITY_PROTOCOL:-SASL_PLAINTEXT}"
   local conf_path="${KAFKA_CMD_CONFIG:-/tmp/hunter-client.properties}"
   local mech="${KAFKA_SASL_MECHANISM:-SCRAM-SHA-512}"
   local user="${KAFKA_SASL_USER:-}" password="${KAFKA_SASL_PASSWORD:-}" extra=""

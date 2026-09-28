@@ -120,7 +120,7 @@ create_topic() {
     return 0
   fi
   log_error "创建 Topic 失败：${name}"
-  log_error "排查建议：① 内部监听认证（KAFKA_INTERNAL_SECURITY_PROTOCOL=${KAFKA_INTERNAL_SECURITY_PROTOCOL:-PLAINTEXT}）；② docker logs ${C_KAFKA} --tail=100；③ 分区数不可少于既有分区"
+  log_error "排查建议：① 内部监听认证（KAFKA_INTERNAL_SECURITY_PROTOCOL=${KAFKA_INTERNAL_SECURITY_PROTOCOL:-SASL_PLAINTEXT}，broker 固定为 SASL_PLAINTEXT，需与 .env 一致且 KAFKA_SASL_USER/PASSWORD 有效）；② docker logs ${C_KAFKA} --tail=100；③ 分区数不可少于既有分区"
   return 1
 }
 
