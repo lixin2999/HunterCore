@@ -132,7 +132,7 @@ verify_topic() {
     log_error "Topic 校验失败（不存在）：${name}"
     return 1
   fi
-  actual_partitions="$(printf '%s\n' "$desc" | awk '/PartitionCount/ {for (i=1;i<=NF;i++) if ($i ~ /^PartitionCount:/) {split($i,a,":"); print a[2]}}' | head -n1)"
+  actual_partitions="$(printf '%s\n' "$desc" | grep -oE 'PartitionCount:[[:space:]]+[0-9]+' | grep -oE '[0-9]+' | head -n1)"
   actual_retention="$(printf '%s\n' "$desc" | awk '/retention.ms=/ {match($0, /retention.ms=[0-9]+/); if (RSTART) {print substr($0, RSTART+13, RLENGTH-13); exit}}')"
   if [ "${actual_partitions:-0}" = "$expect_partitions" ] && [ "${actual_retention:-0}" = "$expect_retention" ]; then
     log_info "校验通过：${name}（partitions=${actual_partitions}, retention.ms=${actual_retention}）"
