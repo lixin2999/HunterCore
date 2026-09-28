@@ -100,6 +100,8 @@ bash /opt/hunter-core/scripts/backup.sh           # 数据备份
 bash /opt/hunter-core/scripts/collect-logs.sh     # 收集日志供排障
 ```
 
+> **Step 7 中间件启动常见阻断（Kafka）**：`install.sh --step 7` 卡在 Kafka 90s 未就绪时，多为逐层暴露的多重根因（config 目录不可写 → inter-broker advertised → OS 孤儿网桥重复子网 → keystore JKS 对 uid 1001 不可读 → healthcheck 无 nc）。以 `docker logs hunter-kafka` 实际异常为准逐层定位，处置命令见 `docs/运维操作手册.md` §3.4.1 与 `docs/故障排查指南.md`（背景与根因见 `release.md` V1.16.2）。
+
 ### 微服务内部结构（固定，不可更改）
 
 ```

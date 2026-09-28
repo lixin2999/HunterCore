@@ -956,6 +956,45 @@ ensure_nginx_conf() {
   return 1
 }
 
+# ensure_srs_conf：确保 ${APP_DIR}/config/srs.conf 就位并替换 candidate 占位符（compose 以文件方式挂载）
+# 背景：bind 源路径不存在时 Docker 会自动创建同名空目录，导致“目录挂载到文件”启动失败（Step 7 srs）
+ensure_srs_conf() {
+  local target="${APP_DIR}/config/srs.conf"
+  local server_ip="$1"
+  if [ -d "$target" ]; then
+    log_error "${target} 是目录（多为 Docker 挂载源缺失时误创建的空目录），应为配置文件"
+    if [ -z "$(ls -A "$target" 2>/dev/null)" ]; then
+      rmdir "$target" && log_success "已清理空目录：${target}"
+    else
+      log_error "该目录非空，请人工确认后移除，再重跑 Step 4"
+      return 1
+    fi
+  fi
+  if [ ! -f "$target" ]; then
+    local src="${APP_DIR}/infra/deploy/config/srs.conf"
+    if [ ! -f "$src" ]; then
+      log_error "未找到 srs.conf 模板（期望 ${src}）：srs 容器将启动失败"
+      log_error "请从仓库 infra/deploy/config/srs.conf 复制到 ${target} 后重试"
+      return 1
+    fi
+    install -m 0644 "$src" "$target"
+    log_success "已复制 SRS 配置：${src} → ${target}"
+  else
+    log_info "SRS 配置已就位：${target}（幂等）"
+  fi
+  # 占位符替换：candidate $SERVER_IP → 真实 IP（SRS 不展开环境变量，未替换则 WebRTC candidate 错误）
+  if grep -qF '$SERVER_IP' "$target"; then
+    if [ -z "$server_ip" ]; then
+      log_error "srs.conf 含 \$SERVER_IP 占位符但 SERVER_IP 为空，无法替换"
+      return 1
+    fi
+    sed -i "s|\$SERVER_IP|${server_ip}|g" "$target"
+    log_success "srs.conf candidate 已替换为 SERVER_IP=${server_ip}"
+  fi
+  chmod 644 "$target"
+  return 0
+}
+
 step_4_gen_config() {
   local env_file example server_ip
   env_file="${ENV_FILE_ARG:-${HUNTER_ENV_FILE:-${APP_DIR}/.env}}"
@@ -1045,6 +1084,9 @@ step_4_gen_config() {
 
   # 4.5 Nginx 配置（web-portal：静态资源 + /api 反代网关 + /ws 反代 remote-control）
   ensure_nginx_conf || return 1
+
+  # 4.6 SRS 配置（compose 挂载 ./config/srs.conf；缺失会被 Docker 误建为空目录导致 Step 7 启动失败）
+  ensure_srs_conf "$server_ip" || return 1
 
   log_success "配置生成完成：${env_file}（权限 600）、${PASSWORDS_FILE}（权限 600）"
 }
