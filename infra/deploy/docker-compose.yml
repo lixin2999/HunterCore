@@ -208,7 +208,10 @@ services:
       # 三监听器：INTERNAL(容器间/业务服务) / EXTERNAL(车端，宿主机映射) / BROKER(inter-broker)
       KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_SSL,BROKER:SASL_PLAINTEXT
       KAFKA_CFG_LISTENERS: INTERNAL://:9092,EXTERNAL://:9093,BROKER://:9094
-      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${SERVER_IP}:9093
+      # advertised 必须涵盖 inter.broker.listener.name（BROKER）；否则 KafkaConfig 校验报
+      # "inter.broker.listener.name must be a listener name defined in advertised.listeners" 启动即退出。
+      # BROKER 走 hunter-net 内服务名 kafka:9094（单节点自连可解析）。
+      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://${SERVER_IP}:9093,BROKER://kafka:9094
       KAFKA_CFG_INTER_BROKER_LISTENER_NAME: BROKER
       # SASL/SCRAM 机制（inter-broker 与 INTERNAL 走 SCRAM；账号由 bitnami 依下列变量创建）
       KAFKA_CFG_SASL_ENABLED_MECHANISMS: SCRAM-SHA-512
