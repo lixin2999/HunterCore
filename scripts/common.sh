@@ -531,13 +531,16 @@ kafka_topics_cli() {
   kafka_tool_cli kafka-topics.sh --bootstrap-server "$bootstrap" "$@"
 }
 
-# kafka_broker_ready <container>：broker 是否可连接（先试 kafka-topics.sh，再退回 TCP 探测，认证无关）
+# kafka_broker_ready <container>：broker 是否可连接（先试 kafka-topics.sh，再退回端口探活，认证无关）
 kafka_broker_ready() {
   local container="${1:-$C_KAFKA}"
   if kafka_topics_cli --list >/dev/null 2>&1; then
     return 0
   fi
-  docker exec "$container" sh -c 'exec 3<>/dev/tcp/127.0.0.1/9092' >/dev/null 2>&1
+  # 端口探活兜底（认证无关）：优先 nc（与 compose healthcheck 一致）；
+  # bitnami 镜像 /bin/sh 为 dash，不支持 /dev/tcp，故退回显式用 bash 探测。
+  docker exec "$container" sh -c 'command -v nc >/dev/null 2>&1 && nc -z localhost 9092' >/dev/null 2>&1 && return 0
+  docker exec "$container" bash -c 'exec 3<>/dev/tcp/127.0.0.1/9092' >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------
