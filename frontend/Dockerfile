@@ -29,9 +29,9 @@ COPY --from=builder /app/dist /usr/share/nginx/html
 
 EXPOSE 80
 
-# busybox wget 探活首页（nginx:alpine 自带 wget）；用 127.0.0.1 而非 localhost，避免解析到 ::1
+# busybox wget 探专用存活探针 /healthz（nginx:alpine 自带 wget）；用 127.0.0.1 而非 localhost，避免解析到 ::1（nginx 仅 listen 80 IPv4）
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
-  CMD wget --quiet --tries=1 --spider http://127.0.0.1/ || exit 1
+  CMD wget --quiet --tries=1 --spider http://127.0.0.1/healthz || exit 1
 
 # 说明：nginx 官方镜像 master 以 root 启动、worker 以 nginx 用户运行。
 # 若需完全非 root（80 端口 <1024 需 net.ipv4.ip_unprivileged_port_start=80 或改用 8080 + 上层映射），
