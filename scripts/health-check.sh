@@ -198,11 +198,22 @@ print_health_report() {
 # =====================================================================
 # ① 容器运行状态 + Docker healthcheck
 check_containers() {
-  local name state health
+  local name state health _waited=0 _pending _h
   if ! command_exists docker || ! docker info >/dev/null 2>&1; then
     record_result "FAIL" "容器运行状态" "Docker 守护进程不可用（systemctl status docker）"
     return 0
   fi
+  # 有界等待：最后启动的容器（如 web 依赖 api-gateway healthy）可能仍在首个探测周期的 starting 态，
+  # 直接判定会误报 FAIL。最多等 HEALTH_SETTLE_WAIT（默认 60）秒让 starting 收敛为 healthy/unhealthy。
+  while [ "$_waited" -lt "${HEALTH_SETTLE_WAIT:-60}" ]; do
+    _pending=0
+    for name in "${EXPECTED_CONTAINERS[@]}"; do
+      _h="$(container_health "$name" 2>/dev/null)"
+      [ "$_h" = "starting" ] && _pending=1
+    done
+    [ "$_pending" -eq 0 ] && break
+    sleep 5; _waited=$((_waited + 5))
+  done
   for name in "${EXPECTED_CONTAINERS[@]}"; do
     if ! docker inspect "$name" >/dev/null 2>&1; then
       record_result "FAIL" "容器 ${name}" "容器不存在（未启动，或 compose 未创建）"
@@ -388,7 +399,7 @@ check_kafka_lag() {
     record_result "WARN" "Kafka 消费积压" "Kafka 容器不存在，跳过积压检查"
     return 0
   fi
-  lag="$(kafka_consumer_lag "$group" 2>/dev/null || printf '%s' "-1")"
+  lag="$(kafka_consumer_lag "$group" 2>/dev/null)"; [ -z "$lag" ] && lag="-1"
   if [ "$lag" -lt 0 ]; then
     record_result "WARN" "Kafka 消费积压" "消费组 ${group} 尚无 offset 提交（车辆未上报或 data-collector 未消费）"
   elif [ "$lag" -gt "$LAG_THRESHOLD" ]; then
