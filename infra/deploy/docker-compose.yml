@@ -304,8 +304,9 @@ services:
       # ⚠ 禁止挂载到 /usr/local/srs/objs：该目录含镜像自带的 srs 二进制（command ./objs/srs），
       #    空宿主机目录覆盖会清空二进制导致容器启动失败；日志走 console（见 config/srs.conf），由 docker logs 采集
     healthcheck:
-      # 用 127.0.0.1 而非 localhost：SRS http_api 仅 bind IPv4，容器内 localhost 常被解析到 ::1 导致探针失败（unhealthy）
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9090/api/v1/versions"]
+      # 不依赖 curl/wget：ossrs/srs:5 镜像内无 curl（用 curl 探针会永远 unhealthy，
+      # 并经 depends_on srs: service_healthy 阻断 remote-control）。改用 bash /dev/tcp 直接探 HTTP API 端口（9090）。
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9090' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
