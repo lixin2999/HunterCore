@@ -22,9 +22,10 @@ class Settings(HunterBaseConfig):
     data_analytics_service_url: str = "http://localhost:8083"
     ota_service_url: str = "http://localhost:8084"
     remote_control_service_url: str = "http://localhost:8085"
-    # vehicle-service / user-service 归属待确认（契约 status=pending_confirmation，端口未登记）：
+    # vehicle-service 已交付（contracts/openapi/vehicle-service.yaml，端口 8086）
+    vehicle_service_url: str = "http://localhost:8086"
+    # user-service 归属待确认（契约 status=pending_confirmation，端口未登记）：
     # 未配置 URL 时对应前缀返回 503 + code=5001（服务不可用），禁止伪造转发
-    vehicle_service_url: str | None = None
     user_service_url: str | None = None
 
     # 转发超时（轻量 API 面向 P95 ≤ 200ms；大文件上传等按需经环境变量调整上限）

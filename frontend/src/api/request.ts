@@ -190,3 +190,45 @@ export async function putToPresignedUrl(
   return typeof etag === 'string' ? etag.replaceAll('"', '') : ''
 }
 
+/**
+ * 二进制下载（契约非统一响应体端点：如 vehicle-service /bundle 返回 application/zip）
+ * - 携带 JWT，同域下自动与业务请求共享拦截器（自动刷新 token）
+ * - 失败时服务端仍会返回统一 JSON，需先尝试从 Blob 中解析后映射为 HunterApiError
+ */
+export async function downloadBlob(
+  url: string,
+  filenameHint?: string,
+): Promise<{ blob: Blob; filename: string }> {
+  const response = await http.get(url, { responseType: 'blob' })
+  // 失败回应的统一 JSON 信封（content-type=application/json）→ 抛错
+  const contentType = String(response.headers['content-type'] ?? '')
+  if (contentType.includes('application/json')) {
+    const text = await (response.data as Blob).text()
+    let payload: { code?: number; message?: string; request_id?: string } | null = null
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      payload = null
+    }
+    const code = typeof payload?.code === 'number' ? payload.code : 5000
+    throw new HunterApiError(
+      code,
+      payload?.message || describeErrorCode(code),
+      payload?.request_id,
+      response.status,
+    )
+  }
+  // 从 Content-Disposition 提取文件名（契约：attachment; filename="<id>-bundle.zip"）
+  let filename = filenameHint ?? 'download.bin'
+  const disposition = String(response.headers['content-disposition'] ?? '')
+  const match = /filename\*?="?([^";]+)"?/i.exec(disposition)
+  if (match?.[1]) {
+    try {
+      filename = decodeURIComponent(match[1])
+    } catch {
+      filename = match[1]
+    }
+  }
+  return { blob: response.data as Blob, filename }
+}
+

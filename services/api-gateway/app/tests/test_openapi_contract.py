@@ -283,6 +283,7 @@ def test_proxy_routes_target_correct_service_ports(contract: dict[str, Any]) -> 
         "/api/v1/analytics": ("data-analytics", 8083),
         "/api/v1/ota": ("ota-service", 8084),
         "/api/v1/remote": ("remote-control", 8085),
+        "/api/v1/vehicle": ("vehicle-service", 8086),
     }
     for prefix, (service, port) in expected.items():
         assert routes[prefix]["target_service"] == service
@@ -291,10 +292,10 @@ def test_proxy_routes_target_correct_service_ports(contract: dict[str, Any]) -> 
 
 
 def test_pending_confirmation_routes_are_marked(contract: dict[str, Any]) -> None:
-    """模块表仅 6 个微服务，vehicle-service / user-service 归属未定 —— 必须显式标记待确认。"""
+    """仅 user-service 归属未定（vehicle 已交付） —— 必须显式标记待确认。"""
     routes = contract["x-hunter-gateway-routes"]["routes"]
     pending = {r["prefix"] for r in routes if r.get("status") == "pending_confirmation"}
-    assert pending == {"/api/v1/vehicle", "/api/v1/user"}
+    assert pending == {"/api/v1/user"}
     discovery = contract["x-hunter-gateway-routes"]["service_discovery"]
     assert discovery["status"] == "pending_confirmation"
 

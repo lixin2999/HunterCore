@@ -12,6 +12,7 @@ export * from './data'
 export * from './ota'
 export * from './permissions'
 export * from './remote'
+export * from './vehicle'
 
 /** 应用标题 */
 export const APP_TITLE: string = import.meta.env.VITE_APP_TITLE ?? 'HunterCore 运营管理后台'

@@ -73,6 +73,11 @@ class Vehicle(Base):
     device_cert_sn: Mapped[str | None] = mapped_column(Text)
     # G-11（设计文档 8.4.2 地理围栏）：circle/polygon 围栏定义 + 可选限速；NULL = 不校验
     fence_json: Mapped[dict | None] = mapped_column(JSONB)
+    # vehicle-service provisioning 状态（契约 openapi/vehicle-service.yaml x-hunter-provisioning）
+    # 结构：{"state": "pending|in_progress|ready|failed",
+    #        "steps": {"db|scram|topics|cert": {"state":..., "ts":..., "error":...}}}
+    # 写入方：仅 vehicle-service；历史内置台账可为 NULL
+    provision_status: Mapped[dict | None] = mapped_column(JSONB)
     description: Mapped[str | None] = mapped_column(Text)
 
     # 无 relationship：events / vehicle_telemetry / algorithm_metrics / ota_records 的 vehicle_id

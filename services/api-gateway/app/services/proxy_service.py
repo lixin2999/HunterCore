@@ -107,7 +107,8 @@ def reset_circuit_breakers() -> None:
 def build_route_table(settings: Settings) -> list[GatewayRoute]:
     """契约路由表（纯静态配置，不依赖运行时 HTTP 客户端；顺序与契约一致）。
 
-    vehicle/user 前缀归属待确认（契约 ``pending_confirmation``）→ base_url 可能为 None。
+    user 前缀归属待确认（契约 ``pending_confirmation``）→ base_url 可能为 None；
+    vehicle 前缀已交付（vehicle-service 8086，见 contracts/openapi/vehicle-service.yaml）。
     """
     return [
         GatewayRoute(prefix="/api/v1/scene", service_name="scene-service", base_url=settings.scene_service_url),
@@ -142,7 +143,7 @@ class ProxyService:
     # 路由解析（契约 x-hunter-gateway-routes.routes；前缀不可更改）
     # -----------------------------------------------------------------
     def routes(self) -> list[GatewayRoute]:
-        """转发路由表（顺序与契约一致；vehicle/user 归属待确认 → URL 可能为 None）。"""
+        """转发路由表（顺序与契约一致；user 归属待确认 → URL 可能为 None）。"""
         return build_route_table(self._settings)
 
     def resolve_route(self, path: str) -> GatewayRoute | None:
@@ -159,7 +160,7 @@ class ProxyService:
         if route is None:
             raise ResourceNotFoundError  # 网关未路由的路径（契约外）→ 404 + 3001
         if route.base_url is None:
-            # 归属待确认（vehicle/user-service 未登记端口与部署）→ 依赖不可用，禁止伪造转发
+            # 归属待确认（user-service 未登记端口与部署）→ 依赖不可用，禁止伪造转发
             logger.warning("proxy_backend_not_configured", service=route.service_name, path=path)
             raise ServiceUnavailableError
         breaker = get_circuit_breaker(route.service_name, self._settings)

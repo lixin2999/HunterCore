@@ -395,6 +395,7 @@ services:
       DATA_ANALYTICS_SERVICE_URL: ${DATA_ANALYTICS_SERVICE_URL:-http://data-analytics:8083}
       OTA_SERVICE_URL: ${OTA_SERVICE_URL:-http://ota-service:8084}
       REMOTE_CONTROL_SERVICE_URL: ${REMOTE_CONTROL_SERVICE_URL:-http://remote-control:8085}
+      VEHICLE_SERVICE_URL: ${VEHICLE_SERVICE_URL:-http://vehicle-service:8086}
       RATE_LIMIT_GLOBAL_QPS: ${RATE_LIMIT_GLOBAL_QPS:-10000}
       RATE_LIMIT_PER_USER_QPS: ${RATE_LIMIT_PER_USER_QPS:-100}
       RATE_LIMIT_PER_IP_QPS: ${RATE_LIMIT_PER_IP_QPS:-200}
@@ -613,7 +614,60 @@ services:
       resources:
         limits: { cpus: "2", memory: 4G }
 
-  # ---------- 14. web-portal（Nginx + Vue3 dist；对外 80，同源反代 /api 与 /ws） ----------
+  # ---------- 14. vehicle-service（8086；车辆台账与一键接入 provisioning） ----------
+  # 与其它业务服务不同：运行期需 openssl 子进程签发每车客户端证书，镜像基于 python:3.11-slim
+  # 预装 openssl（非 distroless）；CA 私钥只读挂载 + setfacl 授权 gid 10001（install.sh 自愈）；
+  # 证书写入 /app/data/vehicle-certs（持久卷，vehicle-service 唯一写域）。
+  vehicle-service:
+    image: ${IMAGE_PREFIX:-hunter}/vehicle-service:${VERSION}
+    build:
+      context: .
+      dockerfile: services/vehicle-service/Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-vehicle-service
+    user: "10001:10001"
+    environment:
+      <<: *business-env
+      SERVICE_NAME: vehicle-service
+      API_PORT: "8086"
+      # CA 只读挂载（install.sh 确保 ca-key.pem 对 gid 10001 可读）
+      KAFKA_CA_KEY_PATH: /srv/kafka-ca/ca-key.pem
+      KAFKA_CA_CERT_PATH: /srv/kafka-ca/ca-cert.pem
+      # 每车证书持久化目录（vehicle-service 唯一写域）
+      VEHICLE_CERTS_DIR: /app/data/vehicle-certs
+      VEHICLE_CERT_VALIDITY_DAYS: ${VEHICLE_CERT_RETENTION_DAYS:-3650}
+      # 车端 kafka.properties 生成用的对外 bootstrap（与 Kafka EXTERNAL 监听 9093 对齐）
+      SERVER_IP: ${SERVER_IP}
+      KAFKA_EXTERNAL_PORT: "${KAFKA_EXTERNAL_LISTEN_PORT:-9093}"
+      # AdminClient 走 hunter-net 内部 kafka:9092（SASL_PLAINTEXT），复用 business-env KAFKA_*
+      KAFKA_ADMIN_TIMEOUT_MS: ${KAFKA_ADMIN_TIMEOUT_MS:-10000}
+      KAFKA_DEFAULT_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
+    ports:
+      - "127.0.0.1:${VEHICLE_SERVICE_PORT:-8086}:8086"
+    volumes:
+      - *contracts-vol
+      # CA 目录只读（gen-kafka-certs.sh 产物）；ca-key.pem 权限由 install.sh 保证 gid 可读
+      - ./certs/kafka:/srv/kafka-ca:ro
+      # 每车证书输出
+      - ${DATA_DIR:-/data}/vehicle-certs:/app/data/vehicle-certs:rw
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
+
+  # ---------- 15. web-portal（Nginx + Vue3 dist；对外 80，同源反代 /api 与 /ws） ----------
   web-portal:
     image: ${IMAGE_PREFIX:-hunter}/web-portal:${VERSION}
     build:

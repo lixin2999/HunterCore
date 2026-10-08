@@ -51,7 +51,7 @@ RESULT_ROWS=()
 EXPECTED_CONTAINERS=(
   "hunter-postgres" "hunter-redis" "hunter-zookeeper" "hunter-kafka" "hunter-minio" "hunter-srs"
   "hunter-flink-jm" "hunter-flink-tm" "hunter-api-gateway" "hunter-scene" "hunter-collector"
-  "hunter-analytics" "hunter-ota" "hunter-remote" "hunter-web"
+  "hunter-analytics" "hunter-ota" "hunter-remote" "hunter-vehicle-service" "hunter-web"
 )
 OPTIONAL_CONTAINERS=("hunter-timescale")
 
@@ -253,6 +253,7 @@ check_http_endpoints() {
     "data-analytics:${DATA_ANALYTICS_PORT:-8083}:${HEALTH_PATH}"
     "ota-service:${OTA_SERVICE_PORT:-8084}:${HEALTH_PATH}"
     "remote-control:${REMOTE_CONTROL_PORT:-8085}:${HEALTH_PATH}"
+    "vehicle-service:${VEHICLE_SERVICE_PORT:-8086}:${HEALTH_PATH}"
     "web-portal:${WEB_PORT:-80}:/"
   )
   for item in "${services[@]}"; do

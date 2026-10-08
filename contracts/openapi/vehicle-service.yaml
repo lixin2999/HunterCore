@@ -1,0 +1,628 @@
+# =====================================================================
+# HunterCore 车辆管理服务契约（OpenAPI 3.0.3）—— 单一事实来源
+# 来源：设计文档 3.4 节（网关路由表 /api/v1/vehicle）、5.3 节（Kafka Topic 与车端接入）、
+#       14.2 节（车-云 mTLS）、附录 A（错误码）、附录 D（API 限流）
+# 实现：services/vehicle-service（FastAPI 0.100+，端口 8086）；变更必须先改本文件再改代码
+#
+# 范围说明：
+#   - 网关前缀 /api/v1/vehicle（不可更改，见 api-gateway.yaml x-hunter-gateway-routes）
+#   - 服务职责：车辆台账 CRUD + 车端接入一键开通（DB/SCRAM/Topic/证书）+ 接入包下载
+#   - 车端数据面仍走 Kafka（hunter.{vehicle_id}.*），本服务不生产/不消费业务 Topic；
+#     仅在"开通/下线"时对 Kafka 执行控制面操作（AdminClient KIP-95 + create_topics）
+#   - 每辆车独立 SCRAM 账号（username = vehicle_id）与独立 mTLS 客户端证书（CN = vehicle_id）
+#
+# 安全（关键）：
+#   1. SCRAM 口令由服务端 secrets.token_urlsafe(24) 生成，仅在开通/轮换响应中一次性返回；
+#      数据库与日志均不保留明文
+#   2. 客户端私钥（client-key.pem/p12）仅在 /bundle 下载响应体中出现，服务端在
+#      VEHICLE_CERTS_DIR 保留 3650 天（可运维清理），禁止写入镜像层/日志
+#   3. CA 私钥挂载 vehicle-service 容器为只读（setfacl 授权 gid），签发使用 openssl 子进程
+# =====================================================================
+openapi: 3.0.3
+
+info:
+  title: HunterCore - vehicle-service
+  version: 0.1.0
+  description: |
+    车辆台账与车端接入编排服务（端口 8086，网关前缀 `/api/v1/vehicle`）。
+
+    **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功，非 0 为预定义错误码（附录 A）。
+
+    **核心能力**：一键开通向导按序完成 4 步 provisioning（DB 台账 → SCRAM 用户 → 8 个车端 Topic →
+    独立 mTLS 客户端证书），任一步失败自动逆序回滚；提供接入包（ZIP）下载，含车端所需的
+    `ca-cert.pem / client-cert.pem / client-key.pem / kafka-client.p12 / kafka.properties / README.md`。
+
+    **鉴权**：经网关 JWT 转发；RBAC 资源域 `vehicle`，动作 create/read/update/delete/execute。
+    仅 admin / operator 可执行 provisioning（create/delete/execute）；analyst / viewer 只读。
+
+    **限流**：继承网关五级限流（全局 10000 QPS / 单用户 100 QPS / 单 IP 200 QPS）；
+    接口级 provisioning 端点（`POST /api/v1/vehicle`、`DELETE`、`/rotate-scram`、
+    `/reissue-cert`、`/bundle`）建议单用户 1 QPS（阈值待附录 D 补充确认）。
+
+    **性能**：单辆车 provisioning 端到端 ≤ 5s（含 openssl 签发与 Kafka 元数据同步等待）。
+  license:
+    name: Proprietary - HunterCore
+
+servers:
+  - url: https://hunter-core.example.com
+    description: 生产环境（控制台经网关 /api/v1/vehicle 转发）
+  - url: http://localhost:8086
+    description: 本地开发（直连服务）
+
+tags:
+  - name: vehicle
+    description: 车辆台账与接入 provisioning
+  - name: ops
+    description: 运维探针与指标
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/vehicle/list:
+    get:
+      tags: [vehicle]
+      summary: 车辆列表（分页 + 状态过滤）
+      description: 权限 `vehicle:read`；默认按 `last_online_time DESC NULLS LAST, vehicle_id` 排序。
+      operationId: listVehicles
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: status
+          in: query
+          schema: { type: string, enum: [offline, online_idle, auto_driving, remote_controlled, upgrading, charging, fault, emergency] }
+          description: 车辆状态过滤（受控词表见 contracts/database/enums.md 第 1 节）
+        - name: provision_state
+          in: query
+          schema: { type: string, enum: [pending, in_progress, ready, failed] }
+          description: provisioning 汇总态过滤（由 4 步状态归并）
+        - name: keyword
+          in: query
+          schema: { type: string, maxLength: 64 }
+          description: 模糊匹配 vehicle_id / vehicle_name
+      responses:
+        '200':
+          description: 分页车辆列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseVehiclePage' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/vehicle:
+    post:
+      tags: [vehicle]
+      summary: 一键开通车辆（provisioning 向导）
+      description: |
+        权限 `vehicle:create`。按序执行：DB 台账 INSERT → SCRAM 用户 → 8 个车端 Topic → 独立客户端证书。
+        任一步失败按逆序回滚，SCRAM 口令仅在成功响应中一次性返回（响应体不落日志）。
+      operationId: createVehicle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VehicleCreateRequest' }
+      responses:
+        '200':
+          description: 开通成功（含一次性 SCRAM 口令与 bundle 下载 URL）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseProvisionResult' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: 3002 vehicle_id 已存在 / 4002 Kafka 已有同名 SCRAM/Topic（可选接管）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseError' }
+        '422': { $ref: '#/components/responses/InvalidParameter' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/vehicle/{vehicle_id}:
+    get:
+      tags: [vehicle]
+      summary: 车辆详情（含 provisioning 步骤状态）
+      operationId: getVehicle
+      parameters:
+        - $ref: '#/components/parameters/VehicleIdPath'
+      responses:
+        '200':
+          description: 车辆详情
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseVehicleDetail' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+    patch:
+      tags: [vehicle]
+      summary: 修改台账基础字段（不涉及 provisioning 资源）
+      description: 权限 `vehicle:update`；仅可修改 vehicle_name / model / firmware_version / software_version / fence_json / description。
+      operationId: patchVehicle
+      parameters:
+        - $ref: '#/components/parameters/VehicleIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VehicleUpdateRequest' }
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseVehicleDetail' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/InvalidParameter' }
+
+    delete:
+      tags: [vehicle]
+      summary: 下线车辆（回收 Kafka SCRAM/Topic 与证书目录）
+      description: |
+        权限 `vehicle:delete`。逆序回收：证书目录 → SCRAM 用户 → Topic（可选保留历史数据）→ DB 行。
+        时序/事件表数据不级联删除（审计保留）。
+      operationId: deleteVehicle
+      parameters:
+        - $ref: '#/components/parameters/VehicleIdPath'
+        - name: purge_topics
+          in: query
+          schema: { type: boolean, default: true }
+          description: 是否删除 8 个车端 Topic（true 会丢失未消费的短期消息）
+      responses:
+        '200':
+          description: 下线成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseEmpty' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/v1/vehicle/{vehicle_id}/rotate-scram:
+    post:
+      tags: [vehicle]
+      summary: 重置车端 SCRAM 口令（服务端生成新口令）
+      description: 权限 `vehicle:execute`。新口令一次性返回；旧口令立即失效（AdminClient 覆盖 SCRAM-SHA-512 凭据）。
+      operationId: rotateScram
+      parameters:
+        - $ref: '#/components/parameters/VehicleIdPath'
+      responses:
+        '200':
+          description: 重置成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseRotateScramResult' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/vehicle/{vehicle_id}/reissue-cert:
+    post:
+      tags: [vehicle]
+      summary: 重签客户端证书（旧证书仍在 CA 有效期内可被 CRL 吊销，本 MVP 不实现 CRL）
+      description: 权限 `vehicle:execute`。新生成 client-key/cert/p12，覆盖 VEHICLE_CERTS_DIR/{vehicle_id}/。
+      operationId: reissueCert
+      parameters:
+        - $ref: '#/components/parameters/VehicleIdPath'
+      responses:
+        '200':
+          description: 重签成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseReissueCertResult' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/v1/vehicle/{vehicle_id}/bundle:
+    get:
+      tags: [vehicle]
+      summary: 下载车端接入包（ZIP：CA + 独立客户端证书 + kafka.properties + README）
+      description: |
+        权限 `vehicle:execute`。响应为 `application/zip`（非统一 JSON 响应体，作为契约明确例外）。
+        ZIP 结构：
+        ```
+        <vehicle_id>/
+          ca-cert.pem
+          client-cert.pem
+          client-key.pem        # PEM，600
+          kafka-client.p12      # PKCS12（口令见 kafka.properties 首行注释）
+          kafka.properties      # 现成的客户端配置模板
+          README.md             # 车端接入步骤说明
+        ```
+      operationId: downloadBundle
+      parameters:
+        - $ref: '#/components/parameters/VehicleIdPath'
+      responses:
+        '200':
+          description: ZIP 二进制
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: 'attachment; filename="<vehicle_id>-bundle.zip"'
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503':
+          description: 尚未 provisioning 或证书文件缺失
+
+  # ---------- 运维端点 ----------
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: healthz
+      summary: 存活探针
+      x-internal: true
+      security: []
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseHealth' }
+
+  /readyz:
+    get:
+      tags: [ops]
+      operationId: readyz
+      summary: 就绪探针（DB / Kafka AdminClient / CA 私钥可读）
+      x-internal: true
+      security: []
+      responses:
+        '200':
+          description: 全部就绪
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiResponseReady' }
+        '503':
+          description: 依赖未就绪
+
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: metrics
+      summary: Prometheus 指标
+      x-internal: true
+      security: []
+      responses:
+        '200':
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT Access Token（同 api-gateway.yaml）
+
+  parameters:
+    VehicleIdPath:
+      name: vehicle_id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,32}$' }
+      description: 车辆唯一标识（= SCRAM 用户名 = 证书 CN = Topic 中的 {vehicle_id}）
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+
+  responses:
+    Unauthenticated:
+      description: 1001 未认证
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponseError' }
+    Forbidden:
+      description: 1002 无权限
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponseError' }
+    NotFound:
+      description: 3001 资源不存在
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponseError' }
+    InvalidParameter:
+      description: 2001 参数错误
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponseError' }
+    InternalError:
+      description: 5000 服务器内部错误
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponseError' }
+    ServiceUnavailable:
+      description: 5001 服务不可用（Kafka/CA/DB 依赖异常）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiResponseError' }
+
+  schemas:
+    # ---------- 通用 ----------
+    ApiResponse:
+      type: object
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code: { type: integer, example: 0 }
+        message: { type: string, example: success }
+        data: { nullable: true }
+        request_id: { type: string, format: uuid }
+        timestamp: { type: integer, example: 1724035200 }
+
+    ApiResponseError:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            code: { type: integer, enum: [1001, 1002, 1003, 2001, 2002, 3001, 3002, 3003, 4001, 4002, 5000, 5001] }
+
+    ApiResponseEmpty:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data: { nullable: true, description: 恒为 null }
+
+    ApiResponseHealth:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [ok] }
+
+    ApiResponseReady:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              type: object
+              properties:
+                database: { type: boolean }
+                kafka_admin: { type: boolean, description: AdminClient 可连（DescribeClusters ≤ 2s） }
+                ca_readable: { type: boolean, description: CA 私钥文件可读 }
+
+    # ---------- 车辆模型 ----------
+    ProvisionStep:
+      type: object
+      required: [name, state]
+      properties:
+        name: { type: string, enum: [db, scram, topics, cert] }
+        state: { type: string, enum: [pending, in_progress, ok, failed, skipped] }
+        error: { type: string, nullable: true, maxLength: 500 }
+        ts: { type: integer, format: int64, nullable: true, description: 步骤完成 Unix 秒 }
+
+    VehicleRow:
+      type: object
+      required: [vehicle_id, vehicle_name, model, status, provision_state]
+      properties:
+        vehicle_id: { type: string }
+        vehicle_name: { type: string }
+        model: { type: string }
+        firmware_version: { type: string, nullable: true }
+        software_version: { type: string, nullable: true }
+        status: { type: string, enum: [offline, online_idle, auto_driving, remote_controlled, upgrading, charging, fault, emergency] }
+        register_time: { type: string, format: date-time }
+        last_online_time: { type: string, format: date-time, nullable: true }
+        device_cert_sn: { type: string, nullable: true }
+        provision_state:
+          type: string
+          enum: [pending, in_progress, ready, failed]
+          description: 由 4 步状态归并的汇总态（全 ok → ready；任一 failed → failed；任一 in_progress → in_progress）
+        provision_steps:
+          type: array
+          items: { $ref: '#/components/schemas/ProvisionStep' }
+
+    VehicleDetail:
+      allOf:
+        - $ref: '#/components/schemas/VehicleRow'
+        - type: object
+          properties:
+            fence_json: { type: object, nullable: true, description: 地理围栏配置（circle/polygon） }
+            description: { type: string, nullable: true }
+            kafka_bootstrap: { type: string, description: 车端接入 bootstrap 地址（SERVER_IP:9093） }
+            scram_username: { type: string, description: 车端 SCRAM 用户名（= vehicle_id） }
+            topics_preview:
+              type: array
+              items: { type: string }
+              description: 8 个车端 Topic 名称预览（不查 Kafka，纯字符串拼接）
+
+    VehicleCreateRequest:
+      type: object
+      required: [vehicle_id, vehicle_name]
+      properties:
+        vehicle_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,32}$' }
+        vehicle_name: { type: string, maxLength: 64 }
+        model: { type: string, default: HUNTER_SE, maxLength: 32 }
+        firmware_version: { type: string, nullable: true, maxLength: 32 }
+        software_version: { type: string, nullable: true, maxLength: 32 }
+        fence_json: { type: object, nullable: true }
+        description: { type: string, nullable: true, maxLength: 500 }
+        takeover_existing:
+          type: boolean
+          default: false
+          description: 若 SCRAM/Topic/证书已存在（历史遗留），是否接管复用（不重复创建）
+
+    VehicleUpdateRequest:
+      type: object
+      properties:
+        vehicle_name: { type: string, maxLength: 64 }
+        model: { type: string, maxLength: 32 }
+        firmware_version: { type: string, nullable: true, maxLength: 32 }
+        software_version: { type: string, nullable: true, maxLength: 32 }
+        fence_json: { type: object, nullable: true }
+        description: { type: string, nullable: true, maxLength: 500 }
+
+    ProvisionResult:
+      type: object
+      required: [vehicle, scram_password, bundle_download_url]
+      properties:
+        vehicle: { $ref: '#/components/schemas/VehicleDetail' }
+        scram_password:
+          type: string
+          writeOnly: true
+          description: 一次性 SCRAM 口令（24 字节 url-safe），不落 DB/日志；未保存需重新 rotate-scram
+        bundle_download_url: { type: string, description: '/api/v1/vehicle/{id}/bundle' }
+
+    RotateScramResult:
+      type: object
+      required: [vehicle_id, scram_password]
+      properties:
+        vehicle_id: { type: string }
+        scram_password: { type: string, writeOnly: true }
+
+    ReissueCertResult:
+      type: object
+      required: [vehicle_id, device_cert_sn, issued_at]
+      properties:
+        vehicle_id: { type: string }
+        device_cert_sn: { type: string, description: 新证书序列号（大写十六进制） }
+        issued_at: { type: string, format: date-time }
+
+    VehiclePage:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/VehicleRow' } }
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+
+    ApiResponseVehiclePage:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data: { $ref: '#/components/schemas/VehiclePage' }
+
+    ApiResponseVehicleDetail:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data: { $ref: '#/components/schemas/VehicleDetail' }
+
+    ApiResponseProvisionResult:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data: { $ref: '#/components/schemas/ProvisionResult' }
+
+    ApiResponseRotateScramResult:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data: { $ref: '#/components/schemas/RotateScramResult' }
+
+    ApiResponseReissueCertResult:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data: { $ref: '#/components/schemas/ReissueCertResult' }
+
+# =====================================================================
+# 扩展字段
+# =====================================================================
+x-hunter-service:
+  name: vehicle-service
+  port: 8086
+  gateway_prefix: /api/v1/vehicle
+  rbac_resource: vehicle
+  rbac_actions: [create, read, update, delete, execute]
+  rbac_role_bindings:
+    admin: [create, read, update, delete, execute]
+    operator: [create, read, update, execute]        # 不下线（delete）
+    analyst: [read]
+    viewer: [read]
+  required_env:
+    - POSTGRES_HOST/PORT/USER/PASSWORD/DB
+    - KAFKA_BOOTSTRAP_SERVERS           # 走 INTERNAL 9092 SASL_PLAINTEXT
+    - KAFKA_SECURITY_PROTOCOL
+    - KAFKA_SASL_MECHANISM
+    - KAFKA_SASL_USERNAME/PASSWORD      # 平台侧 hunter-client（AdminClient 用）
+    - KAFKA_CA_KEY_PATH                 # 例 /srv/kafka-ca/ca-key.pem
+    - KAFKA_CA_CERT_PATH                # 例 /srv/kafka-ca/ca-cert.pem
+    - VEHICLE_CERTS_DIR                 # 例 /data/vehicle-certs（vehicle-service gid 可写）
+    - SERVER_IP                         # 生成 kafka.properties 的 bootstrap
+    - GATEWAY_HMAC_SECRET               # G-02 身份头签名
+  optional_env:
+    - VEHICLE_CERT_RETENTION_DAYS       # 默认 3650（与 CA 同寿）
+    - VEHICLE_PROVISION_TIMEOUT_SECONDS # 默认 15（AdminClient + openssl 组合上限）
+
+x-hunter-kafka:
+  admin_bootstrap: kafka:9092
+  admin_security: SASL_PLAINTEXT + SCRAM-SHA-512
+  admin_client: kafka-python 2.1+（KIP-95 AlterUserScramCredentials + create_topics）
+  per_vehicle_topics:
+    # 与 contracts/kafka/topics.yaml 车辆 Topic 条目严格一致（8 个/车）
+    - hunter.{vehicle_id}.telemetry        # 6 分区, 7d
+    - hunter.{vehicle_id}.event            # 3 分区, 30d
+    - hunter.{vehicle_id}.health           # 3 分区, 7d
+    - hunter.{vehicle_id}.command          # 3 分区, 7d
+    - hunter.{vehicle_id}.command_result   # 3 分区, 7d
+    - hunter.{vehicle_id}.ota_notify       # 3 分区, 7d
+    - hunter.{vehicle_id}.ota_status       # 3 分区, 30d
+    - hunter.{vehicle_id}.remote_control   # 3 分区, 7d
+  scram_users: per-vehicle（username = vehicle_id）
+  produces: []
+  consumes: []
+  note: 本服务不参与业务 Topic 生产/消费，仅在 provisioning 时执行控制面操作
+
+x-hunter-provisioning:
+  description: 一键开通 4 步编排（顺序固定，失败逆序回滚）
+  steps:
+    - name: db
+      action: INSERT vehicle_svc.vehicles（provision_status.steps.db = ok）
+      rollback: DELETE 本行
+    - name: scram
+      action: AdminClient.alter_user_scram_credentials UPSERT (vehicle_id, generated_password)
+      rollback: AdminClient.alter_user_scram_credentials REMOVE
+    - name: topics
+      action: 按 x-hunter-kafka.per_vehicle_topics 创建 8 个 Topic（幂等 --if-not-exists 语义）
+      rollback: AdminClient.delete_topics（仅删除本次新建，不删既有）
+    - name: cert
+      action: openssl 签发 client-key/cert，转 p12；写入 VEHICLE_CERTS_DIR/{vehicle_id}/
+      rollback: 删除本次产物目录（保留其它车辆）
+  idempotency: 每步入库前检查 provision_status，已成功则跳过；takeover_existing=true 允许接管外部资源
+
+x-hunter-cert-policy:
+  ca_source: /opt/hunter-core/certs/kafka/ca-key.pem（由 gen-kafka-certs.sh 生成）
+  per_vehicle_subject: 'CN={vehicle_id}, O=HunterCore'
+  per_vehicle_san: 'DNS:{vehicle_id}'
+  validity_days: 3650
+  storage_layout: |
+    {VEHICLE_CERTS_DIR}/{vehicle_id}/
+      client-key.pem  (0600, gid:vehicle-service)
+      client-cert.pem (0640)
+      kafka-client.p12 (0600)
+  distribution: 仅经 /bundle 端点以 ZIP 形式返回给已认证的浏览器；不落对象存储
+  ca_key_security: |
+    CA 私钥通过 mount + setfacl 授权 vehicle-service 只读；
+    生产环境建议由外部 KMS/HSM 托管根 CA（本 MVP 简化为文件挂载）

@@ -62,6 +62,7 @@ ON CONFLICT DO NOTHING;
 --    analytics : read / execute（data-analytics.yaml 第 54 行）
 --    ota       : create / read / execute（ota-service.yaml x-hunter-endpoints 契约表）
 --    remote    : create / read / execute（remote-control.yaml RBAC 声明）
+--    vehicle   : create / read / update / delete / execute（vehicle-service.yaml x-hunter-service.rbac_actions）
 -- ---------------------------------------------------------------------
 INSERT INTO user_svc.permissions (permission_code, permission_name, resource, action, description) VALUES
     ('scene:create',     '场景创建',       'scene',     'create',  '创建场景 / 复制场景'),
@@ -79,7 +80,12 @@ INSERT INTO user_svc.permissions (permission_code, permission_name, resource, ac
     ('ota:execute',      'OTA 执行',       'ota',       'execute', '发布版本、启动/暂停/回滚任务'),
     ('remote:create',    '操控会话创建',   'remote',    'create',  '发起远程操控会话（车辆互斥）'),
     ('remote:read',      '操控查看',       'remote',    'read',    '会话状态、操控历史与录像下载'),
-    ('remote:execute',   '操控执行',       'remote',    'execute', '下发控制指令、结束会话、紧急停车')
+    ('remote:execute',   '操控执行',       'remote',    'execute', '下发控制指令、结束会话、紧急停车'),
+    ('vehicle:create',   '车辆开通',       'vehicle',   'create',  '一键 provisioning（DB台账/SCRAM/Topic/证书）'),
+    ('vehicle:read',     '车辆查看',       'vehicle',   'read',    '车辆列表/详情/provisioning 状态查询'),
+    ('vehicle:update',   '车辆信息编辑',   'vehicle',   'update',  '修改台账基础字段（不含 provisioning 资源）'),
+    ('vehicle:delete',   '车辆下线',       'vehicle',   'delete',  '回收 Kafka 资源与证书，仅 admin 可执行'),
+    ('vehicle:execute',  '车辆接入运维',   'vehicle',   'execute', '轮换 SCRAM 口令 / 重签证书 / 下载接入包')
 ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------
@@ -95,6 +101,7 @@ ON CONFLICT DO NOTHING;
 
 -- operator：scene 全部 + data(read/create/execute) + analytics:read
 --           + ota(read/create/execute) + remote(read/create/execute)
+--           + vehicle(create/read/update/execute)（不包含 delete，下线仅 admin）
 INSERT INTO user_svc.role_permissions (role_id, permission_id)
 SELECT r.role_id, p.permission_id
 FROM user_svc.roles r
@@ -103,7 +110,8 @@ JOIN user_svc.permissions p ON p.permission_code IN (
         'data:create', 'data:read', 'data:execute',
         'analytics:read',
         'ota:create', 'ota:read', 'ota:execute',
-        'remote:create', 'remote:read', 'remote:execute')
+        'remote:create', 'remote:read', 'remote:execute',
+        'vehicle:create', 'vehicle:read', 'vehicle:update', 'vehicle:execute')
 WHERE r.role_code = 'operator'
 ON CONFLICT DO NOTHING;
 
@@ -112,7 +120,8 @@ INSERT INTO user_svc.role_permissions (role_id, permission_id)
 SELECT r.role_id, p.permission_id
 FROM user_svc.roles r
 JOIN user_svc.permissions p ON p.permission_code IN (
-        'scene:read', 'data:read', 'analytics:read', 'analytics:execute', 'ota:read', 'remote:read')
+        'scene:read', 'data:read', 'analytics:read', 'analytics:execute', 'ota:read', 'remote:read',
+        'vehicle:read')
 WHERE r.role_code = 'analyst'
 ON CONFLICT DO NOTHING;
 
@@ -121,7 +130,8 @@ INSERT INTO user_svc.role_permissions (role_id, permission_id)
 SELECT r.role_id, p.permission_id
 FROM user_svc.roles r
 JOIN user_svc.permissions p ON p.permission_code IN (
-        'scene:read', 'data:read', 'analytics:read', 'ota:read', 'remote:read')
+        'scene:read', 'data:read', 'analytics:read', 'ota:read', 'remote:read',
+        'vehicle:read')
 WHERE r.role_code = 'viewer'
 ON CONFLICT DO NOTHING;
 
@@ -163,9 +173,9 @@ INSERT INTO vehicle_svc.vehicles (vehicle_id, vehicle_name, model, firmware_vers
 ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------
--- 6. 待补充（vehicle-service / user-service 契约落地后按同一来源补录，禁止自行发明编码）
---    vehicle 资源域权限点：vehicle:create / vehicle:read / vehicle:update / vehicle:delete / vehicle:execute
---    user    资源域权限点：user:create / user:read / user:update / user:delete / user:execute
+-- 6. 待补充（user-service 契约落地后按同一来源补录，禁止自行发明编码）
+--    user 资源域权限点：user:create / user:read / user:update / user:delete / user:execute
+--    vehicle 资源域已于上面落库（见第 2/3 小节），本处仅保留 user 待补位
 -- ---------------------------------------------------------------------
 
 -- 校验（人工执行）：

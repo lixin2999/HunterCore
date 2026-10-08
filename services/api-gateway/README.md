@@ -59,7 +59,8 @@ API 网关：统一接入、JWT 认证鉴权、五级限流熔断、路由转发
 ## 路由转发
 
 - 路由表（`x-hunter-gateway-routes.routes`，前缀不可更改）：scene→8081 / data→8082 /
-  analytics→8083 / ota→8084 / remote→8085；`/api/v1/vehicle|user` 归属待确认（不配置 URL → 503 + 5001）
+  analytics→8083 / ota→8084 / remote→8085 / vehicle→8086（新交付）；`/api/v1/user`
+  除网关自持认证端点外归属待确认（不配置 URL → 503 + 5001）
 - `strip_prefix=false`：转发完整路径；请求体**流式转发**（支持 OTA 大包上传），响应透传
   （剥离逐跳头，保留 content-length/encoding 语义）
 - 熔断（契约 circuit_breaker 默认策略，阈值经 env 调整）：连续 5 次失败或窗口超时率 > 50%
@@ -73,7 +74,8 @@ API 网关：统一接入、JWT 认证鉴权、五级限流熔断、路由转发
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `SCENE_SERVICE_URL` 等五个 | `http://localhost:<port>` | 转发目标（K8s 内为 Service DNS） |
-| `VEHICLE_SERVICE_URL` / `USER_SERVICE_URL` | 未配置 | pending_confirmation，未配置返回 503 |
+| `VEHICLE_SERVICE_URL` | `http://localhost:8086` | 车辆台账服务（新交付） |
+| `USER_SERVICE_URL` | 未配置 | pending_confirmation，未配置返回 503 |
 | `PROXY_CONNECT_TIMEOUT_SECONDS` / `PROXY_TIMEOUT_SECONDS` | 5 / 30 | 转发超时 |
 | `CIRCUIT_BREAKER_FAILURE_THRESHOLD` / `_TIMEOUT_RATE` / `_OPEN_SECONDS` | 5 / 0.5 / 30 | 熔断参数 |
 | `RATE_LIMIT_GLOBAL_QPS` / `_USER_QPS` / `_IP_QPS` | 10000 / 100 / 200 | 附录 D（不可更改） |

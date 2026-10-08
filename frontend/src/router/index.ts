@@ -121,6 +121,26 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '事件与文件', icon: 'Warning', permission: PERMISSIONS.dataRead },
       },
       {
+        path: 'vehicle',
+        name: 'vehicle',
+        redirect: { name: 'vehicle-list' },
+        meta: { title: '车辆管理', icon: 'Van', permission: PERMISSIONS.vehicleRead },
+        children: [
+          {
+            path: 'list',
+            name: 'vehicle-list',
+            component: () => import('@/views/vehicle/VehicleListView.vue'),
+            meta: { title: '车辆管理', icon: 'Van', permission: PERMISSIONS.vehicleRead },
+          },
+          {
+            path: ':vehicle_id',
+            name: 'vehicle-detail',
+            component: () => import('@/views/vehicle/VehicleDetailView.vue'),
+            meta: { title: '车辆详情', permission: PERMISSIONS.vehicleRead },
+          },
+        ],
+      },
+      {
         path: 'forbidden',
         name: 'forbidden',
         component: () => import('@/views/error/ForbiddenView.vue'),

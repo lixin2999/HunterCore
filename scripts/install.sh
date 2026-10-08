@@ -796,9 +796,11 @@ step_3_prepare_dirs() {
   # 业务服务本地 Kafka 磁盘缓冲目录：容器以非 root uid 10001（appuser）运行，bind 源必须由宿主预建并 chown 10001；
   # 否则目录缺失时 Docker 会以 root 自动创建，导致 LocalDiskBuffer.mkdir 报 PermissionDenied 启动失败。
   log_info "创建业务服务 Kafka 缓冲目录（属主 10001:10001，供非 root 容器写入）"
-  for d in api-gateway data-collector data-analytics ota-service remote-control scene-service; do
+  for d in api-gateway data-collector data-analytics ota-service remote-control scene-service vehicle-service; do
     ensure_dir "${DATA_DIR}/kafka-buffer/${d}" "10001:10001" "0755"
   done
+  # vehicle-service 专有：每车客户端证书输出目录（gid 10001 可写；契约 x-hunter-cert-policy.storage_layout）
+  ensure_dir "${DATA_DIR}/vehicle-certs" "10001:10001" "0750"
   ensure_dir "${APP_DIR}/config" "root:root" "0755"
   ensure_dir "${APP_DIR}/scripts" "root:root" "0755"
   ensure_dir "${APP_DIR}/certs" "root:root" "0755"
@@ -1232,6 +1234,27 @@ ensure_kafka_certs_readable() {
       log_warn "无法 chgrp $gid，已将 $f 置 0644（仅单机可接受）"
     fi
   done
+
+  # ---- vehicle-service 签发客户端证书需读 ca-key.pem（契约 x-hunter-cert-policy.ca_key_security）----
+  # 方案：保留原 root:root 0600 属主属组 + 通过 POSIX ACL 给 gid 10001 只读（不入镜像层/日志）；
+  # 无 setfacl 环境（最小化镜像）时退回 0640 + chgrp 10001（单机可接受）。
+  local ca_key="${cert_dir}/ca-key.pem" vehicle_gid="${VEHICLE_SERVICE_GID:-10001}"
+  if [ -f "$ca_key" ]; then
+    if command -v setfacl >/dev/null 2>&1; then
+      # 幂等：先 -s 重置再 -m 添加（避免历史 ACL 累积）
+      if setfacl -m "g:${vehicle_gid}:r--" "$ca_key" 2>/dev/null; then
+        log_success "已为 vehicle-service (gid ${vehicle_gid}) 授 ca-key.pem 只读 ACL：$ca_key"
+      else
+        log_warn "setfacl 授权失败（SELinux/文件系统不支持），回退 0640 + chgrp"
+        chgrp "$vehicle_gid" "$ca_key" 2>/dev/null || true
+        chmod 640 "$ca_key"
+      fi
+    else
+      log_warn "未安装 setfacl（建议 apt install acl），回退 0640 + chgrp ${vehicle_gid}"
+      chgrp "$vehicle_gid" "$ca_key" 2>/dev/null || true
+      chmod 640 "$ca_key"
+    fi
+  fi
   return 0
 }
 
@@ -1379,12 +1402,14 @@ step_11_start_services() {
   hc_run_logged "启动 flink-jm flink-tm" compose up -d flink-jm flink-tm || return 1
   wait_for "curl -sf -m 5 $(flink_ui_url)/overview >/dev/null" "Flink JobManager UI（$(flink_ui_url)）" 120 || return 1
 
-  # 11.3 业务服务（场景 / OTA / 远程操控）
-  hc_run_logged "启动 scene-service ota-service remote-control" \
-    compose up -d scene-service ota-service remote-control || return 1
+  # 11.3 业务服务（场景 / OTA / 远程操控 / 车辆接入 provisioning）
+  hc_run_logged "启动 scene-service ota-service remote-control vehicle-service" \
+    compose up -d scene-service ota-service remote-control vehicle-service || return 1
   wait_for "service_health_ok ${scene_port}" "scene-service（${scene_port}）" 120 || return 1
   wait_for "service_health_ok ${ota_port}" "ota-service（${ota_port}）" 120 || return 1
   wait_for "service_health_ok ${remote_port}" "remote-control（${remote_port}）" 120 || return 1
+  local vehicle_port="${VEHICLE_SERVICE_PORT:-8086}"
+  wait_for "service_health_ok ${vehicle_port}" "vehicle-service（${vehicle_port}）" 120 || return 1
 
   # 11.4 API 网关（对外 8080；依赖全部上游服务）
   hc_run_logged "启动 api-gateway" compose up -d api-gateway || return 1

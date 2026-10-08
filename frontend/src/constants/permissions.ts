@@ -7,13 +7,15 @@
  * - data-collector.yaml：资源域 `data`，action ∈ create/read/execute（`data:read` 含全量数据权限）；
  * - data-analytics.yaml：`analytics:read`（查询）、`analytics:execute`（报告生成）；
  * - ota-service.yaml：`ota:read` / `ota:create` / `ota:execute`；
- * - remote-control.yaml：`remote:read` / `remote:create` / `remote:execute`。
+ * - remote-control.yaml：`remote:read` / `remote:create` / `remote:execute`；
+ * - vehicle-service.yaml：`vehicle:read` / `vehicle:create` / `vehicle:update` /
+ *   `vehicle:delete` / `vehicle:execute`（重发 SCRAM、重发证书、下载接入包）。
  *
  * 约定：编码由服务端下发（JWT → /user/me），前端只做成员判断，**不得自行发明编码**。
  */
 
 /** 资源域（各服务契约 RBAC 资源名） */
-export const PERMISSION_RESOURCES = ['scene', 'data', 'analytics', 'ota', 'remote'] as const
+export const PERMISSION_RESOURCES = ['scene', 'data', 'analytics', 'ota', 'remote', 'vehicle'] as const
 
 /** 资源动作集合（scene 支持全 5 种；其余按契约取子集） */
 export const PERMISSION_ACTIONS = ['create', 'read', 'update', 'delete', 'execute'] as const
@@ -34,6 +36,11 @@ export const PERMISSIONS = {
   remoteRead: 'remote:read',
   remoteCreate: 'remote:create',
   remoteExecute: 'remote:execute',
+  vehicleRead: 'vehicle:read',
+  vehicleCreate: 'vehicle:create',
+  vehicleUpdate: 'vehicle:update',
+  vehicleDelete: 'vehicle:delete',
+  vehicleExecute: 'vehicle:execute',
 } as const
 
 /** 角色编码（api-gateway.yaml UserProfile.roles 描述：admin / operator / analyst / viewer） */

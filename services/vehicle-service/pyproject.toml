@@ -1,0 +1,41 @@
+[project]
+name = "vehicle-service"
+version = "0.1.0"
+description = "车辆台账与车端接入 provisioning：DB 台账 + Kafka SCRAM/Topic + 每车独立 mTLS 客户端证书 + 接入包下载"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.100,<1.0",
+    "uvicorn[standard]>=0.23",
+    "prometheus-client>=0.20,<1",
+    "kafka-python-ng>=2.2,<3",   # AdminClient：KIP-95 AlterUserScramCredentials + create_topics（社区 kafka-python 已停更，NG fork API 兼容）
+    "PyYAML>=6.0",                # 契约 contracts/kafka/topics.yaml 加载
+]
+
+# 注意：hunter_common 由仓库统一安装（先执行 pip install -e "common/python"），
+# 服务内通过 import hunter_common 使用；不声明为 PyPI 依赖以免误装同名包。
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "PyYAML>=6.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["app/tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# B008：FastAPI 依赖注入的标准写法（`Depends()` 作为参数默认值），框架惯例豁免
+ignore = ["B008"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

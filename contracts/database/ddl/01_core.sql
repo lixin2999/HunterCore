@@ -27,6 +27,15 @@ CREATE TABLE IF NOT EXISTS vehicle_svc.vehicles (
     register_time    TIMESTAMPTZ NOT NULL DEFAULT now(),
     device_cert_sn   TEXT,                                      -- X.509 设备证书序列号
     fence_json       JSONB,                                     -- G-11 地理围栏定义（结构见上方注释；NULL = 未配置）
+    -- vehicle-service provisioning 状态（契约 vehicle-service.yaml x-hunter-provisioning）
+    -- 结构：{"state": "pending|in_progress|ready|failed",
+    --        "steps": {"db":    {"state":"ok","ts":1700000000,"error":null},
+    --                  "scram": {"state":"ok", ...},
+    --                  "topics":{"state":"in_progress", ...},
+    --                  "cert":  {"state":"pending", ...}}}
+    -- 历史车辆（部署内置台账）可为 NULL，前端按 pending 展示；
+    -- 写入方：仅 vehicle-service（其它服务只读，跨 schema 禁直查）
+    provision_status JSONB,
     description      TEXT
 );
 COMMENT ON TABLE vehicle_svc.vehicles IS

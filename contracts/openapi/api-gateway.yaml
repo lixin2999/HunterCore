@@ -13,8 +13,9 @@
 # ⚠ 待核对（设计文档未明确，需人工确认后回填；禁止擅自新增端点 / 错误码 / 阈值）：
 #   1) 认证端点路径与载荷：3.2.1 节仅给出登录流程，12 章未列出登录 / 刷新 / 登出接口；
 #      本契约按「路由表 /api/v1/user/**」的约定将认证端点落在网关自持
-#   2) user-service / vehicle-service 不在本项目模块表（仅 6 个微服务）内，
-#      /api/v1/user/**、/api/v1/vehicle/** 的其余资源端点归属待确认
+#   2) user-service 不在本项目模块表（仅 6 个微服务 + 新增 vehicle-service）内，
+#      /api/v1/user/** 除网关自持认证端点外的其余资源端点归属待确认；
+#      /api/v1/vehicle/** 已交付（详见 contracts/openapi/vehicle-service.yaml，target_port 8086）
 #   3) MFA(TOTP)：设计文档要求支持，但附录 A 无 MFA 专用错误码，校验失败统一复用 1001
 #   4) 限流超限响应：附录 A 无限流错误码，统一复用 5001 + HTTP 429 + Retry-After
 #   5) 网关不生产 / 不消费任何 Kafka Topic（contracts/kafka/consumer-groups.yaml 12 个组无网关归属）
@@ -777,10 +778,9 @@ x-hunter-gateway-routes:
       auth: jwt
     - prefix: /api/v1/vehicle
       target_service: vehicle-service
-      target_port: null
+      target_port: 8086
       auth: jwt
-      status: pending_confirmation
-      note: "⚠ 本项目模块表仅 6 个微服务（无 vehicle-service），归属待确认"
+      note: "车辆台账与车端接入 provisioning（详见 contracts/openapi/vehicle-service.yaml）"
     - prefix: /api/v1/user
       target_service: user-service
       target_port: null

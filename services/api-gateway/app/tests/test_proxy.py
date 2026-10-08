@@ -132,10 +132,10 @@ async def test_unknown_prefix_404(
 async def test_pending_prefix_returns_503(
     client: AsyncClient, fake_redis: FakeRedis, mock_backend: dict[str, Any]
 ) -> None:
-    """vehicle-service 归属待确认（契约 pending_confirmation，无后端 URL）→ 503 + 5001。"""
-    assert settings.vehicle_service_url is None
+    """user-service 归属待确认（契约 pending_confirmation，无后端 URL）→ 503 + 5001。"""
+    assert settings.user_service_url is None
     headers = await _authorized_headers(fake_redis)
-    resp = await client.get("/api/v1/vehicle/list", headers=headers)
+    resp = await client.get("/api/v1/user/profile", headers=headers)
     assert resp.status_code == 503
     body = resp.json()
     assert body["code"] == 5001

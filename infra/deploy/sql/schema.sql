@@ -82,6 +82,10 @@ CREATE TABLE IF NOT EXISTS vehicle_svc.vehicles (
     --   （health.lat/lng，缺定位/非法围栏 → 拒绝接管 3003），运行期由车端自动减速停车兜底
     --   （18 事件词表不含 fence_violation，见 remote-control 契约 pending #22）
     fence_json       JSONB,
+    -- vehicle-service provisioning 状态（契约 vehicle-service.yaml x-hunter-provisioning）
+    -- 结构：{"state":"pending|in_progress|ready|failed", "steps":{"db|scram|topics|cert":{state,ts,error}}}
+    -- 写入方：仅 vehicle-service；历史内置台账可为 NULL
+    provision_status JSONB,
     description      TEXT
 );
 COMMENT ON TABLE vehicle_svc.vehicles IS
