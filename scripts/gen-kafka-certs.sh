@@ -217,6 +217,12 @@ main() {
   # 幂等：keystore 与 truststore 齐备即跳过
   if [ "$FORCE" -ne 1 ] && [ -f "${cert_dir}/kafka.keystore.jks" ] && [ -f "${cert_dir}/kafka.truststore.jks" ]; then
     log_info "Kafka 证书已存在（${cert_dir}），跳过生成（幂等）"
+    # 自愈：即便复用旧证书，也必须重申目录可穿透（0755）与 JKS 对 broker（GID 1001）可读；
+    # 否则早期版本或异常中断遗留的 0600 root:root 证书会让 broker 加载 keystore 报
+    # AccessDeniedException → SASL_SSL 监听初始化失败 → 整个 broker 崩溃循环（9092 从未监听）。
+    chmod 0755 "$cert_dir" 2>/dev/null || true
+    broker_readable_jks "${cert_dir}/kafka.keystore.jks"
+    broker_readable_jks "${cert_dir}/kafka.truststore.jks"
     log_info "重新签发：bash $0 --force（需重启 Kafka 并更新车端证书）"
     return 0
   fi
