@@ -797,19 +797,52 @@ def _safe_json(resp: Any) -> dict[str, Any] | None:
         return None
 
 
+class _RateLimiter:
+    """全局请求节流：把发起速率压在网关每用户 QPS 阈值之下，避免 429。"""
+
+    def __init__(self, qps: float) -> None:
+        self._interval = (1.0 / qps) if qps and qps > 0 else 0.0
+        self._lock = asyncio.Lock()
+        self._next = 0.0
+
+    async def acquire(self) -> None:
+        if self._interval <= 0:
+            return
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            wait = self._next - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = self._next
+            self._next = now + self._interval
+
+
+def _retry_delay(resp: Any, attempt: int, args: argparse.Namespace) -> float:
+    """429 优先遵循 Retry-After；否则指数退避（封顶 --retry-max）。"""
+    if resp is not None and getattr(resp, "status_code", None) == 429:
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            try:
+                return min(float(ra), args.retry_max)
+            except (TypeError, ValueError):
+                pass
+    return min(args.backoff * (2 ** attempt), args.retry_max)
+
+
 async def _post_scene(
     client: Any, sem: Any, payload: dict[str, Any], headers: Callable[[], dict[str, str]],
-    args: argparse.Namespace, stats: dict[str, int], failures: list[str],
+    args: argparse.Namespace, stats: dict[str, int], failures: list[str], limiter: _RateLimiter,
 ) -> None:
     url = f"{args.base_url}/api/v1/scene"
     last_err = ""
     for attempt in range(args.max_retries + 1):
+        await limiter.acquire()
         async with sem:
             try:
                 resp = await client.post(url, json=payload, headers=headers(), timeout=args.timeout)
             except Exception as exc:  # noqa: BLE001 - 传输层异常统一重试
                 last_err = f"transport: {exc}"
-                await asyncio.sleep(0.5 * (attempt + 1))
+                await asyncio.sleep(_retry_delay(None, attempt, args))
                 continue
         body = _safe_json(resp) or {}
         code = body.get("code")
@@ -818,14 +851,14 @@ async def _post_scene(
             stats["created"] += 1
             scene_id = (body.get("data") or {}).get("scene_id")
             if args.publish and scene_id:
-                await _publish_scene(client, sem, headers, args, scene_id, name, stats, failures)
+                await _publish_scene(client, sem, headers, args, scene_id, name, stats, failures, limiter)
             return
         if code == 3002 or resp.status_code == 409:
             stats["existed"] += 1  # 幂等：名称已存在视为已入库
             return
         if resp.status_code in (429, 500, 502, 503, 504):
             last_err = f"HTTP {resp.status_code} code={code} {body.get('message')}"
-            await asyncio.sleep(0.6 * (attempt + 1))
+            await asyncio.sleep(_retry_delay(resp, attempt, args))
             continue
         failures.append(f"{name}: HTTP {resp.status_code} code={code} msg={body.get('message')}")
         stats["failed"] += 1
@@ -836,19 +869,30 @@ async def _post_scene(
 
 async def _publish_scene(
     client: Any, sem: Any, headers: Callable[[], dict[str, str]], args: argparse.Namespace,
-    scene_id: str, name: str, stats: dict[str, int], failures: list[str],
+    scene_id: str, name: str, stats: dict[str, int], failures: list[str], limiter: _RateLimiter,
 ) -> None:
-    async with sem:
-        try:
-            resp = await client.post(f"{args.base_url}/api/v1/scene/{scene_id}/publish",
-                                     headers=headers(), timeout=args.timeout)
-            body = _safe_json(resp) or {}
-            if resp.status_code in (200, 201) and body.get("code") == 0:
-                stats["published"] += 1
-            else:
-                failures.append(f"{name}(publish): HTTP {resp.status_code} code={body.get('code')}")
-        except Exception as exc:  # noqa: BLE001
-            failures.append(f"{name}(publish): transport {exc}")
+    last_err = ""
+    for attempt in range(args.max_retries + 1):
+        await limiter.acquire()
+        async with sem:
+            try:
+                resp = await client.post(f"{args.base_url}/api/v1/scene/{scene_id}/publish",
+                                         headers=headers(), timeout=args.timeout)
+            except Exception as exc:  # noqa: BLE001
+                last_err = f"transport: {exc}"
+                await asyncio.sleep(_retry_delay(None, attempt, args))
+                continue
+        body = _safe_json(resp) or {}
+        if resp.status_code in (200, 201) and body.get("code") == 0:
+            stats["published"] += 1
+            return
+        if resp.status_code in (429, 500, 502, 503, 504):
+            last_err = f"HTTP {resp.status_code} code={body.get('code')}"
+            await asyncio.sleep(_retry_delay(resp, attempt, args))
+            continue
+        failures.append(f"{name}(publish): HTTP {resp.status_code} code={body.get('code')}")
+        return
+    failures.append(f"{name}(publish): 重试耗尽 last={last_err}")
 
 
 async def submit_scenes(scenes: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, int]:
@@ -857,6 +901,7 @@ async def submit_scenes(scenes: list[dict[str, Any]], args: argparse.Namespace) 
     stats = {"created": 0, "existed": 0, "failed": 0, "published": 0}
     failures: list[str] = []
     sem = asyncio.Semaphore(max(1, args.concurrency))
+    limiter = _RateLimiter(args.qps)
     async with httpx.AsyncClient() as client:
         if args.mode == "gateway":
             token = await _login_gateway(client, args)
@@ -866,7 +911,7 @@ async def submit_scenes(scenes: list[dict[str, Any]], args: argparse.Namespace) 
             headers = _make_header_factory(args, None)
             sign = "HMAC 验签头" if args.hmac_secret else "明文身份头"
             print(f"[auth] direct 模式（{sign}）→ {args.base_url}")
-        tasks = [_post_scene(client, sem, p, headers, args, stats, failures) for p in scenes]
+        tasks = [_post_scene(client, sem, p, headers, args, stats, failures, limiter) for p in scenes]
         total = len(tasks)
         for done, coro in enumerate(asyncio.as_completed(tasks), 1):
             await coro
@@ -907,9 +952,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--username", default=_env("HUNTER_BATCH_USERNAME", ""), help="gateway 模式登录用户名")
     p.add_argument("--password", default=_env("HUNTER_BATCH_PASSWORD", ""), help="gateway 模式登录密码")
     p.add_argument("--publish", action="store_true", help="创建后立即发布（draft→published，需 execute 权限）")
-    p.add_argument("--concurrency", type=int, default=5, help="并发提交数")
+    p.add_argument("--concurrency", type=int, default=5, help="并发提交数（配合 --qps 使用）")
+    p.add_argument("--qps", type=float, default=8.0,
+                   help="全局请求速率上限（须低于网关 RATE_LIMIT_PER_USER_QPS；0=不限速）")
     p.add_argument("--timeout", type=float, default=15.0, help="单请求超时（秒）")
-    p.add_argument("--max-retries", type=int, default=2, help="可重试错误(429/5xx/超时)最大重试次数")
+    p.add_argument("--max-retries", type=int, default=4, help="可重试错误(429/5xx/超时)最大重试次数")
+    p.add_argument("--backoff", type=float, default=1.0, help="重试指数退避基数（秒）")
+    p.add_argument("--retry-max", type=float, default=30.0, help="单次重试等待封顶（秒）")
     p.add_argument("--limit", type=int, default=0, help="仅提交前 N 条（0=全部；用于冒烟测试）")
     p.add_argument("--start", type=int, default=0, help="跳过前 N 条（断点续跑）")
     p.add_argument("--only-type", default="", help="仅生成指定场景类型（逗号分隔，如 rainy,night）")
@@ -1033,7 +1082,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return _dump_scenes(scenes, args)
 
-    print(f"\n[submit] 开始提交 {len(scenes)} 条场景 → {args.base_url} (mode={args.mode}, concurrency={args.concurrency})")
+    print(f"\n[submit] 开始提交 {len(scenes)} 条场景 → {args.base_url} "
+          f"(mode={args.mode}, concurrency={args.concurrency}, qps={args.qps})")
     stats = asyncio.run(submit_scenes(scenes, args))
     print("\n=== 提交结果 ===")
     print(f"新建: {stats['created']}  幂等跳过(已存在): {stats['existed']}  "
