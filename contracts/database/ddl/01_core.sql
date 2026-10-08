@@ -48,6 +48,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_vehicles_device_cert_sn
 CREATE INDEX IF NOT EXISTS idx_vehicles_status_last_online
     ON vehicle_svc.vehicles (status, last_online_time DESC NULLS LAST);
 
+-- 升级兼容（幂等补列）：早期部署已存在的 vehicles 表不会被 CREATE TABLE IF NOT EXISTS 更新，
+--   需显式补齐后续版本引入的列。V1.18.0：provision_status（vehicle-service 一键开通状态）
+ALTER TABLE vehicle_svc.vehicles ADD COLUMN IF NOT EXISTS provision_status JSONB;
+
 -- ---------- user_svc.users：用户 ----------
 CREATE TABLE IF NOT EXISTS user_svc.users (
     user_id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
