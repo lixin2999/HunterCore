@@ -6,7 +6,8 @@
 - **控制面专用**：本服务不参与业务 Topic 生产/消费，仅在 provisioning/下线时调用 AdminClient；
 - **同步 → 异步**：kafka-python-ng AdminClient 为阻塞 API，全部通过 ``asyncio.to_thread`` 移交
   线程池执行，避免卡住事件循环（对齐"全异步" 服务规范）；
-- **凭据管理（KIP-95）**：`AlterUserScramCredentials` 需 broker ≥ 2.7（项目 Kafka 3.6 ✓）；
+- **凭据管理（KIP-95）**：由 **confluent-kafka** `AdminClient.alter_user_scram_credentials` 实现
+  （kafka-python-ng 无任何版本提供 KIP-95，实测最高 2.2.3 无相关类，见 release V1.18.5）；需 broker ≥ 2.7（项目 Kafka 3.6 ✓）；
   机制固定 SCRAM-SHA-512（与车端一致，contracts/kafka/topics.yaml `defaults.sasl_mechanism`）；
 - **Topic 清单**：从 ``contracts/kafka/topics.yaml`` 的 ``vehicle_topics`` 中筛出 ``hunter.{vehicle_id}.``
   模式条目（共 8 个/车；广播 Topic ``hunter.broadcast.command`` 不属任何单车，跳过），
@@ -41,18 +42,17 @@ try:  # pragma: no cover - 依版本分支：老 kafka-python 有此名，ng for
 except ImportError:  # pragma: no cover - kafka-python-ng 回退路径
     AleadyHasPartitionException = TopicAlreadyExistsError  # type: ignore[assignment,misc]
 
-try:  # kafka-python-ng 提供的 KIP-95 请求（fork ≥ 2.2）
-    from kafka.protocol.scram import (  # type: ignore[import-not-found,import-untyped]
-        AlterUserScramCredentialsRequest,
-        ScramCredentialUpdate,
-    )
-    from kafka.scram_types import (  # type: ignore[import-not-found,import-untyped]
-        ScramMechanism,
-    )
-except ImportError:  # pragma: no cover - 依赖版本回退路径
-    AlterUserScramCredentialsRequest = None  # type: ignore[assignment]
-    ScramCredentialUpdate = None  # type: ignore[assignment]
-    ScramMechanism = None  # type: ignore[assignment]
+# KIP-95 SCRAM 凭据管理：kafka-python-ng 无任一版本提供该能力（最高 2.2.3，实测无
+# AlterUserScramCredentials 及相关协议类），敕 SCRAM 走 confluent-kafka（项目既有依赖，
+# 由 hunter_common 引入）；Topic 管理仍用 kafka-python-ng AdminClient。
+from confluent_kafka import KafkaException  # type: ignore[import-untyped]
+from confluent_kafka.admin import AdminClient as ConfluentAdminClient  # type: ignore[import-untyped]
+from confluent_kafka.admin import (  # type: ignore[import-untyped]
+    ScramCredentialInfo,
+    ScramMechanism,
+    UserScramCredentialDeletion,
+    UserScramCredentialUpsertion,
+)
 
 from app.config import settings
 
@@ -143,8 +143,12 @@ class KafkaAdminOps:
     实例被 health router 复用做 list_topics 探测（app.state.kafka_admin）。
     """
 
-    def __init__(self, admin: KafkaAdminClient) -> None:
+    def __init__(
+        self, admin: KafkaAdminClient, scram_admin: ConfluentAdminClient | None = None
+    ) -> None:
         self._admin = admin
+        # SCRAM（KIP-95）走 confluent-kafka AdminClient；None → SCRAM 操作抛 5001（Topic 不受影响）
+        self._scram = scram_admin
         # kafka-python AdminClient 非线程安全：串行化所有请求，避免并发调用交叉写
         self._lock = threading.Lock()
 
@@ -161,31 +165,30 @@ class KafkaAdminOps:
     async def upsert_scram_user(self, username: str, password: str) -> None:
         """创建或覆盖 SCRAM-SHA-512 用户（对应 provisioner.steps.scram 与 rotate-scram）。
 
-        语义：UPSERT（AlterUserScramCredentialsRequest 的 create_or_update_credentials）；
+        语义：UPSERT（confluent-kafka `alter_user_scram_credentials`）；
         已存在用户会覆盖旧凭据（旧口令立即失效，符合 rotate 语义）。
         """
         await asyncio.to_thread(self._upsert_scram_user_sync, username, password)
 
     def _upsert_scram_user_sync(self, username: str, password: str) -> None:
-        if AlterUserScramCredentialsRequest is None or ScramCredentialUpdate is None:
+        if self._scram is None:
             raise ServiceUnavailableError(
-                "kafka-python-ng 版本不支持 KIP-95（AlterUserScramCredentials）；"
-                "请升级至 kafka-python-ng>=2.2",
+                "Kafka SCRAM AdminClient 未就绪（confluent admin=None）",
             )
         try:
             with self._lock:
-                update = ScramCredentialUpdate(
-                    principal=name_principal(username),
-                    scram_mechanism=SCRAM_MECHANISM_ID,
-                    iterations=_SCRAM_ITERATIONS,
+                upsertion = UserScramCredentialUpsertion(
+                    user=username,
+                    scram_credential_info=ScramCredentialInfo(
+                        mechanism=ScramMechanism.SCRAM_SHA_512,
+                        iterations=_SCRAM_ITERATIONS,
+                    ),
                     password=password.encode("utf-8"),
                 )
-                request = AlterUserScramCredentialsRequest(upserts=[update], deletes=[])
-                future = self._admin.client.send_request(request)
-                future.result(
-                    timeout_ms=settings.kafka_admin_timeout_ms
-                )  # 阻塞至 broker 落盘（含元数据同步）
-        except KafkaError as exc:
+                futures = self._scram.alter_user_scram_credentials([upsertion])
+                for future in futures.values():
+                    future.result()  # 阻塞至 broker 落盘；失败抛 KafkaException
+        except KafkaException as exc:
             logger.error("kafka_scram_upsert_failed", username=username, error=str(exc))
             raise ServiceUnavailableError(
                 f"Kafka SCRAM 用户写入失败: {exc}",
@@ -198,19 +201,19 @@ class KafkaAdminOps:
         await asyncio.to_thread(self._delete_scram_user_sync, username)
 
     def _delete_scram_user_sync(self, username: str) -> None:
-        if AlterUserScramCredentialsRequest is None:
+        if self._scram is None:
             raise ServiceUnavailableError(
-                "kafka-python-ng 版本不支持 KIP-95（AlterUserScramCredentials）",
+                "Kafka SCRAM AdminClient 未就绪（confluent admin=None）",
             )
         try:
             with self._lock:
-                request = AlterUserScramCredentialsRequest(
-                    upserts=[],
-                    deletes=[delete_principal(username, SCRAM_MECHANISM_ID)],
+                deletion = UserScramCredentialDeletion(
+                    user=username, mechanism=ScramMechanism.SCRAM_SHA_512
                 )
-                future = self._admin.client.send_request(request)
-                future.result(timeout_ms=settings.kafka_admin_timeout_ms)
-        except KafkaError as exc:
+                futures = self._scram.alter_user_scram_credentials([deletion])
+                for future in futures.values():
+                    future.result()
+        except KafkaException as exc:
             # 用户不存在（SASL_PRINCIPAL_NOT_FOUND / 类似）：幂等成功
             text = str(exc).lower()
             if "not found" in text or "nosuchuser" in text or "no such" in text:
@@ -306,49 +309,13 @@ class KafkaAdminOps:
             self._admin.close()
         except Exception:  # noqa: BLE001 - 关闭尽力而为
             logger.exception("kafka_admin_close_failed")
+        # confluent AdminClient 无显式 close（进程退出时由 librdkafka 回收），无需额外处理
 
     async def aclose(self) -> None:
         await asyncio.to_thread(self.close)
 
 
-# =====================================================================
-# SCRAM 协议辅助（KIP-95 数据结构）
-# =====================================================================
-#: SCRAM-SHA-512 对应 kafka.api.ScramType 数值 1（KIP-576；0=SCRAM-SHA-256）
-SCRAM_MECHANISM_ID = 1
-
-
-def name_principal(username: str) -> Any:
-    """构造 `AlterUserScramCredentials` 请求体的 `ScramCredentialUpdate.principal` 结构。
-
-    kafka-python-ng 通过 dataclasses 定义 `ScramName(principal_name, principal_type)`；
-    principal_type=2 = KAFKA_PRINCIPAL_TYPE（唯一合法值，见 KIP-576）。
-    未导出该类时回退到 duck-typing 匿名对象（协议层只看字段名）。
-    """
-    try:
-        from kafka.protocol.scram import ScramName  # type: ignore[import-not-found]
-        return ScramName(principal_name=username, principal_type=2)
-    except Exception:  # noqa: BLE001 - 未导出则使用轻量替代
-        class _Name:
-            def __init__(self, principal_name: str, principal_type: int) -> None:
-                self.principal_name = principal_name
-                self.principal_type = principal_type
-
-        return _Name(username, 2)
-
-
-def delete_principal(username: str, mechanism: int) -> Any:
-    """构造删除项（principal + mechanism）。"""
-    try:
-        from kafka.protocol.scram import DeleteScramCredential  # type: ignore[import-not-found]
-        return DeleteScramCredential(name=name_principal(username), scram_mechanism=mechanism)
-    except Exception:  # noqa: BLE001
-        class _Del:
-            def __init__(self, name: Any, scram_mechanism: int) -> None:
-                self.name = name
-                self.scram_mechanism = scram_mechanism
-
-        return _Del(name_principal(username), mechanism)
+# （SCRAM 已改由 confluent-kafka 高层 API 实现，不再需 kafka-python-ng 协议级辅助类）
 
 
 def render_vehicle_topics(vehicle_id: str) -> list[dict[str, Any]]:
@@ -364,6 +331,32 @@ def render_vehicle_topics(vehicle_id: str) -> list[dict[str, Any]]:
 # =====================================================================
 # 构造入口（main.py lifespan 调用）
 # =====================================================================
+def _build_scram_admin() -> ConfluentAdminClient:
+    """构造 confluent-kafka AdminClient（仅用于 KIP-95 SCRAM 凭据管理）。
+
+    控制面走内部 bootstrap（默认 9092 SASL_PLAINTEXT）+ 平台侧 hunter-client 凭据；
+    与 kafka-python-ng Topic 控制面并行存在（两套客户端各管一类操作）。
+    """
+    conf: dict[str, Any] = {
+        "bootstrap.servers": settings.admin_bootstrap,
+        "client.id": f"{settings.service_name}-scram-admin",
+        "security.protocol": settings.kafka_security_protocol,
+        "request.timeout.ms": settings.kafka_admin_timeout_ms,
+    }
+    if settings.kafka_security_protocol in ("SASL_PLAINTEXT", "SASL_SSL"):
+        conf["sasl.mechanism"] = settings.kafka_sasl_mechanism
+        conf["sasl.username"] = settings.kafka_sasl_username
+        conf["sasl.password"] = settings.kafka_sasl_password
+    if settings.kafka_security_protocol in ("SSL", "SASL_SSL"):
+        if settings.kafka_ssl_cafile:
+            conf["ssl.ca.location"] = settings.kafka_ssl_cafile
+        if settings.kafka_ssl_certfile:
+            conf["ssl.certificate.location"] = settings.kafka_ssl_certfile
+        if settings.kafka_ssl_keyfile:
+            conf["ssl.key.location"] = settings.kafka_ssl_keyfile
+    return ConfluentAdminClient(conf)
+
+
 def build_admin_client() -> KafkaAdminOps:
     """按 Settings 构造 AdminClient（阻塞 IO，调用方通过 asyncio.to_thread 包装）。
 
@@ -402,7 +395,13 @@ def build_admin_client() -> KafkaAdminOps:
             f"Kafka AdminClient 连接失败: {exc}",
             details={"bootstrap": settings.admin_bootstrap},
         ) from exc
-    return KafkaAdminOps(admin)
+    # SCRAM 控制面（confluent-kafka）：构造失败不阻断 Topic 控制面，SCRAM 调用时再抛 5001
+    try:
+        scram_admin: ConfluentAdminClient | None = _build_scram_admin()
+    except Exception:  # noqa: BLE001 - confluent 配置错误不应连带 Topic 能力不可用
+        logger.exception("kafka_scram_admin_init_failed")
+        scram_admin = None
+    return KafkaAdminOps(admin, scram_admin=scram_admin)
 
 
 async def build_admin_client_safe() -> KafkaAdminOps | None:
@@ -424,7 +423,6 @@ async def build_admin_client_safe() -> KafkaAdminOps | None:
 
 __all__ = [
     "KafkaAdminOps",
-    "SCRAM_MECHANISM_ID",
     "VEHICLE_TOPIC_PATTERN",
     "build_admin_client",
     "build_admin_client_safe",

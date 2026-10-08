@@ -11,7 +11,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-import yaml
 from hunter_common.exceptions import ServiceUnavailableError
 
 from app.config import settings
@@ -128,82 +127,70 @@ async def test_alist_topics_roundtrip(ops: kafka_admin.KafkaAdminOps) -> None:
 
 
 # =====================================================================
-# SCRAM 操作（依赖 kafka-python-ng 的 KIP-95 请求类；缺失时明确 5001）
+# SCRAM 操作（走 confluent-kafka AdminClient；未就绪时明确 5001）
 # =====================================================================
+class _FakeScramAdmin:
+    """模拟 confluent_kafka.admin.AdminClient.alter_user_scram_credentials。"""
+
+    def __init__(self, raise_on_result: Exception | None = None) -> None:
+        self.altered: list[Any] = []
+        self._raise = raise_on_result
+
+    def alter_user_scram_credentials(self, alterations: list[Any]) -> dict[str, Any]:
+        self.altered.extend(alterations)
+        futures: dict[str, Any] = {}
+        for i in range(len(alterations)):
+            future = MagicMock()
+            if self._raise is not None:
+                future.result = MagicMock(side_effect=self._raise)
+            else:
+                future.result = MagicMock(return_value=None)
+            futures[f"op-{i}"] = future
+        return futures
+
+
 @pytest.mark.asyncio
-async def test_upsert_scram_unsupported_raises(
-    ops: kafka_admin.KafkaAdminOps, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """未安装 kafka-python-ng 或版本不支持 KIP-95：明确 5001 而非静默失败。"""
-    monkeypatch.setattr(kafka_admin, "AlterUserScramCredentialsRequest", None, raising=False)
-    monkeypatch.setattr(kafka_admin, "ScramCredentialUpdate", None, raising=False)
+async def test_upsert_scram_not_ready_raises(ops: kafka_admin.KafkaAdminOps) -> None:
+    """SCRAM AdminClient 未就绪（confluent admin=None）：明确 5001 而非静默失败。"""
+    assert ops._scram is None  # noqa: SLF001 - 默认 fixture 未注入 scram
     with pytest.raises(ServiceUnavailableError):
         await ops.upsert_scram_user("v-1", "pw")
 
 
 @pytest.mark.asyncio
-async def test_upsert_scram_success(
-    ops: kafka_admin.KafkaAdminOps, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """注入假的 Request/Update 类，验证调用参数与 future.result 超时。"""
+async def test_upsert_scram_success(ops: kafka_admin.KafkaAdminOps) -> None:
+    """注入假 confluent admin：验证走 alter_user_scram_credentials 且构造 Upsertion。"""
+    from confluent_kafka.admin import UserScramCredentialUpsertion  # noqa: PLC0415
 
-    class _Update:
-        def __init__(self, principal: Any, scram_mechanism: int, iterations: int, password: bytes) -> None:
-            self.principal = principal
-            self.scram_mechanism = scram_mechanism
-            self.iterations = iterations
-            self.password = password
-
-    captured: dict[str, Any] = {}
-
-    class _Req:
-        def __init__(self, upserts: list[_Update], deletes: list[Any]) -> None:
-            captured["upserts"] = upserts
-            captured["deletes"] = deletes
-
-    fake_future = MagicMock()
-    fake_future.result = MagicMock(return_value=None)
-    fake_client = MagicMock()
-    fake_client.send_request = MagicMock(return_value=fake_future)
-    ops._admin.client = fake_client  # noqa: SLF001
-
-    monkeypatch.setattr(kafka_admin, "AlterUserScramCredentialsRequest", _Req, raising=False)
-    monkeypatch.setattr(kafka_admin, "ScramCredentialUpdate", _Update, raising=False)
-
+    fake = _FakeScramAdmin()
+    ops._scram = fake  # noqa: SLF001
     await ops.upsert_scram_user("HUNTER-7", "s3cret")
 
-    assert captured["deletes"] == []
-    assert len(captured["upserts"]) == 1
-    upd = captured["upserts"][0]
-    assert upd.principal.principal_name == "HUNTER-7"
-    assert upd.principal.principal_type == 2  # KAFKA_PRINCIPAL_TYPE
-    assert upd.scram_mechanism == kafka_admin.SCRAM_MECHANISM_ID  # 1 = SCRAM-SHA-512
-    assert upd.password == b"s3cret"
-    # 超时参数来自 settings
-    fake_future.result.assert_called_once_with(timeout_ms=settings.kafka_admin_timeout_ms)
+    assert len(fake.altered) == 1
+    assert isinstance(fake.altered[0], UserScramCredentialUpsertion)
 
 
 @pytest.mark.asyncio
-async def test_delete_scram_user_not_found_idempotent(
-    ops: kafka_admin.KafkaAdminOps, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """底层 KafkaError 含 not found 语义 → 幂等成功（不抛）。"""
+async def test_delete_scram_user_not_found_idempotent(ops: kafka_admin.KafkaAdminOps) -> None:
+    """底层 KafkaException 含 not found 语义 → 幂等成功（不抛）。"""
+    from confluent_kafka import KafkaException  # noqa: PLC0415
 
-    class _Req:
-        def __init__(self, **kwargs: Any) -> None:
-            pass
-
-    fake_future = MagicMock()
-    from kafka.errors import KafkaError  # noqa: PLC0415
-    fake_future.result = MagicMock(
-        side_effect=KafkaError("SASL_PRINCIPAL_NOT_FOUND: principal not found")
+    fake = _FakeScramAdmin(
+        raise_on_result=KafkaException("SASL_PRINCIPAL_NOT_FOUND: principal not found")
     )
-    fake_client = MagicMock()
-    fake_client.send_request = MagicMock(return_value=fake_future)
-    ops._admin.client = fake_client  # noqa: SLF001
-
-    monkeypatch.setattr(kafka_admin, "AlterUserScramCredentialsRequest", _Req, raising=False)
+    ops._scram = fake  # noqa: SLF001
     await ops.delete_scram_user("ghost")  # 不应抛
+
+
+@pytest.mark.asyncio
+async def test_delete_scram_user_error_raises(ops: kafka_admin.KafkaAdminOps) -> None:
+    """非 not-found 的 KafkaException → 明确 5001。"""
+    from confluent_kafka import KafkaException  # noqa: PLC0415
+
+    fake = _FakeScramAdmin(raise_on_result=KafkaException("some broker error"))
+    ops._scram = fake  # noqa: SLF001
+    with pytest.raises(ServiceUnavailableError):
+        await ops.delete_scram_user("v-1")
 
 
 # =====================================================================

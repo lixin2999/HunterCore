@@ -7,7 +7,8 @@ dependencies = [
     "fastapi>=0.100,<1.0",
     "uvicorn[standard]>=0.23",
     "prometheus-client>=0.20,<1",
-    "kafka-python-ng>=2.2,<3",   # AdminClient：KIP-95 AlterUserScramCredentials + create_topics（社区 kafka-python 已停更，NG fork API 兼容）
+    "kafka-python-ng>=2.2,<3",   # AdminClient：仅用于 create/delete/list Topic（不提供 KIP-95 SCRAM）
+    "confluent-kafka>=2.3,<3",    # KIP-95 SCRAM 凭据管理：AdminClient.alter_user_scram_credentials（与 hunter_common 一致）
     "PyYAML>=6.0",                # 契约 contracts/kafka/topics.yaml 加载
 ]
 
