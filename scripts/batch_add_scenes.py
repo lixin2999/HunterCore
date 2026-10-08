@@ -22,18 +22,19 @@
 4. **严守场景库规范**：每条 config 在提交前以 ``SceneCreateRequest``（4.2.2 结构，
    ``extra="forbid"``）自校验；命名全局唯一（重名 → 3002 幂等跳过）；时长 ≤ 600s。
 
-用法（仓库根目录）::
+用法（仓库根目录；Linux 解释器为 ``python3``，需 3.11+ 方可启用契约 Schema 校验）::
 
     # 1) 仅生成 + 校验 + 落盘，不提交（推荐先跑，产出可读的数据集清单）
-    python scripts/batch_add_scenes.py --dry-run
+    #    目标目录不可写时自动回退临时目录；也可 --output ~/scene_batch_300.json 或 --output -
+    python3 scripts/batch_add_scenes.py --dry-run
 
     # 2) 直连 scene-service 批量入库（开发/集群内，可选 GATEWAY_HMAC_SECRET 验签头）
-    python scripts/batch_add_scenes.py --mode direct \
+    python3 scripts/batch_add_scenes.py --mode direct \
         --base-url http://localhost:8081 \
         --user-id 00000000-0000-0000-0000-000000000001 --roles admin
 
     # 3) 经 api-gateway（先登录换 JWT，再带 Bearer 提交）
-    python scripts/batch_add_scenes.py --mode gateway \
+    python3 scripts/batch_add_scenes.py --mode gateway \
         --base-url http://localhost:8080 --username admin --password 'Admin@12345' \
         --publish
 
@@ -51,6 +52,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
@@ -707,15 +709,28 @@ def _light_validate(payload: dict[str, Any]) -> None:
         raise ValueError("success_criteria 取值越界")
 
 
+_SCHEMA_VALIDATOR: Any = None
+_SCHEMA_VALIDATOR_LOADED = False
+
+
 def load_schema_validator() -> Any:
-    """尝试导入 4.2.2 契约 Schema（SceneCreateRequest）。失败返回 None。"""
+    """尝试导入 4.2.2 契约 Schema（SceneCreateRequest）；失败返回 None（结果缓存，只告警一次）。"""
+    global _SCHEMA_VALIDATOR, _SCHEMA_VALIDATOR_LOADED
+    if _SCHEMA_VALIDATOR_LOADED:
+        return _SCHEMA_VALIDATOR
+    _SCHEMA_VALIDATOR_LOADED = True
     try:
         from app.schemas.scene import SceneCreateRequest  # type: ignore
 
-        return SceneCreateRequest
+        _SCHEMA_VALIDATOR = SceneCreateRequest
     except Exception as exc:  # noqa: BLE001
-        print(f"[warn] 无法导入 scene-service Schema（降级轻量校验）: {exc}", file=sys.stderr)
-        return None
+        print(
+            f"[warn] 无法导入 scene-service Schema（降级轻量校验）：{exc}"
+            "\n       （需 Python 3.11+；如用系统 python3.10 请改用项目 venv 或 3.11+ 解释器）",
+            file=sys.stderr,
+        )
+        _SCHEMA_VALIDATOR = None
+    return _SCHEMA_VALIDATOR
 
 
 def validate_scenes(scenes: list[dict[str, Any]]) -> tuple[int, list[str]]:
@@ -934,6 +949,41 @@ def _print_distribution(scenes: list[dict[str, Any]]) -> None:
             print(f"  - {LABEL_BY_TYPE[stype]:<6}({stype:<20}) {by_type[stype]:>3} 条")
 
 
+def _dump_scenes(scenes: list[dict[str, Any]], args: argparse.Namespace) -> int:
+    """写出 dry-run 产物：目标不可写时自动回退临时目录，仍失败则输出到 stdout（绝不崩溃）。"""
+    data = json.dumps(scenes, ensure_ascii=False, indent=2)
+    if args.output == "-":
+        print(data)
+        return 0
+    out = Path(args.output)
+    fallback = Path(tempfile.gettempdir()) / out.name
+    last_err: OSError | None = None
+    for cand in (out, fallback):
+        try:
+            cand.parent.mkdir(parents=True, exist_ok=True)
+            cand.write_text(data, encoding="utf-8")
+        except OSError as exc:
+            last_err = exc
+            continue
+        print(f"\n[dry-run] 已写出 {len(scenes)} 条场景 → {cand}")
+        if cand != out:
+            print(
+                f"[dry-run] 原目标不可写（{type(last_err).__name__}: {last_err}），已回退到临时目录",
+                file=sys.stderr,
+            )
+            print(
+                f"[hint] 若要写入原路径，先确保可写（任选其一）：\n"
+                f"       ① sudo mkdir -p {out.parent} && sudo chown -R \"$(id -un)\":\"$(id -gn)\" {out.parent}\n"
+                f"       ② 改用可写路径：--output ~/scene_batch_300.json\n"
+                f"       ③ 直接输出到 stdout 并重定向：--output - > ~/scene_batch_300.json",
+                file=sys.stderr,
+            )
+        return 0
+    print(f"\n[dry-run] 无法写入 {out}（{type(last_err).__name__}: {last_err}）；改为输出到 stdout：", file=sys.stderr)
+    print(data)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -981,11 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.dry_run:
-        out = Path(args.output)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(scenes, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"\n[dry-run] 已写出 {len(scenes)} 条场景 → {out}")
-        return 0
+        return _dump_scenes(scenes, args)
 
     print(f"\n[submit] 开始提交 {len(scenes)} 条场景 → {args.base_url} (mode={args.mode}, concurrency={args.concurrency})")
     stats = asyncio.run(submit_scenes(scenes, args))
