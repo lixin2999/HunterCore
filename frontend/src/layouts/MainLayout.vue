@@ -126,6 +126,8 @@ async function handleSubmitChangePassword(): Promise<void> {
   try {
     await form.validate()
   } catch {
+    // G-06 弹窗不可关闭：校验未通过时必须显式提示，否则用户会误以为“点了没反应/关不掉”
+    ElMessage.warning('口令不符合要求：长度需 8–128 位，且同时包含大写字母、小写字母与数字')
     return
   }
   pwdSubmitting.value = true
