@@ -50,6 +50,7 @@ from hunter_common.exceptions import (
     ServiceUnavailableError,
 )
 from hunter_common.logging import get_logger
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.repositories.vehicle import VehicleStore
@@ -152,8 +153,17 @@ class Provisioner:
                     provision_status=status,
                 )
             steps["db"] = _new_step("db", "ok")
+        except IntegrityError as exc:
+            # vehicle_id 主键/唯一冲突 → 契约 409/3002（“vehicle_id 已存在”）。
+            # 该行非本次所建：禁止 _persist_status 覆写既有台账的 provision_status；未创建外部资源，无需回滚。
+            # （takeover_existing 仅作用于 SCRAM/Topic/证书等外部资源，不接管已存在的台账行）
+            steps["db"] = _new_step("db", "failed", "vehicle_id 已存在")
+            logger.warning("provision_vehicle_exists", vehicle_id=req.vehicle_id)
+            raise ResourceAlreadyExistsError(
+                "vehicle_id 已存在", details={"vehicle_id": req.vehicle_id}
+            ) from exc
         except HunterBaseException as exc:
-            # 3002 unique 冲突等：直接映射，无需回滚（未创建外部资源）
+            # 其它业务异常（含显式 3002 等）：直接映射，无需回滚（未创建外部资源）
             steps["db"] = _new_step("db", "failed", str(exc))
             await self._persist_status(req.vehicle_id, steps, failed=True)
             raise
