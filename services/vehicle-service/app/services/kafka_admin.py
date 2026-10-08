@@ -28,10 +28,18 @@ from hunter_common.exceptions import ServiceUnavailableError
 from hunter_common.logging import get_logger
 from kafka.admin import KafkaAdminClient, NewTopic  # type: ignore[import-untyped]
 from kafka.errors import (  # type: ignore[import-untyped]
-    AleadyHasPartitionException,
     KafkaError,
     TopicAlreadyExistsError,
 )
+
+# 兼容兜底：`AleadyHasPartitionException` 是 kafka-python 旧仓库的拼写错误类名（"Aleady"），
+# kafka-python-ng 已移除/修正该名，直接顶层导入会在 import 期抛 ImportError 致服务无法启动。
+# create_topics 对已存在 Topic 实际抛 TopicAlreadyExistsError，故缺失时回退到同一异常，
+# 保留模块级名字以不破坏下方 `except (TopicAlreadyExistsError, AleadyHasPartitionException)` 与既有测试。
+try:  # pragma: no cover - 依版本分支：老 kafka-python 有此名，ng fork 无
+    from kafka.errors import AleadyHasPartitionException  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - kafka-python-ng 回退路径
+    AleadyHasPartitionException = TopicAlreadyExistsError  # type: ignore[assignment,misc]
 
 try:  # kafka-python-ng 提供的 KIP-95 请求（fork ≥ 2.2）
     from kafka.protocol.scram import (  # type: ignore[import-not-found,import-untyped]
