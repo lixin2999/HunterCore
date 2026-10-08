@@ -5,7 +5,10 @@
 #
 # 阶段 1：builder —— python:3.12-slim。安装到独立前缀 /install 便于整体搬运到运行阶段。
 FROM python:3.12-slim AS builder
-ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+    PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10
 WORKDIR /build
 COPY common/python ./common/python
 COPY services/data-analytics ./service

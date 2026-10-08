@@ -8,7 +8,10 @@
 #
 # 阶段 1：builder —— 安装依赖到 /install 前缀
 FROM python:3.11-slim AS builder
-ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+    PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10
 WORKDIR /build
 COPY common/python ./common/python
 COPY services/vehicle-service ./service
