@@ -1217,8 +1217,11 @@ ensure_kafka_certs_readable() {
   local cert_dir="${1:-${APP_DIR}/certs/kafka}" f gid="${KAFKA_CERT_GID:-1001}"
   for f in "${cert_dir}/kafka.keystore.jks" "${cert_dir}/kafka.truststore.jks"; do
     [ -f "$f" ] || continue
-    # 已对 GID 可读（group r）则跳过；否则 chgrp + 0640（组不存在则退回 0644）
-    if [ -r "$f" ] && stat -c '%a' "$f" 2>/dev/null | grep -qE '^0?[0-7][4-7][0-7]$'; then
+    # 必须同时满足：属组恰为 broker gid 且组可读，才视为已就绪；否则 chgrp + 0640（组不存在则退回 0644）。
+    # ⚠ 仅凭权限位判断会漏掉 root:root 640（组是 root 而非 1001，容器 1001 落到 other 仍读不到 → broker 起不来）。
+    cur_group="$(stat -c '%g' "$f" 2>/dev/null)"
+    cur_mode="$(stat -c '%a' "$f" 2>/dev/null)"
+    if [ "$cur_group" = "$gid" ] && printf '%s' "$cur_mode" | grep -qE '^0?[0-7][4-7][0-7]$'; then
       continue
     fi
     if chgrp "$gid" "$f" 2>/dev/null; then
