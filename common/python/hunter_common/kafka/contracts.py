@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -41,6 +42,9 @@ KEY_VEHICLE_ID: Final[str] = "vehicle_id"
 
 #: DLQ 后缀（契约 topics.yaml#naming.dlq_pattern）
 _DLQ_SUFFIX: Final[str] = ".dlq"
+
+#: 订阅写法中代表 vehicle_id 的通配记号（``hunter.*.telemetry`` 与模板名 ``hunter.{vehicle_id}.telemetry`` 等价）
+_WILDCARD_TOKENS: Final[tuple[str, ...]] = ("*", "{vehicle_id}")
 
 
 class KafkaContractError(HunterBaseException):
@@ -427,6 +431,37 @@ def strip_dlq(topic: str) -> str:
     while topic.endswith(_DLQ_SUFFIX):
         topic = topic[: -len(_DLQ_SUFFIX)]
     return topic
+
+
+def subscription_term(topic: str) -> str:
+    """契约订阅写法 → librdkafka 订阅项（通配写法转成**正则**，具体名原样返回）。
+
+    **为什么必须转**：librdkafka 只有在订阅项以 ``^`` 开头时才按正则匹配 Topic 名，否则一律
+    视为**字面 Topic 名**。把契约的 ``hunter.*.telemetry`` 直接交给 ``Consumer.subscribe()``，
+    实际订阅的是"名字里真带星号"的 Topic：生产 Kafka 配 ``auto.create.topics.enable=false``
+    （见 infra/deploy/docker-compose.yml 与 infra/k8s/statefulsets/kafka.yaml）时永远报
+    ``UNKNOWN_TOPIC_OR_PART``——消费者进程活着、日志在报错、**一条消息也收不到**，
+    且消费组从不出现在 broker 的消费组列表里（外部表现为车辆始终离线）。
+
+    转换规则：``*`` 与 ``{vehicle_id}`` 都转成 ``[^.]+``（**单层**通配，不跨越 ``.`` 分隔的
+    Topic 类型段，避免 ``hunter.*.telemetry`` 误命中 ``hunter.a.b.telemetry`` 之类的分层名）::
+
+        hunter.*.telemetry              -> ^hunter\\.[^.]+\\.telemetry$
+        hunter.{vehicle_id}.health.dlq  -> ^hunter\\.[^.]+\\.health\\.dlq$
+        telemetry_raw                   -> telemetry_raw（具体名，不转正则）
+        ^hunter\\..*\\.ota_status$      -> 原样（已按 librdkafka 约定写成正则，不得二次转义）
+
+    以 ``^`` 开头的入参视为“调用方已自行完成转换”（ota-service / remote-control 的历史写法），
+    原样下发——否则 ``.*`` 会被当成通配记号再转一道，得到永远匹配不上任何 Topic 的正则。
+    """
+    if topic.startswith("^"):
+        return topic
+    if not any(token in topic for token in _WILDCARD_TOKENS):
+        return topic
+    escaped = re.escape(topic)
+    for token in _WILDCARD_TOKENS:
+        escaped = escaped.replace(re.escape(token), "[^.]+")
+    return f"^{escaped}$"
 
 
 def _vehicle_type_of(topic: str) -> str | None:

@@ -74,6 +74,8 @@ Topic 命名规范：`<domain>.<entity>.<type>`，全小写，点分隔；车端
 | DLQ 消息头 | `dlq.original.topic` / `dlq.partition` / `dlq.offset` / `dlq.reason` / `dlq.error`（错误信息截断 500 字符） | `consumer.KafkaConsumerManager._send_to_dlq` |
 | 消费幂等 | `IdempotencyGuard.claim()` 返回 True 才执行 handler；键由各消费组 `idempotency_key` 派生（`compose()` 归一为 sha256） | `idempotency.IdempotencyGuard` |
 | 消费积压指标 | 批次提交后刷新 `hunter_kafka_consumer_lag`（高水位 - 位点，按分区） | `consumer.KafkaConsumerManager._refresh_lag` |
+| 订阅写法→正则 | `consumer-groups.yaml` 的 `subscribes: ["hunter.*.telemetry"]` 是**契约写法**（`*` = vehicle_id）。librdkafka 仅把**以 `^` 开头**的订阅项当正则，否则视为字面 Topic 名，所以实现侧必须转正则下发：`*` / `{vehicle_id}` → `[^.]+`（单层，不跨越类型段）并加 `^…$` 锚点；已以 `^` 开头的入参原样下发（不二次转义）。服务**不得自行拼正则**（历史例外：ota-service / remote-control 直接配了 `^…$`，仍可正常工作） | `contracts.subscription_term` · `consumer.KafkaConsumerManager.subscription_terms` |
+| 消费者不建 Topic | 消费者侧 `allow.auto.create.topics=false`（与 broker 一致）：写错的订阅名不会在 broker 上落一个同名空 Topic（排障时“Topic 存在”会误导）；正则订阅下新开通车辆的 Topic 靠元数据刷新进入订阅集合（30s，默认 300s 会让“已开通但无数据”持续 5 分钟） | `consumer.KafkaConsumerManager._build_conf` |
 | 契约目录定位 | `KAFKA_CONTRACT_DIR` → 工作目录向上查找 → 包位置向上查找；显式启用 Schema 校验时契约缺失即启动失败（fail fast） | `contracts.locate_contract_dir` |
 
 

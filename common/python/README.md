@@ -123,7 +123,10 @@ await producer.close()                  # 先尽力重投缓冲，再 flush
 consumer = KafkaConsumerManager(
     settings,
     group_id="data-collector-telemetry",      # 须登记在 consumer-groups.yaml
-    topics=["hunter.*.telemetry"],            # 正则订阅：新车接入无需改配置
+    topics=["hunter.*.telemetry"],            # 契约通配写法（新车接入无需改配置）；
+                                              # 库内由 contracts.subscription_term() 转成 librdkafka 正则
+                                              # ^hunter\.[^.]+\.telemetry$ 再下发——librdkafka 只把以 ^
+                                              # 开头的项当正则，直发会被当字面 Topic 名而永不命中
     schema_name=SCHEMA_AUTO,                  # 按消息实际 Topic 解析契约 Schema
 )
 await consumer.run(handler)                   # handler(message, value) 抛异常 → 重试耗尽后 DLQ

@@ -5,7 +5,7 @@
 # 用途：一次性核对容器 / HTTP 探针 / 数据库 / Redis / Kafka / MinIO / 磁盘与内存 / 消费积压，
 #       输出 [PASS] [WARN] [FAIL] 明细与汇总，并给出退出码（供 install.sh、巡检脚本、CI 调用）。
 #
-# 检查项（共 12 类）：
+# 检查项（共 13 类）：
 #   ① 容器运行状态与 Docker healthcheck（缺失/非 healthy/未运行 → FAIL）
 #   ② HTTP 探针：api-gateway/scene/collector/analytics/ota/remote（/healthz）、web-portal、
 #      MinIO(/minio/health/live)、SRS(/api/v1/versions)、Flink UI(/overview)
@@ -16,6 +16,9 @@
 #   ⑪ 配置漂移硬闸（G-03）：docker-compose.override.yml 存在即 FAIL（HUNTER_ALLOW_OVERRIDE=1 降为 WARN）；
 #      并按容器 label 判定实际生效的编排文件（防裸跑 docker compose 命中仓库根开发版编排）
 #   ⑫ 车端接入证书：broker 证书 SAN 必须含 SERVER_IP（车端 https 主机名校验只比 SAN）；CA/broker 有效期预警
+#   ⑬ 服务运行期错误日志：扫描各服务容器近期 error/critical/Traceback（探针类检查永远看不到的一类故障：
+#      消费者进程活着、/healthz 200，但订阅从未命中——只有日志里有痕迹）；订阅/Topic 类致命错直接 FAIL；
+#      窗口由 ERROR_LOG_WINDOW 控制（默认 15m）
 #
 # 用法：
 #   sudo bash scripts/health-check.sh [选项]
@@ -62,7 +65,7 @@ usage() {
 HunterCore 全栈健康检查脚本
 
 用途：
-  检查 12 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
+  检查 13 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
   退出码：0=全部通过，1=有告警，2=有失败。
 
 用法：
@@ -81,7 +84,7 @@ HunterCore 全栈健康检查脚本
 检查项：
   容器状态/Docker healthcheck、服务 HTTP 探针、PostgreSQL、TimescaleDB、Redis、
   Kafka Topic 数、MinIO Bucket 数、/data 磁盘使用率、内存使用率、Kafka 消费积压、
-  配置漂移硬闸、车端接入证书（broker 证书 SAN 与有效期）。
+  配置漂移硬闸、车端接入证书（broker 证书 SAN 与有效期）、服务运行期错误日志。
 EOF
 }
 
@@ -529,7 +532,46 @@ check_kafka_broker_cert() {
   return 0
 }
 
-# run_all_health_checks：执行全部 12 类检查（供 daily-check 与 main 复用）
+# ⑬ 服务运行期错误日志（探针看不见的故障类）：近窗口内 error/critical/Traceback
+# 背景（V1.18.12）：通配订阅未转 librdkafka 正则时，消费者只报 UNKNOWN_TOPIC_OR_PART：
+# 容器 healthy、/healthz 200、消费组根本不存在，当时 41 项巡检全部“正常”，
+# 而平台其实一条消息也没收过。本项把“日志里有错”从人工排查提升为例行硬信号。
+check_service_error_logs() {
+  local containers=(hunter-api-gateway hunter-scene hunter-collector hunter-analytics \
+    hunter-ota hunter-remote hunter-vehicle-service)
+  local window="${ERROR_LOG_WINDOW:-15m}"
+  local err_re='\[(error|critical)[[:space:]]*\]|Traceback \(most recent call last\)'
+  local fatal_re='Subscribed topic not available|UNKNOWN_TOPIC_OR_PART'
+  local c logs errors fatal sample scanned=0 flagged=0
+  if ! command_exists docker; then
+    record_result "WARN" "服务错误日志" "缺少 docker 命令，跳过运行期错误日志扫描"
+    return 0
+  fi
+  for c in "${containers[@]}"; do
+    docker inspect "$c" >/dev/null 2>&1 || continue
+    scanned=$((scanned + 1))
+    logs="$(docker logs --since "$window" "$c" 2>&1 || true)"
+    [ -n "$logs" ] || continue
+    errors="$(printf '%s\n' "$logs" | grep -cE "$err_re" || true)"
+    fatal="$(printf '%s\n' "$logs" | grep -m1 -E "$fatal_re" || true)"
+    if [ -n "$fatal" ]; then
+      record_result "FAIL" "服务错误日志（${c}）" \
+        "订阅/Topic 类致命错（近 ${window} 共 ${errors:-0} 条 error）：$(printf '%.200s' "$fatal") → 该服务从未消费到任何消息（看板与车辆台账会恒显离线）；先确认镜像含“通配订阅转正则”修复（V1.18.12，启动日志 subscription 应形如 ^hunter\\.[^.]+\\.<type>$）；docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --build $c"
+      flagged=$((flagged + 1))
+    elif [ "${errors:-0}" -gt 0 ]; then
+      sample="$(printf '%s\n' "$logs" | grep -E "$err_re" | tail -1)"
+      record_result "WARN" "服务错误日志（${c}）" \
+        "近 ${window} 有 ${errors} 条 error/critical/Traceback，最后一条：$(printf '%.200s' "$sample")（docker logs --since ${window} ${c}）"
+      flagged=$((flagged + 1))
+    fi
+  done
+  if [ "$flagged" -eq 0 ]; then
+    record_result "PASS" "服务错误日志" "近 ${window} ${scanned} 个服务容器无 error/critical/Traceback"
+  fi
+  return 0
+}
+
+# run_all_health_checks：执行全部 13 类检查（供 daily-check 与 main 复用）
 # 各项均以“失败被测试”的上下文调用（if ! f）：bash 在该上下文中会关闭 errexit，
 # 使某项内部命令报错不再中断整轮检查（历史现象：脚本中途退出，导致后面的
 # “车端接入证书 SAN”硬闸静默缺失，运维只看到前面几项而误以为全部通过）。
@@ -538,7 +580,7 @@ run_all_health_checks() {
   local check
   for check in check_compose_override check_containers check_http_endpoints check_databases \
     check_redis check_kafka_topics check_minio_buckets check_disk_usage check_memory_usage \
-    check_kafka_lag check_kafka_broker_cert; do
+    check_kafka_lag check_kafka_broker_cert check_service_error_logs; do
     if ! "$check"; then
       record_result "WARN" "检查项未完成（${check}）" "该项内部命令返回非 0（已继续执行余下检查，stderr 有具体报错行）"
     fi

@@ -3,7 +3,7 @@
 # HunterCore 单机部署 —— 日常巡检（daily-check.sh）
 #
 # 用途：在 health-check.sh 全量检查基础上追加业务侧巡检项，生成当日报告：
-#   ① 复用 health-check.sh 的全部检查（容器/HTTP/DB/Redis/Kafka/MinIO/磁盘/内存/消费积压）
+#   ① 复用 health-check.sh 的全部 13 类检查（容器/HTTP/DB/Redis/Kafka/MinIO/磁盘/内存/消费积压/配置漂移/接入证书/错误日志）
 #   ② 最近 24 小时 critical 事件数（data_collector.events，event_level='critical'）
 #   ③ PostgreSQL 当前连接数（pg_stat_activity）与连接上限余量
 #   ④ 各容器重启次数（RestartCount，>0 提示可能反复崩溃）
@@ -46,7 +46,7 @@ usage() {
 HunterCore 日常巡检脚本
 
 用途：
-  复用 health-check.sh 的 10 类检查，并追加业务巡检项（critical 事件数、DB 连接数、
+  复用 health-check.sh 的 13 类检查，并追加业务巡检项（critical 事件数、DB 连接数、
   容器重启次数、数据目录占用），生成当日报告并打印摘要。
 
 用法：

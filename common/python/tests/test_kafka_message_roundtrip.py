@@ -1,4 +1,4 @@
-"""Kafka 消息契约 round-trip 单测：契约解析 / 编解码往返 / key 规则 / Schema 校验。
+"""Kafka 消息契约 round-trip 单测：契约解析 / 编解码往返 / key 规则 / Schema 校验 / 订阅写法转换。
 
 契约来源：``contracts/kafka/{topics.yaml, consumer-groups.yaml, schemas/*.schema.json}``；
 示例消息取 Schema 的 ``examples[0]``（禁止在测试中手写消息体，避免与契约漂移）。
@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from hunter_common.kafka.contracts import (
     KafkaContractError,
     KafkaMessageSchemaError,
     get_contract,
+    subscription_term,
 )
 from hunter_common.kafka.messages import (
     build_record,
@@ -78,6 +80,39 @@ def test_topic_spec_resolves_all_notations(contract: KafkaContract) -> None:
     with pytest.raises(KafkaContractError):
         contract.topic_spec("hunter.HUNTER-001.not_a_type")
     assert contract.has_topic("telemetry_raw") is True
+
+
+#: 契约订阅写法 → librdkafka 订阅项（librdkafka **仅把以 ``^`` 开头的订阅项当正则**，
+#: 直接下发 ``hunter.*.telemetry`` 等于订阅一个名字里真带星号的 Topic）
+SUBSCRIPTION_TERM_CASES: dict[str, str] = {
+    "hunter.*.telemetry": r"^hunter\.[^.]+\.telemetry$",
+    "hunter.{vehicle_id}.health": r"^hunter\.[^.]+\.health$",
+    "hunter.*.command_result.dlq": r"^hunter\.[^.]+\.command_result\.dlq$",
+    "telemetry_raw": "telemetry_raw",
+    # 已按 librdkafka 约定给出正则（ota-service / remote-control 历史写法）→ 不得二次转义
+    r"^hunter\..*\.ota_status$": r"^hunter\..*\.ota_status$",
+    "hunter.broadcast.command": "hunter.broadcast.command",
+    f"hunter.{VEHICLE_ID}.telemetry": f"hunter.{VEHICLE_ID}.telemetry",
+}
+
+
+@pytest.mark.parametrize(("notation", "term"), sorted(SUBSCRIPTION_TERM_CASES.items()))
+def test_subscription_term_converts_wildcard_to_regex(notation: str, term: str) -> None:
+    """通配写法转 ``^`` 正则；具体名（平台内部/广播/实例）原样下发。"""
+    assert subscription_term(notation) == term
+
+
+def test_subscription_regex_covers_contract_topics_without_overmatch(contract: KafkaContract) -> None:
+    """转换出的正则能吃下契约内全部实例 Topic，且不越界命中其它类型/分层名。"""
+    telemetry = re.compile(subscription_term("hunter.*.telemetry"))
+    assert telemetry.fullmatch(f"hunter.{VEHICLE_ID}.telemetry")
+    assert not telemetry.fullmatch(f"hunter.{VEHICLE_ID}.health")
+    assert not telemetry.fullmatch(f"hunter.{VEHICLE_ID}.telemetry.dlq")
+    assert not telemetry.fullmatch("hunter.A.B.telemetry")  # 单层通配：不跨越类型段
+    # 契约每个车端 Topic 都能被自己转换出的正则命中（新接入车辆无需改配置）
+    for template in contract.vehicle_topics:
+        topic = KafkaContract.render_topic(template, VEHICLE_ID)
+        assert re.compile(subscription_term(template)).fullmatch(topic), topic
 
 
 def test_topic_contract_values_match_design_doc(contract: KafkaContract) -> None:

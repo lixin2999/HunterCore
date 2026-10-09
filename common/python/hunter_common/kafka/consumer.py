@@ -11,6 +11,9 @@
   （契约 ``defaults.idempotency=required``）；
 - **消费延迟监控**：每批处理完刷新 ``hunter_kafka_consumer_lag``（高水位 - 当前位点，按分区）；
 - **异步**：阻塞调用（consume/commit/watermark）全部在线程池执行，不阻塞事件循环。
+- **通配订阅转正则**：契约的 ``hunter.*.telemetry`` 写法必须转成 librdkafka 能识别的
+  ``^`` 正则（:func:`~hunter_common.kafka.contracts.subscription_term`），否则会被当作
+  字面 Topic 名——订阅永不命中、消费组不注册、进程看起来正常但收不到任何消息。
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ from hunter_common.kafka.contracts import (
     KafkaContractError,
     KafkaMessageSchemaError,
     get_contract,
+    subscription_term,
 )
 from hunter_common.kafka.idempotency import IdempotencyGuard
 from hunter_common.kafka.messages import parse_payload
@@ -58,6 +62,11 @@ _DLQ_ERROR_MAX_CHARS: Final[int] = 500
 #: 退避指数上限（防止位移溢出）
 _MAX_BACKOFF_EXPONENT: Final[int] = 10
 
+#: 正则订阅下的元数据刷新间隔（librdkafka 默认 300s）：新开通车辆的 Topic 是在消费者
+#: 启动之后才创建的，靠全量元数据刷新才能进入订阅集合——5 分钟“已开通但看板无数据”
+#: 会被当成接入故障排查，压到 30s（全量元数据请求开销与百~千量级 Topic 数不成问题）。
+_METADATA_REFRESH_INTERVAL_MS: Final[int] = 30_000
+
 
 class KafkaConsumerManager:
     """Kafka 消费者封装（契约 Schema 校验 + 手动提交 + 重试 + DLQ + 积压指标）。"""
@@ -85,7 +94,8 @@ class KafkaConsumerManager:
         """
         Args:
             group_id: 消费者组（须在 ``contracts/kafka/consumer-groups.yaml`` 登记；未登记仅告警）。
-            topics: 订阅列表（支持契约正则写法 ``hunter.*.telemetry``，新车接入无需改配置）。
+            topics: 订阅列表（支持契约正则写法 ``hunter.*.telemetry``，新车接入无需改配置；
+                实际下发给 librdkafka 前会转为 ``^`` 正则，见 :attr:`subscription_terms`）。
             schema_name: ``None`` = 不做 Schema 校验（兼容既有调用方）；
                 ``"auto"`` = 按消息实际 Topic 从契约解析 Schema（契约不可用则构造时抛错）；
                 其他值 = 固定 Schema 逻辑名（如 ``telemetry``，不存在则构造时抛错）。
@@ -100,6 +110,8 @@ class KafkaConsumerManager:
         self._service = config.service_name
         self._group_id = group_id
         self._topics = list(topics)
+        #: 真正交给 ``Consumer.subscribe()`` 的订阅项（通配写法 → librdkafka 正则）
+        self._subscription_terms = [subscription_term(topic) for topic in self._topics]
         self._dlq_enabled = dlq_enabled
         self._poll_timeout = poll_timeout
         self._batch_size = batch_size
@@ -128,6 +140,11 @@ class KafkaConsumerManager:
         self._running = False
 
     # ---------- 配置 ----------
+
+    @property
+    def subscription_terms(self) -> list[str]:
+        """实际订阅项（排障用：日志/巡检据此区分“契约写法”与“broker 侧真订阅名”）。"""
+        return list(self._subscription_terms)
 
     def _validate_schema_config(self) -> None:
         """Schema 配置 fail fast：显式 Schema 必须存在；auto 模式必须有契约。"""
@@ -160,6 +177,11 @@ class KafkaConsumerManager:
             "security.protocol": config.kafka_security_protocol,
             "enable.auto.commit": False,  # 手动提交：处理成功后 commit（契约 consumer_defaults）
             "auto.offset.reset": "earliest",
+            # 消费者侧禁止自动建 Topic：契约 Topic 只由 provisioner / init-kafka 按
+            # topics.yaml 创建。开启后，写错的订阅名会在 broker 上落一个真实空 Topic，
+            # 排障时“Topic 存在”反而误导（与 broker auto.create.topics.enable=false 一致）。
+            "allow.auto.create.topics": False,
+            "topic.metadata.refresh.interval.ms": _METADATA_REFRESH_INTERVAL_MS,
             "client.id": config.service_name,
         }
         if config.kafka_security_protocol in ("SASL_SSL", "SASL_PLAINTEXT"):
@@ -192,12 +214,13 @@ class KafkaConsumerManager:
             handler: 异步处理函数，参数为 ``(Message, 解码后的值)``；
                 解码与契约校验见 :meth:`_decode_and_validate`。
         """
-        self._consumer.subscribe(self._topics)
+        self._consumer.subscribe(self._subscription_terms)
         self._running = True
         loop = asyncio.get_running_loop()
         logger.info(
             "kafka_consumer_started",
             topics=self._topics,
+            subscription=self._subscription_terms,
             group_id=self._group_id,
             schema=self._schema_name or "-",
             idempotency=self._idempotency is not None,

@@ -1,7 +1,7 @@
 """消费者契约行为单测（Mock confluent-kafka Consumer/Producer，不需要 broker）。
 
 覆盖：契约 Schema 校验（非法消息进 DLQ 不重试）/ handler 重试与 DLQ 转投 /
-手动提交 offset / 幂等跳过 / 消费积压指标 / 解码回退。
+手动提交 offset / 幂等跳过 / 消费积压指标 / 解码回退 / 通配订阅转 librdkafka 正则。
 """
 from __future__ import annotations
 
@@ -236,11 +236,28 @@ async def test_batch_success_commits_offset_and_closes(
     with pytest.raises(StopConsume):
         await manager.run(handler)
 
-    assert fake_consumer.subscribed == ["hunter.*.telemetry"]
+    assert fake_consumer.subscribed == [r"^hunter\.[^.]+\.telemetry$"]
     assert handled == [contract.schema("telemetry")["examples"][0]]
     assert fake_consumer.commit_calls == 1
     assert fake_consumer.closed is True
     assert consumed_counter("processed") - before_processed == 1.0
+
+
+def test_manager_exposes_effective_subscription_terms(contract: KafkaContract) -> None:
+    """订阅项在构造期即转正则（排障时看的是下发名，不是契约写法）。"""
+    manager, _, _ = build_manager(contract, [])
+    assert manager.subscription_terms == [r"^hunter\.[^.]+\.telemetry$"]
+
+
+def test_consumer_conf_forbids_auto_topic_creation() -> None:
+    """消费者侧禁止自动建 Topic + 缩短元数据刷新（正则订阅下新开通车辆需尽快可见）。
+
+    直接断言配置构造结果：这两个键是“消费者在跑但收不到消息”类故障的第一排查点，
+    必须被测试钉住（broker 侧 `auto.create.topics.enable=false`，写错的订阅名不应落成一个空 Topic）。
+    """
+    conf = KafkaConsumerManager._build_conf(make_config(), GROUP_ID)
+    assert conf["allow.auto.create.topics"] is False
+    assert conf["topic.metadata.refresh.interval.ms"] == 30_000
 
 
 async def test_handler_retry_then_success(contract: KafkaContract) -> None:

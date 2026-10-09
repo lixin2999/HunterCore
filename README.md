@@ -84,7 +84,7 @@ HunterCore/
 | `init-db.sh` | 应用 `schema.sql`/`timescaledb.sql`/`init-data.sql` 并校验（8 schema / 11 表 / 2 hypertable），可选注入 admin 口令 |
 | `init-kafka.sh` | 创建 6 个契约 Topic（分区/保留时间校验），可选 `--scram-users` |
 | `init-minio.sh` | 创建 7 个 Bucket 与生命周期规则（30/90 天与永久） |
-| `health-check.sh` | 全栈健康检查（12 类，`[PASS]/[WARN]/[FAIL]`，退出码 0/1/2；含车端接入证书 SAN 全集比对（`SERVER_IP` + `KAFKA_CERT_SAN_IPS/DNS`）与有效期，单项内部报错不中断整轮），可被其他脚本 source 复用 |
+| `health-check.sh` | 全栈健康检查（13 类，`[PASS]/[WARN]/[FAIL]`，退出码 0/1/2；含车端接入证书 SAN 全集比对（`SERVER_IP` + `KAFKA_CERT_SAN_IPS/DNS`）与有效期、服务运行期错误日志巡检（订阅未命中这类“探针全绿但从未消费”的故障只有日志有痕迹），单项内部报错不中断整轮），可被其他脚本 source 复用 |
 | `daily-check.sh` | 日常巡检（复用健康检查 + critical 事件/DB 连接数/容器重启次数/容量），报告写入 `/var/log/hunter-core/check/` |
 | `backup.sh` | 备份 PostgreSQL 全量 + 时序热数据 + 配置 + Redis RDB，按保留天数清理，输出 MinIO `mc mirror` 指引 |
 | `uninstall.sh` | 卸载（默认保留数据；`--all` 需输入 `DELETE-ALL`，含受保护路径护栏） |
@@ -319,6 +319,12 @@ Kafka 契约驱动的生产/消费（共享库 `hunter_common.kafka`）要点：
 - **消费者**：`schema_name="auto"` 时按消息实际 Topic 校验契约 Schema（非法消息直接进 DLQ，`reason=schema_invalid` 不重试）；
   handler 失败指数退避重试，耗尽后转投 `{topic}.dlq` 并保留 `dlq.original.topic/partition/offset/reason/error` 头；
   整批处理后手动提交 offset（at-least-once）；可注入 `IdempotencyGuard` 跳过重复消息；每批刷新 `hunter_kafka_consumer_lag`
+- **通配订阅转正则**（⚠ 易错点）：librdkafka **只把以 `^` 开头的订阅项当正则**，其余一律视为字面 Topic 名；
+  因此契约写法 `hunter.*.telemetry` 下发前必须经 `contracts.subscription_term()` 转成 `^hunter\.[^.]+\.telemetry$`
+  （`*` / `{vehicle_id}` → 单层 `[^.]+`，不跨类型段）。直发写法会订阅一个“名字里真带星号”的 Topic，
+  而 broker 关闭自动建 Topic → 永远 `UNKNOWN_TOPIC_OR_PART`：**进程活着、`/healthz` 200、消费组根本不存在、一条消息也收不到**；
+  消费者侧同时置 `allow.auto.create.topics=false`（写错的订阅名不会在 broker 落一个同名空 Topic 误导排障）
+  与 `topic.metadata.refresh.interval.ms=30000`（新开通车辆的 Topic 靠元数据刷新进入订阅集合，默认 300s 太久）
 - **指标**（前缀 `hunter_kafka_`，随各服务 `/metrics` 暴露）：生产计数/时延/重试、缓冲水位/丢弃/重投、
   消费计数（processed/skipped_duplicate/schema_invalid/handler_failed）、DLQ 计数、分区消费积压
 - **验证**：`pytest common/python/tests -q`（契约 round-trip、Mock Producer/Consumer 行为、缓冲崩溃恢复、幂等守卫）；
