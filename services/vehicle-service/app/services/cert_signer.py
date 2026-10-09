@@ -178,7 +178,8 @@ def issue_client_cert_sync(vehicle_id: str) -> CertArtifacts:
         )
         _safe_chmod(p["csr"], 0o600)
 
-        # 4) CA 签发（-set_serial 免依赖 serial 文件；-days 与 CA 同寿）
+        # 4) CA 签发（-CA/-CAkey 大写为 openssl x509 合法选项；-set_serial 免依赖 serial 文件）
+        #    不加 -CAcreateserial：与 -set_serial 互斥，且会向只读挂载的 CA 目录写 .srl 而失败
         _run(
             [
                 "openssl",
@@ -186,11 +187,10 @@ def issue_client_cert_sync(vehicle_id: str) -> CertArtifacts:
                 "-req",
                 "-in",
                 str(p["csr"]),
-                "-ca",
+                "-CA",
                 settings.kafka_ca_cert_path,
-                "-cakey",
+                "-CAkey",
                 settings.kafka_ca_key_path,
-                "-CAcreateserial",
                 "-outform",
                 "PEM",
                 "-out",

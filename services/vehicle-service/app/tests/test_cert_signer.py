@@ -79,10 +79,17 @@ def test_issue_invokes_openssl_in_order(tmp_certs_dir: Path, monkeypatch: pytest
     serial_idx = x509_cmd.index("-set_serial")
     serial_val = x509_cmd[serial_idx + 1]
     assert serial_val.startswith("0x") and serial_val[2:] == artifacts.serial_hex
-    assert f"-{'' }days" not in x509_cmd  # 存在 -days（非 -days 前置符号）
     assert "-days" in x509_cmd
     days_idx = x509_cmd.index("-days")
     assert x509_cmd[days_idx + 1] == str(settings.vehicle_cert_validity_days)
+
+    # CA 签发选项必须大写（openssl x509 只认 -CA/-CAkey；小写 -ca 会被当未知选项）
+    assert "-CA" in x509_cmd and "-CAkey" in x509_cmd, "x509 必须用大写 -CA/-CAkey"
+    assert "-ca" not in x509_cmd and "-cakey" not in x509_cmd, "禁止小写 -ca/-cakey（OpenSSL 视为未知选项）"
+    assert x509_cmd[x509_cmd.index("-CA") + 1] == settings.kafka_ca_cert_path
+    assert x509_cmd[x509_cmd.index("-CAkey") + 1] == settings.kafka_ca_key_path
+    # -set_serial 与 -CAcreateserial 互斥，且后者会向只读 CA 目录写 .srl → 必须不出现
+    assert "-CAcreateserial" not in x509_cmd, "禁止 -CAcreateserial（只读挂载 + 与 -set_serial 冲突）"
 
     # Subject = /O=HunterCore/CN=<vehicle_id>
     req_cmd = rec.cmds[1]
