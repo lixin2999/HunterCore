@@ -43,8 +43,9 @@ except ImportError:  # pragma: no cover - kafka-python-ng 回退路径
     AleadyHasPartitionException = TopicAlreadyExistsError  # type: ignore[assignment,misc]
 
 # KIP-95 SCRAM 凭据管理：kafka-python-ng 无任一版本提供该能力（最高 2.2.3，实测无
-# AlterUserScramCredentials 及相关协议类），敕 SCRAM 走 confluent-kafka（项目既有依赖，
+# AlterUserScramCredentials 及相关协议类），故 SCRAM 走 confluent-kafka（项目既有依赖，
 # 由 hunter_common 引入）；Topic 管理仍用 kafka-python-ng AdminClient。
+from confluent_kafka import KafkaError as ConfluentKafkaError  # type: ignore[import-untyped]
 from confluent_kafka import KafkaException  # type: ignore[import-untyped]
 from confluent_kafka.admin import AdminClient as ConfluentAdminClient  # type: ignore[import-untyped]
 from confluent_kafka.admin import (  # type: ignore[import-untyped]
@@ -64,6 +65,30 @@ VEHICLE_TOPIC_PATTERN = "hunter.{vehicle_id}."
 
 #: SCRAM 迭代次数（KIP-95 建议默认值，与 kafka-configs.sh --scram-mechanisms 默认对齐）
 _SCRAM_ITERATIONS = 8192
+
+
+def _is_scram_principal_missing(exc: BaseException) -> bool:
+    """判定 SCRAM 删除异常是否为“用户/凭据不存在”（下线/回滚可幂等忽略）。
+
+    主判据：confluent `KafkaError.code() == RESOURCE_NOT_FOUND`（KIP-95 删除不存在主体的标准返回，
+    如“Attempt to delete a user credential that does not exist”）；
+    回退判据：异常文本关键词（不同 broker/版本措辞差异）。仅靠文本会漏判（见 release V1.18.7）。
+    """
+    err = exc.args[0] if getattr(exc, "args", None) else None
+    code = getattr(err, "code", None)
+    if callable(code) and code() == ConfluentKafkaError.RESOURCE_NOT_FOUND:
+        return True
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "resource_not_found",
+            "not found",
+            "does not exist",
+            "nosuchuser",
+            "no such",
+        )
+    )
 
 
 # =====================================================================
@@ -214,9 +239,8 @@ class KafkaAdminOps:
                 for future in futures.values():
                     future.result()
         except KafkaException as exc:
-            # 用户不存在（SASL_PRINCIPAL_NOT_FOUND / 类似）：幂等成功
-            text = str(exc).lower()
-            if "not found" in text or "nosuchuser" in text or "no such" in text:
+            # 用户/凭据不存在 → 幂等成功（主按错误码 RESOURCE_NOT_FOUND 判定，文本仅作回退兼容）
+            if _is_scram_principal_missing(exc):
                 logger.info("kafka_scram_delete_missing", username=username)
                 return
             logger.error("kafka_scram_delete_failed", username=username, error=str(exc))

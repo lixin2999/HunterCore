@@ -172,12 +172,17 @@ async def test_upsert_scram_success(ops: kafka_admin.KafkaAdminOps) -> None:
 
 @pytest.mark.asyncio
 async def test_delete_scram_user_not_found_idempotent(ops: kafka_admin.KafkaAdminOps) -> None:
-    """底层 KafkaException 含 not found 语义 → 幂等成功（不抛）。"""
+    """真实错误串（“does not exist”，无“not found”字样）→ 仍须幂等成功（不抛）。
+
+    旧启发式仅匹配 not found/nosuchuser/no such，会漏判此串导致下线失败（见 release V1.18.7）。
+    """
     from confluent_kafka import KafkaException  # noqa: PLC0415
 
-    fake = _FakeScramAdmin(
-        raise_on_result=KafkaException("SASL_PRINCIPAL_NOT_FOUND: principal not found")
+    real_msg = (
+        'KafkaError{code=RESOURCE_NOT_FOUND,val=91,'
+        'str="Attempt to delete a user credential that does not exist"}'
     )
+    fake = _FakeScramAdmin(raise_on_result=KafkaException(real_msg))
     ops._scram = fake  # noqa: SLF001
     await ops.delete_scram_user("ghost")  # 不应抛
 
@@ -191,6 +196,43 @@ async def test_delete_scram_user_error_raises(ops: kafka_admin.KafkaAdminOps) ->
     ops._scram = fake  # noqa: SLF001
     with pytest.raises(ServiceUnavailableError):
         await ops.delete_scram_user("v-1")
+
+
+# ---------- 幂等判定辅助：优先错误码、文本回退 ----------
+class _FakeErr:
+    """模拟 confluent KafkaError：仅提供 code()。"""
+
+    def __init__(self, code_val: int) -> None:
+        self._code = code_val
+
+    def code(self) -> int:
+        return self._code
+
+
+def test_is_scram_principal_missing_by_error_code() -> None:
+    """主判据：args[0].code()==RESOURCE_NOT_FOUND 即幂等（即使文本无任何关键词）。"""
+    from confluent_kafka import KafkaError, KafkaException  # noqa: PLC0415
+
+    exc = KafkaException(_FakeErr(KafkaError.RESOURCE_NOT_FOUND))
+    assert kafka_admin._is_scram_principal_missing(exc)  # noqa: SLF001
+
+
+def test_is_scram_principal_missing_by_text_fallback() -> None:
+    """回退判据：无 code()（args[0] 为字符串）时靠文本关键词命中。"""
+    from confluent_kafka import KafkaException  # noqa: PLC0415
+
+    exc = KafkaException(
+        'KafkaError{code=RESOURCE_NOT_FOUND,val=91,str="...does not exist"}'
+    )
+    assert kafka_admin._is_scram_principal_missing(exc)  # noqa: SLF001
+
+
+def test_is_scram_principal_missing_other_code_returns_false() -> None:
+    """其它错误码且文本无关键词 → 非幂等（应向上抛 5001）。"""
+    from confluent_kafka import KafkaException  # noqa: PLC0415
+
+    exc = KafkaException(_FakeErr(-12345))
+    assert not kafka_admin._is_scram_principal_missing(exc)  # noqa: SLF001
 
 
 # =====================================================================
