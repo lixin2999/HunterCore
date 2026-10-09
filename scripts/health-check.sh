@@ -451,7 +451,7 @@ check_compose_override() {
 # ⑫ 车端接入证书（车端 9093 可用前提）：broker 证书 SAN 覆盖接入地址 + 有效期预警
 check_kafka_broker_cert() {
   local cert_dir broker_cert ca_cert san_entries san_flat name f enddate end_epoch days_left
-  local warn_days=30
+  local warn_days=30 csv item raw want missing kind
   # 依赖版本对齐：SAN 归一函数在 common.sh（旧版无此函数时，command not found 会在
   # set -e 下直接打断脚本，导致本项及其后所有检查静默不执行）——先给可读提示。
   if ! declare -F hc_cert_san_entries >/dev/null 2>&1; then
@@ -472,14 +472,38 @@ check_kafka_broker_cert() {
   fi
 
   # SAN 必须含车端实际访问地址（openssl 写法差异由 hc_cert_san_entries 归一）
+  # 要求集合 = SERVER_IP + .env 声明的附加地址（KAFKA_CERT_SAN_IPS/DNS）：
+  # 附加地址同样是车端会用的接入地址，缺一个就会那批车端连不上（与 gen-kafka-certs.sh 同一口径）。
   san_entries="$(hc_cert_san_entries "$broker_cert")"
   san_flat="$(printf '%s' "$san_entries" | tr '\n' ' ')"
-  if [ -z "${SERVER_IP:-}" ] || [ "${SERVER_IP:-}" = "CHANGE_ME_SERVER_IP" ]; then
-    record_result "WARN" "车端接入证书 SAN" ".env SERVER_IP 未配置，无法比对（现有 SAN：${san_flat}）"
-  elif printf '%s\n' "$san_entries" | grep -qxF "IP:${SERVER_IP}"; then
-    record_result "PASS" "车端接入证书 SAN" "含车端接入地址 ${SERVER_IP}（SAN：${san_flat}）"
+  local -a need=()
+  if [ -n "${SERVER_IP:-}" ] && [ "${SERVER_IP:-}" != "CHANGE_ME_SERVER_IP" ]; then
+    need+=("IP:${SERVER_IP}")
+  fi
+  for csv in "${KAFKA_CERT_SAN_IPS:-}:IP" "${KAFKA_CERT_SAN_DNS:-}:DNS"; do
+    raw="${csv%:*}"
+    kind="${csv##*:}"
+    [ -n "$raw" ] || continue
+    local -a items=()
+    IFS=',' read -r -a items <<<"$raw"
+    for item in ${items[@]+"${items[@]}"}; do
+      item="${item//[[:space:]]/}"
+      [ -n "$item" ] && need+=("${kind}:${item}")
+    done
+  done
+  if [ "${#need[@]}" -eq 0 ]; then
+    record_result "WARN" "车端接入证书 SAN" ".env SERVER_IP 未配置且无附加地址，无法比对（现有 SAN：${san_flat}）"
   else
-    record_result "FAIL" "车端接入证书 SAN" "不含 ${SERVER_IP}（SAN：${san_flat}）→ 车端 TLS 主机名校验失败、连不上 9093；修复：bash ${GEN_KAFKA_CERTS_SH} --ip ${SERVER_IP} --broker-only（复用 CA，车端无需换证书）后重启 kafka（改过 SERVER_IP 需 up -d --force-recreate kafka）"
+    missing=""
+    for want in "${need[@]}"; do
+      case "$want" in IP:*:*) continue ;; esac          # IPv6 输出写法差异大，不做严格比对
+      printf '%s\n' "$san_entries" | grep -qxF "$want" || missing="${missing}${missing:+ }${want}"
+    done
+    if [ -z "$missing" ]; then
+      record_result "PASS" "车端接入证书 SAN" "含全部接入地址（要求：${need[*]}；SAN：${san_flat}）"
+    else
+      record_result "FAIL" "车端接入证书 SAN" "不含 ${missing}（现有 SAN：${san_flat}）→ 对应地址接入的车端 TLS 主机名校验失败、连不上 9093；修复：bash ${GEN_KAFKA_CERTS_SH} --broker-only（复用 CA，车端无需换证书，附加地址可写在 .env 的 KAFKA_CERT_SAN_IPS/DNS）后 docker compose -f infra/deploy/docker-compose.yml --project-directory . restart kafka（改过 SERVER_IP 需 --force-recreate）"
+    fi
   fi
 
   # 有效期（到期前 30 天 WARN；已过期 FAIL）

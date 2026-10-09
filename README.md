@@ -84,7 +84,7 @@ HunterCore/
 | `init-db.sh` | 应用 `schema.sql`/`timescaledb.sql`/`init-data.sql` 并校验（8 schema / 11 表 / 2 hypertable），可选注入 admin 口令 |
 | `init-kafka.sh` | 创建 6 个契约 Topic（分区/保留时间校验），可选 `--scram-users` |
 | `init-minio.sh` | 创建 7 个 Bucket 与生命周期规则（30/90 天与永久） |
-| `health-check.sh` | 全栈健康检查（12 类，`[PASS]/[WARN]/[FAIL]`，退出码 0/1/2；含车端接入证书 SAN 与有效期），可被其他脚本 source 复用 |
+| `health-check.sh` | 全栈健康检查（12 类，`[PASS]/[WARN]/[FAIL]`，退出码 0/1/2；含车端接入证书 SAN 全集比对（`SERVER_IP` + `KAFKA_CERT_SAN_IPS/DNS`）与有效期，单项内部报错不中断整轮），可被其他脚本 source 复用 |
 | `daily-check.sh` | 日常巡检（复用健康检查 + critical 事件/DB 连接数/容器重启次数/容量），报告写入 `/var/log/hunter-core/check/` |
 | `backup.sh` | 备份 PostgreSQL 全量 + 时序热数据 + 配置 + Redis RDB，按保留天数清理，输出 MinIO `mc mirror` 指引 |
 | `uninstall.sh` | 卸载（默认保留数据；`--all` 需输入 `DELETE-ALL`，含受保护路径护栏） |
