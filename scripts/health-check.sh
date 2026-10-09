@@ -5,7 +5,7 @@
 # 用途：一次性核对容器 / HTTP 探针 / 数据库 / Redis / Kafka / MinIO / 磁盘与内存 / 消费积压，
 #       输出 [PASS] [WARN] [FAIL] 明细与汇总，并给出退出码（供 install.sh、巡检脚本、CI 调用）。
 #
-# 检查项（共 10 类）：
+# 检查项（共 12 类）：
 #   ① 容器运行状态与 Docker healthcheck（缺失/非 healthy/未运行 → FAIL）
 #   ② HTTP 探针：api-gateway/scene/collector/analytics/ota/remote（/healthz）、web-portal、
 #      MinIO(/minio/health/live)、SRS(/api/v1/versions)、Flink UI(/overview)
@@ -13,7 +13,9 @@
 #   ⑤ Redis：redis-cli PING        ⑥ Kafka：Topic 数 ≥6
 #   ⑦ MinIO：Bucket 数 ≥7          ⑧ 磁盘：/data 使用率（>85% WARN，>95% FAIL）
 #   ⑨ 内存使用率（>90% WARN）      ⑩ Kafka 消费积压：data-collector-telemetry LAG（>10000 WARN）
-#   ⑪ 配置漂移硬闸（G-03）：docker-compose.override.yml 存在即 FAIL（HUNTER_ALLOW_OVERRIDE=1 降为 WARN）
+#   ⑪ 配置漂移硬闸（G-03）：docker-compose.override.yml 存在即 FAIL（HUNTER_ALLOW_OVERRIDE=1 降为 WARN）；
+#      并按容器 label 判定实际生效的编排文件（防裸跑 docker compose 命中仓库根开发版编排）
+#   ⑫ 车端接入证书：broker 证书 SAN 必须含 SERVER_IP（车端 https 主机名校验只比 SAN）；CA/broker 有效期预警
 #
 # 用法：
 #   sudo bash scripts/health-check.sh [选项]
@@ -421,6 +423,27 @@ check_compose_override() {
     record_result "WARN" "配置漂移（G-03）" "存在 override 且 HUNTER_ALLOW_OVERRIDE=1 放行（仅限联调，需书面豁免）"
   else
     record_result "FAIL" "配置漂移（G-03）" "存在 ${override}：compose 将静默合并降级配置，生产必须移除"
+  fi
+
+  # 编排来源校验：仓库根 docker-compose.yml 是**本地开发版**（KRaft + PLAINTEXT、镜像 3.6.2、
+  # container_name 与生产相同）。在部署目录裸跑 `docker compose ...` 会命中它，把生产 broker
+  # 换成无 TLS / 无证书挂载的实例 → 车端 9093 直接失效。此处按 label 回看创建它的编排文件。
+  if command_exists docker && docker inspect "${C_KAFKA:-hunter-kafka}" >/dev/null 2>&1; then
+    local cf
+    cf="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' \
+      "${C_KAFKA:-hunter-kafka}" 2>/dev/null || true)"
+    case "$cf" in
+      *infra/deploy/docker-compose.yml*)
+        record_result "PASS" "编排来源（G-03）" "${C_KAFKA:-hunter-kafka} 由生产编排创建"
+        ;;
+      '')
+        record_result "WARN" "编排来源（G-03）" "读不到 ${C_KAFKA:-hunter-kafka} 的编排 label（非 compose 创建？）"
+        ;;
+      *)
+        record_result "FAIL" "编排来源（G-03）" \
+          "${C_KAFKA:-hunter-kafka} 由 ${cf}（非生产编排）创建：裸跑 docker compose 会命中仓库根开发版（KRaft/PLAINTEXT，车端 9093 失效）；修复：docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --force-recreate kafka"
+        ;;
+    esac
   fi
   return 0
 }
