@@ -452,6 +452,12 @@ check_compose_override() {
 check_kafka_broker_cert() {
   local cert_dir broker_cert ca_cert san_entries san_flat name f enddate end_epoch days_left
   local warn_days=30
+  # 依赖版本对齐：SAN 归一函数在 common.sh（旧版无此函数时，command not found 会在
+  # set -e 下直接打断脚本，导致本项及其后所有检查静默不执行）——先给可读提示。
+  if ! declare -F hc_cert_san_entries >/dev/null 2>&1; then
+    record_result "FAIL" "车端接入证书" "scripts/common.sh 未同步（缺 hc_cert_san_entries）：无法比对 SAN，请先 rsync 脚本集"
+    return 0
+  fi
   cert_dir="${KAFKA_CERTS_DIR:-${APP_DIR}/certs/kafka}"
   broker_cert="${cert_dir}/broker-cert.pem"
   ca_cert="${cert_dir}/ca-cert.pem"
@@ -500,18 +506,19 @@ check_kafka_broker_cert() {
 }
 
 # run_all_health_checks：执行全部 12 类检查（供 daily-check 与 main 复用）
+# 各项均以“失败被测试”的上下文调用（if ! f）：bash 在该上下文中会关闭 errexit，
+# 使某项内部命令报错不再中断整轮检查（历史现象：脚本中途退出，导致后面的
+# “车端接入证书 SAN”硬闸静默缺失，运维只看到前面几项而误以为全部通过）。
+# 未完成项记为 WARN，汇总里能直接看出“哪项没跑完”。
 run_all_health_checks() {
-  check_compose_override
-  check_containers
-  check_http_endpoints
-  check_databases
-  check_redis
-  check_kafka_topics
-  check_minio_buckets
-  check_disk_usage
-  check_memory_usage
-  check_kafka_lag
-  check_kafka_broker_cert
+  local check
+  for check in check_compose_override check_containers check_http_endpoints check_databases \
+    check_redis check_kafka_topics check_minio_buckets check_disk_usage check_memory_usage \
+    check_kafka_lag check_kafka_broker_cert; do
+    if ! "$check"; then
+      record_result "WARN" "检查项未完成（${check}）" "该项内部命令返回非 0（已继续执行余下检查，stderr 有具体报错行）"
+    fi
+  done
   return 0
 }
 
