@@ -50,6 +50,10 @@ class Settings(HunterBaseConfig):
     vehicle_offline_threshold_seconds: int = 10
     # 车辆状态守护周期（redis-keys pending #5：在线集合无 TTL，需周期对账 SREM）
     vehicle_offline_sweep_interval_seconds: int = 5
+    # 台账回写（vehicle_svc.vehicles.status / last_online_time）：车辆管理页的唯一数据源。
+    # 同一间隔内的重复上报不写库（health 1Hz）；状态跃迁与离线判定不受节流。
+    vehicle_ledger_write_enabled: bool = True
+    vehicle_ledger_write_interval_seconds: int = 30
 
     # ---------- 遥测查询保护（x-hunter-telemetry-query-contract：跨度上限保护 API P95） ----------
     telemetry_query_max_range_hours: int = 24

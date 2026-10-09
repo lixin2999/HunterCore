@@ -286,6 +286,36 @@ async def test_vehicle_update_status_returns_none_for_missing_vehicle() -> None:
     assert len(stub.executed) == 1
 
 
+async def test_vehicle_touch_only_writes_last_online_time_column() -> None:
+    """只刷心跳不改状态：业务状态由 health/状态机决定，遥测只能证明“在上报”。"""
+    repo, stub = repo_pair(VehicleRepository)
+    seen = datetime(2026, 9, 19, 8, 0, tzinfo=UTC)
+    stub.queue(StubResult(rowcount=1))
+
+    assert await repo.touch_last_online_time("HUNTER-001", seen_at=seen) is True
+
+    sql = compiled(stub.executed[0][0], literal=True)
+    assert len(stub.executed) == 1
+    assert sql.startswith("UPDATE vehicle_svc.vehicles SET last_online_time")
+    assert "status" not in sql.split("WHERE")[0], "本方不得触碰业务状态列"
+    assert "vehicle_svc.vehicles.vehicle_id = 'HUNTER-001'" in sql
+    assert stub.flushed == 0
+
+
+async def test_vehicle_touch_requires_time_to_move_forward() -> None:
+    """单调不回退：仅当现有时间为 NULL 或早于本次才写（重放的旧消息产生 0 行）。"""
+    repo, stub = repo_pair(VehicleRepository)
+    seen = datetime(2026, 9, 19, 8, 0, tzinfo=UTC)
+    stub.queue(StubResult(rowcount=0))
+
+    assert await repo.touch_last_online_time("HUNTER-001", seen_at=seen) is False
+
+    where = compiled(stub.executed[0][0], literal=True).split("WHERE")[1]
+    assert "last_online_time IS NULL" in where
+    assert "last_online_time < '2026-09-19 08:00:00+00:00'" in where
+    assert " OR " in where
+
+
 # ---------- UserRepository ----------
 
 

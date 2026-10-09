@@ -34,6 +34,10 @@ data:
   # 车辆离线判定与状态守护（系统约束：遥测中断 > 10s → 离线）
   VEHICLE_OFFLINE_THRESHOLD_SECONDS: "10"
   VEHICLE_OFFLINE_SWEEP_INTERVAL_SECONDS: "5"
+  # 台账回写（vehicle_svc.vehicles.status / last_online_time）：车辆管理页的唯一数据源
+  # （vehicle-service 不读 Redis）；稳态按窗口合并，状态跃迁与离线判定不节流
+  VEHICLE_LEDGER_WRITE_ENABLED: "true"
+  VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS: "30"
   # 时序批量写入（性能指标：≥ 10000 点/秒，批量插入）
   TELEMETRY_BATCH_SIZE: "2000"
   TELEMETRY_FLUSH_INTERVAL_MS: "500"

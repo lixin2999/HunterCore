@@ -476,6 +476,9 @@ services:
       SERVICE_NAME: data-collector
       API_PORT: "8082"
       # 私有：消费组等（契约 consumer-groups.yaml；其余走 KAFKA_CONTRACT_DIR 校验）
+      # 台账回写：车辆管理页「状态/最近在线」的唯一数据源（vehicle-service 不读 Redis）
+      VEHICLE_LEDGER_WRITE_ENABLED: ${VEHICLE_LEDGER_WRITE_ENABLED:-true}
+      VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS: ${VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS:-30}
     ports:
       - "127.0.0.1:${DATA_COLLECTOR_PORT:-8082}:8082"
     volumes:

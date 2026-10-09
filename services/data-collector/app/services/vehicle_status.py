@@ -16,6 +16,11 @@
   车端排期上报；不写入未上报的 field），供 remote-control 地理围栏接管门禁只读消费；
 - ``last_seen_seconds`` 由 ``last_seen_at`` 与当前时间推导（:class:`VehicleStatusSweeper`
   周期刷新并在超阈值时移出在线集合，实现「遥测中断 > 10s → 离线」约束）。
+
+台账回写（V1.18.11）：本模块的三个写入点同时把结果回写 ``vehicle_svc.vehicles.status /
+last_online_time``（“车辆管理”页的唯一数据源，Redis 读模型不被 vehicle-service 读取），
+由注入的 :class:`~app.services.vehicle_ledger.VehicleLedgerWriter` 负责节流与异常隔离；
+未注入（旧调用方/单测）时行为与之前完全一致。
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ from typing import Any, Protocol
 from hunter_common.logging import get_logger
 
 from app.config import Settings
+from app.services.vehicle_ledger import VehicleLedgerWriter
 
 logger = get_logger("app.services.vehicle_status")
 
@@ -62,10 +68,14 @@ def status_key(vehicle_id: str) -> str:
 
 
 class VehicleStatusWriter:
-    """读模型写入器（health / telemetry 消费路径共用）。"""
+    """读模型写入器（health / telemetry 消费路径共用，并旁路回写车辆台账）。"""
 
-    def __init__(self, redis_client: RedisHashClient) -> None:
+    def __init__(
+        self, redis_client: RedisHashClient, ledger: VehicleLedgerWriter | None = None
+    ) -> None:
         self._redis = redis_client
+        #: 台账回写器（``None`` = 仅写 Redis 读模型；回写失败不向上抛错）
+        self._ledger = ledger
 
     async def update_from_health(
         self, payload: dict[str, Any], *, now: float | None = None
@@ -117,8 +127,12 @@ class VehicleStatusWriter:
         await self._redis.hset(status_key(vehicle_id), mapping=mapping)
         if status == OFFLINE_STATUS:
             await self._redis.srem(ONLINE_SET_KEY, vehicle_id)
+            if self._ledger is not None:
+                await self._ledger.mark_offline(vehicle_id, now=current)
         else:
             await self._redis.sadd(ONLINE_SET_KEY, vehicle_id)
+            if self._ledger is not None:
+                await self._ledger.record_status(vehicle_id, status, now=current)
         return status
 
     async def update_from_telemetry(
@@ -150,14 +164,20 @@ class VehicleStatusWriter:
                 mapping[field] = str(value)
         await self._redis.hset(status_key(vehicle_id), mapping=mapping)
         await self._redis.sadd(ONLINE_SET_KEY, vehicle_id)
+        if self._ledger is not None:
+            # 遥测只证明“在上报”→ 仅刷新 last_online_time，不改业务状态
+            await self._ledger.record_seen(vehicle_id, now=current)
 
-    async def mark_offline(self, vehicle_id: str) -> None:
+    async def mark_offline(self, vehicle_id: str, *, now: float | None = None) -> None:
         """标记车辆离线（心跳超阈值 / 通信中断；由守护任务调用）。"""
+        current = time.time() if now is None else now
         await self._redis.hset(
             status_key(vehicle_id),
             mapping={"vehicle_id": vehicle_id, "status": OFFLINE_STATUS},
         )
         await self._redis.srem(ONLINE_SET_KEY, vehicle_id)
+        if self._ledger is not None:
+            await self._ledger.mark_offline(vehicle_id, now=current)
 
 
 class VehicleStatusSweeper:

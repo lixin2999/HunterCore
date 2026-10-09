@@ -5,7 +5,8 @@
 - :class:`FakeSensorFileProducer`：记录投递载荷，可注入失败（验证 5001 不被吞掉）；
 - :class:`FakeEventRepository` / :class:`FakeTelemetryRepository`：仓储协议内存实现；
 - :class:`FakeRedisHash`：``vehicle:status`` / ``vehicle:online:set`` 读模型替身；
-- :class:`FakeTelemetryIngestRepository` / :class:`FakePipelineProducer`：采集链路替身。
+- :class:`FakeTelemetryIngestRepository` / :class:`FakePipelineProducer`：采集链路替身；
+- :class:`FakeVehicleLedgerRepository`：台账回写（``vehicle_svc.vehicles``）替身。
 
 设计原则：替身只实现被服务层调用的方法签名（接口兼容），与 ``scene-service/app/tests/fakes.py``
 的既有做法一致。
@@ -30,6 +31,7 @@ __all__ = [
     "FakeSensorFileProducer",
     "FakeTelemetryIngestRepository",
     "FakeTelemetryRepository",
+    "FakeVehicleLedgerRepository",
     "make_event",
 ]
 
@@ -344,6 +346,35 @@ class FakePipelineProducer:
         if self.fail_with is not None:
             raise self.fail_with
         self.events.append((dict(payload), vehicle_id))
+
+
+class FakeVehicleLedgerRepository:
+    """车辆台账仓储替身（只实现回写器用到的两个方法，可注入 DB 故障）。"""
+
+    def __init__(self, *, fail_with: Exception | None = None) -> None:
+        #: update_status 调用记录：(vehicle_id, status, last_online_time)
+        self.status_calls: list[tuple[str, Any, Any]] = []
+        #: touch_last_online_time 调用记录：(vehicle_id, seen_at)
+        self.touch_calls: list[tuple[str, Any]] = []
+        self.fail_with = fail_with
+        #: 台账中存在的车辆（None = 全部存在）；不在其中则返回 False
+        self.known_vehicles: set[str] | None = None
+
+    async def update_status(
+        self, vehicle_id: str, status: Any, *, last_online_time: Any = None
+    ) -> Any:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.status_calls.append((vehicle_id, status, last_online_time))
+        return {"vehicle_id": vehicle_id, "status": status}
+
+    async def touch_last_online_time(self, vehicle_id: str, *, seen_at: Any) -> bool:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.touch_calls.append((vehicle_id, seen_at))
+        if self.known_vehicles is None:
+            return True
+        return vehicle_id in self.known_vehicles
 
 
 class FakeEventIngestRepository:

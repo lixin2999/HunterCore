@@ -195,7 +195,7 @@ ruff check tests common/python services           # Lint（CI 同款命令）
 | 消费组 | 订阅 | 职责 | 产出 |
 |--------|------|------|------|
 | `data-collector-telemetry` | `hunter.*.telemetry` | 6 步预处理（校验→时间对齐→清洗→映射）→ 批量入库 | `telemetry_raw` / `telemetry_clean` + `vehicle_telemetry` |
-| `data-collector-health` | `hunter.*.health` | 写车辆实时读模型（不落库） | `vehicle:status:{id}` / `vehicle:online:set` |
+| `data-collector-health` | `hunter.*.health` | 写车辆实时读模型（+ 节流回写台账状态列） | `vehicle:status:{id}` / `vehicle:online:set` + `vehicles.status/last_online_time` |
 | `data-collector-events` | `hunter.*.event` | 等级一致性校验 → 幂等落库 | `event_raw` + `events` |
 
 - **批量入库**：缓冲达到 `TELEMETRY_BATCH_SIZE` 或消费者批次收尾时冲刷；
@@ -204,6 +204,11 @@ ruff check tests common/python services           # Lint（CI 同款命令）
 - **车辆状态守护**：`VehicleStatusSweeper` 周期对账，心跳超
   `VEHICLE_OFFLINE_THRESHOLD_SECONDS`（默认 10s）→ 置 `offline` 并移出在线集合
   （OTA 门禁与远程接管判定的数据来源）。
+- **台账回写**（两套读模型不互通：车辆管理页由 vehicle-service 直读 DB，不读 Redis）：
+  上述三个写入点同时回写 `vehicle_svc.vehicles.status` / `last_online_time`，
+  状态跃迁与离线判定立即写、稳态按 `VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS`（默认 30s）合并；
+  开关 `VEHICLE_LEDGER_WRITE_ENABLED`（默认开）；回写失败只记 WARN
+  （`vehicle_ledger_*_write_failed`），不影响采集链路。
 - **运行时契约**：消费侧 Schema 校验（`schema_name="auto"`）需要契约目录可访问，
   集群内由 `hunter-contracts` ConfigMap 挂载（生成/校验：
   `python scripts/generate_contracts_configmap.py [--check]`）。

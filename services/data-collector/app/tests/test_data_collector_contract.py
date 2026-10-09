@@ -30,6 +30,7 @@ from hunter_common.database.repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from hunter_common.exceptions import ErrorCode
 from pydantic import BaseModel
 
+from app.config import Settings
 from app.core.error_handlers import HTTP_STATUS_BY_CODE
 from app.main import app
 from app.schemas.events import EventItem, EventListData
@@ -688,6 +689,31 @@ def test_required_env_keys_are_wired(contract: dict[str, Any]) -> None:
     assert contract["x-hunter-telemetry-query-contract"]["max_range"]["env"] == (
         "TELEMETRY_QUERY_MAX_RANGE_HOURS"
     )
+
+
+def test_vehicle_ledger_writeback_is_configured() -> None:
+    """台账回写（车辆管理页「状态/最近在线」的唯一数据源）必须显式接线。
+
+    回写失败不会报错到采集链路（只留 WARN），关掉它也没有任何启动期报错——唯一表现是
+    页面永远显示“离线”，所以把开关/节流值登记进 K8s 清单，并把职责写进 consumer-groups notes。
+    """
+    config = next(
+        doc["data"]
+        for doc in yaml.safe_load_all(K8S_MANIFEST.read_text(encoding="utf-8"))
+        if doc and doc.get("kind") == "ConfigMap"
+    )
+    defaults = Settings()
+    assert config["VEHICLE_LEDGER_WRITE_ENABLED"] == (
+        "true" if defaults.vehicle_ledger_write_enabled else "false"
+    ), "默认开启（不依赖部署方补环境变量）"
+    assert int(config["VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS"]) == (
+        defaults.vehicle_ledger_write_interval_seconds
+    )
+    groups = {group["group_id"]: group for group in load_yaml(CONSUMER_GROUPS)["groups"]}
+    assert "vehicle_svc.vehicles" in groups["data-collector-health"]["notes"], (
+        "health 路径的回写职责必须在契约登记（否则下一个修改者会删掉回写）"
+    )
+    assert "vehicle_svc.vehicles" in groups["data-collector-telemetry"]["notes"]
 
 
 def test_db_tables_match_data_layer_contract(contract: dict[str, Any]) -> None:

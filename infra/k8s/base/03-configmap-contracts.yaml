@@ -49,7 +49,7 @@ data:
         handler: "预处理（字段校验 → 清洗 → 时间对齐）→ 批量写 vehicle_telemetry + 投递 raw/clean"
         idempotency_key: "(vehicle_id, seq) 与 (vehicle_id, time)"
         target_latency: "入库延迟 ≤ 1s"
-        notes: "批量入库 ≥ 10000 点/秒；单车限流 100 msg/s"
+        notes: "批量入库 ≥ 10000 点/秒；单车限流 100 msg/s；并节流回写 vehicle_svc.vehicles.last_online_time（只刷时间，不改 status）"
 
       - group_id: data-collector-events
         service: data-collector
@@ -65,7 +65,7 @@ data:
         subscribe_mode: regex_pattern
         produces: []
         idempotency_key: "(vehicle_id, timestamp)"
-        notes: "写 Redis vehicle:status:{vehicle_id} / vehicle:online:set；不在 DB 落明细"
+        notes: "写 Redis vehicle:status:{vehicle_id} / vehicle:online:set；不在 DB 落明细（仅节流回写 vehicle_svc.vehicles.status/last_online_time——车辆管理页的唯一数据源，该服务不读 Redis）"
 
       - group_id: data-collector-command-result
         service: data-collector

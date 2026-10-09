@@ -8,7 +8,8 @@
 - /metrics Prometheus 指标端点（供 infra/monitoring 抓取）
 - 业务路由：/api/v1/data/**（telemetry / events / files，契约 data-collector.yaml）
 - 采集链路（审查 R1 补齐）：三路 Kafka 消费者（telemetry/health/event）+
-  车辆状态守护（vehicle:status / vehicle:online:set 读模型唯一写方）
+  车辆状态守护（vehicle:status / vehicle:online:set 读模型唯一写方，并节流回写
+  vehicle_svc.vehicles.status / last_online_time——“车辆管理”页的数据源）
 """
 from __future__ import annotations
 
@@ -42,12 +43,14 @@ from app.producers.sensor_file import SensorFileProducer
 from app.repositories.events import EventRepository
 from app.repositories.storage import MinioStorage, get_storage
 from app.repositories.telemetry import TelemetryRepository
+from app.repositories.vehicle_ledger import VehicleLedgerRepositoryAdapter
 from app.routers import events, files, telemetry
 from app.routers.health import router as health_router
 from app.services.events import EventService
 from app.services.files import FileService
 from app.services.ingest import TelemetryIngestService
 from app.services.telemetry import TelemetryService
+from app.services.vehicle_ledger import VehicleLedgerWriter
 from app.services.vehicle_status import VehicleStatusSweeper, VehicleStatusWriter
 
 logger = get_logger("app.main")
@@ -106,9 +109,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ---------- 采集链路（审查 R1 补齐）：Kafka 消费者 + 车辆状态守护 ----------
     # 契约 x-hunter-ingest-pipeline：telemetry/event/health 三路消费 + telemetry_raw/clean 投递
     pipeline_producer = PipelineProducer(settings)
-    status_writer = VehicleStatusWriter(app.state.redis.client)
+    # 台账回写器：读模型写入时一并刷新 vehicle_svc.vehicles.status / last_online_time
+    # （状态跃迁与离线判定立即写，稳态按 VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS 节流）
+    ledger_writer = VehicleLedgerWriter(VehicleLedgerRepositoryAdapter(app.state.db), settings)
+    status_writer = VehicleStatusWriter(app.state.redis.client, ledger_writer)
     ingest_service = TelemetryIngestService(telemetry_repository, pipeline_producer, settings)
     app.state.telemetry_ingest_service = ingest_service
+    app.state.vehicle_ledger_writer = ledger_writer
     app.state.vehicle_status_writer = status_writer
 
     consumers = _build_consumers(settings, ingest_service, event_repository, pipeline_producer, status_writer)

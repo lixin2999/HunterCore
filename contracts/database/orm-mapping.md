@@ -85,7 +85,7 @@ DDL 定义表结构，本文件定义「ORM 如何映射这些结构」「每个
 <!-- repository-table:start -->
 | Repository | 模型 | 模块 | 专属方法（映射的契约索引） |
 |------------|------|------|---------------------------|
-| `VehicleRepository` | `Vehicle` | `repositories/core.py` | `get_by_device_cert_sn`（`uq_vehicles_device_cert_sn`）、`list_by_status`（`idx_vehicles_status_last_online`）、`update_status`（单条 `UPDATE ... RETURNING`，1 次往返） |
+| `VehicleRepository` | `Vehicle` | `repositories/core.py` | `get_by_device_cert_sn`（`uq_vehicles_device_cert_sn`）、`list_by_status`（`idx_vehicles_status_last_online`）、`update_status`（单条 `UPDATE ... RETURNING`，1 次往返）、`touch_last_online_time`（单条 UPDATE + rowcount 判定；WHERE 附加时间比较 → 时间单调不回退，不改写 status 列） |
 | `UserRepository` | `User` | `repositories/core.py` | `get_by_username`（`uq_users_username`）、`get_by_email`（`uq_users_email`，小写比较）、`list_role_codes` / `list_permission_codes`（RBAC 展开）、`touch_last_login`（单条 UPDATE + rowcount 判定） |
 | `RoleRepository` | `Role` | `repositories/core.py` | `get_by_role_code`（`uq_roles_role_code`）、`list_enabled`（`roles.status`） |
 | `PermissionRepository` | `Permission` | `repositories/core.py` | `get_by_permission_code`（`uq_permissions_permission_code`）、`list_by_resource`（`idx_permissions_resource_action`） |
@@ -176,11 +176,12 @@ tasks = await OtaTaskRepository(session).find_all(
 | 服务 | 允许使用的共享 Repository | 说明 |
 |------|--------------------------|------|
 | `scene-service` | `SceneRepository` | `scene_svc.scenes`（软删除） |
-| `data-collector` | `EventRepository`、`VehicleTelemetryRepository` | `data_collector.events` / `vehicle_telemetry`（写路径幂等） |
+| `data-collector` | `EventRepository`、`VehicleTelemetryRepository`、`VehicleRepository` | `data_collector.events` / `vehicle_telemetry`（写路径幂等）；`VehicleRepository` **仅限**回写 `vehicle_svc.vehicles.status` / `last_online_time` 两列（V1.18.11：Redis 读模型 → 台账，「车辆管理」页的唯一数据源；经 `app/repositories/vehicle_ledger.py` 适配层，节流 + 异常隔离）——其余列（含主数据与 `provision_status`）仍归 vehicle-service，禁止扩展 |
 | `data-analytics` | `AlgorithmMetricRepository`、`EventRepository`、`VehicleTelemetryRepository` | 分析读取（时序 + 事件，只读） |
 | `ota-service` | `OtaVersionRepository`、`OtaTaskRepository`、`OtaRecordRepository` | `ota_svc` 三表（灰度成功率统计等） |
 | `api-gateway` | `UserRepository`、`RoleRepository`、`PermissionRepository`、`UserRoleRepository`、`RolePermissionRepository`、`VehicleRepository` | 鉴权链路（`user_svc` RBAC 五表）+ 车辆台账只读 |
 | `remote-control` | `VehicleRepository` | 车辆状态读取（状态写入走 REST 调 vehicle-service） |
+| `vehicle-service` | 无（`VehicleRepository` 等共享层未引用） | `vehicle_svc` owner：本服务 `app/repositories/vehicle.py` 直接基于 `AsyncSession` + `hunter_common.database.models.Vehicle` 实现（历史形态，第 4 节收敛路径待迁移）；登记本行仅为消除「未登记白名单」，**不得**据此新增共享 Repository 引用 |
 | `flink-jobs`（非服务，书面豁免） | 无（禁止使用任何 Repository） | G-13 写侧豁免：实时作业（`hunter_flink`）经 Kafka 写 `alert_event`/`algorithm_metrics`，不直连数据库、不经 hunter_common 数据层；不在 services/ 目录（校验 14 不扫描），本行为书面登记 |
 <!-- service-repository-table:end -->
 

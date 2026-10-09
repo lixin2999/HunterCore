@@ -49,10 +49,13 @@ python scripts/generate_contracts_configmap.py --check                   # 运�
 | 预处理 | `app/services/ingest.py` | 5.4 节 6 步流水线；批缓冲由 `KafkaConsumerManager.on_batch_end` 驱动（**写库成功才提交 offset**） |
 | 入库 | `app/repositories/{telemetry,events}.py` | 单条多值 `INSERT ... ON CONFLICT ... DO NOTHING`（≥ 10000 点/秒，重放幂等） |
 | 读模型 | `app/services/vehicle_status.py` | `vehicle:status:{id}` / `vehicle:online:set` 唯一写方 + 心跳超阈值离线守护 |
+| 台账回写 | `app/services/vehicle_ledger.py` + `app/repositories/vehicle_ledger.py` | 同一写入点节流回写 `vehicle_svc.vehicles.status` / `last_online_time`（车辆管理页唯一数据源）；跃迁立即写、DB 异常只 WARN |
 | 投递 | `app/producers/pipeline.py` | `telemetry_raw` / `telemetry_clean` / `event_raw`，一律经契约校验入口 `publish_payload` |
 
 关键配置（K8s ConfigMap 已接线）：`TELEMETRY_BATCH_SIZE`、`TELEMETRY_PUBLISH_CONCURRENCY`、
 `TELEMETRY/EVENT/HEALTH_CONSUMER_ENABLED`、`VEHICLE_OFFLINE_THRESHOLD_SECONDS`、
+`VEHICLE_LEDGER_WRITE_ENABLED`（台账回写开关，默认 `true`）、
+`VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS`（稳态合并窗口，默认 30；`0` = 不节流）、
 `INGEST_SCHEMA_VALIDATION_ENABLED`、`KAFKA_CONTRACT_DIR`（契约 ConfigMap 挂载点）。
 
 ## 分层状态

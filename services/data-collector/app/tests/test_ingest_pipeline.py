@@ -4,7 +4,7 @@
 - 预处理 5.4 流水线：时间戳对齐（毫秒/时钟漂移）、数据清洗（NaN/Inf 丢弃、值域裁剪）、
   扁平行映射（与读路径 ``telemetry_row_to_dict`` 对称）；
 - 批量入库与 raw/clean 投递（含「写库失败 → flush 抛错 → 消费者不提交 offset」链路）；
-- ``vehicle:status`` / ``vehicle:online:set`` 读模型写入与离线守护；
+- ``vehicle:status`` / ``vehicle:online:set`` 读模型写入与离线守护（含台账回写挂钩）；
 - 消费者幂等键与处理入口（遥测/健康/事件）。
 """
 from __future__ import annotations
@@ -31,6 +31,7 @@ from app.services.ingest import (
     normalize_epoch_seconds,
     prepare_telemetry,
 )
+from app.services.vehicle_ledger import VehicleLedgerWriter
 from app.services.vehicle_status import (
     OFFLINE_STATUS,
     ONLINE_SET_KEY,
@@ -43,6 +44,7 @@ from app.tests.fakes import (
     FakePipelineProducer,
     FakeRedisHash,
     FakeTelemetryIngestRepository,
+    FakeVehicleLedgerRepository,
 )
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -79,6 +81,13 @@ def make_settings(**overrides: Any) -> Settings:
     }
     kwargs.update(overrides)
     return Settings(**kwargs)
+
+
+def make_ledger_writer(repository: FakeVehicleLedgerRepository) -> VehicleLedgerWriter:
+    """台账回写器（测试口径：不节流，便于逐条断言写入次数）。"""
+    return VehicleLedgerWriter(
+        repository, make_settings(vehicle_ledger_write_interval_seconds=0)
+    )
 
 
 def make_ingest_service(
@@ -323,6 +332,80 @@ async def test_sweeper_marks_stale_vehicle_offline_and_refreshes_live_one() -> N
     assert redis.sets[ONLINE_SET_KEY] == {live}                    # 陈旧车辆被移出在线集合
     assert redis.hashes[status_key(stale)]["status"] == OFFLINE_STATUS
     assert redis.hashes[status_key(live)]["last_seen_seconds"] == "2.000"
+
+
+async def test_status_writer_hooks_ledger_writeback() -> None:
+    """读模型三个写入点同步回写台账（V1.18.11：车辆管理页只读 DB，不读 Redis）。"""
+    redis = FakeRedisHash()
+    repo = FakeVehicleLedgerRepository()
+    writer = VehicleStatusWriter(redis, make_ledger_writer(repo))
+
+    await writer.update_from_health(
+        {"vehicle_id": "HUNTER-001", "status": "auto_driving", "system": {}, "timestamp": NOW},
+        now=NOW,
+    )
+    assert [(call[0], call[1].value) for call in repo.status_calls] == [
+        ("HUNTER-001", "auto_driving")
+    ]
+    assert repo.touch_calls == []
+
+    await writer.update_from_telemetry(telemetry_payload(), now=NOW + 1)
+    assert [call[0] for call in repo.touch_calls] == ["HUNTER-001"]   # 遥测只刷时间
+    assert len(repo.status_calls) == 1                               # 不改业务状态
+
+    await writer.update_from_health(
+        {"vehicle_id": "HUNTER-001", "status": OFFLINE_STATUS, "system": {}, "timestamp": NOW},
+        now=NOW + 2,
+    )
+    assert repo.status_calls[-1][1].value == OFFLINE_STATUS
+
+
+async def test_status_writer_survives_ledger_database_failure() -> None:
+    """台账 DB 故障不影响读模型写入，也不向上抛（否则消费重试/DLQ）。"""
+    redis = FakeRedisHash()
+    repo = FakeVehicleLedgerRepository(fail_with=RuntimeError("database unavailable"))
+    writer = VehicleStatusWriter(redis, make_ledger_writer(repo))
+    payload = {
+        "vehicle_id": "HUNTER-001",
+        "status": "online_idle",
+        "system": {},
+        "timestamp": NOW,
+    }
+
+    assert await writer.update_from_health(payload, now=NOW) == "online_idle"
+    await writer.update_from_telemetry(telemetry_payload(), now=NOW)
+
+    assert redis.sets[ONLINE_SET_KEY] == {"HUNTER-001"}
+    assert redis.hashes[status_key("HUNTER-001")]["status"] == "online_idle"
+
+
+async def test_status_writer_without_ledger_keeps_legacy_behaviour() -> None:
+    """未注入回写器（旧调用方）时行为不变：仅写 Redis，不触碰 DB。"""
+    redis = FakeRedisHash()
+    writer = VehicleStatusWriter(redis)
+
+    await writer.update_from_health(
+        {"vehicle_id": "HUNTER-001", "status": "fault", "system": {}, "timestamp": NOW},
+        now=NOW,
+    )
+
+    assert redis.hashes[status_key("HUNTER-001")]["status"] == "fault"
+
+
+async def test_sweeper_offline_judgement_writes_ledger() -> None:
+    """守护判离线必须回写台账（否则页面永远停在上一个在线状态）。"""
+    redis = FakeRedisHash()
+    repo = FakeVehicleLedgerRepository()
+    writer = VehicleStatusWriter(redis, make_ledger_writer(repo))
+    redis.hashes[status_key("HUNTER-009")] = {
+        "vehicle_id": "HUNTER-009",
+        "status": "auto_driving",
+        "last_seen_at": f"{NOW - 60:.3f}",
+    }
+
+    await VehicleStatusSweeper(redis, make_settings(), writer).run_once(now=NOW)
+
+    assert [(call[0], call[1].value) for call in repo.status_calls] == [("HUNTER-009", "offline")]
 
 
 async def test_sweeper_marks_vehicle_without_heartbeat_offline() -> None:

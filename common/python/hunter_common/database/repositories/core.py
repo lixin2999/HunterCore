@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from hunter_common.database.enums import PermissionResource, RoleStatus, VehicleStatus
@@ -69,6 +69,24 @@ class VehicleRepository(BaseRepository[Vehicle]):
         )
         result = await self.session.execute(stmt)
         return result.scalars().first()
+
+    async def touch_last_online_time(self, vehicle_id: str, *, seen_at: datetime) -> bool:
+        """仅刷新“最近在线时间”（**不改写 status**）；返回是否命中行。
+
+        供采集链路（telemetry 心跳）使用：业务状态由 health 消息与状态机决定，遥测只能
+        证明“该车此刻在上报”。WHERE 附加时间比较，使重放的旧消息既不把时间回退也不产生
+        有效写入（单调不回退）；车辆不存在时返回 ``False``。
+        """
+        stmt = (
+            update(Vehicle)
+            .where(
+                Vehicle.vehicle_id == vehicle_id,
+                or_(Vehicle.last_online_time.is_(None), Vehicle.last_online_time < seen_at),
+            )
+            .values(last_online_time=seen_at)
+        )
+        result = await self.session.execute(stmt)
+        return bool(getattr(result, "rowcount", 0))
 
 
 class UserRepository(BaseRepository[User]):

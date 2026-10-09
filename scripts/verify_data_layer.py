@@ -285,11 +285,14 @@ def parse_ddl() -> dict[str, dict[str, Any]]:
     for path in sorted(DDL_DIR.glob("*.sql")):
         text = path.read_text(encoding="utf-8")
         for match in CREATE_TABLE_RE.finditer(text):
-            fq_name, body = match.group(1), match.group(2)
+            fq_name = match.group(1)
+            # 先剔离行注释再切分：注释内的逗号（如 vehicles.provision_status 的 JSON 结构示例）
+            # 会把 CREATE TABLE 主体从注释中间切开，残段（"ts":1700000000 等）被当作列名→假阳性
+            body = re.sub(r"--[^\n]*", "", match.group(2))
             columns: dict[str, dict[str, Any]] = {}
             pk_columns: list[str] = []
             for item in split_top_level(body):
-                line = " ".join(re.sub(r"--[^\n]*", "", item).split())
+                line = " ".join(item.split())
                 if not line:
                     continue
                 upper = line.upper()
