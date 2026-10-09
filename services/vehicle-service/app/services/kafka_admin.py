@@ -275,7 +275,7 @@ class KafkaAdminOps:
                 name=t["name"],
                 num_partitions=t["partitions"],
                 replication_factor=t["replication_factor"],
-                topic_config={
+                topic_configs={
                     "retention.ms": str(t["retention_ms"]),
                     "cleanup.policy": t["cleanup_policy"],
                 },

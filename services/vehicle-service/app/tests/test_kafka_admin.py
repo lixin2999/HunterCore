@@ -103,9 +103,9 @@ async def test_create_vehicle_topics_skip_existing(ops: kafka_admin.KafkaAdminOp
     underlying = ops._admin.created  # noqa: SLF001
     telemetry = next(t for t in underlying if t.name == "hunter.v-100.telemetry")
     assert telemetry.num_partitions == 6  # 契约：telemetry=6 分区
-    assert telemetry.topic_config["retention.ms"] == "604800000"  # 7 天
+    assert telemetry.topic_configs["retention.ms"] == "604800000"  # 7 天
     event = next(t for t in underlying if t.name == "hunter.v-100.event")
-    assert event.topic_config["retention.ms"] == "2592000000"  # 30 天
+    assert event.topic_configs["retention.ms"] == "2592000000"  # 30 天
 
 
 @pytest.mark.asyncio
@@ -241,5 +241,5 @@ def test_is_scram_principal_missing_other_code_returns_false() -> None:
 def test_new_topic_config_includes_cleanup(ops: kafka_admin.KafkaAdminOps) -> None:
     asyncio.run(ops.create_vehicle_topics("v-9", skip_existing=True))
     for t in ops._admin.created:  # noqa: SLF001
-        assert "cleanup.policy" in t.topic_config
-        assert "retention.ms" in t.topic_config
+        assert "cleanup.policy" in t.topic_configs
+        assert "retention.ms" in t.topic_configs
