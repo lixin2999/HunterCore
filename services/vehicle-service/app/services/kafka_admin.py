@@ -136,8 +136,11 @@ def load_vehicle_topics() -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for item in raw.get("vehicle_topics") or []:
             name = str(item.get("name", ""))
-            if VEHICLE_TOPIC_PATTERN.format(vehicle_id="") not in name:
-                continue  # 广播 Topic 与每车 provisioning 无关
+            # 取字面模板（含 `{vehicle_id}` 占位符）去匹配：每车 Topic 形如
+            # "hunter.{vehicle_id}.telemetry"；广播 "hunter.broadcast.command" 无占位符 → 跳过。
+            # （不可先 .format(vehicle_id="")：会得到 "hunter.." 而模板名里无连续两点 → 全部漏筛）
+            if VEHICLE_TOPIC_PATTERN not in name:
+                continue
             entries.append(
                 {
                     "name": name,
