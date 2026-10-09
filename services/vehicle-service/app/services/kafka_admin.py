@@ -1,4 +1,4 @@
-"""Kafka AdminClient 封装：SCRAM 用户 + 每车 8 Topic 的创建/删除。
+"""Kafka AdminClient 封装：SCRAM 用户 + 每车 Topic（8 源 + 8 死信）的创建/删除。
 
 契约依据：contracts/openapi/vehicle-service.yaml `x-hunter-kafka` + `x-hunter-provisioning`。
 
@@ -12,6 +12,10 @@
 - **Topic 清单**：从 ``contracts/kafka/topics.yaml`` 的 ``vehicle_topics`` 中筛出 ``hunter.{vehicle_id}.``
   模式条目（共 8 个/车；广播 Topic ``hunter.broadcast.command`` 不属任何单车，跳过），
   分区/保留期严格按契约字段读取，禁止硬编码；
+- **死信 Topic 同步创建**：每条源 Topic 额外派生 ``naming.dlq_pattern``（``{original_topic}.dlq``）条目，
+  分区继承源 Topic、保留取 ``naming.dlq_retention_ms``。broker 关 ``auto.create.topics.enable``，
+  死信名**不会自动存在**；缺失时消费侧转投 DLQ 报 ``_UNKNOWN_TOPIC``（不可重试）→ 非法消息被静默丢弃，
+  因此开通必须一并创建（见 contracts/kafka/README.md「DLQ Topic 必须显式创建」）；
 - **幂等**：`create_topics` / `alter_user_scram_credentials(UPSERT)` 天然幂等，
   Topic 已存在视为成功；SCRAM 用户已存在时覆盖口令（对应 rotate-scram 与 takeover_existing 语义）；
 - **失败传播**：底层 KafkaError 一律抛出，由 provisioner 决策回滚与 provision_status 记录，
@@ -63,6 +67,11 @@ logger = get_logger("app.services.kafka_admin")
 #: 广播 `hunter.broadcast.command` 无 vehicle_id 段，创建每车 Topic 时跳过）
 VEHICLE_TOPIC_PATTERN = "hunter.{vehicle_id}."
 
+#: DLQ 派生缺省值（仅契约 naming 段缺字段时兜底，正常路径一律读契约：dlq_pattern /
+#: dlq_retention_ms / dlq_partitions_inherit_source）
+_DLQ_FALLBACK_PATTERN = "{original_topic}.dlq"
+_DLQ_FALLBACK_RETENTION_MS = 2_592_000_000  # 30 天：与契约 naming.dlq_retention_ms 一致
+
 #: SCRAM 迭代次数（KIP-95 建议默认值，与 kafka-configs.sh --scram-mechanisms 默认对齐）
 _SCRAM_ITERATIONS = 8192
 
@@ -95,6 +104,7 @@ def _is_scram_principal_missing(exc: BaseException) -> bool:
 # 契约 Topic 清单加载（进程级缓存）
 # =====================================================================
 _VEHICLE_TOPICS_CACHE: list[dict[str, Any]] | None = None
+_DLQ_NAMING_CACHE: dict[str, Any] | None = None
 _CACHE_LOCK = threading.Lock()
 
 
@@ -116,12 +126,13 @@ def _find_contracts_dir() -> Path:
 
 
 def load_vehicle_topics() -> list[dict[str, Any]]:
-    """从 topics.yaml 加载车辆 Topic 模板（进程内缓存；契约变更需重启服务）。
+    """从 topics.yaml 加载车辆 Topic 模板与 DLQ 命名规则（进程内缓存；契约变更需重启服务）。
 
     返回列表元素结构：``{"name": 模板, "partitions": int, "retention_ms": int}``；
     `name` 保留 `{vehicle_id}` 占位符，由调用方 `.format(vehicle_id=...)` 展开。
+    同时缓存 naming 段的 DLQ 派生规则（供 :func:`render_vehicle_topics` 使用）。
     """
-    global _VEHICLE_TOPICS_CACHE  # noqa: PLW0603 - 单例缓存，进程内允许
+    global _VEHICLE_TOPICS_CACHE, _DLQ_NAMING_CACHE  # noqa: PLW0603 - 单例缓存，进程内允许
     with _CACHE_LOCK:
         if _VEHICLE_TOPICS_CACHE is not None:
             return _VEHICLE_TOPICS_CACHE
@@ -156,9 +167,40 @@ def load_vehicle_topics() -> list[dict[str, Any]]:
                 f"topics.yaml 未包含任何车辆 Topic 条目（模式 {VEHICLE_TOPIC_PATTERN}）",
                 details={"file": str(topics_file)},
             )
+        _DLQ_NAMING_CACHE = _parse_dlq_naming(raw.get("naming") or {})
         _VEHICLE_TOPICS_CACHE = entries
-        logger.info("vehicle_topics_loaded", count=len(entries), file=str(topics_file))
+        logger.info(
+            "vehicle_topics_loaded",
+            count=len(entries),
+            dlq_pattern=_DLQ_NAMING_CACHE["pattern"],
+            file=str(topics_file),
+        )
         return entries
+
+
+def _parse_dlq_naming(naming: dict[str, Any]) -> dict[str, Any]:
+    """解析契约 naming 段的 DLQ 派生规则（缺字段时兜底为契约当前值并告警）。"""
+    pattern = str(naming.get("dlq_pattern") or "")
+    if "{original_topic}" not in pattern:
+        logger.warning(
+            "kafka_dlq_pattern_missing",
+            configured=naming.get("dlq_pattern"),
+            fallback=_DLQ_FALLBACK_PATTERN,
+        )
+        pattern = _DLQ_FALLBACK_PATTERN
+    retention = naming.get("dlq_retention_ms")
+    if not isinstance(retention, int) or retention <= 0:
+        logger.warning(
+            "kafka_dlq_retention_missing",
+            configured=retention,
+            fallback=_DLQ_FALLBACK_RETENTION_MS,
+        )
+        retention = _DLQ_FALLBACK_RETENTION_MS
+    inherit = naming.get("dlq_partitions_inherit_source", True)
+    if inherit is not True:
+        # 契约未提供“固定分区数”字段：不继承就无值可取，仍按继承创建（需改契约字段后同步实现）
+        logger.warning("kafka_dlq_partitions_inherit_source_not_true", configured=inherit)
+    return {"pattern": pattern, "retention_ms": int(retention), "inherit_partitions": True}
 
 
 # =====================================================================
@@ -257,11 +299,13 @@ class KafkaAdminOps:
     async def create_vehicle_topics(
         self, vehicle_id: str, *, skip_existing: bool = True
     ) -> list[str]:
-        """为单车创建 8 个 `hunter.{vehicle_id}.*` Topic；返回本次实际新建的名称列表。
+        """为单车创建 8 个 `hunter.{vehicle_id}.*` Topic + 8 个对应死信 Topic（共 16）；返回本次实际新建的名称列表。
 
         - 已存在 → 跳过（对应 `takeover_existing=true`）；
         - 底层 `TopicAlreadyExistsError` 归类为"跳过"而非失败；
-        - 返回的 `created` 供 provisioner 回滚使用：只删本次真的新建的 Topic，
+        - 死信 Topic 必须一并创建：broker 不自动建 Topic，转投不存在的 `.dlq` 属不可重试错误，
+          会使非法消息随 offset 提交被静默丢弃；
+        - 返回的 `created` 供 provisioner 回滚使用：只删本次真的新建的 Topic（含死信），
           不动外部既有资源（契约 x-hunter-provisioning.topics.rollback）。
         """
         return await asyncio.to_thread(self._create_vehicle_topics_sync, vehicle_id, skip_existing)
@@ -345,14 +389,37 @@ class KafkaAdminOps:
 # （SCRAM 已改由 confluent-kafka 高层 API 实现，不再需 kafka-python-ng 协议级辅助类）
 
 
-def render_vehicle_topics(vehicle_id: str) -> list[dict[str, Any]]:
-    """把契约模板展开为该车辆的实际 Topic 名（保留分区/保留期/RF/cleanup 元数据）。"""
+def render_vehicle_topics(vehicle_id: str, *, include_dlq: bool = True) -> list[dict[str, Any]]:
+    """把契约模板展开为该车辆的实际 Topic 名（保留分区/保留期/RF/cleanup 元数据）。
+
+    `include_dlq=True`（默认）时每条源 Topic 后紧跟其死信 Topic（`is_dlq=True`）：
+    开通/下线需要覆盖完整集合；车端接入预览（只需知道生产/消费的 Topic）应传 False。
+    """
     result: list[dict[str, Any]] = []
     for entry in load_vehicle_topics():
         rendered = dict(entry)
         rendered["name"] = str(entry["name"]).format(vehicle_id=vehicle_id)
+        rendered["is_dlq"] = False
         result.append(rendered)
+        if include_dlq:
+            result.append(_derive_dlq_entry(rendered))
     return result
+
+
+def _derive_dlq_entry(source: dict[str, Any]) -> dict[str, Any]:
+    """由源 Topic 派生死信 Topic 元数据（命名/保留期/分区继承均取契约 naming 段）。"""
+    naming = _DLQ_NAMING_CACHE or {
+        "pattern": _DLQ_FALLBACK_PATTERN,
+        "retention_ms": _DLQ_FALLBACK_RETENTION_MS,
+        "inherit_partitions": True,
+    }
+    dlq = dict(source)
+    dlq["name"] = str(naming["pattern"]).format(original_topic=source["name"])
+    dlq["retention_ms"] = int(naming["retention_ms"])
+    # 分区继承源 Topic（dlq_partitions_inherit_source）：同一车辆消息在死信内仍可定位原分区
+    dlq["is_dlq"] = True
+    dlq["source_topic"] = source["name"]
+    return dlq
 
 
 # =====================================================================

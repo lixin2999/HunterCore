@@ -20,6 +20,13 @@ naming:
   broadcast_topic: "hunter.broadcast.command"
   # DLQ 由 hunter_common.kafka.consumer 派生：{original_topic}.dlq（保留 30 天，分区数继承源 Topic）
   dlq_pattern: "{original_topic}.dlq"
+  dlq_retention_ms: 2592000000          # 30 天：人工排查与重放窗口（与 event_raw 对齐）
+  dlq_partitions_inherit_source: true    # 分区数继承源 Topic（同一车辆消息在死信内仍可定位原分区）
+  # ⚠ **DLQ Topic 不会自动存**：broker 关闭 auto.create.topics.enable（本契约安全基线），因此
+  #   派生死信名必须被显式创建，否则转投必然 UNKNOWN_TOPIC 而非法消息被静默丢弃。创建责任三方一致：
+  #     - 平台内部 Topic → infra/docker/kafka/create-topics.sh 与 scripts/init-kafka.sh
+  #     - 车端 Topic（hunter.{vehicle_id}.*）→ 车辆 provisioning（vehicle-service kafka_admin）
+  #   由 scripts/verify_data_layer.py 逐项比对三方清单与本文 naming 段。
 
 # ---------- 全局默认（未显式覆盖时生效） ----------
 defaults:

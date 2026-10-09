@@ -1,15 +1,17 @@
 """消费者契约行为单测（Mock confluent-kafka Consumer/Producer，不需要 broker）。
 
-覆盖：契约 Schema 校验（非法消息进 DLQ 不重试）/ handler 重试与 DLQ 转投 /
+覆盖：契约 Schema 校验（非法消息进 DLQ 不重试、日志带字段级明细）/
+handler 重试与 DLQ 转投 / DLQ 不可用时落盘兜底（buffer_on_error，不丢消息）/
 手动提交 offset / 幂等跳过 / 消费积压指标 / 解码回退 / 通配订阅转 librdkafka 正则。
 """
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from confluent_kafka import TopicPartition
+from confluent_kafka import KafkaException, TopicPartition
 
 from hunter_common.config import HunterBaseConfig
 from hunter_common.kafka import consumer as consumer_module
@@ -118,10 +120,13 @@ class FakeConsumer:
 
 
 class FakeProducerManager:
-    """替身生产者：仅记录 DLQ 投递。"""
+    """替身生产者：记录 DLQ 投递与关键字参数（buffer_on_error），可指定返回状态/抛错。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, status: str = "delivered", raise_error: Exception | None = None) -> None:
         self.sent: list[dict[str, Any]] = []
+        self.call_kwargs: list[dict[str, Any]] = []
+        self._status = status
+        self._raise = raise_error
 
     async def produce(
         self,
@@ -130,8 +135,32 @@ class FakeProducerManager:
         *,
         key: bytes | None = None,
         headers: list[tuple[str, bytes]] | None = None,
-    ) -> None:
+        **kwargs: Any,
+    ) -> SimpleNamespace:
         self.sent.append({"topic": topic, "value": value, "key": key, "headers": headers or []})
+        self.call_kwargs.append(kwargs)
+        if self._raise is not None:
+            raise self._raise
+        return SimpleNamespace(topic=topic, status=self._status)
+
+
+class LogRecorder:
+    """替身 logger：收集结构化事件（部分回归需要验证“日志里到底记了什么”，
+    只有 [2001] 而无字段明细是历史故障无法归因的直接原因）。"""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def _record(self, event: str, **kw: Any) -> None:
+        self.events.append((event, kw))
+
+    error = warning = info = debug = exception = _record
+
+    def names(self) -> list[str]:
+        return [event for event, _ in self.events]
+
+    def payload(self, event: str) -> dict[str, Any]:
+        return next(kw for name, kw in self.events if name == event)
 
 
 @pytest.fixture(scope="module")
@@ -338,6 +367,90 @@ async def test_schema_invalid_message_dlq_without_handler(contract: KafkaContrac
     assert fake_producer.sent[0]["topic"] == f"{CONSUMED_TOPIC}.dlq"
     assert dict(fake_producer.sent[0]["headers"])["dlq.reason"] == b"schema_invalid"
     assert consumed_counter("schema_invalid") - before_invalid == 1.0
+
+
+async def test_schema_invalid_log_carries_field_details(
+    contract: KafkaContract, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回归（V1.18.13）：Schema 不符必须把字段级明细写进日志与死信头。
+
+    旧行为：只有 ``[2001] 消息不符合契约 Schema telemetry``——`HunterBaseException.__str__`
+    不输出 details，现场只能猜“是车端少字段还是契约写错”（实际故障就这么被卡住）。
+    """
+    logs = LogRecorder()
+    monkeypatch.setattr(consumer_module, "logger", logs)
+    manager, _, fake_producer = build_manager(contract, [[invalid_telemetry_message()]])
+
+    async def handler(message: FakeMessage, value: Any) -> None:
+        pass
+
+    with pytest.raises(StopConsume):
+        await manager.run(handler)
+
+    errors = logs.payload("kafka_message_schema_invalid")["schema_errors"]
+    assert errors, "字段明细为空 = 又回到无法归因的 [2001]"
+    assert any("chassis" in item for item in errors)  # 缺必填段必须点名到字段
+    dlq_error = dict(fake_producer.sent[0]["headers"])["dlq.error"]
+    assert b"chassis" in dlq_error  # 从 DLQ 取回报文时不用再看日志
+
+
+async def test_dlq_produce_requests_disk_fallback(contract: KafkaContract) -> None:
+    """DLQ 转投必须带 buffer_on_error=True：死信 Topic 缺失属不可重试错误，不落盘就是丢消息。"""
+    manager, _, fake_producer = build_manager(contract, [[invalid_telemetry_message()]])
+
+    async def handler(message: FakeMessage, value: Any) -> None:
+        pass
+
+    with pytest.raises(StopConsume):
+        await manager.run(handler)
+
+    assert fake_producer.call_kwargs[0]["buffer_on_error"] is True
+
+
+async def test_dlq_buffered_status_is_not_counted_as_failure(
+    contract: KafkaContract, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """已落盘（status=buffered）：消息未丢 → 不计 dlq_failed 指标，但记可告警日志并正常提交。"""
+    before_failed = dlq_failed_counter("schema_invalid")
+    logs = LogRecorder()
+    monkeypatch.setattr(consumer_module, "logger", logs)
+    manager, fake_consumer, _ = build_manager(
+        contract, [[invalid_telemetry_message()]], producer=FakeProducerManager(status="buffered")
+    )
+
+    async def handler(message: FakeMessage, value: Any) -> None:
+        pass
+
+    with pytest.raises(StopConsume):
+        await manager.run(handler)
+
+    assert dlq_failed_counter("schema_invalid") - before_failed == 0.0
+    assert "kafka_dlq_message_buffered" in logs.names()
+    assert "kafka_message_sent_to_dlq" not in logs.names()
+    assert fake_consumer.commit_calls == 1  # 落盘后提交 offset 是安全的
+
+
+async def test_dlq_failure_still_counted_when_buffer_unavailable(
+    contract: KafkaContract, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """缓冲也不可用（生产抛错）：保留原语义——计 dlq_failed 指标 + 异常日志（必须可告警）。"""
+    before_failed = dlq_failed_counter("schema_invalid")
+    logs = LogRecorder()
+    monkeypatch.setattr(consumer_module, "logger", logs)
+    manager, _, _ = build_manager(
+        contract,
+        [[invalid_telemetry_message()]],
+        producer=FakeProducerManager(raise_error=KafkaException("local: buffer unavailable")),
+    )
+
+    async def handler(message: FakeMessage, value: Any) -> None:
+        pass
+
+    with pytest.raises(StopConsume):
+        await manager.run(handler)
+
+    assert dlq_failed_counter("schema_invalid") - before_failed == 1.0
+    assert "kafka_dlq_produce_failed" in logs.names()
 
 
 async def test_schema_auto_resolves_per_message(contract: KafkaContract) -> None:

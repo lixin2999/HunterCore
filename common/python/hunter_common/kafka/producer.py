@@ -9,7 +9,10 @@
   （``publish_payload`` 入口），保证单车辆消息分区内有序；
 - **重试**：契约 ``retries=3`` + 指数退避（仅对可重试错误重试，编程错误立即抛出）；
 - **本地磁盘缓冲**：网络中断且重试耗尽时消息落盘（上限 1GB，契约 producer_defaults），
-  链路恢复后由 :meth:`KafkaProducerManager.replay_buffered` 重投；
+  链路恢复后由 :meth:`KafkaProducerManager.replay_buffered` 重投（close() 内置一次尽力补投，
+  无定时轮询：需要立即重投请显式调用或重启服务）；
+  ``produce(buffer_on_error=True)`` 用于“不得丢消息”路径（DLQ 转投）：不可重试错误也落盘
+  （典型 ``_UNKNOWN_TOPIC``：Topic 尚未创建，补投即可成功），仅消息体自身非法除外；
 - **异步**：``produce`` 异步等待 delivery 回调，poll 由独立线程驱动，不阻塞事件循环。
 
 低层 ``produce`` 保持宽松（用于 DLQ 等契约外 Topic，既有服务调用方零改动）；
@@ -39,6 +42,11 @@ ProduceStatus = Literal["delivered", "buffered"]
 
 #: 退避指数上限（2^10 足够覆盖退避上限，防止位移溢出）
 _MAX_BACKOFF_EXPONENT = 10
+
+#: 落盘也救不回来的错误（消息体自身非法：补投必然再次失败，落盘只会把问题藏进磁盘）
+#: 注：confluent-kafka 错误码命名不统一——``MSG_SIZE_TOO_LARGE`` 无前缀（librdkafka 正文码），
+#: ``_INVALID_ARG`` 带前缀（本地码）；写错名字会在 import 期 AttributeError 直接打挂服务。
+_UNRECOVERABLE_CODES = frozenset({KafkaError.MSG_SIZE_TOO_LARGE, KafkaError._INVALID_ARG})
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +222,7 @@ class KafkaProducerManager:
         partition: int | None = None,
         acks: str | None = None,
         use_buffer: bool | None = None,
+        buffer_on_error: bool = False,
     ) -> ProduceResult:
         """异步投递（低层入口：不做 Schema/key 契约校验，供 DLQ 等契约外 Topic 使用）。
 
@@ -221,7 +230,11 @@ class KafkaProducerManager:
         - 成功 → ``status="delivered"``（broker 按契约 acks 确认）；
         - 可重试错误按 ``kafka_produce_max_attempts`` 重试（指数退避），仍失败且缓冲启用 →
           落盘并返回 ``status="buffered"``；
-        - 不可重试错误（消息体非法/超长等）或缓冲关闭 → 抛 KafkaException（由调用方转 5001）。
+        - 不可重试错误（消息体非法/超长等）或缓冲关闭 → 抛 KafkaException（由调用方转 5001）；
+        - ``buffer_on_error=True``：改变不可重试错误的默认行为——**同样落盘而不抛异常**。
+          适用于转投死信队列：目标 Topic 缺失（``_UNKNOWN_TOPIC``）在 librdkafka 里属不可重试，
+          但只是“运维还没建 Topic”，补投即可成功；若仍报错并让调用方提交 offset，非法消息就永久丢了。
+          例外：``MSG_SIZE_TOO_LARGE`` / ``_INVALID_ARG`` 这类消息体自身非法仍直接抛出（补投无用）。
         """
         value_bytes, key_bytes, header_items = _normalize(value, key, headers)
         producer = self._producer_for(self._acks_for(topic, acks))
@@ -251,7 +264,14 @@ class KafkaProducerManager:
 
         duration = time.perf_counter() - started
         buffering = self._config.kafka_local_buffer_enabled if use_buffer is None else use_buffer
-        if last_error is not None and retriable and buffering and self._buffer is not None:
+        # 不可重试但“可补投成功”的错误（典型：死信 Topic 尚未创建）在 buffer_on_error 下也落盘
+        force_buffer = buffer_on_error and not _is_unrecoverable_payload(last_error)
+        if (
+            last_error is not None
+            and (retriable or force_buffer)
+            and buffering
+            and self._buffer is not None
+        ):
             # 落盘为阻塞 IO（open/flush/fsync + 容量淘汰目录扫描）：下沉线程池，
             # 禁止在事件循环内做同步文件 IO（异步优先约束；审查 R4）
             await asyncio.to_thread(
@@ -266,9 +286,24 @@ class KafkaProducerManager:
                 topic=topic,
                 attempts=attempts,
                 error=str(last_error),
-                hint="链路中断：消息已落盘，恢复后由 replay_buffered() 重投",
+                forced=bool(force_buffer and not retriable),
+                hint=(
+                    "目标 Topic 不可用但已落盘：创建齐 Topic 后由 replay_buffered() 补投"
+                    "（服务优雅停止时 close() 自动触发，需立即补投则 restart 本服务）"
+                    if force_buffer and not retriable
+                    else "链路中断：消息已落盘，恢复后由 replay_buffered() 重投"
+                ),
             )
             return ProduceResult(topic, "buffered", attempts)
+        if buffer_on_error and last_error is not None and not _is_unrecoverable_payload(last_error):
+            # 缓冲不可用（配置关闭或目录未初始化）：不能静默——显式告警后仍抛异常
+            logger.error(
+                "kafka_produce_buffer_unavailable",
+                topic=topic,
+                attempts=attempts,
+                error=str(last_error),
+                hint="本地磁盘缓冲未启用或不可用：此消息将随调用方失败丢失（检查 KAFKA_LOCAL_BUFFER_ENABLED / KAFKA_LOCAL_BUFFER_DIR）",
+            )
         kafka_metrics.record_produced(self._service, topic, "failed", duration)
         logger.error("kafka_produce_failed", topic=topic, attempts=attempts, error=str(last_error))
         if last_error is not None:
@@ -452,6 +487,22 @@ def _is_retriable(error: KafkaException) -> bool:
     kafka_error = error.args[0] if error.args else None
     retriable = getattr(kafka_error, "retriable", None)
     return bool(retriable()) if callable(retriable) else False
+
+
+def _is_unrecoverable_payload(error: KafkaException | None) -> bool:
+    """是否为“消息体自身非法”的错误（落盘也无意义：补投必然再次失败）。
+
+    主按错误码判定（``MSG_SIZE_TOO_LARGE`` / ``_INVALID_ARG``）；无 code() 时回退错误文本，
+    保证测试桩与旧版 librdkafka 措辞也能命中。
+    """
+    if error is None or not error.args:
+        return False
+    kafka_error = error.args[0]
+    code = getattr(kafka_error, "code", None)
+    if callable(code) and code() in _UNRECOVERABLE_CODES:
+        return True
+    text = str(kafka_error).lower()
+    return any(token in text for token in ("msg_size_too_large", "invalid arg", "message size"))
 
 
 

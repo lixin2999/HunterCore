@@ -10,13 +10,14 @@
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 CONTRACT_PATH = ROOT / "contracts" / "openapi" / "vehicle-service.yaml"
 GATEWAY_CONTRACT = ROOT / "contracts" / "openapi" / "api-gateway.yaml"
 TOPICS_CONTRACT = ROOT / "contracts" / "kafka" / "topics.yaml"
@@ -55,6 +56,29 @@ def _endpoints_from_contract(doc: dict[str, Any]) -> set[tuple[str, str]]:
     return out
 
 
+def iter_registered_routes(routes: Any) -> Iterator[tuple[str, str]]:
+    """递归展开 FastAPI 已注册路由（兼容 Starlette `_IncludedRouter` 聚合节点）。
+
+    与 data-collector / data-analytics / scene-service 契约测试同一实现：`include_router`
+    在新版 Starlette 下不拍平为 APIRoute，直接遍历 `app.routes` 会漏掉全部业务/探针路由。
+    """
+    for route in routes:
+        nested = getattr(route, "routes", None)
+        if nested is None:
+            inner = getattr(route, "original_router", None)
+            nested = getattr(inner, "routes", None) if inner is not None else None
+        if nested:
+            yield from iter_registered_routes(nested)
+            continue
+        path = getattr(route, "path", None)
+        if path is None:
+            continue
+        for method in getattr(route, "methods", None) or ():
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            yield method, path
+
+
 def test_openapi_version_and_info(contract_doc: dict[str, Any]) -> None:
     assert contract_doc["openapi"] == "3.0.3"
     assert contract_doc["info"]["title"] == "HunterCore - vehicle-service"
@@ -79,19 +103,10 @@ def test_fastapi_routes_registered(contract_doc: dict[str, Any]) -> None:
     """FastAPI 实际路由 == 契约端点集合（业务 + 运维；/metrics 由 register_metrics 注入）。"""
     from app.main import app  # noqa: PLC0415 - 延迟导入避免 pytest 收集期启动 lifespan
 
-    actual: set[tuple[str, str]] = set()
-    for route in app.routes:
-        methods = set(getattr(route, "methods", set()) or set())
-        path = getattr(route, "path", None)
-        if not path:
-            continue
-        for method in methods:
-            if method in ("HEAD", "OPTIONS"):
-                continue
-            actual.add((method.upper(), path))
+    actual: set[tuple[str, str]] = set(iter_registered_routes(app.routes))
     expected = EXPECTED_BUSINESS_ENDPOINTS | EXPECTED_OPS_ENDPOINTS
-    for method, path in expected:
-        assert (method, path) in actual, f"路由未注册：{method} {path}"
+    missing = {e for e in expected if e not in actual}
+    assert not missing, f"路由未注册：{sorted(missing)}"
 
 
 def test_rbac_bindings_match_settings(contract_doc: dict[str, Any]) -> None:
@@ -123,7 +138,10 @@ def test_rbac_bindings_match_settings(contract_doc: dict[str, Any]) -> None:
 
 
 def test_per_vehicle_topics_count(contract_doc: dict[str, Any]) -> None:
-    """契约 `x-hunter-kafka.per_vehicle_topics` == topics.yaml 车辆 Topic 条目 == 8。"""
+    """契约 `x-hunter-kafka.per_vehicle_topics` == topics.yaml 车辆 Topic 条目 == 8（源 Topic）。
+
+    另需声明每车死信 Topic 的创建责任与命名来源（broker 关 auto.create，不登记则非法消息被静默丢弃）。
+    """
     contract_list = contract_doc["x-hunter-kafka"]["per_vehicle_topics"]
     assert len(contract_list) == 8, f"契约声明每车 Topic 应为 8，实际 {len(contract_list)}"
 
@@ -138,6 +156,19 @@ def test_per_vehicle_topics_count(contract_doc: dict[str, Any]) -> None:
     contract_types = {str(entry).split(".")[-1] for entry in contract_list}
     yaml_types = {str(item["name"]).split(".")[-1] for item in vehicle_topics}
     assert contract_types == yaml_types, f"Topic 类型漂移：{contract_types ^ yaml_types}"
+
+    # 死信 Topic：命名/保留期只由 topics.yaml#naming 决定，创建责任必须在契约登记
+    naming = topics.get("naming") or {}
+    assert "{original_topic}" in str(naming.get("dlq_pattern", "")), (
+        "topics.yaml#naming.dlq_pattern 缺失或不含 {original_topic} 占位符"
+    )
+    assert int(naming.get("dlq_retention_ms") or 0) > 0, "topics.yaml#naming.dlq_retention_ms 缺失"
+    assert bool(naming.get("dlq_partitions_inherit_source")), (
+        "topics.yaml#naming.dlq_partitions_inherit_source 应为 true"
+    )
+    assert str(contract_doc["x-hunter-kafka"].get("dlq_creation") or "").strip(), (
+        "契约未登记每车 .dlq 的创建责任（x-hunter-kafka.dlq_creation）"
+    )
 
 
 def test_error_codes_in_http_status_map(contract_doc: dict[str, Any]) -> None:

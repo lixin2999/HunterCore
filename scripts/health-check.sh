@@ -536,13 +536,21 @@ check_kafka_broker_cert() {
 # 背景（V1.18.12）：通配订阅未转 librdkafka 正则时，消费者只报 UNKNOWN_TOPIC_OR_PART：
 # 容器 healthy、/healthz 200、消费组根本不存在，当时 41 项巡检全部“正常”，
 # 而平台其实一条消息也没收过。本项把“日志里有错”从人工排查提升为例行硬信号。
+# ⚠ 三类信号必须分开判读（V1.18.13：本项曾把“生产侧 Topic 缺失”归到“订阅未命中”，指错了修复方向）：
+#   A 订阅未命中（FAIL）：Subscribed topic not available —— 镜像未含“通配订阅转正则”修复（V1.18.12）
+#   B 目标 Topic 缺失（FAIL）：kafka_dlq_produce_failed / kafka_dlq_message_buffered / kafka_produce_failed
+#     —— broker 关自动建 Topic，消息要去的 Topic（典型：死信 {topic}.dlq）还没创建
+#   C 报文与契约 Schema 不符（WARN）：kafka_message_schema_invalid —— 车端报文问题，不是平台代码故障；
+#     字段级明细见日志 schema_errors，非法消息已转投 DLQ／落盘（不丢），但不会入库（车辆页面会离线）
 check_service_error_logs() {
   local containers=(hunter-api-gateway hunter-scene hunter-collector hunter-analytics \
     hunter-ota hunter-remote hunter-vehicle-service)
   local window="${ERROR_LOG_WINDOW:-15m}"
   local err_re='\[(error|critical)[[:space:]]*\]|Traceback \(most recent call last\)'
-  local fatal_re='Subscribed topic not available|UNKNOWN_TOPIC_OR_PART'
-  local c logs errors fatal sample scanned=0 flagged=0
+  local sub_re='Subscribed topic not available'
+  local topic_missing_re='kafka_dlq_produce_failed|kafka_dlq_message_buffered|kafka_produce_failed|code=_UNKNOWN_TOPIC|code=UNKNOWN_TOPIC_OR_PART'
+  local schema_re='kafka_message_schema_invalid'
+  local c logs errors sub_hit topic_hit schema_cnt sample scanned=0 flagged=0
   if ! command_exists docker; then
     record_result "WARN" "服务错误日志" "缺少 docker 命令，跳过运行期错误日志扫描"
     return 0
@@ -553,12 +561,25 @@ check_service_error_logs() {
     logs="$(docker logs --since "$window" "$c" 2>&1 || true)"
     [ -n "$logs" ] || continue
     errors="$(printf '%s\n' "$logs" | grep -cE "$err_re" || true)"
-    fatal="$(printf '%s\n' "$logs" | grep -m1 -E "$fatal_re" || true)"
-    if [ -n "$fatal" ]; then
-      record_result "FAIL" "服务错误日志（${c}）" \
-        "订阅/Topic 类致命错（近 ${window} 共 ${errors:-0} 条 error）：$(printf '%.200s' "$fatal") → 该服务从未消费到任何消息（看板与车辆台账会恒显离线）；先确认镜像含“通配订阅转正则”修复（V1.18.12，启动日志 subscription 应形如 ^hunter\\.[^.]+\\.<type>$）；docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --build $c"
+    sub_hit="$(printf '%s\n' "$logs" | grep -m1 -E "$sub_re" || true)"
+    topic_hit="$(printf '%s\n' "$logs" | grep -m1 -E "$topic_missing_re" || true)"
+    schema_cnt="$(printf '%s\n' "$logs" | grep -cE "$schema_re" || true)"
+    if [ -n "$sub_hit" ]; then
+      record_result "FAIL" "服务错误日志（${c}：订阅未命中）" \
+        "$(printf '%.200s' "$sub_hit") → 该服务从未消费到任何消息（看板与台账恒显离线）；先确认镜像含“通配订阅转正则”修复（V1.18.12，启动日志 subscription 应形如 ^hunter\\.[^.]+\\.<type>$）；docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --build $c"
       flagged=$((flagged + 1))
-    elif [ "${errors:-0}" -gt 0 ]; then
+    fi
+    if [ -n "$topic_hit" ]; then
+      record_result "FAIL" "服务错误日志（${c}：目标 Topic 缺失）" \
+        "$(printf '%.200s' "$topic_hit") → 要去的 Topic 不存在（多为死信 {topic}.dlq 未创建）；修复：sudo bash scripts/init-kafka.sh（平台内部 + 死信）；每车死信由车辆 provisioning 创建（V1.18.13 起，已开通车辆需重跑开通或手工补建 hunter.<id>.<type>.dlq）；日志含 kafka_dlq_message_buffered 则消息已落盘，Topic 建齐后自动补投"
+      flagged=$((flagged + 1))
+    fi
+    if [ "${schema_cnt:-0}" -gt 0 ]; then
+      record_result "WARN" "服务错误日志（${c}：报文不符合契约 Schema）" \
+        "近 ${window} ${schema_cnt} 条 kafka_message_schema_invalid（车端与契约不一致，非平台故障）→ 看日志 schema_errors 字段级明细定位哪个字段不符（旧版本只有 [2001] 无法归因）；这类消息不入库（对应车辆页面会显离线）；取证：console-consumer 读原 Topic 或 {topic}.dlq"
+      flagged=$((flagged + 1))
+    fi
+    if [ -z "$sub_hit" ] && [ -z "$topic_hit" ] && [ "${schema_cnt:-0}" -eq 0 ] && [ "${errors:-0}" -gt 0 ]; then
       sample="$(printf '%s\n' "$logs" | grep -E "$err_re" | tail -1)"
       record_result "WARN" "服务错误日志（${c}）" \
         "近 ${window} 有 ${errors} 条 error/critical/Traceback，最后一条：$(printf '%.200s' "$sample")（docker logs --since ${window} ${c}）"

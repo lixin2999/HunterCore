@@ -21,7 +21,7 @@ from app.services import kafka_admin
 # 契约加载（真实 contracts/kafka/topics.yaml）
 # =====================================================================
 def test_load_vehicle_topics_returns_8() -> None:
-    """从仓库 contracts/kafka/topics.yaml 加载：8 项车辆 Topic（不含广播）。"""
+    """从仓库 contracts/kafka/topics.yaml 加载：8 项车辆源 Topic（不含广播、不含死信）。"""
     # 清缓存以隔离
     kafka_admin._VEHICLE_TOPICS_CACHE = None  # type: ignore[attr-defined]
     topics = kafka_admin.load_vehicle_topics()
@@ -34,18 +34,58 @@ def test_load_vehicle_topics_returns_8() -> None:
         assert f"hunter.{{vehicle_id}}.{expected_type}" in names
     # 广播 Topic 不在清单（无 {vehicle_id} 段）
     assert all("{vehicle_id}" in n for n in names)
+    # 死信名不属 vehicle_topics（由 naming.dlq_pattern 派生，不在源清单里重复登记）
+    assert not any(n.endswith(".dlq") for n in names)
 
 
 def test_render_vehicle_topics_expands_placeholder() -> None:
     kafka_admin._VEHICLE_TOPICS_CACHE = None  # type: ignore[attr-defined]
     rendered = kafka_admin.render_vehicle_topics("HUNTER-042")
-    assert len(rendered) == 8
+    assert len(rendered) == 16  # 8 源 + 8 死信
     assert all("{vehicle_id}" not in t["name"] for t in rendered)
     assert any(t["name"] == "hunter.HUNTER-042.telemetry" for t in rendered)
     # 元数据保留
     for entry in rendered:
         assert entry["partitions"] >= 1
         assert entry["retention_ms"] > 0
+
+
+def test_render_vehicle_topics_dlq_derived_from_contract_naming() -> None:
+    """死信条目：命名取 naming.dlq_pattern、保留取 dlq_retention_ms、分区继承源 Topic。"""
+    kafka_admin._VEHICLE_TOPICS_CACHE = None  # type: ignore[attr-defined]
+    rendered = kafka_admin.render_vehicle_topics("HUNTER-042")
+    by_name = {t["name"]: t for t in rendered}
+    source = by_name["hunter.HUNTER-042.telemetry"]
+    dlq = by_name["hunter.HUNTER-042.telemetry.dlq"]
+    assert source["is_dlq"] is False
+    assert dlq["is_dlq"] is True
+    assert dlq["source_topic"] == source["name"]
+    assert dlq["partitions"] == source["partitions"] == 6
+    assert dlq["retention_ms"] == 2_592_000_000  # 契约 naming.dlq_retention_ms（30 天）
+    assert dlq["retention_ms"] != source["retention_ms"]  # 源为 7 天
+    assert dlq["cleanup_policy"] == source["cleanup_policy"]
+    # 每条源 Topic 都有对应死信（缺一即非法消息无处可送）
+    sources = [t for t in rendered if not t["is_dlq"]]
+    assert {f"{t['name']}.dlq" for t in sources} <= set(by_name)
+
+
+def test_render_vehicle_topics_include_dlq_false() -> None:
+    """车端面向的输出（接入包/详情预览）不含死信 Topic：只给 8 个生产/消费 Topic。"""
+    kafka_admin._VEHICLE_TOPICS_CACHE = None  # type: ignore[attr-defined]
+    rendered = kafka_admin.render_vehicle_topics("HUNTER-042", include_dlq=False)
+    assert len(rendered) == 8
+    assert not any(t["name"].endswith(".dlq") for t in rendered)
+
+
+def test_parse_dlq_naming_falls_back_when_contract_fields_missing() -> None:
+    """契约 naming 缺字段时兜底为契约当前值（不抛错、不硬编码在业务链路里）。"""
+    naming = kafka_admin._parse_dlq_naming({})
+    assert naming["pattern"] == "{original_topic}.dlq"
+    assert naming["retention_ms"] == 2_592_000_000
+    # 错误形态（缺占位符 / 非正整数）同样回退
+    naming = kafka_admin._parse_dlq_naming({"dlq_pattern": "dead_letter", "dlq_retention_ms": 0})
+    assert naming["pattern"] == "{original_topic}.dlq"
+    assert naming["retention_ms"] == 2_592_000_000
 
 
 def test_missing_contract_dir_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -95,10 +135,11 @@ def ops() -> kafka_admin.KafkaAdminOps:
 
 @pytest.mark.asyncio
 async def test_create_vehicle_topics_skip_existing(ops: kafka_admin.KafkaAdminOps) -> None:
-    """契约 8 Topic 全部创建；调用方拿到的 created 应不含外部既有资源。"""
+    """契约 8 源 Topic + 8 死信 Topic 全部创建；调用方拿到的 created 应不含外部既有资源。"""
     created = await ops.create_vehicle_topics("v-100", skip_existing=True)
-    assert len(created) == 8
+    assert len(created) == 16
     assert all(name.startswith("hunter.v-100.") for name in created)
+    assert sum(1 for name in created if name.endswith(".dlq")) == 8
     # 元数据落 NewTopic（分区/保留期/cleanup.policy）
     underlying = ops._admin.created  # noqa: SLF001
     telemetry = next(t for t in underlying if t.name == "hunter.v-100.telemetry")
@@ -106,6 +147,13 @@ async def test_create_vehicle_topics_skip_existing(ops: kafka_admin.KafkaAdminOp
     assert telemetry.topic_configs["retention.ms"] == "604800000"  # 7 天
     event = next(t for t in underlying if t.name == "hunter.v-100.event")
     assert event.topic_configs["retention.ms"] == "2592000000"  # 30 天
+    # 死信：分区继承源 Topic、保留 30 天（即使源是 7 天）
+    dlq = next(t for t in underlying if t.name == "hunter.v-100.telemetry.dlq")
+    assert dlq.num_partitions == telemetry.num_partitions
+    assert dlq.topic_configs["retention.ms"] == "2592000000"
+    assert dlq.topic_configs["cleanup.policy"] == telemetry.topic_configs["cleanup.policy"]
+    health_dlq = next(t for t in underlying if t.name == "hunter.v-100.health.dlq")
+    assert health_dlq.num_partitions == 3
 
 
 @pytest.mark.asyncio

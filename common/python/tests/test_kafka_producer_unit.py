@@ -1,7 +1,8 @@
 """生产者契约行为单测（Mock confluent-kafka Producer，不需要 broker）。
 
 覆盖：契约 acks 选择 / 可重试错误指数退避 / 不可重试错误直接抛出 /
-重试耗尽落盘缓冲 / 契约驱动入口（Schema + key=vehicle_id）/ 缓冲重投 /
+重试耗尽落盘缓冲 / buffer_on_error（DLQ 转投：不可重试也落盘，不丢消息）/
+契约驱动入口（Schema + key=vehicle_id）/ 缓冲重投 /
 落盘与重投的线程归属（审查 R4：事件循环不得被同步文件 IO 阻塞）。
 """
 from __future__ import annotations
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
-from confluent_kafka import KafkaException
+from confluent_kafka import KafkaError, KafkaException
 
 from hunter_common.config import HunterBaseConfig
 from hunter_common.kafka import producer as producer_module
@@ -29,19 +30,20 @@ TELEMETRY_TOPIC = f"hunter.{VEHICLE_ID}.telemetry"
 
 
 class FakeError:
-    """替身 KafkaError：仅需 ``code()`` / ``retriable()`` 供重试判定。"""
+    """替身 KafkaError：仅需 ``code()`` / ``retriable()`` 供重试与落盘判定。"""
 
-    def __init__(self, *, retriable: bool) -> None:
+    def __init__(self, *, retriable: bool, code: int = -195) -> None:
         self._retriable = retriable
+        self._code = code
 
     def code(self) -> int:
-        return -195
+        return self._code
 
     def retriable(self) -> bool:
         return self._retriable
 
     def __str__(self) -> str:
-        return f"fake kafka error(retriable={self._retriable})"
+        return f"fake kafka error(retriable={self._retriable}, code={self._code})"
 
 
 class FakeMessage:
@@ -200,6 +202,86 @@ async def test_retry_exhaustion_buffers_to_local_disk(
     assert (result.status, result.attempts) == ("buffered", 3)
     assert stats is not None and stats.message_count == 1
     assert buffered_bytes > 0  # 关闭时已重投并删段，故在关闭前记录大小
+
+
+async def test_buffer_on_error_buffers_non_retriable_unknown_topic(
+    tmp_path: Path, contract: KafkaContract, patch_producer: type[FakeProducer]
+) -> None:
+    """V1.18.13 核心：死信 Topic 尚未创建（``_UNKNOWN_TOPIC`` 属不可重试）也必须落盘。
+
+    旧行为：不可重试 → 直接抛 → 消费侧吃掉异常并照常提交 offset → 非法消息永久丢失。
+    现在 attempts=1（仍不重试）但结果 buffered，Topic 建齐后由 replay_buffered() 补投。
+    """
+    manager = KafkaProducerManager(make_config(tmp_path), contract=contract)
+    instance = patch_producer.instances[0]
+    instance.outcomes = [FakeError(retriable=False, code=KafkaError._UNKNOWN_TOPIC)]
+    try:
+        result = await manager.produce(
+            "telemetry_raw.dlq", b'{"seq":1}', key=VEHICLE_ID.encode(), buffer_on_error=True
+        )
+        stats = manager.buffer_stats()
+        buffered = list((tmp_path / "buffer" / "data-collector").glob("seg-*.jsonl"))
+    finally:
+        await manager.close()
+
+    assert (result.status, result.attempts) == ("buffered", 1)
+    assert stats is not None and stats.message_count == 1
+    assert buffered  # 消息真的写进了磁盘，不是口头保证
+
+
+async def test_buffer_on_error_still_raises_for_invalid_payload(
+    tmp_path: Path, contract: KafkaContract, patch_producer: type[FakeProducer]
+) -> None:
+    """消息体自身非法（超长）：即使 buffer_on_error=True 也不落盘——补投必然再失败。"""
+    manager = KafkaProducerManager(make_config(tmp_path), contract=contract)
+    instance = patch_producer.instances[0]
+    instance.outcomes = [FakeError(retriable=False, code=KafkaError.MSG_SIZE_TOO_LARGE)]
+    try:
+        with pytest.raises(KafkaException):
+            await manager.produce(
+                "telemetry_raw.dlq", b"x" * 10, buffer_on_error=True, use_buffer=None
+            )
+        stats = manager.buffer_stats()
+    finally:
+        await manager.close()
+
+    assert len(instance.produced) == 1
+    assert stats is not None and stats.message_count == 0
+
+
+async def test_buffer_on_error_without_local_buffer_still_raises(
+    tmp_path: Path, contract: KafkaContract, patch_producer: type[FakeProducer]
+) -> None:
+    """本地缓冲未启用：不得假装已落盘，仍抛异常（调用方计 dlq_failed 指标并可告警）。"""
+    manager = KafkaProducerManager(
+        make_config(tmp_path, kafka_local_buffer_enabled=False), contract=contract
+    )
+    instance = patch_producer.instances[0]
+    instance.outcomes = [FakeError(retriable=False, code=KafkaError._UNKNOWN_TOPIC)]
+    try:
+        with pytest.raises(KafkaException):
+            await manager.produce(
+                "telemetry_raw.dlq", b'{"seq":1}', buffer_on_error=True
+            )
+    finally:
+        await manager.close()
+
+
+def test_is_unrecoverable_payload_by_code_and_text() -> None:
+    """落盘例外判定：主按错误码，无 code() 时回退文本（测试桩/旧版措辞也能命中）。"""
+    assert producer_module._is_unrecoverable_payload(
+        KafkaException(FakeError(retriable=False, code=KafkaError.MSG_SIZE_TOO_LARGE))
+    )
+    assert not producer_module._is_unrecoverable_payload(
+        KafkaException(FakeError(retriable=False, code=KafkaError._UNKNOWN_TOPIC))
+    )
+
+    class _TextOnly:
+        def __str__(self) -> str:
+            return "Local: Message size too large for configuration"
+
+    assert producer_module._is_unrecoverable_payload(KafkaException(_TextOnly()))
+    assert not producer_module._is_unrecoverable_payload(None)
 
 
 async def test_buffering_can_be_disabled_per_message(

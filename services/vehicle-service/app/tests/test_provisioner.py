@@ -259,18 +259,18 @@ async def test_deprovision_sequence(_stub_cert: dict[str, Any]) -> None:
     store = _StoreStub()
     store.delete_ledger = AsyncMock(return_value=True)  # type: ignore[attr-defined]
     admin = _make_admin()
-    admin.delete_topics = AsyncMock(
-        return_value=[f"hunter.test-01.{t}" for t in (
-            "telemetry", "event", "health", "command",
-            "command_result", "ota_notify", "ota_status", "remote_control"
-        )]
-    )
+    # 回显请求清单：便于断言下线确实覆盖了死信 Topic（开通建了 16 个就必须能回收 16 个）
+    admin.delete_topics = AsyncMock(side_effect=lambda names: list(names))
     prov = Provisioner(store, admin)
 
     summary = await prov.deprovision("test-01", purge_topics=True)
 
+    requested = admin.delete_topics.await_args.args[0]
+    assert len(requested) == 16  # 8 源 + 8 死信
+    assert sum(1 for name in requested if name.endswith(".dlq")) == 8
+    assert "hunter.test-01.telemetry.dlq" in requested
     assert summary["scram_removed"] is True
-    assert len(summary["topics_removed"]) == 8
+    assert len(summary["topics_removed"]) == 16
     assert summary["ledger_removed"] is True
     admin.delete_scram_user.assert_awaited_once_with("test-01")
     admin.delete_topics.assert_awaited_once()

@@ -2,8 +2,12 @@
 # =====================================================================
 # HunterCore 单机部署 —— Kafka 平台内部 Topic 初始化（init-kafka.sh）
 #
-# 用途：等待 broker 就绪后，按 contracts/kafka/topics.yaml 创建 6 个平台内部 Topic
-#       （分区数/保留时间严格对齐契约，禁止新增未定义 Topic），并校验创建结果。
+#   用途：等待 broker 就绪后，按 contracts/kafka/topics.yaml 创建 6 个平台内部 Topic
+#       与对应的 6 个死信 Topic（{topic}.dlq）（分区数/保留时间严格对齐契约，禁止新增未定义 Topic），并校验创建结果。
+#
+#   ⚠ 死信 Topic 必须显式创建：broker 关 auto.create.topics.enable，而消费侧转投
+#     {topic}.dlq 属于投递行为——Topic 不存在时报 _UNKNOWN_TOPIC（不可重试），
+#     非法消息会被静默丢弃（无死信可查、无法人工重放）。
 #
 #   Topic            分区  保留     用途
 #   telemetry_raw     12   7 天     原始遥测（data-collector 生产）
@@ -53,15 +57,18 @@ TOPIC_SPECS=(
   "analytics_result:6:2592000000"   # 30 天
   "alert_event:3:2592000000"        # 30 天
 )
+# 死信 Topic（topics.yaml#naming：dlq_pattern / dlq_retention_ms / 分区继承源 Topic）
+DLQ_RETENTION_MS=2592000000
 
 usage() {
   cat <<'EOF'
 HunterCore Kafka 内部 Topic 初始化脚本
 
 用途：
-  等待 broker 就绪后创建 6 个平台内部 Topic（分区数与保留时间严格对齐 Kafka 契约）并校验：
+  等待 broker 就绪后创建 6 个平台内部 Topic + 6 个死信 Topic（分区数与保留时间严格对齐 Kafka 契约）并校验：
     telemetry_raw(12,7d) telemetry_clean(12,7d) event_raw(6,30d)
     sensor_file(3,7d) analytics_result(6,30d) alert_event(3,30d)
+    {以上每个}.dlq（分区继承源 Topic，保留 30 天）——缺死信 Topic 时非法消息会被静默丢弃
 
 用法：
   sudo bash scripts/init-kafka.sh [选项]
@@ -76,7 +83,8 @@ HunterCore Kafka 内部 Topic 初始化脚本
   sudo bash /opt/hunter-core/scripts/init-kafka.sh --scram-users
 
 校验：
-  docker exec hunter-kafka kafka-topics.sh --bootstrap-server localhost:9092 --list
+  docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+  （裸写 kafka-topics.sh 在 docker exec 的 shell 里找不到：bitnami 仅在 entrypoint 环境设该 PATH）
   （内部监听为 SASL_PLAINTEXT 时需附带 --command-config，详见脚本输出）
 EOF
 }
@@ -188,9 +196,15 @@ main() {
     return 1
   fi
 
-  # ---------- 2) 创建 6 个内部 Topic（幂等） ----------
-  log_info "===== 创建平台内部 Topic（契约：contracts/kafka/topics.yaml）====="
+  # ---------- 2) 创建平台 Topic 与死信 Topic（幂等） ----------
+  log_info "===== 创建平台内部 Topic + 死信 Topic（契约：contracts/kafka/topics.yaml）====="
+  local -a all_specs=("${TOPIC_SPECS[@]}")
+  local spec dlq_partitions
   for spec in "${TOPIC_SPECS[@]}"; do
+    dlq_partitions="$(printf '%s' "$spec" | cut -d: -f2)"
+    all_specs+=("${spec%%:*}.dlq:${dlq_partitions}:${DLQ_RETENTION_MS}")
+  done
+  for spec in "${all_specs[@]}"; do
     name="${spec%%:*}"
     partitions="$(printf '%s' "$spec" | cut -d: -f2)"
     retention="$(printf '%s' "$spec" | cut -d: -f3)"
@@ -203,7 +217,7 @@ main() {
 
   # ---------- 3) 校验（分区数与保留时间） ----------
   log_info "===== 校验 Topic 配置 ====="
-  for spec in "${TOPIC_SPECS[@]}"; do
+  for spec in "${all_specs[@]}"; do
     name="${spec%%:*}"
     partitions="$(printf '%s' "$spec" | cut -d: -f2)"
     retention="$(printf '%s' "$spec" | cut -d: -f3)"
@@ -228,14 +242,14 @@ main() {
   kafka_topics_cli --list 2>/dev/null | sed 's/^/  /' || true
   local total
   total="$(kafka_topic_count)"
-  log_info "Topic 总数：${total}（含契约 6 个内部 Topic 与系统 Topic __consumer_offsets）"
+  log_info "Topic 总数：${total}（含契约 6 个内部 Topic + 6 个死信 Topic 与系统 Topic __consumer_offsets）"
 
   if [ "$failed" -ne 0 ]; then
     log_error "Kafka 初始化存在 ${failed} 项失败（成功处理 ${created} 项 / 校验通过 ${verified} 项）"
     return 1
   fi
-  log_success "Kafka 内部 Topic 初始化完成（6 个 Topic 已就绪且配置与契约一致）"
-  log_warn "车端 Topic（hunter.{vehicle_id}.*）在车辆注册时按契约创建；车端接入需 SASL_SSL 9093 与 SCRAM 账号"
+  log_success "Kafka 内部 Topic 初始化完成（${#all_specs[@]} 个 Topic 已就绪且配置与契约一致）"
+  log_warn "车端 Topic（hunter.{vehicle_id}.*）与其死信（hunter.{vehicle_id}.*.dlq）在车辆注册时按契约创建；车端接入需 SASL_SSL 9093 与 SCRAM 账号"
   return 0
 }
 

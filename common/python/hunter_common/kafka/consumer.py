@@ -5,8 +5,10 @@
 - **手动提交**：``enable.auto.commit=false``，整批处理（含 DLQ 转投）成功后才 commit；
 - **契约校验**：``schema_name`` 启用后按 ``contracts/kafka/schemas`` 校验消息体，
   非法消息直接进 DLQ（``reason=schema_invalid``，不重试——数据本身不会自愈）；
+  日志必须带字段级明细（``schema_errors``），否则只有 ``[2001]`` 无法归因；
 - **重试 + 死信队列**：handler 失败按 ``kafka_consumer_max_attempts`` 指数退避重试，
   耗尽后转投 ``{topic}.dlq``（``reason=handler_error``，保留原 topic/partition/offset 溯源头）；
+  死信 Topic 尚未创建等情形下转投会**落盘缓冲**（不丢消息），建齐后自动补投；
 - **幂等**：可注入 :class:`IdempotencyGuard` + 幂等键提取函数，重复消息跳过 handler
   （契约 ``defaults.idempotency=required``）；
 - **消费延迟监控**：每批处理完刷新 ``hunter_kafka_consumer_lag``（高水位 - 当前位点，按分区）；
@@ -66,6 +68,21 @@ _MAX_BACKOFF_EXPONENT: Final[int] = 10
 #: 启动之后才创建的，靠全量元数据刷新才能进入订阅集合——5 分钟“已开通但看板无数据”
 #: 会被当成接入故障排查，压到 30s（全量元数据请求开销与百~千量级 Topic 数不成问题）。
 _METADATA_REFRESH_INTERVAL_MS: Final[int] = 30_000
+
+
+def _schema_error_details(exc: BaseException) -> list[str]:
+    """取 Schema/契约校验异常的字段级明细（``validate_message`` 已生成，但 ``__str__`` 不含）。
+
+    ``HunterBaseException.__str__`` 只输出 ``[code] message``，详情存在 ``.details``：
+    不主动取就会造成“报错看得见、原因看不见”（历史故障：车端与契约不一致无法归因）。
+    """
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return []
+    errors = details.get("errors")
+    if not isinstance(errors, list):
+        return []
+    return [str(item) for item in errors]
 
 
 class KafkaConsumerManager:
@@ -289,6 +306,10 @@ class KafkaConsumerManager:
                 partition=message.partition(),
                 offset=message.offset(),
                 error=str(exc),
+                # 字段级明细（前 5 条 “字段路径: 说明”）：只有 [2001] 根本无法归因，
+                # 运维只能猜是车端少字段还是契约错（见 contracts/kafka/README.md 语义登记）
+                schema_errors=_schema_error_details(exc),
+                hint="消息已转投死信队列（或落盘缓冲），可在 DLQ 取回原始报文比对契约",
             )
             await self._send_to_dlq(message, "schema_invalid", exc)
             return
@@ -391,9 +412,11 @@ class KafkaConsumerManager:
     ) -> None:
         """转投死信队列 ``{topic}.dlq``（保留原位置与失败原因，便于排查与人工重放）。
 
-        转投失败/不可用（DLQ 关闭、生产者未初始化、投递异常）时上报
-        ``hunter_kafka_dlq_failed_total`` 指标（审查 Y7）：此路径下消息会随 offset
-        提交而丢失，必须可告警、可人工从日志溯源重放（禁止静默失败）。
+        不得丢消息：转投带 ``buffer_on_error=True``，即使 Topic 尚未创建（``_UNKNOWN_TOPIC``
+        属不可重试错误）也**落盘缓冲**，建齐死信 Topic 后由 ``replay_buffered()`` 补投
+        （生产者 ``close()`` 内置一次尽力补投，无定时轮询：服务优雅停止/重启即触发）。
+        仅当本地缓冲也不可用时才降级为失败：上报 ``hunter_kafka_dlq_failed_total``（审查 Y7）
+        + 错误日志（此路径下消息会随 offset 提交而丢失，必须可告警、可从日志溯源）。
         """
         topic = str(message.topic())
         kafka_metrics.record_dlq(self._service, self._group_id, topic, reason)
@@ -415,24 +438,49 @@ class KafkaConsumerManager:
         ]
         if error is not None:
             detail = f"{type(error).__name__}: {error}"[:_DLQ_ERROR_MAX_CHARS]
+            # 字段级明细同样写进死信头（日后从 DLQ 取回报文即可直接比对哪个字段不符）
+            schema_errors = _schema_error_details(error)
+            if schema_errors:
+                detail = f"{detail} | {'; '.join(schema_errors)}"[:_DLQ_ERROR_MAX_CHARS]
             headers.append((DLQ_ERROR_HEADER, detail.encode("utf-8")))
+        dlq_topic = self._dlq_topic(topic)
         try:
-            await producer.produce(
-                self._dlq_topic(topic),
+            result = await producer.produce(
+                dlq_topic,
                 value=message.value(),
                 key=message.key(),
                 headers=headers,
-            )
-            logger.warning(
-                "kafka_message_sent_to_dlq",
-                topic=topic,
-                partition=message.partition(),
-                offset=message.offset(),
-                reason=reason,
+                buffer_on_error=True,
             )
         except KafkaException:
             kafka_metrics.record_dlq_failed(self._service, self._group_id, topic, reason)
-            logger.exception("kafka_dlq_produce_failed", topic=topic, reason=reason)
+            logger.exception(
+                "kafka_dlq_produce_failed",
+                topic=topic,
+                dlq_topic=dlq_topic,
+                reason=reason,
+                hint="本地缓冲也不可用：消息将随 offset 提交丢失（先确认死信 Topic 已创建、缓冲目录可写）",
+            )
+            return
+        if getattr(result, "status", "delivered") == "buffered":
+            # 死信 Topic 缺失但已落盘：不计失败指标（消息未丢），但必须可告警提醒建 Topic
+            logger.error(
+                "kafka_dlq_message_buffered",
+                topic=topic,
+                dlq_topic=dlq_topic,
+                reason=reason,
+                offset=message.offset(),
+                hint="死信 Topic 不可用，消息已落盘；创建齐 Topic 后重启本服务即自动补投（close 时 replay_buffered）",
+            )
+            return
+        logger.warning(
+            "kafka_message_sent_to_dlq",
+            topic=topic,
+            dlq_topic=dlq_topic,
+            partition=message.partition(),
+            offset=message.offset(),
+            reason=reason,
+        )
 
     def _resolve_producer(self) -> Any | None:
         """DLQ 生产者解析（优先注入替身，其次全局单例；均不可用返回 None）。"""

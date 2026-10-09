@@ -315,10 +315,17 @@ Kafka 契约驱动的生产/消费（共享库 `hunter_common.kafka`）要点：
   契约目录定位顺序：显式 `KAFKA_CONTRACT_DIR` → 工作目录向上查找 → 包位置向上查找（**显式启用校验时契约缺失即 fail fast**，不静默降级）
 - **生产者**：按 Topic 契约 `acks` 选择底层 Producer 实例（telemetry=1 / health=0 / 其余=all）；
   契约 `key=vehicle_id` 的 Topic 强制 key 与消息体一致；`retries=3` + 指数退避（仅可重试错误）；
-  网络中断且重试耗尽时落盘缓冲（上限 1GB，契约 `producer_defaults.local_disk_buffer_bytes`），`replay_buffered()` 重投
-- **消费者**：`schema_name="auto"` 时按消息实际 Topic 校验契约 Schema（非法消息直接进 DLQ，`reason=schema_invalid` 不重试）；
+  网络中断且重试耗尽时落盘缓冲（上限 1GB，契约 `producer_defaults.local_disk_buffer_bytes`），`replay_buffered()` 重投；
+  “不得丢消息”的路径（DLQ 转投）额外传 `buffer_on_error=True`：**不可重试错误也落盘**（典型 `_UNKNOWN_TOPIC`：
+  Topic 尚未创建，补投即成功），仅消息体自身非法/超长除外。⚠ 补投只在生产者 `close()` 里触发（无定时轮询）
+- **消费者**：`schema_name="auto"` 时按消息实际 Topic 校验契约 Schema（非法消息直接进 DLQ，`reason=schema_invalid` 不重试，
+  日志带 `schema_errors=[字段路径: 不符项]` 前 5 条并追入死信头 `dlq.error`，否则只有 `[2001]` 无法归因）；
   handler 失败指数退避重试，耗尽后转投 `{topic}.dlq` 并保留 `dlq.original.topic/partition/offset/reason/error` 头；
   整批处理后手动提交 offset（at-least-once）；可注入 `IdempotencyGuard` 跳过重复消息；每批刷新 `hunter_kafka_consumer_lag`
+- **⚠ 死信 Topic 必须显式创建**：`{topic}.dlq` 派生名不会自动存在（broker 关 `auto.create.topics.enable`），
+  由五处共同保证：`topics.yaml#naming` ↔ `infra/docker/kafka/create-topics.sh` ↔ `infra/k8s/jobs/kafka-init-job.yaml` ↔
+  `scripts/init-kafka.sh`（平台内部 6 + 死信 6）↔ 车辆 provisioning `kafka_admin`（每车 8 源 + 8 死信）；
+  缺失时转投报 `_UNKNOWN_TOPIC`（不可重试）→ 旧版会“报错但仍提交位点”而**静默丢弃**非法消息（`contracts/kafka/README.md` 已登记）
 - **通配订阅转正则**（⚠ 易错点）：librdkafka **只把以 `^` 开头的订阅项当正则**，其余一律视为字面 Topic 名；
   因此契约写法 `hunter.*.telemetry` 下发前必须经 `contracts.subscription_term()` 转成 `^hunter\.[^.]+\.telemetry$`
   （`*` / `{vehicle_id}` → 单层 `[^.]+`，不跨类型段）。直发写法会订阅一个“名字里真带星号”的 Topic，

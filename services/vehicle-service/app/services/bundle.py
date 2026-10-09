@@ -135,11 +135,15 @@ def _resolve_bootstrap() -> str:
 
 
 def _topic_lines(vehicle_id: str) -> str:
-    """从 cert_signer 依赖的 kafka_admin 处读取实际 Topic 清单（懒导入避免循环）。"""
+    """从 cert_signer 依赖的 kafka_admin 处读取实际 Topic 清单（懒导入避免循环）。
+
+    `include_dlq=False`：接入包是给车端的，只列车端生产/消费的 8 个 Topic；
+    死信 Topic 由平台侧 provisioning 一并创建，不属车端接入职责。
+    """
     from app.services.kafka_admin import render_vehicle_topics  # noqa: PLC0415 - 懒导入避免循环
 
     lines = []
-    for t in render_vehicle_topics(vehicle_id):
+    for t in render_vehicle_topics(vehicle_id, include_dlq=False):
         lines.append(
             f"#   {t['name']}    partitions={t['partitions']}, retention={t['retention_ms'] / 86_400_000:.1f}d"
         )

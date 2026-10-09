@@ -90,7 +90,9 @@ def get_provisioner(request: Request) -> Provisioner:
 # =====================================================================
 def _topics_preview(vehicle_id: str) -> list[str]:
     try:
-        return [t["name"] for t in kafka_admin.render_vehicle_topics(vehicle_id)]
+        # include_dlq=False：预览只给车端需要生产/消费的 8 个 Topic（契约 x-hunter-kafka）；
+        # 死信 Topic 属平台内部运维资源，车端无需知道
+        return [t["name"] for t in kafka_admin.render_vehicle_topics(vehicle_id, include_dlq=False)]
     except Exception:  # noqa: BLE001 - 详情视图不应因契约加载失败而整体 500
         return []
 

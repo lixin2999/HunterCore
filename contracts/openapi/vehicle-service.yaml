@@ -582,6 +582,9 @@ x-hunter-kafka:
   admin_client: kafka-python 2.1+（KIP-95 AlterUserScramCredentials + create_topics）
   per_vehicle_topics:
     # 与 contracts/kafka/topics.yaml 车辆 Topic 条目严格一致（8 个/车）
+    # ⚠ 实际创建集合 = 下列 8 个 + 按 topics.yaml#naming.dlq_pattern 派生的 8 个死信 Topic
+    #   （hunter.{vehicle_id}.<type>.dlq：分区继承源 Topic、保留取 naming.dlq_retention_ms）；
+    #   broker 关 auto.create.topics.enable，死信 Topic 不显式创建则非法消息转投必失败并被静默丢弃
     - hunter.{vehicle_id}.telemetry        # 6 分区, 7d
     - hunter.{vehicle_id}.event            # 3 分区, 30d
     - hunter.{vehicle_id}.health           # 3 分区, 7d
@@ -594,6 +597,9 @@ x-hunter-kafka:
   produces: []
   consumes: []
   note: 本服务不参与业务 Topic 生产/消费，仅在 provisioning 时执行控制面操作
+  dlq_creation: |
+    每车 8 个 .dlq 由本服务创建（平台内部 Topic 的死信由 create-topics.sh / init-kafka.sh 创建）；
+    命名与保留期仍不属本服务决策，一律读 contracts/kafka/topics.yaml#naming。
 
 x-hunter-provisioning:
   description: 一键开通 4 步编排（顺序固定，失败逆序回滚）
@@ -605,8 +611,8 @@ x-hunter-provisioning:
       action: AdminClient.alter_user_scram_credentials UPSERT (vehicle_id, generated_password)
       rollback: AdminClient.alter_user_scram_credentials REMOVE
     - name: topics
-      action: 按 x-hunter-kafka.per_vehicle_topics 创建 8 个 Topic（幂等 --if-not-exists 语义）
-      rollback: AdminClient.delete_topics（仅删除本次新建，不删既有）
+      action: 按 x-hunter-kafka.per_vehicle_topics 创建 8 个 Topic + 8 个派生死信 Topic（共 16，幂等 --if-not-exists 语义）
+      rollback: AdminClient.delete_topics（仅删除本次新建，不删既有；含死信 Topic）
     - name: cert
       action: openssl 签发 client-key/cert，转 p12；写入 VEHICLE_CERTS_DIR/{vehicle_id}/
       rollback: 删除本次产物目录（保留其它车辆）

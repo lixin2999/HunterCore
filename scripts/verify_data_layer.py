@@ -7,7 +7,8 @@
   3. DDL CHECK 枚举 ↔ hunter_common.database.enums 受控词表一致
   4. TimescaleDB hypertable 契约（1 day 分块 / 90 天保留）在 DDL、迁移、代码常量三处一致
   5. Alembic 离线 SQL 可生成（无需数据库），包含全部 13 张表与 hypertable/保留策略语句
-  6. Kafka Topic 契约三处同步（contracts/kafka/topics.yaml、docker create-topics.sh、K8s kafka-init Job）
+  6. Kafka Topic 契约四方同步（contracts/kafka/topics.yaml、docker create-topics.sh、
+     K8s kafka-init Job、scripts/init-kafka.sh）+ 死信 Topic（{topic}.dlq）创建责任逐项比对
   7. JSON Schema（draft-07）：结构合法、required 非空、examples 通过自身校验
   8. consumer-groups.yaml 消费的 Topic 均已登记、消费者组 ID 唯一
   9. Redis 键契约（contracts/database/redis-keys.yaml）↔ 各服务 x-hunter-service.redis_keys
@@ -42,6 +43,8 @@ KAFKA_CONTRACT_DIR = ROOT / "contracts" / "kafka"
 SCHEMA_DIR = KAFKA_CONTRACT_DIR / "schemas"
 COMPOSE_TOPICS_SCRIPT = ROOT / "infra" / "docker" / "kafka" / "create-topics.sh"
 K8S_TOPICS_JOB = ROOT / "infra" / "k8s" / "jobs" / "kafka-init-job.yaml"
+INIT_KAFKA_SCRIPT = ROOT / "scripts" / "init-kafka.sh"
+VEHICLE_KAFKA_ADMIN = ROOT / "services" / "vehicle-service" / "app" / "services" / "kafka_admin.py"
 ALEMBIC_INI = ROOT / "common" / "python" / "alembic.ini"
 SERVICE_CONTRACT_DIR = ROOT / "contracts" / "openapi"
 ORM_MAPPING_CONTRACT = DB_CONTRACT_DIR / "orm-mapping.md"
@@ -794,16 +797,72 @@ def check_write_path_and_window_contract() -> None:
 
 
 def parse_create_topic_calls(text: str) -> dict[str, tuple[int, int]]:
-    """解析 ``create_topic "<name>" <partitions> <retention_ms>`` 调用（docker 脚本与 K8s Job 同格式）。"""
-    pattern = re.compile(r'create_topic\s+"([\w.]+)"\s+(\d+)\s+(\d+)')
+    """解析 ``create_topic "<name>" <partitions> <retention_ms>`` 调用（docker 脚本与 K8s Job 同格式）。
+
+    保留期允许写成 shell 变量（死信 Topic 统一用 "$DLQ_RETENTION_MS"）：先按同文件内的
+    ``NAME=数字`` 赋值展开，再匹配 —— 否则变量形式的调用会被静默漏过，校验形同不存在。
+    """
+    assigns = dict(re.findall(r"^[ \t]*([A-Z][A-Z0-9_]*)=(\d+)\b", text, re.MULTILINE))
+
+    def _expand(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return assigns.get(name, match.group(0))
+
+    expanded = re.sub(r"\$\{([A-Z][A-Z0-9_]*)\}|\$([A-Z][A-Z0-9_]*)", _expand, text)
+    pattern = re.compile(r'create_topic\s+"([\w.]+)"\s+(\d+)\s+"?(\d+)"?')
     return {
         name: (int(partitions), int(retention))
-        for name, partitions, retention in pattern.findall(text)
+        for name, partitions, retention in pattern.findall(expanded)
+    }
+
+
+def parse_init_kafka_specs(text: str, dlq_pattern: str) -> dict[str, tuple[int, int]]:
+    """解析 scripts/init-kafka.sh 的 Topic 集合：TOPIC_SPECS 字面项 + 循环派生的死信项。
+
+    该脚本不逐条写死 `.dlq`，而是从 TOPIC_SPECS 派生（分区继承、保留取 DLQ_RETENTION_MS），
+    因此校验必须重演同样的派生逻辑，否则无法发现“派生集与契约不一致”。
+    """
+    block = re.search(r"TOPIC_SPECS=\((.*?)\n\)", text, re.DOTALL)
+    if block is None:
+        fail("scripts/init-kafka.sh 未找到 TOPIC_SPECS 定义块")
+        return {}
+    specs: dict[str, tuple[int, int]] = {}
+    for name, partitions, retention in re.findall(r'"([\w.]+):(\d+):(\d+)"', block.group(1)):
+        specs[name] = (int(partitions), int(retention))
+    dlq_retention = re.search(r"^DLQ_RETENTION_MS=(\d+)\b", text, re.MULTILINE)
+    if dlq_retention is None:
+        fail("scripts/init-kafka.sh 未定义 DLQ_RETENTION_MS（死信保留期不得靠默认值）")
+        return specs
+    if ".dlq:" not in text or "${DLQ_RETENTION_MS}" not in text:
+        fail("scripts/init-kafka.sh 未见死信 Topic 派生逻辑（${spec%%:*}.dlq + ${DLQ_RETENTION_MS}）")
+        return specs
+    for name, (partitions, _retention) in list(specs.items()):
+        specs[dlq_pattern.format(original_topic=name)] = (partitions, int(dlq_retention.group(1)))
+    return specs
+
+
+def expected_dlq_set(
+    naming: dict[str, Any], sources: dict[str, tuple[int, int]]
+) -> dict[str, tuple[int, int]]:
+    """按契约 naming 段从源 Topic 派生期望的死信集合（名称 / 分区继承 / 保留期）。"""
+    pattern = str(naming.get("dlq_pattern") or "")
+    retention = naming.get("dlq_retention_ms")
+    if "{original_topic}" not in pattern:
+        fail(f"DLQ 命名必须为 {{original_topic}}.dlq，当前={pattern!r}")
+        return {}
+    if not isinstance(retention, int) or retention <= 0:
+        fail(f"naming.dlq_retention_ms 必须为正整数毫秒，当前={retention!r}")
+        return {}
+    if naming.get("dlq_partitions_inherit_source") is not True:
+        fail("naming.dlq_partitions_inherit_source 必须为 true（分区继承源 Topic）")
+    return {
+        pattern.format(original_topic=name): (partitions, retention)
+        for name, (partitions, _retention) in sources.items()
     }
 
 
 def check_kafka_topics() -> dict[str, Any]:
-    """校验 6：Kafka Topic 契约三处同步（契约 / docker 脚本 / K8s Job）。"""
+    """校验 6：Kafka Topic 契约四方同步（契约 / docker 脚本 / K8s Job / init-kafka.sh）+ 死信 Topic 创建责任。"""
     topics = load_yaml(KAFKA_CONTRACT_DIR / "topics.yaml")
     before = len(failures)
 
@@ -874,21 +933,41 @@ def check_kafka_topics() -> dict[str, Any]:
         fail(f"Schema 待定 Topic 集合异常: {sorted(tbd_actual)}（期望 {sorted(tbd_allowed)}）")
 
     compose_calls = parse_create_topic_calls(COMPOSE_TOPICS_SCRIPT.read_text(encoding="utf-8"))
-    if compose_calls != EXPECTED_PLATFORM_TOPICS:
-        fail(f"infra/docker/kafka/create-topics.sh 与契约不一致: {compose_calls}")
 
     k8s_script = ""
     for doc in yaml.safe_load_all(K8S_TOPICS_JOB.read_text(encoding="utf-8")):
         if doc and doc.get("kind") == "ConfigMap":
             k8s_script = (doc.get("data") or {}).get("create-topics.sh", "")
     k8s_calls = parse_create_topic_calls(k8s_script)
-    if k8s_calls != EXPECTED_PLATFORM_TOPICS:
+
+    # ---- 死信 Topic 创建责任（broker 不自动建 Topic：缺 .dlq 时非法消息被静默丢弃） ----
+    expected_platform_dlq = expected_dlq_set(naming, EXPECTED_PLATFORM_TOPICS)
+    expected_platform_all = {**EXPECTED_PLATFORM_TOPICS, **expected_platform_dlq}
+    missing_dlq = sorted(set(expected_platform_dlq) - set(compose_calls))
+    if missing_dlq:
+        fail(f"create-topics.sh 未创建平台死信 Topic: {missing_dlq}")
+    if compose_calls != expected_platform_all:
+        fail(f"infra/docker/kafka/create-topics.sh 与契约不一致: {compose_calls}")
+    if k8s_calls != expected_platform_all:
         fail(f"infra/k8s/jobs/kafka-init-job.yaml 与契约不一致: {k8s_calls}")
+
+    init_kafka_specs = parse_init_kafka_specs(
+        INIT_KAFKA_SCRIPT.read_text(encoding="utf-8"), str(naming.get("dlq_pattern") or "")
+    )
+    if init_kafka_specs != expected_platform_all:
+        fail(f"scripts/init-kafka.sh 与契约不一致: {init_kafka_specs}")
+
+    # 车端死信 Topic 由 provisioning 派生：kafka_admin 必须读契约 naming 段（不得写死后缀/保留期）
+    admin_src = VEHICLE_KAFKA_ADMIN.read_text(encoding="utf-8")
+    for token in ("dlq_pattern", "dlq_retention_ms", "dlq_partitions_inherit_source"):
+        if token not in admin_src:
+            fail(f"vehicle-service kafka_admin 未按契约派生每车死信 Topic（未读取 naming.{token}）")
 
     if len(failures) == before:
         ok(
             f"Kafka Topic 契约一致（车端 {len(vehicle_topics)} + 平台 {len(platform_topics)}，"
-            "topics.yaml ↔ create-topics.sh ↔ kafka-init Job）"
+            f"含死信 {len(expected_platform_dlq)} 项：topics.yaml ↔ create-topics.sh ↔ kafka-init Job "
+            "↔ init-kafka.sh ↔ provisioning 派生）"
         )
     return topics
 

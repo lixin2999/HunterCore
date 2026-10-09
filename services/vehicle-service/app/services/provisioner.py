@@ -5,7 +5,7 @@
 步骤（顺序固定）：
   1. **db**     INSERT vehicle_svc.vehicles（初始 provision_status 骨架，各步 pending）
   2. **scram**  AdminClient UPSERT SCRAM-SHA-512 用户（username=vehicle_id，口令服务端生成）
-  3. **topics** AdminClient 创建 8 个 `hunter.{vehicle_id}.*` Topic
+  3. **topics** AdminClient 创建 8 个 `hunter.{vehicle_id}.*` Topic + 8 个对应死信 `.dlq`
   4. **cert**   openssl 签发每车独立客户端证书（key/cert/p12），落 VEHICLE_CERTS_DIR/{id}/
 
 失败处理：
@@ -329,7 +329,7 @@ class Provisioner:
         if self._admin is not None:
             await self._admin.delete_scram_user(vehicle_id)
             summary["scram_removed"] = True
-        # 3) Topic（可选）
+        # 3) Topic（可选：含死信 Topic，render 默认 include_dlq=True —— 开通建了的必须能下线回收）
         if purge_topics and self._admin is not None:
             names = [t["name"] for t in kafka_admin.render_vehicle_topics(vehicle_id)]
             summary["topics_removed"] = await self._admin.delete_topics(names)

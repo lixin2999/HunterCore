@@ -4,6 +4,8 @@
 # - 与 infra/docker/kafka/create-topics.sh 保持同步（差异：RF=3 集群、SASL_SSL 客户端配置）
 # - 应用顺序：statefulsets/kafka.yaml 就绪后执行（脚本内置等待循环）
 # ⚠ 车端 Topic（hunter.{vehicle_id}.*）在车辆注册时按契约创建，不在此处创建
+# ⚠ 死信 Topic（{topic}.dlq）一并显式创建（broker 关 auto.create.topics.enable，
+#   转投不存在的 DLQ 属不可重试错误 → 非法消息会被静默丢弃），与 create-topics.sh 同步
 # =====================================================================
 apiVersion: v1
 kind: ConfigMap
@@ -61,6 +63,15 @@ data:
     create_topic "sensor_file"        3 604800000
     create_topic "analytics_result"   6 2592000000
     create_topic "alert_event"        3 2592000000
+
+    # ---- 死信队列（分区继承源 Topic，保留 30 天：contracts/kafka/topics.yaml#naming.dlq_retention_ms） ----
+    DLQ_RETENTION_MS=2592000000
+    create_topic "telemetry_raw.dlq"      12 "$DLQ_RETENTION_MS"
+    create_topic "telemetry_clean.dlq"    12 "$DLQ_RETENTION_MS"
+    create_topic "event_raw.dlq"           6 "$DLQ_RETENTION_MS"
+    create_topic "sensor_file.dlq"         3 "$DLQ_RETENTION_MS"
+    create_topic "analytics_result.dlq"    6 "$DLQ_RETENTION_MS"
+    create_topic "alert_event.dlq"         3 "$DLQ_RETENTION_MS"
 
     echo "[kafka-init] platform topics ready:"
     kafka_topics --list

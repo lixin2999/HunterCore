@@ -99,7 +99,7 @@ async def demo(db: AsyncSession) -> None:
 pytest common/python/tests/test_kafka_contracts.py -q     # Kafka Topic / 消费者组 / 11 个消息 Schema
 pytest common/python/tests/test_storage_contracts.py -q   # Redis Key / MinIO Bucket ↔ 服务声明 ↔ 初始化脚本
 pytest common/python/tests/test_orm_relationships.py -q   # ORM 关系 + Repository 专属方法双向契约
-python scripts/verify_data_layer.py                       # 32 项数据层契约校验（含校验 9 Redis / 10 MinIO / 13b 专属方法）
+python scripts/verify_data_layer.py                       # 34 项数据层契约校验（含校验 9 Redis / 10 MinIO / 13b 专属方法）
 ```
 
 ## Kafka 契约驱动生产/消费（用法）
@@ -116,7 +116,7 @@ producer = KafkaProducerManager.initialize(settings)
 result = await producer.publish_payload(
     "sensor_file", payload, contract_required=True
 )   # result.status ∈ {"delivered", "buffered"}
-await producer.replay_buffered()        # 链路恢复后重投磁盘缓冲
+await producer.replay_buffered()        # 链路恢复后重投磁盘缓冲（close() 已内置一次，无定时轮询）
 await producer.close()                  # 先尽力重投缓冲，再 flush
 
 # --- 消费者：契约校验（非法消息进 DLQ）+ 手动提交 + 重试 + 幂等 + 积压指标 ---
@@ -132,6 +132,18 @@ consumer = KafkaConsumerManager(
 await consumer.run(handler)                   # handler(message, value) 抛异常 → 重试耗尽后 DLQ
 consumer.stop()                               # 优雅停机
 ```
+
+“不得丢消息”的投递路径（典型：消费侧 DLQ 转投）请显式开强制落盘：
+`await producer.produce(topic=dlq_topic, value=raw, key=key, headers=headers, buffer_on_error=True)`
+——不可重试错误也落盘，`result.status == "buffered"` 即消息已保全（目标 Topic 建齐后补投）。
+
+普通 `produce/publish_payload` 仅在**可重试**错误耗尽时落盘；`_UNKNOWN_TOPIC`、`MSG_SIZE_TOO_LARGE`、`_INVALID_ARG`
+属不可重试错误。DLQ 转投之所以必须强制落盘：broker 关 `auto.create.topics.enable`，`{topic}.dlq` 不预先创建就
+永远报 `_UNKNOWN_TOPIC`（只尝试 1 次）——旧行为是“报错但仍提交位点”，等于静默丢弃非法消息（语义登记见
+`contracts/kafka/README.md`；创建责任五方比对见 `scripts/verify_data_layer.py`）。
+
+Schema 不符不只有 `[2001]`：`kafka_message_schema_invalid` 日志带 `schema_errors=["字段路径: 不符项", …]`（前 5 条），
+并追入死信消息头 `dlq.error`；归因时先看这两个明细（`KafkaMessageSchemaError.details["errors"]`），再定“改车端”还是“改契约”。
 
 契约目录定位顺序：显式 `KAFKA_CONTRACT_DIR` → 工作目录向上查找 → 包位置向上查找
 （`get_contract(required=True)` 在契约缺失时 fail fast，禁止静默跳过校验）。

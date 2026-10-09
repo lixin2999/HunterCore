@@ -59,7 +59,7 @@ Topic 命名规范：`<domain>.<entity>.<type>`，全小写，点分隔；车端
    `producer.py` 契约 acks/重试/本地磁盘缓冲 · `consumer.py` 手动提交/Schema 校验→DLQ/重试/积压指标 ·
    `buffer.py` 磁盘缓冲 · `idempotency.py` 幂等守卫 · `metrics.py` 指标）
 
-校验命令：`python scripts/verify_data_layer.py`（含 Topic 清单四处一致性与 Schema/examples 校验）。
+校验命令：`python scripts/verify_data_layer.py`（含 Topic 清单一致性与 Schema/examples 校验；死信 Topic 创建责任五方比对：topics.yaml naming ↔ create-topics.sh ↔ kafka-init Job ↔ init-kafka.sh ↔ provisioning 派生）。
 
 ## 实现侧语义登记（本契约未显式定义、由共享库统一的约定）
 
@@ -72,6 +72,9 @@ Topic 命名规范：`<domain>.<entity>.<type>`，全小写，点分隔；车端
 | 消费 Schema 校验 | `schema_name="auto"` 按消息实际 Topic 解析 Schema；非法消息直接 DLQ（`reason=schema_invalid`，不重试）；契约外 Topic 告警后放行 | `consumer.KafkaConsumerManager._decode_and_validate` |
 | 消费重试 | handler 异常按 `KAFKA_CONSUMER_MAX_ATTEMPTS` 指数退避重试，耗尽转 DLQ（`reason=handler_error`） | `consumer.KafkaConsumerManager._invoke_handler` |
 | DLQ 消息头 | `dlq.original.topic` / `dlq.partition` / `dlq.offset` / `dlq.reason` / `dlq.error`（错误信息截断 500 字符） | `consumer.KafkaConsumerManager._send_to_dlq` |
+| **DLQ Topic 必须显式创建** | broker 关 `auto.create.topics.enable`，派生名 `{topic}.dlq` **不会自动存在**。创建集合 = 全部平台内部 Topic（`create-topics.sh` / `init-kafka.sh`）**+ 每车 8 个车端 Topic**（车辆 provisioning `kafka_admin`），分区继承源 Topic、保留取 `naming.dlq_retention_ms`。缺失时转投报 `_UNKNOWN_TOPIC`（**属不可重试错误**），非法消息会随 offset 提交被静默丢弃——“DLQ 开关开着但死信无处可送”比不开关更危险 | `infra/docker/kafka/create-topics.sh` · `scripts/init-kafka.sh` · `services/vehicle-service/app/services/kafka_admin.py`（三方由 `verify_data_layer.py` 比对） |
+| DLQ 转投失败不丢消息 | 转投失败（Topic 缺失/生产异常）→ **落盘缓冲**（与普通投递不同：不可重试错误也缓冲，仅“消息体本身非法/超长”除外），DLQ Topic 建齐后由 `replay_buffered()` 补投（**在生产者 `close()` 里触发、无定时轮询**：运维上表现为“重启该服务即补投”）；落盘时记 `kafka_dlq_message_buffered`（**不计** `hunter_kafka_dlq_failed_total`，消息未丢），仅本地缓冲也不可用时才记 `kafka_produce_buffer_unavailable` + `kafka_dlq_produce_failed` 并计入失败指标。**不得靠“照常提交 offset”把丢弃当默认行为** | `producer.KafkaProducerManager.produce(buffer_on_error=True)` · `consumer._send_to_dlq` |
+| Schema 不符必须留字段明细 | `KafkaMessageSchemaError.details["errors"]`（前 5 条 `字段路径: 说明`）**必须进日志**——只有 `[2001] 消息不符合契约 Schema` 无法定位，运维只能猜（历史故障：车端与契约不一致却无法归因） | `contracts.KafkaContract.validate_message` · `consumer._handle_message` |
 | 消费幂等 | `IdempotencyGuard.claim()` 返回 True 才执行 handler；键由各消费组 `idempotency_key` 派生（`compose()` 归一为 sha256） | `idempotency.IdempotencyGuard` |
 | 消费积压指标 | 批次提交后刷新 `hunter_kafka_consumer_lag`（高水位 - 位点，按分区） | `consumer.KafkaConsumerManager._refresh_lag` |
 | 订阅写法→正则 | `consumer-groups.yaml` 的 `subscribes: ["hunter.*.telemetry"]` 是**契约写法**（`*` = vehicle_id）。librdkafka 仅把**以 `^` 开头**的订阅项当正则，否则视为字面 Topic 名，所以实现侧必须转正则下发：`*` / `{vehicle_id}` → `[^.]+`（单层，不跨越类型段）并加 `^…$` 锚点；已以 `^` 开头的入参原样下发（不二次转义）。服务**不得自行拼正则**（历史例外：ota-service / remote-control 直接配了 `^…$`，仍可正常工作） | `contracts.subscription_term` · `consumer.KafkaConsumerManager.subscription_terms` |
