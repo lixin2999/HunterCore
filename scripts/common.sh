@@ -356,6 +356,18 @@ hc_rand_hex() {
   openssl rand -hex "$bytes"
 }
 
+# hc_cert_san_entries <证书.pem>：输出证书 SAN 条目（每行一条，统一为 IP:x / DNS:x）
+# 不同 openssl 版本写法不一致（1.x “IP Address:x”、3.x “IP:x”、部分构建“IPAddress:x”），
+# 不归一就会把已存在的地址误判为缺失（例：反复重签 broker 证书），故在此统一归一。
+hc_cert_san_entries() {
+  local pem="${1:-}"
+  [ -f "$pem" ] || return 0
+  command_exists openssl || return 0
+  openssl x509 -in "$pem" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr -d ' \r' |
+    tr ',' '\n' | sed -E 's/^IP[[:space:]]*Address:/IP:/I' | sed '/^$/d' || true
+  return 0
+}
+
 # hc_log_begin：创建日志文件与目录（幂等，权限 640；不可写时静默降级）
 hc_log_begin() {
   [ "${HC_LOG_TO_FILE:-1}" = "1" ] || return 0

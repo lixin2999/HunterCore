@@ -60,7 +60,7 @@ usage() {
 HunterCore 全栈健康检查脚本
 
 用途：
-  检查 10 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
+  检查 12 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
   退出码：0=全部通过，1=有告警，2=有失败。
 
 用法：
@@ -78,7 +78,8 @@ HunterCore 全栈健康检查脚本
 
 检查项：
   容器状态/Docker healthcheck、服务 HTTP 探针、PostgreSQL、TimescaleDB、Redis、
-  Kafka Topic 数、MinIO Bucket 数、/data 磁盘使用率、内存使用率、Kafka 消费积压。
+  Kafka Topic 数、MinIO Bucket 数、/data 磁盘使用率、内存使用率、Kafka 消费积压、
+  配置漂移硬闸、车端接入证书（broker 证书 SAN 与有效期）。
 EOF
 }
 
@@ -424,7 +425,58 @@ check_compose_override() {
   return 0
 }
 
-# run_all_health_checks：执行全部 11 类检查（供 daily-check 与 main 复用）
+# ⑫ 车端接入证书（车端 9093 可用前提）：broker 证书 SAN 覆盖接入地址 + 有效期预警
+check_kafka_broker_cert() {
+  local cert_dir broker_cert ca_cert san_entries san_flat name f enddate end_epoch days_left
+  local warn_days=30
+  cert_dir="${KAFKA_CERTS_DIR:-${APP_DIR}/certs/kafka}"
+  broker_cert="${cert_dir}/broker-cert.pem"
+  ca_cert="${cert_dir}/ca-cert.pem"
+
+  if ! command_exists openssl; then
+    record_result "WARN" "车端接入证书" "缺少 openssl，无法校验 broker 证书 SAN 与有效期"
+    return 0
+  fi
+  if [ ! -f "$broker_cert" ]; then
+    record_result "FAIL" "车端接入证书" "缺少 ${broker_cert}：bash ${GEN_KAFKA_CERTS_SH} --ip <服务器IP> 生成"
+    return 0
+  fi
+
+  # SAN 必须含车端实际访问地址（openssl 写法差异由 hc_cert_san_entries 归一）
+  san_entries="$(hc_cert_san_entries "$broker_cert")"
+  san_flat="$(printf '%s' "$san_entries" | tr '\n' ' ')"
+  if [ -z "${SERVER_IP:-}" ] || [ "${SERVER_IP:-}" = "CHANGE_ME_SERVER_IP" ]; then
+    record_result "WARN" "车端接入证书 SAN" ".env SERVER_IP 未配置，无法比对（现有 SAN：${san_flat}）"
+  elif printf '%s\n' "$san_entries" | grep -qxF "IP:${SERVER_IP}"; then
+    record_result "PASS" "车端接入证书 SAN" "含车端接入地址 ${SERVER_IP}（SAN：${san_flat}）"
+  else
+    record_result "FAIL" "车端接入证书 SAN" "不含 ${SERVER_IP}（SAN：${san_flat}）→ 车端 TLS 主机名校验失败、连不上 9093；修复：bash ${GEN_KAFKA_CERTS_SH} --ip ${SERVER_IP} --broker-only（复用 CA，车端无需换证书）后重启 kafka（改过 SERVER_IP 需 up -d --force-recreate kafka）"
+  fi
+
+  # 有效期（到期前 30 天 WARN；已过期 FAIL）
+  for f in "$broker_cert" "$ca_cert"; do
+    [ -f "$f" ] || continue
+    name="broker"
+    [ "$f" = "$ca_cert" ] && name="CA"
+    enddate="$(openssl x509 -in "$f" -noout -enddate 2>/dev/null | cut -d= -f2-)"
+    end_epoch="$(date -d "${enddate:-1970-01-01}" +%s 2>/dev/null || printf '-1')"
+    if [ "$end_epoch" = "-1" ]; then
+      record_result "WARN" "车端接入证书有效期（${name}）" "无法解析 notAfter：${enddate:-<空>}"
+      continue
+    fi
+    days_left=$(( (end_epoch - $(date +%s)) / 86400 ))
+    if [ "$days_left" -le 0 ]; then
+      record_result "FAIL" "车端接入证书有效期（${name}）" "已过期（notAfter：${enddate}）：重签后重启 kafka 并同步车端"
+    elif [ "$days_left" -le "$warn_days" ]; then
+      record_result "WARN" "车端接入证书有效期（${name}）" "剩余 ${days_left} 天（${enddate}）：见运维手册证书更新章节"
+    else
+      record_result "PASS" "车端接入证书有效期（${name}）" "剩余 ${days_left} 天（${enddate}）"
+    fi
+  done
+  return 0
+}
+
+# run_all_health_checks：执行全部 12 类检查（供 daily-check 与 main 复用）
 run_all_health_checks() {
   check_compose_override
   check_containers
@@ -436,6 +488,7 @@ run_all_health_checks() {
   check_disk_usage
   check_memory_usage
   check_kafka_lag
+  check_kafka_broker_cert
   return 0
 }
 

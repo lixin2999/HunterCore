@@ -1123,17 +1123,10 @@ step_4_gen_config() {
 # Step 5：生成 Kafka SASL_SSL 证书
 # =====================================================================
 step_5_gen_certs() {
-  local env_file cert_dir broker_cert
+  local env_file cert_dir broker_cert san_entries
   env_file="${ENV_FILE_ARG:-${HUNTER_ENV_FILE:-${APP_DIR}/.env}}"
   load_env "$env_file" || return 1
   cert_dir="${KAFKA_CERTS_DIR:-${APP_DIR}/certs/kafka}"
-
-  # 幂等：keystore/truststore 齐备即跳过（重新签发用 gen-kafka-certs.sh --force）
-  if [ -f "${cert_dir}/kafka.keystore.jks" ] && [ -f "${cert_dir}/kafka.truststore.jks" ]; then
-    log_info "Kafka 证书已存在（${cert_dir}），跳过生成（幂等）"
-    log_info "如需重新签发（例如 SERVER_IP 变更）：bash ${GEN_KAFKA_CERTS_SH} --force"
-    return 0
-  fi
 
   # SERVER_IP 必须已配置：证书 SAN 与 Kafka advertised.listeners 都依赖它
   if ! require_env SERVER_IP; then
@@ -1157,21 +1150,35 @@ step_5_gen_certs() {
   if [ -n "$OPT_IP" ]; then
     args+=(--ip "$OPT_IP")
   fi
+  # 非交互模式下让证书脚本的确认步骤自动通过（SAN 漂移自愈需无人值守）
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    args+=(-y)
+  fi
+  # 证书脚本自身幂等：JKS 齐备且 SAN 覆盖全部地址 → 跳过；
+  # SAN 缺地址（典型：服务器换 IP）→ 复用 CA 仅重签 broker 证书（车端信任链不变）。
+  # 此处不再“见 JKS 就跳过”，否则会带着旧 SAN 进入 Step 7，车端 9093 永远连不上。
   hc_run_logged "生成 Kafka SASL_SSL 证书" bash "$GEN_KAFKA_CERTS_SH" "${args[@]}" || {
-    log_error "Kafka 证书生成失败；常见原因：openssl/keytool 缺失、${cert_dir} 不可写"
+    log_error "Kafka 证书生成失败；常见原因：openssl/keytool 缺失、${cert_dir} 不可写、CA 私钥丢失"
     return 1
   }
 
-  # 校验证书 SAN 是否含真实 SERVER_IP（车端以 SERVER_IP 连接 9093，SAN 不匹配会握手中断）
+  # 交付前硬校验：broker 证书 SAN 必须含 SERVER_IP（车端 https 主机名校验只比 SAN，缺则连不上 9093）
+  # SAN 写法随 openssl 版本不同，统一走 common.sh 的 hc_cert_san_entries 归一后再比对
   broker_cert="${cert_dir}/broker-cert.pem"
-  if [ -f "$broker_cert" ] && command_exists openssl; then
-    if openssl x509 -in "$broker_cert" -noout -ext subjectAltName 2>/dev/null | grep -qF "IP Address:${SERVER_IP}"; then
+  if command_exists openssl && [ -f "$broker_cert" ]; then
+    san_entries="$(hc_cert_san_entries "$broker_cert")"
+    if printf '%s\n' "$san_entries" | grep -qxF "IP:${SERVER_IP}"; then
       log_success "broker 证书 SAN 已包含 SERVER_IP=${SERVER_IP}"
     else
-      log_warn "broker 证书 SAN 未包含 ${SERVER_IP}：请执行 bash ${GEN_KAFKA_CERTS_SH} --force --ip ${SERVER_IP} 重新签发"
+      log_error "broker 证书 SAN 不含 ${SERVER_IP}（当前 SAN：$(printf '%s ' "$san_entries")）"
+      log_error "车端以 ${SERVER_IP}:9093 接入会因主机名/SAN 校验失败而连不上（属 Broker 侧证书问题，车端改不了）"
+      log_error "修复后重跑 --step 5："
+      log_error "  sudo bash ${GEN_KAFKA_CERTS_SH} --ip ${SERVER_IP} --broker-only    # 复用 CA，车端无需换证书"
+      log_error "  多个接入地址（内网 + 公网）：--ip <主地址> --san-ip <次地址>，或写入 ${env_file} 的 KAFKA_CERT_SAN_IPS"
+      return 1
     fi
   fi
-  log_success "Kafka 证书生成完成：${cert_dir}（私钥 600；JKS 组 1001 可读 640）"
+  log_success "Kafka 证书就绪：${cert_dir}（私钥 600；JKS 组 1001 可读 640）"
 }
 
 # =====================================================================
