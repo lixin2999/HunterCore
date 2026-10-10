@@ -209,6 +209,9 @@ ruff check tests common/python services           # Lint（CI 同款命令）
   状态跃迁与离线判定立即写、稳态按 `VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS`（默认 30s）合并；
   开关 `VEHICLE_LEDGER_WRITE_ENABLED`（默认开）；回写失败只记 WARN
   （`vehicle_ledger_*_write_failed`），不影响采集链路。
+- **消费任务健壮性**（V1.18.14）：观测/指标旁路（如 `_refresh_lag` 积压采样）任何异常都不得冒泡终止消费主循环；
+  三个消费任务各由 `_SupervisedConsumer` 监督——崩溃时记录完整堆栈并以 factory 重建、退避 5s 自动重启
+  （`Consumer.run()` 的 `finally` 会关闭底层实例，崩溃后不可复用，故重建而非重跑），避免“进程/探针全绿但消费静默停摆”。
 - **运行时契约**：消费侧 Schema 校验（`schema_name="auto"`）需要契约目录可访问，
   集群内由 `hunter-contracts` ConfigMap 挂载（生成/校验：
   `python scripts/generate_contracts_configmap.py [--check]`）。

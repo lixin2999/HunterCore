@@ -111,9 +111,13 @@ class FakeConsumer:
     ) -> tuple[int, int]:
         return 0, self._high
 
-    def position(self, partitions: list[TopicPartition]) -> list[int]:
-        """与 confluent-kafka 一致：传分区列表返回位点列表。"""
-        return [self._position for _ in partitions]
+    def position(self, partitions: list[TopicPartition]) -> list[TopicPartition]:
+        """与 confluent-kafka 运行时一致：传分区列表→返回 ``.offset`` 已填充的 TopicPartition 列表。
+
+        ⚠ 历史教训：旧实现返回 ``list[int]``（与生产代码同一错误假设），导致
+        ``_refresh_lag`` 对 ``TopicPartition`` 取整抛 ``TypeError`` 的 bug 被 Mock 掩盖。
+        """
+        return [TopicPartition(tp.topic, tp.partition, self._position) for tp in partitions]
 
     def close(self) -> None:
         self.closed = True

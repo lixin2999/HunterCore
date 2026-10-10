@@ -23,7 +23,7 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, Final, cast
+from typing import Any, Final
 
 from confluent_kafka import Consumer, KafkaError, KafkaException, Message
 
@@ -501,31 +501,37 @@ class KafkaConsumerManager:
             logger.error("kafka_commit_failed", error=str(exc))
 
     def _refresh_lag(self) -> None:
-        """刷新分区消费积压（高水位 - 当前位点）；批次提交后调用，失败不影响消费。"""
+        """刷新分区消费积压（高水位 - 当前位点）；批次提交后调用，失败不影响消费。
+
+        ⚠ 本方法是**纯观测**（Prometheus 积压指标），任何异常都不得冒泡到 ``run()`` 主循环——
+        否则一次指标计算失败会杀死整个消费者（历史故障：``position()`` 返回 ``TopicPartition``
+        对象被误当 int 取整抛 ``TypeError``，导致消费到首批消息即崩溃且无监督重启）。
+        故此处兜底捕获 ``Exception``（而非仅 ``KafkaException``）。
+        """
         if not self._lag_metrics_enabled:
             return
         try:
             assignment = self._consumer.assignment()
-        except KafkaException:  # pragma: no cover - 未分配分区时部分版本抛错
+        except Exception:  # noqa: BLE001 - 观测失败不得影响消费（未分配分区时部分版本抛错）
             return
         for partition in assignment or []:
             try:
                 _low, high = self._consumer.get_watermark_offsets(
                     partition, timeout=1.0, cached=True
                 )
-                # confluent-kafka 支持单分区与分区列表两种调用，统一用列表形态
-                # （类型桩把返回值标注为 list[TopicPartition]，与实际 list[int] 不符，故做显式 cast）
-                raw_positions = self._consumer.position([partition])
-                positions = cast("list[int]", raw_positions)
-                position = int(positions[0]) if positions else 0
-            except KafkaException:  # pragma: no cover - rebalance 竞态下位点可能不可用
+                # ``Consumer.position([tp])`` 运行时返回 list[TopicPartition]（偏移在 .offset 上），
+                # 非 list[int]——取 ``positions[0].offset``（类型桩与此一致，无需 cast）。
+                positions = self._consumer.position([partition])
+                position = int(positions[0].offset) if positions else 0
+                lag = int(high) - position
+            except Exception:  # noqa: BLE001, S112 - rebalance 竞态/位点不可用时跳过本分区，绝不上抛
                 continue
             kafka_metrics.set_consumer_lag(
                 self._service,
                 self._group_id,
                 str(partition.topic),
                 int(partition.partition),
-                int(high) - position,
+                lag,
             )
 
     def _close(self) -> None:

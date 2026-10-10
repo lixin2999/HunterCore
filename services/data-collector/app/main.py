@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
@@ -56,24 +56,85 @@ from app.services.vehicle_status import VehicleStatusSweeper, VehicleStatusWrite
 logger = get_logger("app.main")
 
 
+#: 消费者崩溃后的重启退避（秒）：依赖未恢复时避免重启风暴（审查：消费任务静默死亡）
+CONSUMER_RESTART_BACKOFF_S = 5.0
+
+
+class _SupervisedConsumer:
+    """消费者监督器：崩溃后重建底层实例并退避重启。
+
+    背景：``KafkaConsumerManager.run()`` 在 ``finally`` 关闭底层 ``Consumer``，崩溃后旧实例
+    不可复用（对已关闭 consumer 再 ``subscribe`` 会抛 ``RuntimeError``），故必须以 factory 重建。
+    无本监督时，任一消费任务异常退出即静默永久停摆（进程与 /healthz 仍健康，故障被掩盖）——
+    历史故障：``_refresh_lag`` 抛 ``TypeError`` 冲垮 health/telemetry 消费循环，last_online 冻结 37 分钟。
+    """
+
+    def __init__(self, factory: Callable[[], BaseIngestConsumer], group_id: str) -> None:
+        self._factory = factory
+        self.group_id = group_id
+        self._current: BaseIngestConsumer | None = None
+        self._stopping = False
+
+    async def run(self) -> None:
+        """监督主循环：``run()`` 正常返回 = 优雅停机；抛异常 = 崩溃 → 退避后重建重启。"""
+        while not self._stopping:
+            consumer = self._factory()
+            self._current = consumer
+            try:
+                await consumer.run()
+                return  # stop() 已置位，底层消费循环正常收尾
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # 单消费者崩溃不得拖垮进程：记录堆栈后重建重启
+                logger.exception(
+                    "consumer_crashed_restarting",
+                    group_id=self.group_id,
+                    backoff_seconds=CONSUMER_RESTART_BACKOFF_S,
+                )
+                await asyncio.sleep(CONSUMER_RESTART_BACKOFF_S)
+            finally:
+                self._current = None
+
+    def stop(self) -> None:
+        """请求优雅停机：置位并停止当前活动实例（正处于退避睡眠时由外层 task.cancel 打断）。"""
+        self._stopping = True
+        if self._current is not None:
+            self._current.stop()
+
+
 def _build_consumers(
     config: Settings,
     ingest_service: TelemetryIngestService,
     event_repository: EventRepository,
     pipeline_producer: PipelineProducer,
     status_writer: VehicleStatusWriter,
-) -> list[BaseIngestConsumer]:
-    """按配置装配采集消费者（契约 consumer-groups.yaml 的 3 个 data-collector 组）。"""
-    consumers: list[BaseIngestConsumer] = []
+) -> list[_SupervisedConsumer]:
+    """按配置装配采集消费者监督器（契约 consumer-groups.yaml 的 3 个 data-collector 组）。"""
+    supervisors: list[_SupervisedConsumer] = []
     if config.telemetry_consumer_enabled:
-        consumers.append(
-            TelemetryIngestConsumer(config, ingest_service, status_writer=status_writer)
+        supervisors.append(
+            _SupervisedConsumer(
+                lambda: TelemetryIngestConsumer(
+                    config, ingest_service, status_writer=status_writer
+                ),
+                TelemetryIngestConsumer.group_id,
+            )
         )
     if config.health_consumer_enabled:
-        consumers.append(HealthIngestConsumer(config, status_writer))
+        supervisors.append(
+            _SupervisedConsumer(
+                lambda: HealthIngestConsumer(config, status_writer),
+                HealthIngestConsumer.group_id,
+            )
+        )
     if config.event_consumer_enabled:
-        consumers.append(EventIngestConsumer(config, event_repository, pipeline_producer))
-    return consumers
+        supervisors.append(
+            _SupervisedConsumer(
+                lambda: EventIngestConsumer(config, event_repository, pipeline_producer),
+                EventIngestConsumer.group_id,
+            )
+        )
+    return supervisors
 
 
 @asynccontextmanager
