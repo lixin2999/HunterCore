@@ -1405,7 +1405,7 @@ step_11_start_services() {
   hc_run_logged "启动 data-analytics" compose up -d data-analytics || return 1
   wait_for "service_health_ok ${analytics_port}" "data-analytics（${analytics_port}）" 120 || return 1
 
-  # 11.2 Flink 1.18（JobManager 容器内 8081 → 宿主机 8088）
+  # 11.2 Flink 2.1（镜像 hunter-flink/jobs:2.1.1，含 CPython 3.12 + 作业依赖；JobManager 容器内 8081 → 宿主机 8088）
   hc_run_logged "启动 flink-jm flink-tm" compose up -d flink-jm flink-tm || return 1
   wait_for "curl -sf -m 5 $(flink_ui_url)/overview >/dev/null" "Flink JobManager UI（$(flink_ui_url)）" 120 || return 1
 

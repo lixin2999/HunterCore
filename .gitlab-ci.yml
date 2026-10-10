@@ -156,11 +156,11 @@ build-images:
         docker push "$image"
       done
     # Flink PyFlink 作业镜像（代码内置形态，见 flink-jobs/Dockerfile 头注释）：
-    # 前缀 hunter-flink/ 而非 hunter/ —— 规避 6 微服务模块表；标签钉 Flink 运行时版本 1.18.1，
+    # 前缀 hunter-flink/ 而非 hunter/ —— 规避 6 微服务模块表；标签钉 Flink 运行时版本 2.1.1（V1.19.5），
     # 不参与 {version} 渲染（render_k8s 只改写 hunter/ 前缀镜像）。推送到 hunter-flink/ 需该命名空间推送凭据（人工确认项）。
     - |
       set -e
-      flink_image="hunter-flink/jobs:1.18.1"
+      flink_image="hunter-flink/jobs:2.1.1"
       echo "==> build $flink_image"
       docker build -f flink-jobs/Dockerfile -t "$flink_image" .
       docker push "$flink_image"

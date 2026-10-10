@@ -175,7 +175,7 @@ def expand_metrics(
 
 
 def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内不可执行
-    """PyFlink DataStream 作业提交入口（Flink 1.18）。
+    """PyFlink DataStream 作业提交入口（Flink 2.1）。
 
     拓扑（契约 x-hunter-realtime-jobs algorithm_performance_monitor）::
 

@@ -2,7 +2,7 @@
 
 > 目标环境：Ubuntu 22.04 LTS + Docker Engine 24.0+ / Compose v2，单机部署
 > 6 业务服务 + 中间件（PostgreSQL 15 + TimescaleDB 2.13 / Kafka 3.6 / ZooKeeper 3.8 / Redis 7 /
-> MinIO / SRS 5.0 / Flink 1.18）+ Vue3 前端（Nginx）。
+> MinIO / SRS 5.0 / Flink 2.1）+ Vue3 前端（Nginx）。
 > 部署文档：`docs/01-部署概述与环境要求.md` … `docs/07-卸载与灾难恢复.md`。
 
 ## 目录映射（仓库 → 服务器）

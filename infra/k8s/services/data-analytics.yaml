@@ -15,7 +15,7 @@ data:
   API_PORT: "8083"
   DB_POOL_SIZE: "9"          # 单副本可用 CPU(4 核) × 2 + 1
   DB_MAX_OVERFLOW: "5"
-  # Flink 1.18 实时作业（flink-jobs/ 目录作业提交目标）
+  # Flink 2.1 实时作业（flink-jobs/ 目录作业提交目标）
   FLINK_JOBMANAGER_URL: "http://flink-jobmanager.hunter-core.svc.cluster.local:8081"
   # 实时分析输入 Topic 与消费组（contracts/kafka/consumer-groups.yaml，禁止自行更改）
   KAFKA_CONSUMER_TOPIC_TELEMETRY_CLEAN: "telemetry_clean"

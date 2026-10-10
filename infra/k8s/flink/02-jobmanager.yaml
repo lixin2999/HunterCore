@@ -2,7 +2,7 @@
 # Flink JobManager（Standalone 主节点）+ Service flink-jobmanager
 # - Service 名与 data-analytics ConfigMap 的 FLINK_JOBMANAGER_URL（flink-jobmanager:8081）及
 #   flink-common-config 的 jobmanager.rpc.address 对齐（此前该 URL 悬空，本清单补齐）
-# - 镜像 hunter-flink/jobs:1.18.1（非 hunter/ 前缀，避开 6 微服务模块表；不参与 {version} 渲染，
+# - 镜像 hunter-flink/jobs:2.1.1（非 hunter/ 前缀，避开 6 微服务模块表；不参与 {version} 渲染，
 #   标签随 Flink 运行时版本管理）——见 flink-jobs/Dockerfile 头注释
 # - verify_infra check_workloads 对 Deployment 强制：显式版本 / requests+limits(cpu+memory) /
 #   livenessProbe+readinessProbe / 容器 drop ALL + allowPrivilegeEscalation=false / Pod 非 root
@@ -41,7 +41,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: jobmanager
-          image: "hunter-flink/jobs:1.18.1"   # 第三方独立前缀镜像，禁止改成 hunter/（CI 模块表校验）
+          image: "hunter-flink/jobs:2.1.1"   # 第三方独立前缀镜像，禁止改成 hunter/（CI 模块表校验）
           imagePullPolicy: IfNotPresent
           args: ["jobmanager"]                # flink 默认 entrypoint 依 args 选角色
           ports:
@@ -88,7 +88,7 @@ spec:
             failureThreshold: 3
       volumes:
         - name: checkpoints
-          emptyDir: {}                        # 生产建议改 PVC/对象存储（state.checkpoints.dir），见 release.md 待办
+          emptyDir: {}                        # 生产建议改 PVC/对象存储（`execution.checkpointing.dir`，V1.19.5 旧 state.* 已移除），见 release.md 待办
         - name: log
           emptyDir: {}
 ---

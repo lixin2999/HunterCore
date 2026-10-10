@@ -148,7 +148,7 @@ def encode_redis_value(metric: Mapping[str, Any]) -> str:
 
 
 def main() -> None:  # pragma: no cover - 需要 PyFlink + Redis 运行时，仓库内不可执行
-    """PyFlink DataStream 作业提交入口（Flink 1.18）→ Redis 指标键。
+    """PyFlink DataStream 作业提交入口（Flink 2.1）→ Redis 指标键。
 
     拓扑（契约 data_quality_monitor「延迟」子项，pending #10 结案路线）::
 

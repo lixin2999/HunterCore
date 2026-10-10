@@ -39,7 +39,7 @@ info:
 
     **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功，非 0 为预定义错误码（附录 A）。
 
-    **实时分析**（6.2 节，Flink 1.18 DataStream，`flink-jobs/`）：消费 `telemetry_clean`（4 个作业）
+    **实时分析**（6.2 节，Flink 2.1 DataStream，`flink-jobs/`）：消费 `telemetry_clean`（4 个作业）
     与 `telemetry_raw`（数据质量监控）→ 车辆状态监控 / 异常驾驶检测 / 算法性能监控 / 碰撞风险评估 /
     数据质量监控；告警投递 `alert_event`（等级取受控词表 `EVENT_LEVEL_BY_TYPE`，实时告警触发 ≤ 2s），
     算法指标写 `data_analytics.algorithm_metrics`，指标/报告结果投递 `analytics_result`。
@@ -1449,7 +1449,7 @@ x-hunter-service:
     - service: vehicle-service
       usage: "REST（车辆台账校验 / 车队总数）；⚠ 服务归属待确认（模块表仅 6 个微服务）"
     - service: flink
-      usage: "Flink 1.18 实时作业提交与状态查询（FLINK_JOBMANAGER_URL）"
+      usage: "Flink 2.1 实时作业提交与状态查询（FLINK_JOBMANAGER_URL）"
     - service: spark
       usage: "Spark 3.5 离线作业调度（K8s CronJob / SparkApplication）"
   config_source: "pydantic-settings（环境变量 / K8s ConfigMap data-analytics-config + Secret hunter-app-secrets）"
@@ -1576,7 +1576,7 @@ x-hunter-endpoints:
 
 x-hunter-realtime-jobs:
   source: "设计文档 6.2 节（Flink 实时分析任务：车辆状态监控 / 异常驾驶检测 / 算法性能监控 / 碰撞风险评估 / 数据质量监控）"
-  engine: "Flink 1.18（DataStream API，作业目录 flink-jobs/）"
+  engine: "Flink 2.1（DataStream API，作业目录 flink-jobs/）"  # V1.19.5：随镜像基座 1.18.1 → 2.1.1（对齐 Python 3.12 基线）
   input:
     - topic: telemetry_clean
       consumer_group: data-analytics-telemetry

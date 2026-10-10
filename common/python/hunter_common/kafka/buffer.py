@@ -78,6 +78,7 @@ class LocalDiskBuffer:
         self._lock = threading.Lock()
         self._segment_path: Path | None = None
         self._segment_records = 0
+        self._segment_seq = 0
         self._message_count = 0
         self._bytes_size = 0
         self._recover_incomplete_segments()
@@ -244,6 +245,8 @@ class LocalDiskBuffer:
             self._message_count += self._count_lines(segment)
         if segments:
             self._segment_path = segments[-1]
+            # 段序号续接既有最大值（重启后不得回退，否则同毫秒内新段字典序会排到旧段之前）
+            self._segment_seq = self._max_segment_seq(segments)
             # 末段可能已有内容：按记录数续写，避免已满段继续追加
             self._segment_records = min(
                 self._count_lines(segments[-1]), self._segment_max_records
@@ -269,8 +272,24 @@ class LocalDiskBuffer:
     # ---------- 内部：分段与淘汰 ----------
 
     def _segments(self) -> list[Path]:
-        """按时间升序返回分段文件（文件名前缀为毫秒时间戳，字典序即时间序）。"""
+        """按写入先后升序返回分段文件。
+
+        段名 ``seg-<毫秒时间戳>-<段序号>-<随机后缀>.jsonl``：两级**定宽**数字前缀保证字典序 ==
+        写入顺序。仅靠时间戳不足以保证 FIFO（同一毫秒内滚动多段时，随机后缀会决定字典序，
+        重投顺序随之错乱，V1.19.6 修）；旧命名（无段序号）的既存段仍可被 glob 读到，
+        仅同毫秒并列时不保证有序（重启后新段序号从 0 续接，不会与之回退冲突）。
+        """
         return sorted(self._root.glob("seg-*.jsonl"))
+
+    @staticmethod
+    def _max_segment_seq(segments: list[Path]) -> int:
+        """从既有段名解析最大段序号；旧命名段（无序号位）计入为 0。"""
+        highest = 0
+        for segment in segments:
+            parts = segment.name.removeprefix("seg-").removesuffix(".jsonl").split("-")
+            if len(parts) >= 2 and parts[1].isdigit():
+                highest = max(highest, int(parts[1]))
+        return highest
 
     def _current_segment(self) -> Path:
         if (
@@ -279,7 +298,11 @@ class LocalDiskBuffer:
             or not self._segment_path.exists()
         ):
             stamp = int(time.time() * 1000)
-            self._segment_path = self._root / f"seg-{stamp:013d}-{uuid.uuid4().hex[:8]}.jsonl"
+            self._segment_seq += 1
+            # 段序号（定宽）决定同毫秒内的先后，随机后缀仅用于避免进程间文件名碰撞（见 _segments 注）
+            self._segment_path = self._root / (
+                f"seg-{stamp:013d}-{self._segment_seq:06d}-{uuid.uuid4().hex[:8]}.jsonl"
+            )
             self._segment_path.touch()
             self._segment_records = 0
         return self._segment_path

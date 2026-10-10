@@ -1,4 +1,4 @@
-"""``driving_anomaly_detection``（6.2.2 异常驾驶检测）Flink 1.18 作业入口。
+"""``driving_anomaly_detection``（6.2.2 异常驾驶检测）Flink 2.1 作业入口。
 
 拓扑（契约 x-hunter-realtime-jobs）：
     Kafka telemetry_clean（group=data-analytics-telemetry）
@@ -58,7 +58,7 @@ def expand_alerts(
 
 
 def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内不可执行
-    """PyFlink DataStream 作业提交入口（Flink 1.18）。"""
+    """PyFlink DataStream 作业提交入口（Flink 2.1）。"""
     from pyflink.common import Types
     from pyflink.datastream import StreamExecutionEnvironment
     from pyflink.datastream.connectors.kafka import (

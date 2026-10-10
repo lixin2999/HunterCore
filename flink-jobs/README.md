@@ -1,4 +1,4 @@
-# flink-jobs — Flink 1.18 实时分析作业
+# flink-jobs — Flink 2.1 实时分析作业
 
 实时流处理作业（Python DataStream API / PyFlink），消费 Kafka 平台内部 Topic。
 
@@ -51,7 +51,14 @@ battery_low / battery_critical 独立边沿触发（SOC 8% 时两条各一次）
 python scripts/run_unit_tests.py flink-jobs
 
 # 仓库根构建作业镜像（compose 与 K8s 同一镜像，V1.19.2 起 compose 也已切换）
-docker build -f flink-jobs/Dockerfile -t hunter-flink/jobs:1.18.1 .
+# ⚠ 标签与镜像内 Python 必须与基座 Flink 同版本（V1.19.5 钉 Flink 2.1.1 + CPython 3.12）：
+#   PyPI 上 apache-flink 1.18.1 只发 cp37–cp310、1.20.x 到 cp311、2.1.x 才发 cp312，
+#   而 hunter_common 下限 3.11（enum.StrEnum）——升级 Flink 才能把作业对齐到服务基线 3.12。
+docker build -f flink-jobs/Dockerfile -t hunter-flink/jobs:2.1.1 .
+# ⚠ 构建会额外从 Maven Central 拉 DataStream Kafka 连接器 jar（官方基座与 apache-flink wheel 都不带它，
+#   缺则提交后报 ClassNotFoundException: ...connector.kafka.source.KafkaSource）：Flink 2.1 对应
+#   `flink-sql-connector-kafka-5.0.0-2.1.jar`（命名是 `<连接器版本>-<Flink 版本>`）。镜像源覆盖：
+#   docker build -f flink-jobs/Dockerfile --build-arg KAFKA_CONNECTOR_URL=<同路径镜像地址> -t … .
 
 # compose 单机形态（生产机用 sudo，.env 为 600/root）：镜像内置 hunter_flink 与 hunter_common，
 # 提交走 -pym（官方纯 JVM 镜像无 Python，必报 `Cannot run program "python"`）
@@ -71,13 +78,13 @@ docker compose -f infra/deploy/docker-compose.yml --project-directory . exec fli
   与第一方 `hunter_flink` 分块）。
 - **部署形态**（两种并存，按环境择一）：
   1. **K8s 自建集群（推荐生产）**：`infra/k8s/flink/`（`01-configmap` + `02-jobmanager`
-     Deployment/Service + `03-taskmanager` Deployment + `04-submit-job` batch/v1）+ `hunter-flink/jobs:1.18.1`
+     Deployment/Service + `03-taskmanager` Deployment + `04-submit-job` batch/v1）+ `hunter-flink/jobs:2.1.1`
      **代码内置镜像**（`flink-jobs/Dockerfile`）。提交 Job 经 `flink run -pym hunter_flink.<job>` 拉起三个
      已交付流作业；`data-analytics` 的 `FLINK_JOBMANAGER_URL` 即指向此处 `flink-jobmanager:8081`。
      入向放行见 `infra/k8s/networkpolicies/flink.yaml`。
      ⚠ **镜像前缀必须为 `hunter-flink/`、禁止 `hunter/`**：`verify_infra`/`render_k8s` 的 6 微服务
      模块表只放行 `hunter/<svc>`，`hunter/flink-jobs` 会判「未登记微服务镜像」致 lint 失败。
-  2. **compose 单机（受控降级）**：flink-jm + 单 flink-tm，**V1.19.2 起同样使用 `hunter-flink/jobs:1.18.1`
+  2. **compose 单机（受控降级）**：flink-jm + 单 flink-tm，**V1.19.2 起同样使用 `hunter-flink/jobs:2.1.1`
      内置镜像**（compose 定义已带 `build: flink-jobs/Dockerfile`，与 K8s 形态单一事实来源；旧官方镜像无
      Python 不能跑作业），`flink-jobs/` 只读挂载保留作应急热替换；书面豁免见 `docs/deployment.md` §12
      （G-13/G-28 决策①）。

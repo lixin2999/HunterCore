@@ -83,7 +83,7 @@ data:
         service: data-analytics
         subscribes: [telemetry_clean]
         produces: [alert_event, analytics_result, algorithm_metrics]
-        engine: Flink 1.18 (DataStream)
+        engine: Flink 2.1 (DataStream)          # 引擎版本与镜像基座同源（V1.19.5：1.18.1 → 2.1.1，为对齐 Python 3.12 基线）
         jobs:
           - vehicle_state_monitor            # 6.2.1 心跳/状态变更 → communication_loss
           - driving_anomaly_detection        # 6.2.2 急加速/急减速/急转弯/超速/低电量
@@ -106,7 +106,7 @@ data:
         service: data-analytics
         subscribes: [telemetry_raw]
         produces: [analytics_result]
-        engine: Flink 1.18 (DataStream)
+        engine: Flink 2.1 (DataStream)
         jobs: [data_quality_monitor]
         idempotency_key: "(vehicle_id, time)"
         notes: "6.2.5 数据质量监控：消费原始遥测统计丢包率/延迟/异常值 → analytics_result(result_type=metric)；需与 telemetry_clean 独立 offset 才可对比"
@@ -115,7 +115,7 @@ data:
         service: data-analytics
         subscribes: [event_raw]
         produces: [analytics_result]
-        engine: "Flink 1.18（实时统计）/ Spark 3.5（离线 Corner Case 挖掘）"
+        engine: "Flink 2.1（实时统计）/ Spark 3.5（离线 Corner Case 挖掘）"
         jobs: [corner_case_mining]
         idempotency_key: "(vehicle_id, event_type, event_time)"
         notes: "事件统计与 Corner Case 挖掘（6.4 节：Isolation Forest + DBSCAN，消费组同一幂等键）"
@@ -168,7 +168,7 @@ data:
       "$schema": "http://json-schema.org/draft-07/schema#",
       "$id": "https://hunter-core.local/contracts/kafka/schemas/alert_event.schema.json",
       "title": "alert_event",
-      "description": "平台内部 Topic alert_event 消息（生产者 data-analytics 的 Flink 1.18 实时作业，设计文档 6.2 节）。消费方：告警处理（⚠ 落位服务待定，见 contracts/kafka/consumer-groups.yaml 的 platform-alert-event）。语义：平台侧基于 telemetry_clean / telemetry_raw 重算触发的告警（与车端上报的 hunter.{vehicle_id}.event 相互独立，禁止混用）；实时告警触发延迟 ≤ 2s（性能指标）。level 必须等于受控词表 EVENT_LEVEL_BY_TYPE[alert_type]（contracts/database/enums.md 第 3 节，不可放宽）。",
+      "description": "平台内部 Topic alert_event 消息（生产者 data-analytics 的 Flink 2.1 实时作业，设计文档 6.2 节）。消费方：告警处理（⚠ 落位服务待定，见 contracts/kafka/consumer-groups.yaml 的 platform-alert-event）。语义：平台侧基于 telemetry_clean / telemetry_raw 重算触发的告警（与车端上报的 hunter.{vehicle_id}.event 相互独立，禁止混用）；实时告警触发延迟 ≤ 2s（性能指标）。level 必须等于受控词表 EVENT_LEVEL_BY_TYPE[alert_type]（contracts/database/enums.md 第 3 节，不可放宽）。",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -377,7 +377,7 @@ data:
       "$schema": "http://json-schema.org/draft-07/schema#",
       "$id": "https://hunter-core.local/contracts/kafka/schemas/algorithm_metrics.schema.json",
       "title": "algorithm_metrics",
-      "description": "平台内部 Topic algorithm_metrics 消息（生产者 data-analytics 的 Flink 1.18 实时作业 algorithm_performance_monitor，设计文档 6.2.4 节；按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 滚动窗口聚合 telemetry_clean 产出）。消费方：data-analytics 常驻 Kafka 消费者（group data-analytics-algorithm-metrics），批量落库 data_analytics.algorithm_metrics（ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING），是运营看板 algorithm 块的契约数据源。字段严格对齐表列 {time, vehicle_id, module, metric_name, metric_value, tags}，禁止新增表外字段。module 为受控词表（perception/planning/control，见 contracts/database/enums.md MetricModule，不可新增）。",
+      "description": "平台内部 Topic algorithm_metrics 消息（生产者 data-analytics 的 Flink 2.1 实时作业 algorithm_performance_monitor，设计文档 6.2.4 节；按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 滚动窗口聚合 telemetry_clean 产出）。消费方：data-analytics 常驻 Kafka 消费者（group data-analytics-algorithm-metrics），批量落库 data_analytics.algorithm_metrics（ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING），是运营看板 algorithm 块的契约数据源。字段严格对齐表列 {time, vehicle_id, module, metric_name, metric_value, tags}，禁止新增表外字段。module 为受控词表（perception/planning/control，见 contracts/database/enums.md MetricModule，不可新增）。",
       "type": "object",
       "additionalProperties": false,
       "required": [

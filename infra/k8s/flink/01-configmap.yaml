@@ -1,6 +1,9 @@
 # =====================================================================
-# Flink 1.18 Standalone（k8s 自建集群形态）—— 公共配置
+# Flink 2.1 Standalone（k8s 自建集群形态）—— 公共配置
 # - 代码内置镜像 hunter-flink/jobs（见 flink-jobs/Dockerfile），JM/TM/提交 Job 共用
+# - ⚠ V1.19.5：本 ConfigMap 的 FLINK_PROPERTIES 由 docker-entrypoint 追加至 flink-conf.yaml，
+#   Flink 2.0 已将旧 `state.*` 配置键移除 → checkpoint 目录必须用 `execution.checkpointing.dir`
+#   （写旧键会使 JM/TM 启动直接失败并在日志里提示替换项）
 # - 命名/标签统一 component=flink，供 networkpolicies/flink.yaml 最小入向放行
 # - ⚠ 本 ConfigMap 禁止写入任何口令/SASL 凭据（verify_infra check_configmaps 强制）：
 #     敏感项一律走 hunter-app-secrets 的 secretKeyRef
@@ -26,7 +29,7 @@ data:
     blob.server.port: 6124
     taskmanager.rpc.port: 6122
     classloader.check-leaked-classloader: false
-    state.checkpoints.dir: file:///opt/flink/checkpoints
+    execution.checkpointing.dir: file:///opt/flink/checkpoints
     execution.checkpointing.interval: 10000
   # 作业消费端连接项（对齐 flink-jobs/hunter_flink/*.py 读取的环境变量名，禁止改拼写）
   KAFKA_BOOTSTRAP_SERVERS: "kafka-0.kafka-headless.hunter-core.svc.cluster.local:9092"

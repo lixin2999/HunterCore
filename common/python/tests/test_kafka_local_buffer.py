@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 
 from hunter_common.kafka.buffer import BufferedRecord, LocalDiskBuffer
@@ -130,6 +131,42 @@ async def test_replay_stops_on_failure_and_keeps_remainder(tmp_path: Path) -> No
     assert await buffer.replay(send_ok) == 2
     assert retried == [b'{"seq":1}', b'{"seq":2}']
     assert buffer.stats().message_count == 0
+
+
+async def test_replay_keeps_fifo_for_segments_within_same_millisecond(tmp_path: Path) -> None:
+    """回归（V1.19.6）：同一毫秒滚动多段时重投仍严格按写入顺序。
+
+    旧段名仅含毫秒时间戳 + 随机后缀，同毫秒内字典序由随机后缀决定 → 重投顺序错乱
+    （本用例在修复前为概率性失败，因为 200 次连续写入几乎全部落在同一毫秒）。
+    """
+    total = 200
+    buffer = make_buffer(tmp_path, segment_max_records=1)
+    for index in range(total):
+        buffer.append(record(index))
+    assert len(segments_of(buffer)) == total  # 每段 1 条且未被容量淘汰
+
+    delivered: list[int] = []
+
+    async def send(item: BufferedRecord) -> None:
+        delivered.append(int(json.loads(item.value)["seq"]))
+
+    assert await buffer.replay(send) == total
+    assert delivered == list(range(total))
+
+
+def test_segment_sequence_does_not_regress_after_restart(tmp_path: Path) -> None:
+    """重启后新段序号续接既有最大值（否则同毫秒内新段会排到旧段之前，破坏 FIFO）。"""
+    first = make_buffer(tmp_path, segment_max_records=1)
+    first.append(record(1))
+    seq_before = int(segments_of(first)[0].name.removeprefix("seg-").split("-")[1])
+
+    restored = make_buffer(tmp_path, segment_max_records=1)
+    restored.append(record(2))
+
+    segments = segments_of(restored)
+    assert len(segments) == 2
+    seq_after = int(segments[-1].name.removeprefix("seg-").split("-")[1])
+    assert seq_after > seq_before
 
 
 async def test_replay_skips_corrupt_line(tmp_path: Path) -> None:

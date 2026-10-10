@@ -38,7 +38,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: taskmanager
-          image: "hunter-flink/jobs:1.18.1"   # 与 JM 同镜像（代码内置，worker 侧经 PYTHONPATH import hunter_flink）
+          image: "hunter-flink/jobs:2.1.1"   # 与 JM 同镜像（代码内置，worker 侧经 PYTHONPATH import hunter_flink）
           imagePullPolicy: IfNotPresent
           args: ["taskmanager"]
           ports:

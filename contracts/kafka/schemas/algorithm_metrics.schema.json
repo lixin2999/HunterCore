@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://hunter-core.local/contracts/kafka/schemas/algorithm_metrics.schema.json",
   "title": "algorithm_metrics",
-  "description": "平台内部 Topic algorithm_metrics 消息（生产者 data-analytics 的 Flink 1.18 实时作业 algorithm_performance_monitor，设计文档 6.2.4 节；按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 滚动窗口聚合 telemetry_clean 产出）。消费方：data-analytics 常驻 Kafka 消费者（group data-analytics-algorithm-metrics），批量落库 data_analytics.algorithm_metrics（ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING），是运营看板 algorithm 块的契约数据源。字段严格对齐表列 {time, vehicle_id, module, metric_name, metric_value, tags}，禁止新增表外字段。module 为受控词表（perception/planning/control，见 contracts/database/enums.md MetricModule，不可新增）。",
+  "description": "平台内部 Topic algorithm_metrics 消息（生产者 data-analytics 的 Flink 2.1 实时作业 algorithm_performance_monitor，设计文档 6.2.4 节；按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 滚动窗口聚合 telemetry_clean 产出）。消费方：data-analytics 常驻 Kafka 消费者（group data-analytics-algorithm-metrics），批量落库 data_analytics.algorithm_metrics（ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING），是运营看板 algorithm 块的契约数据源。字段严格对齐表列 {time, vehicle_id, module, metric_name, metric_value, tags}，禁止新增表外字段。module 为受控词表（perception/planning/control，见 contracts/database/enums.md MetricModule，不可新增）。",
   "type": "object",
   "additionalProperties": false,
   "required": [

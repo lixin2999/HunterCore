@@ -13,8 +13,8 @@
 
 ## 技术栈
 
-- **后端**：Python 3.11+ / FastAPI 0.100+（异步）/ SQLAlchemy 2.0（asyncpg）/ confluent-kafka 2.x
-- **数据**：PostgreSQL 15 + TimescaleDB 2.13 / Redis 7 / MinIO / Apache Kafka 3.6 / Flink 1.18 / Spark 3.5
+- **后端**：Python 3.12（服务镜像基线 `python:3.12-slim`，共享库下限 3.11）/ FastAPI 0.100+（异步）/ SQLAlchemy 2.0（asyncpg）/ confluent-kafka 2.x
+- **数据**：PostgreSQL 15 + TimescaleDB 2.13 / Redis 7 / MinIO / Apache Kafka 3.6 / Flink 2.1 / Spark 3.5
 - **前端**：Vue 3 + TypeScript + Vite + Element Plus + Pinia + ECharts 5 + Three.js
 - **部署**：Docker / Kubernetes 1.28 / Prometheus + Grafana + Loki + Jaeger
 
@@ -36,7 +36,7 @@
 └───────────┬────────────────────────────┬───────────────────────────────┬───────────────┘
             │                            │                               │
 ┌───────────▼────────────────────────────▼───────────────────────────────▼───────────────┐
-│  数据层：PostgreSQL 15 + TimescaleDB 2.13 / Redis 7 / MinIO / Kafka / Flink 1.18 /      │
+│  数据层：PostgreSQL 15 + TimescaleDB 2.13 / Redis 7 / MinIO / Kafka / Flink 2.1 /       │
 │          Spark 3.5                                                                       │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -65,7 +65,7 @@ HunterCore/
 │   ├── k8s/                   # K8s 清单：6 微服务 Deployment/Service/ConfigMap、中间件 StatefulSet/PVC、初始化 Job、Ingress
 │   ├── docker/                # 本地开发：postgres/kafka/minio 初始化脚本
 │   └── monitoring/            # Prometheus 采集与告警 + Alertmanager + Grafana 看板 + exporters + 监控组件清单
-├── flink-jobs/                # Flink 1.18 实时分析作业（后续层级）
+├── flink-jobs/                # Flink 2.1 实时分析作业（后续层级）
 ├── spark-jobs/                # Spark 3.5 离线分析作业（后续层级）
 ├── docs/                      # 设计与开发文档
 ├── scripts/                   # 部署与运维脚本集（Ubuntu 22.04 单机 Docker Compose 一键部署）

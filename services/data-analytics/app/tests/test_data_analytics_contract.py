@@ -429,7 +429,7 @@ def test_rate_limits_inherit_appendix_d(contract: dict[str, Any]) -> None:
 def test_realtime_jobs_match_6_2(contract: dict[str, Any]) -> None:
     """6.2 节 5 个 Flink 实时作业必须齐备，且各自声明输入 Topic 与输出通道。"""
     realtime = contract["x-hunter-realtime-jobs"]
-    assert "Flink 1.18" in realtime["engine"]
+    assert "Flink 2.1" in realtime["engine"]
     jobs = realtime["jobs"]
     assert {job["name"] for job in jobs} == EXPECTED_REALTIME_JOBS
     for job in jobs:

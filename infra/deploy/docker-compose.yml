@@ -318,16 +318,23 @@ services:
       resources:
         limits: { cpus: "2", memory: 4G }
 
-  # ---------- 7. Flink 1.18（实时分析；JobManager Web UI 容器 8081 → 宿主机 8088） ----------
+  # ---------- 7. Flink 2.1（实时分析；JobManager Web UI 容器 8081 → 宿主机 8088） ----------
   # V1.19.2：镜像由官方 flink:1.18.1（纯 JVM、无任何 Python）切为代码内置作业镜像
-  # flink-jobs/Dockerfile（CPython 3.11 + apache-flink==1.18.1 + hunter_common + PYTHONPATH，
-  # 与 K8s 形态 deployment.md §13.1 同一镜像）；官方镜像下 `-pym` 提交 PyFlink 作业必报
+  # flink-jobs/Dockerfile（CPython + apache-flink + hunter_common + PYTHONPATH，与 K8s 形态
+  # deployment.md §13.1 同一镜像）；官方镜像下 `-pym` 提交 PyFlink 作业必报
   # `Cannot run program "python"`（服务器实录）。前缀 hunter-flink/ 独立于 6 微服务模块表，
   # 标签随 Flink 运行时版本、不参与 {version} 渲染。
-  # ⚠ V1.19.4：镜像内 Python 固定 3.11（hunter_common 依赖 enum.StrEnum，基座 apt python3=3.10
-  #   会被 pip Requires-Python 门禁拒装）；镜像带构建期 import 自检，改作业/共享库后重建即可。
+  # ⚠ V1.19.5：运行时 1.18.1 → **2.1.1**，镜像内 Python = **3.12**（与服务基线 python:3.12-slim 对齐）。
+  #   原因：PyPI 上 apache-flink 1.18.1 只发 cp37–cp310 轮子（无 cp311/cp312），而 hunter_common
+  #   下限 3.11（enum.StrEnum）——只有 2.1.x 有 cp312；改前的 apt 3.10 形态会运行期缺 hunter_common。
+  #   升级连带：① Kafka 连接器 jar 已内置进镜像的 /opt/flink/lib（flink-sql-connector-kafka-5.0.0-2.1，
+  #     Flink 2.1 对应版本；官方基座与 apache-flink wheel 都不带）；若仍报
+  #     ClassNotFoundException: org.apache.flink.connector.kafka.* → 构建时 jar 下载阶段被跳过/替换，
+  #     先查 build 日志第三道自检（kafka connector jar OK）。② Flink 2.0 做了一轮状态/检查点配置重组，
+  #     旧的 `state.*` 键已**移除**，下方 checkpoint 目录改用新键 `execution.checkpointing.dir`；旧键会
+  #     直接拉响启动失败并提示替换项（非仅告警）。
   flink-jm:
-    image: hunter-flink/jobs:1.18.1
+    image: hunter-flink/jobs:2.1.1
     build:
       context: .
       dockerfile: flink-jobs/Dockerfile
@@ -338,7 +345,7 @@ services:
         jobmanager.rpc.address: flink-jm
         jobmanager.memory.process.size: ${FLINK_JM_PROCESS_MEM:-2048m}
         classloader.check-leaked-classloader: false
-        state.checkpoints.dir: file:///opt/flink/data/checkpoints
+        execution.checkpointing.dir: file:///opt/flink/data/checkpoints
       TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "127.0.0.1:${FLINK_UI_HOST_PORT:-8088}:8081"
@@ -359,7 +366,7 @@ services:
         limits: { cpus: "2", memory: 4G }
 
   flink-tm:
-    image: hunter-flink/jobs:1.18.1
+    image: hunter-flink/jobs:2.1.1
     build:
       context: .
       dockerfile: flink-jobs/Dockerfile
@@ -374,7 +381,7 @@ services:
         taskmanager.memory.process.size: ${FLINK_TM_PROCESS_MEM:-4096m}
         taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-2}
         classloader.check-leaked-classloader: false
-        state.checkpoints.dir: file:///opt/flink/data/checkpoints
+        execution.checkpointing.dir: file:///opt/flink/data/checkpoints
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - ${DATA_DIR:-/data}/flink:/opt/flink/data
