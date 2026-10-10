@@ -516,6 +516,16 @@ services:
       SERVICE_NAME: data-analytics
       API_PORT: "8083"
       FLINK_JM_URL: ${FLINK_JM_URL:-http://flink-jm:8081}   # 私有：访问 JobManager REST
+      FLINK_JOBMANAGER_URL: ${FLINK_JOBMANAGER_URL:-http://flink-jm:8081}   # 对齐 config.flink_jobmanager_url（旧 FLINK_JM_URL 键名与代码不符）
+      # ---- 运营看板四数据块的依赖（此前 compose 未注入 → fleet/events/pipeline/algorithm 全降级 → 503「看板全部数据源均不可用」）----
+      # 下游 REST（hunter-net 内服务名，与 infra/k8s/services/data-analytics.yaml 对齐）
+      DATA_COLLECTOR_BASE_URL: ${DATA_COLLECTOR_BASE_URL:-http://data-collector:8082}
+      VEHICLE_SERVICE_BASE_URL: ${VEHICLE_SERVICE_BASE_URL:-http://vehicle-service:8086}
+      SCENE_SERVICE_BASE_URL: ${SCENE_SERVICE_BASE_URL:-http://scene-service:8081}
+      # 只读库账号（pipeline/algorithm 块 SELECT data_collector.vehicle_telemetry / data_analytics.algorithm_metrics）；
+      # 单机部署默认复用 POSTGRES 超级用户（compose 未创建 hunter_analytics_ro 角色），生产加固应在 .env 覆盖为只读专用账号（见 er.md 第 3 节）
+      ANALYTICS_RO_DB_USER: ${ANALYTICS_RO_DB_USER:-${POSTGRES_USER}}
+      ANALYTICS_RO_DB_PASSWORD: ${ANALYTICS_RO_DB_PASSWORD:-${POSTGRES_PASSWORD}}
     ports:
       - "127.0.0.1:${DATA_ANALYTICS_PORT:-8083}:8083"
     volumes:
