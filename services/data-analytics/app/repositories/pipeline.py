@@ -154,17 +154,20 @@ class KafkaLagProbe:
             )
 
     def _lag_sync(self) -> dict[str, int]:
-        """同步读取各消费组提交位点与末端水位差（仅阻塞工作线程，不阻塞事件循环）。"""
+        """同步读取各消费组提交位点与末端水位差（仅阻塞工作线程，不阻塞事件循环）。
+
+        confluent-kafka（2.16 实测）的 ``list_consumer_group_offsets`` 单次仅支持
+        **一个**消费组，传多组会即时抛 ``ValueError: Currently we support listing offsets
+        for a single consumer group only``，故此处逐组各调一次（单组异常不阻塞其余组）。
+        """
         admin = AdminClient(self._conf)
         consumer = Consumer(self._conf)
         result: dict[str, int] = {}
         try:
-            futures = admin.list_consumer_group_offsets(
-                [ConsumerGroupTopicPartitions(group) for group in self._groups]
-            )
-            for group, future in futures.items():
+            for group in self._groups:
                 try:
-                    offsets = future.result(timeout=self._timeout)
+                    futmap = admin.list_consumer_group_offsets([ConsumerGroupTopicPartitions(group)])
+                    offsets = next(iter(futmap.values())).result(timeout=self._timeout)
                 except Exception:  # noqa: BLE001 - 单组位点失败不阻塞其余消费组探测（已记 warning）
                     logger.warning("consumer_group_offset_fetch_failed", group=group)
                     continue
