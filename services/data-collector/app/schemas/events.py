@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import time
+
 from hunter_common.database.enums import EventLevel, EventType
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -60,7 +62,7 @@ class EventListResponse(BaseModel):
     message: str = "success"
     data: EventListData | None = None
     request_id: str
-    timestamp: int
+    timestamp: int = Field(default_factory=lambda: int(time.time()))
 
 
 class EventResponse(BaseModel):
@@ -70,7 +72,7 @@ class EventResponse(BaseModel):
     message: str = "success"
     data: EventItem | None = None
     request_id: str
-    timestamp: int
+    timestamp: int = Field(default_factory=lambda: int(time.time()))
 
 
 __all__ = [

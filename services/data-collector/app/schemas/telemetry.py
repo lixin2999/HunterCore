@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import time
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.common import TELEMETRY_RETENTION_DAYS, VEHICLE_ID_PATTERN
@@ -141,4 +143,4 @@ class TelemetryQueryResponse(BaseModel):
     message: str = "success"
     data: TelemetryQueryData | None = None
     request_id: str
-    timestamp: int
+    timestamp: int = Field(default_factory=lambda: int(time.time()))

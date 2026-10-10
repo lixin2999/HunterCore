@@ -1,6 +1,7 @@
 """文件上传模型（契约 components.schemas：UploadBucket → FileCompleteResponse，5.5 节）。"""
 from __future__ import annotations
 
+import time
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -82,7 +83,7 @@ class FilePresignResponse(BaseModel):
     message: str = "success"
     data: FilePresignData | None = None
     request_id: str
-    timestamp: int
+    timestamp: int = Field(default_factory=lambda: int(time.time()))
 
 
 class CompletedPart(BaseModel):
@@ -142,7 +143,7 @@ class FileCompleteResponse(BaseModel):
     message: str = "success"
     data: FileCompleteData | None = None
     request_id: str
-    timestamp: int
+    timestamp: int = Field(default_factory=lambda: int(time.time()))
 
 
 class FileObjectItem(BaseModel):
@@ -176,4 +177,4 @@ class FileListResponse(BaseModel):
     message: str = "success"
     data: FileListData | None = None
     request_id: str
-    timestamp: int
+    timestamp: int = Field(default_factory=lambda: int(time.time()))
