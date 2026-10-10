@@ -86,7 +86,23 @@ class MetricsReadOnlyRepository:
         return int(value or 0)
 
     async def algorithm_averages(self, start_ts: float, end_ts: float) -> dict[str, float] | None:
-        """窗口内算法指标均值（{module}.{metric_name} → avg；同 telemetry_points：float→datetime）。"""
+        """窗口内算法指标均值（{module}.{metric_name} → avg）。
+
+        契约数据源为 ``data_analytics.algorithm_metrics``（由 Flink ``algorithm_performance_monitor``
+        作业写入）；该作业尚未实现→表恒空，看板 algorithm 块全为 ``-``。故先查 algorithm_metrics，
+        **为空时回退**到从 ``data_collector.vehicle_telemetry`` 原始宽列即时聚合（同窗口列均值，
+        口径一致）；将来 Flink 作业产出后自动优先用聚合表。任一查询失败返回 None（上层按降级处理）；
+        asyncpg 只接受 datetime 绑定（同 telemetry_points：float→datetime）。
+        """
+        metrics = await self._algorithm_averages_from_metrics(start_ts, end_ts)
+        if metrics is None:
+            return None
+        if metrics:
+            return metrics
+        return await self._algorithm_averages_from_telemetry(start_ts, end_ts)
+
+    async def _algorithm_averages_from_metrics(self, start_ts: float, end_ts: float) -> dict[str, float] | None:
+        """契约源：data_analytics.algorithm_metrics 长表按 (module, metric_name) 求均值（失败 None）。"""
         try:
             pool = await self._get_pool()
             async with pool.acquire() as conn:
@@ -101,6 +117,38 @@ class MetricsReadOnlyRepository:
             logger.exception("algorithm_averages_query_failed")
             return None
         return {f"{row['module']}.{row['metric_name']}": float(row["avg_value"]) for row in rows}
+
+    async def _algorithm_averages_from_telemetry(self, start_ts: float, end_ts: float) -> dict[str, float] | None:
+        """回退源：data_collector.vehicle_telemetry 原始宽列即时聚合（algorithm_metrics 未产数时）。
+
+        列别名以 ``{module}__{metric_name}`` 命名，拆为 ``module.metric_name`` 键（与看板
+        ``_CORE_ALGORITHM_METRIC_KEYS`` 一致）；Postgres ``avg`` 忽略 NULL，全空列不入结果。
+        """
+        try:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT avg(fps) AS perception__fps, "
+                    "avg(latency_ms) AS perception__latency_ms, "
+                    "avg(detected_objects) AS perception__detected_objects, "
+                    "avg(planning_latency_ms) AS planning__planning_latency_ms, "
+                    "avg(control_latency_ms) AS control__control_latency_ms, "
+                    "avg(velocity_error) AS control__velocity_error, "
+                    "avg(steer_error) AS control__steer_error "
+                    "FROM data_collector.vehicle_telemetry WHERE time >= $1 AND time < $2",
+                    datetime.fromtimestamp(start_ts, tz=UTC),
+                    datetime.fromtimestamp(end_ts, tz=UTC),
+                )
+        except Exception:
+            logger.exception("algorithm_averages_telemetry_fallback_failed")
+            return None
+        result: dict[str, float] = {}
+        for alias, value in (row or {}).items():
+            if value is None:
+                continue
+            module, _, metric = alias.partition("__")
+            result[f"{module}.{metric}"] = float(value)
+        return result
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -168,8 +216,8 @@ class KafkaLagProbe:
                 try:
                     futmap = admin.list_consumer_group_offsets([ConsumerGroupTopicPartitions(group)])
                     offsets = next(iter(futmap.values())).result(timeout=self._timeout)
-                except Exception:  # noqa: BLE001 - 单组位点失败不阻塞其余消费组探测（已记 warning）
-                    logger.warning("consumer_group_offset_fetch_failed", group=group)
+                except Exception:  # 单组位点失败不阻塞其余消费组探测（带异常上下文便于定位）
+                    logger.exception("consumer_group_offset_fetch_failed", group=group)
                     continue
                 total_lag = 0
                 for tp in getattr(offsets, "partitions", []) or []:
@@ -215,15 +263,15 @@ class KafkaLagProbe:
     async def consumer_lag(self) -> dict[str, int] | None:
         try:
             return await asyncio.wait_for(asyncio.to_thread(self._lag_sync), timeout=self._timeout + 1.0)
-        except Exception:  # noqa: BLE001 - 探测失败降级为 None（上层按不可用处理），不向请求路径抛出
-            logger.warning("kafka_lag_probe_failed")
+        except Exception:  # 探测失败降级为 None（上层按不可用处理），不向请求路径抛出；带堆栈便于定位真因
+            logger.exception("kafka_lag_probe_failed")
             return None
 
     async def dlq_depth(self) -> dict[str, int] | None:
         try:
             return await asyncio.wait_for(asyncio.to_thread(self._dlq_sync), timeout=self._timeout + 1.0)
-        except Exception:  # noqa: BLE001 - 探测失败降级为 None（上层按不可用处理），不向请求路径抛出
-            logger.warning("kafka_dlq_probe_failed")
+        except Exception:  # 探测失败降级为 None（上层按不可用处理），不向请求路径抛出；带堆栈便于定位真因
+            logger.exception("kafka_dlq_probe_failed")
             return None
 
 
