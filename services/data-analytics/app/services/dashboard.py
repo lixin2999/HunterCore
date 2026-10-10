@@ -100,21 +100,24 @@ class DashboardService:
         return FleetOverview(available=True, total_vehicles=total, online_vehicles=online, by_status=merged)
 
     async def _pipeline_block(self, start: float, end: float) -> PipelineStats:
-        """管道块：遥测样本数 + 消费组滞后 + DLQ 水位（任一不可用即整块降级但保留可用字段）。"""
-        points = await self._pipeline.telemetry_points(start, end)
-        lag = await self._pipeline.consumer_lag()
-        dlq = await self._pipeline.dlq_depth()
+        """管道块：遥测样本数 + 消费组滞后 + DLQ 水位 + 入库延迟 P95（任一不可用仅降级该字段）。"""
+        points, lag, dlq, latency = await asyncio.gather(
+            self._pipeline.telemetry_points(start, end),
+            self._pipeline.consumer_lag(),
+            self._pipeline.dlq_depth(),
+            self._pipeline.ingest_latency_p95(),
+        )
         reasons: list[str] = []
         if points is None:
             reasons.append("database unavailable")
         if lag is None or dlq is None:
             reasons.append("kafka unavailable")
+        # latency 为可选指标（Flink 入库延迟作业未产出/键过期时为 None）：不计入降级理由
         return PipelineStats(
             available=not reasons,
             reason="; ".join(dict.fromkeys(reasons)) if reasons else None,
-            # 入库延迟 P95 由 Flink 入库延迟统计作业补齐（契约 pending 项，暂置 null）
             telemetry_points=points,
-            ingest_latency_ms_p95=None,
+            ingest_latency_ms_p95=latency,
             kafka_consumer_lag=lag or {},
             dlq_messages=dlq or {},
         )

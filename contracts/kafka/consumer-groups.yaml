@@ -57,17 +57,25 @@ groups:
   - group_id: data-analytics-telemetry
     service: data-analytics
     subscribes: [telemetry_clean]
-    produces: [alert_event, analytics_result]
-    writes: [data_analytics.algorithm_metrics]
+    produces: [alert_event, analytics_result, algorithm_metrics]
     engine: Flink 1.18 (DataStream)
     jobs:
       - vehicle_state_monitor            # 6.2.1 心跳/状态变更 → communication_loss
       - driving_anomaly_detection        # 6.2.2 急加速/急减速/急转弯/超速/低电量
       - collision_risk_assessment        # 6.2.3 TTC 计算 → collision_warning
-      - algorithm_performance_monitor    # 6.2.4 感知帧率/规划延迟/控制误差 → algorithm_metrics
+      - algorithm_performance_monitor    # 6.2.4 感知帧率/规划延迟/控制误差 → algorithm_metrics（投 Kafka，不直连库 G-13）
     idempotency_key: "(vehicle_id, time)"
     target_latency: "实时告警触发 ≤ 2s"
-    notes: "实时流处理：阈值取 contracts/database/enums.md 第 3 节，不可放宽（禁止自行新增/改等级）"
+    notes: "实时流处理：阈值取 contracts/database/enums.md 第 3 节，不可放宽（禁止自行新增/改等级）；算法指标经 algorithm_metrics Topic 投递，由 data-analytics-algorithm-metrics 组落库"
+
+  - group_id: data-analytics-algorithm-metrics
+    service: data-analytics
+    subscribes: [algorithm_metrics]
+    produces: []
+    writes: [data_analytics.algorithm_metrics]
+    engine: "data-analytics 常驻 Kafka 消费者（非 Flink；经 AlgorithmMetricRepository 写会话）"
+    idempotency_key: "(vehicle_id, time, module, metric_name)"
+    notes: "消费 Flink algorithm_performance_monitor 产出的 algorithm_metrics Topic，批量落 data_analytics.algorithm_metrics（ON CONFLICT DO NOTHING，写自身 schema 非跨库越界）；运营看板 algorithm 块契约数据源"
 
   - group_id: data-analytics-telemetry-raw
     service: data-analytics

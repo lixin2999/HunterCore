@@ -39,7 +39,10 @@ class PipelineStats(BaseModel):
     available: bool = Field(description="数据源是否可用（false 表示降级展示）")
     reason: str | None = Field(default=None, description="不可用原因")
     telemetry_points: int | None = Field(default=None, ge=0, description="窗口内遥测样本数")
-    ingest_latency_ms_p95: float | None = Field(default=None, description="遥测入库延迟 P95（ms），待入库延迟统计作业补齐")
+    ingest_latency_ms_p95: float | None = Field(
+        default=None,
+        description="遥测入库延迟 P95（ms）：Flink data_quality_monitor 统计 Kafka 时间戳差→Redis 指标键，未产出/过期为 null",
+    )
     kafka_consumer_lag: dict[str, int] = Field(
         default_factory=dict, description="按消费组的消息滞后总数（group → lag）"
     )

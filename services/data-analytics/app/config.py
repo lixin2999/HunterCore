@@ -37,6 +37,8 @@ class Settings(HunterBaseConfig):
     internal_call_roles: str = "analyst"
 
     # ---------- 只读数据库（hunter_analytics_ro，仅 SELECT；契约 db_access.read_only） ----------
+    # 读路径与就绪探针一律走此账号（审查 Y10：最小权限）；写路径仅落本服务自身 schema
+    # （algorithm_metrics，经 DatabaseSessionManager + RW POSTGRES_USER/PASSWORD，见 main 装配）
     analytics_ro_db_user: str = ""
     analytics_ro_db_password: str = ""
 
@@ -96,6 +98,19 @@ class Settings(HunterBaseConfig):
         "telemetry-clean-group,telemetry-raw-failure-group,corner-case-miner-consumer"
     )
     dlq_topic: str = "dead_letter_queue"
+
+    # ---------- algorithm_metrics 落库消费者（契约 consumer-groups.yaml: data-analytics-algorithm-metrics） ----------
+    # 消费 Flink algorithm_performance_monitor 产出的 algorithm_metrics Topic，批量落自身 schema
+    algorithm_metrics_consumer_enabled: bool = True
+    algorithm_metrics_topic: str = "algorithm_metrics"
+    # 消费侧契约 Schema 校验（契约先行：默认开启；需 KAFKA_CONTRACT_DIR 可访问，
+    # K8s 由 hunter-contracts ConfigMap 挂载）。仅在明确知悉风险时关闭（记录 CRITICAL 告警）。
+    ingest_schema_validation_enabled: bool = True
+    # 消费重试参数（契约 defaults：max_poll_records=100，手动提交）
+    consumer_batch_size: int = 100
+    consumer_poll_timeout_seconds: float = 1.0
+    # 落库缓冲冲刷阈值（达此行数尽力冲刷；批次收尾钩子兜底，写库成功才提交 offset）
+    algorithm_metrics_flush_batch_size: int = 500
 
     # ---------- RBAC（网关注入 X-Roles；角色→动作映射待 RBAC 服务化后收敛为权限查询） ----------
     analytics_read_roles: str = "admin,analyst,operator"

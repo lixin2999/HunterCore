@@ -9,14 +9,16 @@
 """
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from hunter_common.database import DatabaseSessionManager
 from hunter_common.logging import (
     configure_logging,
     get_logger,
@@ -27,30 +29,111 @@ from hunter_common.metrics import register_metrics
 from hunter_common.redis import RedisManager
 
 from app.config import settings
+from app.consumers.algorithm_metrics import AlgorithmMetricsConsumer
 from app.core import dependencies
 from app.core.error_handlers import register_exception_handlers
+from app.repositories.algorithm_metrics import AlgorithmMetricsWriter
 from app.repositories.pipeline import MetricsReadOnlyRepository
 from app.routers import corner_cases, coverage, dashboard, evaluation, reports
 from app.routers.health import router as health_router
+from app.services.algorithm_metrics_ingest import AlgorithmMetricsIngest
 
 logger = get_logger("app.main")
 
 
+#: 消费者崩溃后的重启退避（秒）：依赖未恢复时避免重启风暴（对齐 data-collector 采集链路）
+CONSUMER_RESTART_BACKOFF_S = 5.0
+
+
+class _SupervisedConsumer:
+    """algorithm_metrics 消费者监督器：崩溃后重建底层实例并退避重启。
+
+    背景：``KafkaConsumerManager.run()`` 在 ``finally`` 关闭底层 ``Consumer``，崩溃后旧实例
+    不可复用，故以 factory 重建；无监督时任一消费任务异常退出即静默永久停摆（进程与
+    /healthz 仍健康）。落库缓冲 ``AlgorithmMetricsIngest`` 跨重建复用（未冲刷样本不丢）。
+    """
+
+    def __init__(self, factory: Callable[[], AlgorithmMetricsConsumer]) -> None:
+        self._factory = factory
+        self.group_id = AlgorithmMetricsConsumer.group_id
+        self._current: AlgorithmMetricsConsumer | None = None
+        self._stopping = False
+
+    async def run(self) -> None:
+        """监督主循环：``run()`` 正常返回 = 优雅停机；抛异常 = 崩溃 → 退避后重建重启。"""
+        while not self._stopping:
+            consumer = self._factory()
+            self._current = consumer
+            try:
+                await consumer.run()
+                return  # stop() 已置位，底层消费循环正常收尾
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # 单消费者崩溃不得拖垮进程：记录堆栈后重建重启
+                logger.exception(
+                    "consumer_crashed_restarting",
+                    group_id=self.group_id,
+                    backoff_seconds=CONSUMER_RESTART_BACKOFF_S,
+                )
+                await asyncio.sleep(CONSUMER_RESTART_BACKOFF_S)
+            finally:
+                self._current = None
+
+    def stop(self) -> None:
+        """请求优雅停机：置位并停止当前活动实例（正处退避睡眠时由外层 task.cancel 打断）。"""
+        self._stopping = True
+        if self._current is not None:
+            self._current.stop()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """应用生命周期：初始化日志/DB/Redis 管理器（惰性连接，不阻塞启动）。"""
+    """应用生命周期：初始化日志/DB/Redis 管理器与 algorithm_metrics 落库消费者（惰性连接）。"""
     configure_logging(
         settings.service_name,
         settings.log_level,
         json_output=settings.environment != "dev",
     )
-    # 只读就绪探针仓库（审查 Y10）：本服务仅以 hunter_analytics_ro 只读账号访问数据库，
-    # 不初始化全权限 DatabaseSessionManager（最小权限；契约 x-hunter-db-readonly）
+    # 只读就绪探针仓库（审查 Y10）：跨 schema 读路径与 /readyz 仅以 hunter_analytics_ro 只读账号执行
     app.state.readonly_metrics = MetricsReadOnlyRepository(settings)
     app.state.redis = RedisManager(settings)
     app.state.redis.init()
-    logger.info("service_started", service=settings.service_name, port=settings.api_port)
+    # ---------- algorithm_metrics 落库链路（契约 consumer-groups.yaml: data-analytics-algorithm-metrics） ----------
+    # Flink algorithm_performance_monitor 产出 algorithm_metrics Topic → 本服务常驻消费者落库。
+    # Y10 只读约束仅针对**跨 schema 读路径与就绪探针**；本服务写**自身** data_analytics.algorithm_metrics
+    # 合法（契约 db_access.write 声明该表为本服务唯一写方），故初始化 RW DatabaseSessionManager（POSTGRES_USER）。
+    app.state.db = DatabaseSessionManager(settings)
+    app.state.db.init()
+    metrics_ingest = AlgorithmMetricsIngest(AlgorithmMetricsWriter(app.state.db), settings)
+    app.state.algorithm_metrics_ingest = metrics_ingest
+    supervisors: list[_SupervisedConsumer] = []
+    if settings.algorithm_metrics_consumer_enabled:
+        supervisors.append(
+            _SupervisedConsumer(lambda: AlgorithmMetricsConsumer(settings, metrics_ingest))
+        )
+    app.state.metrics_consumers = supervisors
+    consumer_tasks = [
+        asyncio.create_task(supervisor.run(), name=f"consumer-{supervisor.group_id}")
+        for supervisor in supervisors
+    ]
+    logger.info(
+        "service_started",
+        service=settings.service_name,
+        port=settings.api_port,
+        consumers=[supervisor.group_id for supervisor in supervisors],
+    )
     yield
+    # 停机顺序：先停消费（避免使用已关闭的 DB），再释放依赖
+    for supervisor in supervisors:
+        supervisor.stop()
+    for task in consumer_tasks:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # 单个消费者停机异常不得阻断其余资源释放
+            logger.exception("consumer_stop_failed")
     # 关闭请求期惰性创建的下游资源（httpx 客户端 / asyncpg 池 / MinIO 客户端）
     closables: list[Any] = getattr(app.state, dependencies.KEY_CLOSABLES, [])
     for closable in closables:
@@ -62,6 +145,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if storage is not None:
         await storage.close()
     await app.state.redis.close()
+    await app.state.db.close()
     await app.state.readonly_metrics.close()
     logger.info("service_stopped", service=settings.service_name)
 

@@ -63,6 +63,7 @@ data:
     create_topic "sensor_file"        3 604800000
     create_topic "analytics_result"   6 2592000000
     create_topic "alert_event"        3 2592000000
+    create_topic "algorithm_metrics"  6 604800000
 
     # ---- 死信队列（分区继承源 Topic，保留 30 天：contracts/kafka/topics.yaml#naming.dlq_retention_ms） ----
     DLQ_RETENTION_MS=2592000000
@@ -72,6 +73,7 @@ data:
     create_topic "sensor_file.dlq"         3 "$DLQ_RETENTION_MS"
     create_topic "analytics_result.dlq"    6 "$DLQ_RETENTION_MS"
     create_topic "alert_event.dlq"         3 "$DLQ_RETENTION_MS"
+    create_topic "algorithm_metrics.dlq"    6 "$DLQ_RETENTION_MS"
 
     echo "[kafka-init] platform topics ready:"
     kafka_topics --list

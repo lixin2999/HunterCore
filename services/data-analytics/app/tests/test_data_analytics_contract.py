@@ -451,14 +451,14 @@ def test_realtime_job_inputs_match_consumer_groups(contract: dict[str, Any]) -> 
         for group in load_yaml(CONSUMER_GROUPS)["groups"]
         if group["service"] == "data-analytics"
     }
-    assert len(groups) == 4, f"data-analytics 消费组数量异常: {sorted(groups)}"
+    assert len(groups) == 5, f"data-analytics 消费组数量异常: {sorted(groups)}"
     for entry in realtime["input"]:
         group = groups[entry["consumer_group"]]
         assert group["subscribes"] == [entry["topic"]]
         assert set(entry["jobs"]) <= set(group["jobs"])
-    # 生产侧一致：alert_event + analytics_result，且不得声明生产 telemetry_clean
+    # 生产侧一致：alert_event + analytics_result + algorithm_metrics，且不得声明生产 telemetry_clean
     produces = {entry["topic"] for entry in contract["x-hunter-kafka"]["produces"]}
-    assert produces == {"analytics_result", "alert_event"}
+    assert produces == {"analytics_result", "alert_event", "algorithm_metrics"}
     for group in groups.values():
         assert "telemetry_clean" not in group["produces"], (
             "telemetry_clean 生产者为 data-collector（topics.yaml），data-analytics 不得声明生产"
@@ -793,7 +793,7 @@ def test_db_access_follows_cross_schema_exception(contract: dict[str, Any]) -> N
 
 
 def test_dashboard_contract_covers_blocks_and_degradation(contract: dict[str, Any]) -> None:
-    """看板四块（车队/管道/算法/事件）+ 局部降级语义，且不得跨 schema 直查或新增 Redis 键。"""
+    """看板四块（车队/管道/算法/事件）+ 局部降级语义，且不得跨 schema 直查；Redis 键仅限已登记模式。"""
     dashboard = contract["x-hunter-dashboard-contract"]
     assert set(dashboard["blocks"]) == {"fleet", "pipeline", "algorithm", "events"}
     data = contract["components"]["schemas"]["DashboardData"]
@@ -808,10 +808,14 @@ def test_dashboard_contract_covers_blocks_and_degradation(contract: dict[str, An
     collector_endpoints = load_yaml(DATA_COLLECTOR_CONTRACT)["x-hunter-endpoints"]["endpoints"]
     assert "GET /api/v1/data/events" in collector_endpoints
 
-    assert "禁止新增键模式" in contract["x-hunter-service"]["redis_keys"]["note"]
-    assert set(contract["x-hunter-service"]["redis_keys"]["read"]) == {
+    redis_keys = contract["x-hunter-service"]["redis_keys"]
+    # 只读键模式以 redis-keys.yaml 为单一事实来源（禁止服务自行新增）；
+    # analytics:ingest_latency 为本服务 Flink 写、看板只读的指标缓存键（pending #10 结案，已在 redis-keys.yaml 登记）
+    assert "redis-keys.yaml" in redis_keys["note"] and "禁止" in redis_keys["note"]
+    assert set(redis_keys["read"]) == {
         "vehicle:online:set",
         "vehicle:status:{vehicle_id}",
+        "analytics:ingest_latency",
     }
 
 
@@ -822,13 +826,19 @@ def test_kafka_participation_matches_contracts(contract: dict[str, Any]) -> None
         entry["name"]: entry for entry in load_yaml(TOPICS_CONTRACT)["platform_topics"]
     }
     consumed = {entry["topic"] for entry in kafka["consumes"]}
-    assert consumed == {"telemetry_clean", "telemetry_raw", "event_raw", "sensor_file"}
+    assert consumed == {
+        "telemetry_clean",
+        "telemetry_raw",
+        "event_raw",
+        "sensor_file",
+        "algorithm_metrics",
+    }
     for entry in kafka["consumes"]:
         assert entry["topic"] in platform, entry["topic"]
         assert (ROOT / entry["schema"]).is_file(), entry["schema"]
         assert entry["enabled"] is True
     produced = {entry["topic"] for entry in kafka["produces"]}
-    assert produced == {"analytics_result", "alert_event"}
+    assert produced == {"analytics_result", "alert_event", "algorithm_metrics"}
     for entry in kafka["produces"]:
         assert platform[entry["topic"]]["producer"] == "data-analytics"
         assert (ROOT / entry["schema"]).is_file(), entry["schema"]

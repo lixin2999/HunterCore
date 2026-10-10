@@ -6,6 +6,7 @@ Kafka 探测使用独立消费组 ID，不消费消息（仅取水位/提交位�
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -13,6 +14,7 @@ from urllib.parse import quote
 import asyncpg
 from confluent_kafka import OFFSET_INVALID, Consumer, TopicPartition
 from confluent_kafka.admin import AdminClient
+from redis.asyncio import Redis
 
 try:  # confluent-kafka 2.x：公开名在部分小版本中为私有别名（_ConsumerGroupTopicPartitions）
     from confluent_kafka.admin import ConsumerGroupTopicPartitions
@@ -44,6 +46,10 @@ class PipelineSource(Protocol):
 
     async def dlq_depth(self) -> dict[str, int] | None:
         """DLQ 消息堆积（失败返回 None）。"""
+        ...
+
+    async def ingest_latency_p95(self) -> float | None:
+        """遥测入库延迟 P95（ms）（Flink data_quality_monitor → Redis 指标键；缺失/不可用 → None）。"""
         ...
 
 
@@ -275,12 +281,51 @@ class KafkaLagProbe:
             return None
 
 
-class PipelineRepository:
-    """管道健康聚合门面（DB + Kafka 独立降级：失败返回 None，由服务层标记降级）。"""
+class IngestLatencyRedisReader:
+    """入库延迟指标只读器（读 Flink ``data_quality_monitor`` 写入的 Redis 指标键）。
 
-    def __init__(self, settings: HunterBaseConfig) -> None:
+    契约：``contracts/database/redis-keys.yaml`` 键 ``analytics:ingest_latency``（pending #10
+    结案：Kafka 时间戳差 → Flink 流式统计 → Redis 指标键）；本服务**只读**（写方 = 本服务
+    的 Flink 实时作业）。键缺失/Redis 不可用/载荷不可解析 → 返回 None（看板降级为 null，
+    绝不展示陈旧值：作业停摆时键按 TTL 自然过期）。
+    """
+
+    #: 指标键（契约 redis-keys.yaml 登记的模式；与 Flink ``ingest_latency_job.REDIS_KEY`` 一致）
+    KEY = "analytics:ingest_latency"
+
+    def __init__(self, redis: Redis | None) -> None:
+        self._redis = redis
+
+    async def p95_ms(self) -> float | None:
+        if self._redis is None:
+            return None
+        try:
+            raw = await self._redis.get(self.KEY)
+        except Exception:  # noqa: BLE001 - 观测性读取，失败降级为 None（不向请求路径抛出）
+            logger.warning("ingest_latency_read_failed")
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            metric = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("ingest_latency_value_unparsable")
+            return None
+        value = metric.get("p95_ms") if isinstance(metric, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+
+class PipelineRepository:
+    """管道健康聚合门面（DB + Kafka + Redis 独立降级：失败返回 None，由服务层标记降级）。"""
+
+    def __init__(self, settings: HunterBaseConfig, *, redis: Redis | None = None) -> None:
         self._db = MetricsReadOnlyRepository(settings)
         self._kafka = KafkaLagProbe(settings)
+        self._latency = IngestLatencyRedisReader(redis)
 
     async def telemetry_points(self, start_ts: float, end_ts: float) -> int | None:
         return await self._db.telemetry_points(start_ts, end_ts)
@@ -293,6 +338,9 @@ class PipelineRepository:
 
     async def dlq_depth(self) -> dict[str, int] | None:
         return await self._kafka.dlq_depth()
+
+    async def ingest_latency_p95(self) -> float | None:
+        return await self._latency.p95_ms()
 
     async def close(self) -> None:
         await self._db.close()

@@ -195,13 +195,33 @@ keys:
     status: pending_confirmation
     refs: ["contracts/openapi/remote-control.yaml#x-hunter-service.redis_keys（待正式登记：pending #11）"]
 
+  # ---------------------------------------------------------------- 9
+  - pattern: "analytics:ingest_latency"
+    type: "String(JSON)"
+    value: "遥测入库延迟车队级 P95 指标（{\"metric\",\"p95_ms\",\"count\",\"window\",\"window_end\"} JSON）"
+    ttl_seconds: 300
+    ttl_source: "契约推导（pending #10 结案路线：Flink 流式统计→Redis 指标键）：写入窗口 60s，TTL 300s 兜底——作业停摆时键自然过期，看板 pipeline 块降级为 null，绝不展示陈旧值；INGEST_LATENCY_TTL_SECONDS 可调"
+    owner_service: data-analytics
+    writers: [data-analytics]
+    writers_note: "由本服务 Flink 实时作业 data_quality_monitor（消费组 data-analytics-telemetry-raw，输入 telemetry_raw）写入；G-13「Flink 不直连业务库」——本键为指标缓存非系统事实库，属契约批准例外（pending #10 结案）"
+    readers: [data-analytics]
+    lifecycle: "每窗口冲刷（跨窗口边界）SET analytics:ingest_latency EX 300 覆盖；无主动删除，依赖 TTL 过期（缺失即降级 null）"
+    sensitive: false
+    ops: ["SET key json EX 300", "GET", "TTL"]
+    status: pending_confirmation
+    refs:
+      - "contracts/openapi/data-analytics.yaml#x-hunter-service.redis_keys"
+      - "contracts/openapi/data-analytics.yaml#x-hunter-dashboard-contract.pipeline.ingest_latency"
+      - "contracts/openapi/data-analytics.yaml#x-hunter-realtime-jobs.jobs[data_quality_monitor]"
+
 # =====================================================================
 # 交叉校验（scripts/verify_data_layer.py / common/python/tests/test_storage_contracts.py）
 #   1) 各服务 openapi 的 x-hunter-service.redis_keys 声明的键 ∈ 本文件 keys[].pattern
 #   2) 声明中的 type / ttl_seconds 与本文件一致
 #   3) 声明键的服务 ∈ 本文件 writers ∪ readers
-#   4) 8 个受控键的 TTL 与声明一致：session 1800（G-04① 收紧，原第 8 条 7200）/ rate_limit 60 /
-#      ota:progress 86400 / cache:scene 3600 / vehicle:* 与 rc:session 不过期（null）
+#   4) 9 个受控键的 TTL 与声明一致：session 1800（G-04① 收紧，原第 8 条 7200）/ rate_limit 60 /
+#      ota:progress 86400 / cache:scene 3600 / analytics:ingest_latency 300（指标缓存，pending #10 结案）/
+#      vehicle:* 与 rc:session 不过期（null）
 # =====================================================================
 cross_check:
   contracts:
@@ -252,5 +272,9 @@ x-hunter-pending-confirmation:
       question: "各服务 Redis 键声明结构不统一：data-collector / ota-service / remote-control / scene-service 用「对象列表（pattern/type/ttl_seconds）」，data-analytics 用「read: [key, ...]」字符串列表"
       impact: "非阻塞：校验器与测试需同时兼容两种形态，字段级比对在字符串列表形态下无法进行（丢失去重/类型校验能力）"
       contract_decision: "统一为对象列表（推荐）或在校验器与测试中同时支持两种形式；统一后各服务契约同步调整"
+    - id: 9
+      question: "analytics:ingest_latency 未在系统约束第 8 条登记（由 data-analytics Flink data_quality_monitor 作业的入库延迟 P95 指标派生，pending #10 结案路线：Kafka 时间戳差 → Flink 流式统计 → Redis 指标键）"
+      impact: "非阻塞：看板 pipeline 块「入库延迟 P95」子项数据源；键模式冻结前改名会造成 Flink 写方与 data-analytics 读方拼写漂移，看板该字段恒降级 null"
+      contract_decision: "确认是否将该指标键正式纳入系统约束第 8 条受控键集（与 rc:lock 同属派生键）；确认后键模式冻结，各服务契约与 verify_data_layer.py/test_storage_contracts.py 受控键集同步回填"
 
 

@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/algorithm_metrics.schema.json",
+  "title": "algorithm_metrics",
+  "description": "平台内部 Topic algorithm_metrics 消息（生产者 data-analytics 的 Flink 1.18 实时作业 algorithm_performance_monitor，设计文档 6.2.4 节；按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 滚动窗口聚合 telemetry_clean 产出）。消费方：data-analytics 常驻 Kafka 消费者（group data-analytics-algorithm-metrics），批量落库 data_analytics.algorithm_metrics（ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING），是运营看板 algorithm 块的契约数据源。字段严格对齐表列 {time, vehicle_id, module, metric_name, metric_value, tags}，禁止新增表外字段。module 为受控词表（perception/planning/control，见 contracts/database/enums.md MetricModule，不可新增）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "vehicle_id",
+    "module",
+    "metric_name",
+    "metric_value",
+    "time"
+  ],
+  "properties": {
+    "vehicle_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "车辆 ID；同时是 Kafka 消息 key（保证单车辆有序）"
+    },
+    "module": {
+      "enum": ["perception", "planning", "control"],
+      "description": "算法模块（受控词表 MetricModule，DDL CHECK 约束，不可新增取值）"
+    },
+    "metric_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "指标名（小写下划线；来自契约 metric_mapping：fps / latency_ms / planning_latency_ms / control_latency_ms / velocity_error_abs / steer_error_abs 等）"
+    },
+    "metric_value": {
+      "type": "number",
+      "description": "窗口聚合后的指标值（均值/最小值/P95，口径由作业 logic 定义；控制误差取绝对值 velocity_error_abs/steer_error_abs）"
+    },
+    "time": {
+      "type": "number",
+      "description": "聚合窗口终点时间（Unix epoch 秒，含毫秒小数；取窗口内车端遥测时间上界，禁止用处理时间替代；落库映射到 algorithm_metrics.time 分区键）"
+    },
+    "tags": {
+      "type": "object",
+      "description": "维度标签（版本/路段/场景类型/窗口口径等，可选；落库映射到 algorithm_metrics.tags JSONB，默认 {}）",
+      "additionalProperties": true
+    }
+  },
+  "examples": [
+    {
+      "vehicle_id": "HUNTER-001",
+      "module": "perception",
+      "metric_name": "fps",
+      "metric_value": 28.5,
+      "time": 1724035260.0,
+      "tags": { "window": "60s", "agg": "avg", "sw_version": "1.4.2" }
+    },
+    {
+      "vehicle_id": "HUNTER-001",
+      "module": "planning",
+      "metric_name": "planning_latency_ms",
+      "metric_value": 42.7,
+      "time": 1724035260.0,
+      "tags": { "window": "60s", "agg": "p95" }
+    },
+    {
+      "vehicle_id": "HUNTER-002",
+      "module": "control",
+      "metric_name": "velocity_error_abs",
+      "metric_value": 0.18,
+      "time": 1724035320.0
+    }
+  ]
+}

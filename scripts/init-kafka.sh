@@ -2,8 +2,8 @@
 # =====================================================================
 # HunterCore 单机部署 —— Kafka 平台内部 Topic 初始化（init-kafka.sh）
 #
-#   用途：等待 broker 就绪后，按 contracts/kafka/topics.yaml 创建 6 个平台内部 Topic
-#       与对应的 6 个死信 Topic（{topic}.dlq）（分区数/保留时间严格对齐契约，禁止新增未定义 Topic），并校验创建结果。
+#   用途：等待 broker 就绪后，按 contracts/kafka/topics.yaml 创建 7 个平台内部 Topic
+#       与对应的 7 个死信 Topic（{topic}.dlq）（分区数/保留时间严格对齐契约，禁止新增未定义 Topic），并校验创建结果。
 #
 #   ⚠ 死信 Topic 必须显式创建：broker 关 auto.create.topics.enable，而消费侧转投
 #     {topic}.dlq 属于投递行为——Topic 不存在时报 _UNKNOWN_TOPIC（不可重试），
@@ -16,6 +16,7 @@
 #   sensor_file        3   7 天     传感器文件通知
 #   analytics_result   6   30 天    分析结果
 #   alert_event        3   30 天    告警事件
+#   algorithm_metrics  6   7 天     算法指标（Flink 产出→data-analytics 落库）
 #
 # ⚠ 车端 Topic（hunter.{vehicle_id}.telemetry/event/health/...）在车辆注册时按契约创建，
 #   不在本脚本范围内；副本数单机为 1（生产集群为 3，min.insync.replicas=2）。
@@ -56,6 +57,7 @@ TOPIC_SPECS=(
   "sensor_file:3:604800000"         # 7 天
   "analytics_result:6:2592000000"   # 30 天
   "alert_event:3:2592000000"        # 30 天
+  "algorithm_metrics:6:604800000"   # 7 天（Flink 产出→data-analytics 落库）
 )
 # 死信 Topic（topics.yaml#naming：dlq_pattern / dlq_retention_ms / 分区继承源 Topic）
 DLQ_RETENTION_MS=2592000000
@@ -65,9 +67,9 @@ usage() {
 HunterCore Kafka 内部 Topic 初始化脚本
 
 用途：
-  等待 broker 就绪后创建 6 个平台内部 Topic + 6 个死信 Topic（分区数与保留时间严格对齐 Kafka 契约）并校验：
+  等待 broker 就绪后创建 7 个平台内部 Topic + 7 个死信 Topic（分区数与保留时间严格对齐 Kafka 契约）并校验：
     telemetry_raw(12,7d) telemetry_clean(12,7d) event_raw(6,30d)
-    sensor_file(3,7d) analytics_result(6,30d) alert_event(3,30d)
+    sensor_file(3,7d) analytics_result(6,30d) alert_event(3,30d) algorithm_metrics(6,7d)
     {以上每个}.dlq（分区继承源 Topic，保留 30 天）——缺死信 Topic 时非法消息会被静默丢弃
 
 用法：
@@ -242,7 +244,7 @@ main() {
   kafka_topics_cli --list 2>/dev/null | sed 's/^/  /' || true
   local total
   total="$(kafka_topic_count)"
-  log_info "Topic 总数：${total}（含契约 6 个内部 Topic + 6 个死信 Topic 与系统 Topic __consumer_offsets）"
+  log_info "Topic 总数：${total}（含契约 7 个内部 Topic + 7 个死信 Topic 与系统 Topic __consumer_offsets）"
 
   if [ "$failed" -ne 0 ]; then
     log_error "Kafka 初始化存在 ${failed} 项失败（成功处理 ${created} 项 / 校验通过 ${verified} 项）"

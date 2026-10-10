@@ -25,6 +25,7 @@ EXPECTED_PLATFORM_TOPICS: dict[str, tuple[int, int]] = {
     "sensor_file": (3, 604_800_000),
     "analytics_result": (6, 2_592_000_000),
     "alert_event": (3, 2_592_000_000),
+    "algorithm_metrics": (6, 604_800_000),
 }
 
 #: 车端 Topic（分区数, acks, 频率）
@@ -52,6 +53,7 @@ SCHEMA_FILES = (
     "analytics_result.schema.json",
     "sensor_file.schema.json",
     "alert_event.schema.json",
+    "algorithm_metrics.schema.json",
 )
 
 CREATE_TOPIC_CALL_RE = re.compile(r'create_topic\s+"([\w.]+)"\s+(\d+)\s+(\d+)')
@@ -120,7 +122,7 @@ def test_topics_yaml_synced_with_compose_and_k8s_scripts() -> None:
 
 
 def test_all_schemas_are_valid_draft7_with_examples() -> None:
-    """11 个消息 Schema：draft-07 合法、required 非空、examples 通过自身校验。"""
+    """12 个消息 Schema：draft-07 合法、required 非空、examples 通过自身校验。"""
     jsonschema = pytest.importorskip("jsonschema")
     for name in SCHEMA_FILES:
         schema = load_schema(name)

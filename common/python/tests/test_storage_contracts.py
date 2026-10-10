@@ -31,6 +31,7 @@ EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
     "rc:session:{vehicle_id}": ("Hash", None),
     "cache:scene:{scene_id}": ("String(JSON)", 3600),
     "rc:lock:{vehicle_id}": ("String", 30),
+    "analytics:ingest_latency": ("String(JSON)", 300),  # 入库延迟指标缓存（pending #10 结案，redis-keys.yaml pending #9）
 }
 
 #: MinIO Bucket（名称 → 过期天数；None = 永久）——系统关键约束第 7 条（名称不可更改）
@@ -153,7 +154,7 @@ def expected_expiry_rules() -> dict[str, list[tuple[int, str | None]]]:
     ]
     return rules
 def test_redis_contract_keys_and_ttls_match_constraints() -> None:
-    """8 个受控键：键模式 / 类型 / TTL 与系统关键约束第 8 条逐项一致。"""
+    """9 个受控键：键模式 / 类型 / TTL 与系统关键约束第 8 条逐项一致。"""
     keys = contract_keys()
     assert set(keys) == set(EXPECTED_REDIS_KEYS)
     for pattern, (expected_type, expected_ttl) in EXPECTED_REDIS_KEYS.items():

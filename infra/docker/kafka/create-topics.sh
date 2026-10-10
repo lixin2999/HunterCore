@@ -41,6 +41,7 @@ create_topic "event_raw"          6 2592000000   # 事件数据，保留 30 天
 create_topic "sensor_file"        3 604800000    # 传感器文件通知，保留 7 天
 create_topic "analytics_result"   6 2592000000   # 分析结果，保留 30 天
 create_topic "alert_event"        3 2592000000   # 告警事件，保留 30 天
+create_topic "algorithm_metrics"  6 604800000    # 算法指标（Flink 产出→data-analytics 落库），保留 7 天
 
 # ---- 平台内部 Topic 的死信队列（分区继承源 Topic，保留 30 天，契约 naming.dlq_retention_ms） ----
 # 消费方包括 data-analytics（telemetry_raw/clean、event_raw、sensor_file）、scene-service
@@ -52,6 +53,7 @@ create_topic "event_raw.dlq"           6 "$DLQ_RETENTION_MS"
 create_topic "sensor_file.dlq"         3 "$DLQ_RETENTION_MS"
 create_topic "analytics_result.dlq"    6 "$DLQ_RETENTION_MS"
 create_topic "alert_event.dlq"         3 "$DLQ_RETENTION_MS"
+create_topic "algorithm_metrics.dlq"    6 "$DLQ_RETENTION_MS"
 
 echo "[kafka-init] platform topics ready:"
 "$KAFKA_TOPICS" --bootstrap-server "$BOOTSTRAP" --list

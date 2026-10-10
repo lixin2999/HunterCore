@@ -12,7 +12,7 @@
   7. JSON Schema（draft-07）：结构合法、required 非空、examples 通过自身校验
   8. consumer-groups.yaml 消费的 Topic 均已登记、消费者组 ID 唯一
   9. Redis 键契约（contracts/database/redis-keys.yaml）↔ 各服务 x-hunter-service.redis_keys
-     （键模式 / 类型 / TTL / 读写方归属；8 个受控键与系统约束第 8 条一致）
+     （键模式 / 类型 / TTL / 读写方归属；9 个受控键与系统约束第 8 条一致）
  10. 对象存储契约（contracts/database/object-storage.yaml）↔ docker 与 K8s MinIO 初始化脚本
      ↔ 各服务 x-hunter-service.minio_buckets / minio_bucket_lifecycle / 预签名 TTL（三方一致）
 
@@ -134,6 +134,7 @@ EXPECTED_PLATFORM_TOPICS: dict[str, tuple[int, int]] = {
     "sensor_file": (3, 604_800_000),
     "analytics_result": (6, 2_592_000_000),
     "alert_event": (3, 2_592_000_000),
+    "algorithm_metrics": (6, 604_800_000),
 }
 
 #: 车端 Topic 契约（名称模式 → 分区数、acks、频率）
@@ -160,6 +161,7 @@ EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
     "rc:session:{vehicle_id}": ("Hash", None),
     "cache:scene:{scene_id}": ("String(JSON)", 3600),
     "rc:lock:{vehicle_id}": ("String", 30),
+    "analytics:ingest_latency": ("String(JSON)", 300),  # 入库延迟指标缓存（pending #10 结案，redis-keys.yaml pending #9）
 }
 
 #: MinIO Bucket 契约（名称 → 过期天数；None = 永久）——来源：系统关键约束第 7 条（名称不可更改）
@@ -207,6 +209,7 @@ EXPECTED_SCHEMAS_FILES = (
     "analytics_result.schema.json",
     "sensor_file.schema.json",
     "alert_event.schema.json",
+    "algorithm_metrics.schema.json",
 )
 
 CREATE_TABLE_RE = re.compile(
@@ -1001,6 +1004,7 @@ def check_json_schemas() -> None:
         "analytics_result.schema.json",
         "sensor_file.schema.json",
         "alert_event.schema.json",
+        "algorithm_metrics.schema.json",
     }
     before = len(failures)
     for name in EXPECTED_SCHEMAS_FILES:

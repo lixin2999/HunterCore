@@ -161,10 +161,13 @@ def get_fleet_repository(request: Request) -> RedisFleetRepository:
 
 
 def get_pipeline_repository(request: Request) -> PipelineRepository:
-    """管道健康仓储（只读 DB + Kafka 探测）。"""
+    """管道健康仓储（只读 DB + Kafka 探测 + Redis 入库延迟指标）。"""
 
     def factory() -> PipelineRepository:
-        repository = PipelineRepository(settings)
+        redis_manager = getattr(request.app.state, "redis", None)
+        # 入库延迟读自身 schema 同服务写的 Redis 指标键（只读）；Redis 未就绪则降级为 None
+        client = getattr(redis_manager, "client", None) if redis_manager is not None else None
+        repository = PipelineRepository(settings, redis=client)
         # asyncpg 连接池惰性创建，登记到关闭清单（lifespan 统一释放）
         _track_closable(request, repository)
         return repository

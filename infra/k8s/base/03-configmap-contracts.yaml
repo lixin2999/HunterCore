@@ -82,17 +82,25 @@ data:
       - group_id: data-analytics-telemetry
         service: data-analytics
         subscribes: [telemetry_clean]
-        produces: [alert_event, analytics_result]
-        writes: [data_analytics.algorithm_metrics]
+        produces: [alert_event, analytics_result, algorithm_metrics]
         engine: Flink 1.18 (DataStream)
         jobs:
           - vehicle_state_monitor            # 6.2.1 心跳/状态变更 → communication_loss
           - driving_anomaly_detection        # 6.2.2 急加速/急减速/急转弯/超速/低电量
           - collision_risk_assessment        # 6.2.3 TTC 计算 → collision_warning
-          - algorithm_performance_monitor    # 6.2.4 感知帧率/规划延迟/控制误差 → algorithm_metrics
+          - algorithm_performance_monitor    # 6.2.4 感知帧率/规划延迟/控制误差 → algorithm_metrics（投 Kafka，不直连库 G-13）
         idempotency_key: "(vehicle_id, time)"
         target_latency: "实时告警触发 ≤ 2s"
-        notes: "实时流处理：阈值取 contracts/database/enums.md 第 3 节，不可放宽（禁止自行新增/改等级）"
+        notes: "实时流处理：阈值取 contracts/database/enums.md 第 3 节，不可放宽（禁止自行新增/改等级）；算法指标经 algorithm_metrics Topic 投递，由 data-analytics-algorithm-metrics 组落库"
+
+      - group_id: data-analytics-algorithm-metrics
+        service: data-analytics
+        subscribes: [algorithm_metrics]
+        produces: []
+        writes: [data_analytics.algorithm_metrics]
+        engine: "data-analytics 常驻 Kafka 消费者（非 Flink；经 AlgorithmMetricRepository 写会话）"
+        idempotency_key: "(vehicle_id, time, module, metric_name)"
+        notes: "消费 Flink algorithm_performance_monitor 产出的 algorithm_metrics Topic，批量落 data_analytics.algorithm_metrics（ON CONFLICT DO NOTHING，写自身 schema 非跨库越界）；运营看板 algorithm 块契约数据源"
 
       - group_id: data-analytics-telemetry-raw
         service: data-analytics
@@ -361,6 +369,79 @@ data:
           "metrics": { "min_acceleration": -3.42, "velocity": 0.31 },
           "location": { "x": 126.12, "y": 68.41, "z": 0.32, "heading": 1.236 },
           "description": "急减速 -3.42 m/s² 持续 0.6s（阈值 -3.0 m/s² 且持续 > 0.5s）"
+        }
+      ]
+    }
+  "schemas/algorithm_metrics.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/algorithm_metrics.schema.json",
+      "title": "algorithm_metrics",
+      "description": "平台内部 Topic algorithm_metrics 消息（生产者 data-analytics 的 Flink 1.18 实时作业 algorithm_performance_monitor，设计文档 6.2.4 节；按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 滚动窗口聚合 telemetry_clean 产出）。消费方：data-analytics 常驻 Kafka 消费者（group data-analytics-algorithm-metrics），批量落库 data_analytics.algorithm_metrics（ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING），是运营看板 algorithm 块的契约数据源。字段严格对齐表列 {time, vehicle_id, module, metric_name, metric_value, tags}，禁止新增表外字段。module 为受控词表（perception/planning/control，见 contracts/database/enums.md MetricModule，不可新增）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vehicle_id",
+        "module",
+        "metric_name",
+        "metric_value",
+        "time"
+      ],
+      "properties": {
+        "vehicle_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "车辆 ID；同时是 Kafka 消息 key（保证单车辆有序）"
+        },
+        "module": {
+          "enum": ["perception", "planning", "control"],
+          "description": "算法模块（受控词表 MetricModule，DDL CHECK 约束，不可新增取值）"
+        },
+        "metric_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "指标名（小写下划线；来自契约 metric_mapping：fps / latency_ms / planning_latency_ms / control_latency_ms / velocity_error_abs / steer_error_abs 等）"
+        },
+        "metric_value": {
+          "type": "number",
+          "description": "窗口聚合后的指标值（均值/最小值/P95，口径由作业 logic 定义；控制误差取绝对值 velocity_error_abs/steer_error_abs）"
+        },
+        "time": {
+          "type": "number",
+          "description": "聚合窗口终点时间（Unix epoch 秒，含毫秒小数；取窗口内车端遥测时间上界，禁止用处理时间替代；落库映射到 algorithm_metrics.time 分区键）"
+        },
+        "tags": {
+          "type": "object",
+          "description": "维度标签（版本/路段/场景类型/窗口口径等，可选；落库映射到 algorithm_metrics.tags JSONB，默认 {}）",
+          "additionalProperties": true
+        }
+      },
+      "examples": [
+        {
+          "vehicle_id": "HUNTER-001",
+          "module": "perception",
+          "metric_name": "fps",
+          "metric_value": 28.5,
+          "time": 1724035260.0,
+          "tags": { "window": "60s", "agg": "avg", "sw_version": "1.4.2" }
+        },
+        {
+          "vehicle_id": "HUNTER-001",
+          "module": "planning",
+          "metric_name": "planning_latency_ms",
+          "metric_value": 42.7,
+          "time": 1724035260.0,
+          "tags": { "window": "60s", "agg": "p95" }
+        },
+        {
+          "vehicle_id": "HUNTER-002",
+          "module": "control",
+          "metric_name": "velocity_error_abs",
+          "metric_value": 0.18,
+          "time": 1724035320.0
         }
       ]
     }
@@ -1687,6 +1768,21 @@ data:
             group_id: platform-alert-event
             usage: "告警聚合 → WebSocket 推送前端 + 对接 Alertmanager"
         idempotency_key: "(vehicle_id, alert_id)"
+
+      - name: algorithm_metrics
+        partitions: 6
+        acks: all
+        retention_ms: 604800000
+        retention_human: "7 天"
+        key: vehicle_id
+        producer: data-analytics
+        consumers: [data-analytics]
+        schema: schemas/algorithm_metrics.schema.json   # 字段严格对齐表列（Flink 6.2.4 算法性能监控产出）
+        description: |
+          算法指标时序（Flink algorithm_performance_monitor 按 ALGORITHM_METRICS_WINDOW_SECONDS(60s)
+          滚动窗口聚合 telemetry_clean 后投递；data-analytics 常驻消费者再落 data_analytics.algorithm_metrics）；
+          实时作业不直连库（G-13），落库经本 Topic 由服务侧消费者完成（写自身 schema，非跨 schema 越界）
+        idempotency_key: "(vehicle_id, time, module, metric_name)"
 
     # =====================================================================
     # 三、Topic 级限流（设计文档附录 D，不可放宽）

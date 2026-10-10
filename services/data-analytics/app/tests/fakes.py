@@ -62,6 +62,7 @@ class FakePipelineRepository:
         lag: dict[str, int] | None = None,
         dlq: dict[str, int] | None = None,
         averages: dict[str, float] | None = None,
+        ingest_latency: float | None = None,
     ) -> None:
         # 字段按传入值原样保存：None 表示该数据源不可用（触发服务层降级），
         # 需要默认可用数据时由调用方显式传入。
@@ -69,6 +70,7 @@ class FakePipelineRepository:
         self.lag = lag
         self.dlq = dlq
         self.averages = averages
+        self.ingest_latency = ingest_latency
 
     async def telemetry_points(self, start_ts: float, end_ts: float) -> int | None:
         return self.points
@@ -81,6 +83,9 @@ class FakePipelineRepository:
 
     async def dlq_depth(self) -> dict[str, int] | None:
         return self.dlq
+
+    async def ingest_latency_p95(self) -> float | None:
+        return self.ingest_latency
 
     async def close(self) -> None:
         return None

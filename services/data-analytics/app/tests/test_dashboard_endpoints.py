@@ -54,6 +54,7 @@ def _seed_dashboard(
             lag={"analytics-stream-consumer": 12},
             dlq={},
             averages={"perception.fps": 10.2, "planning.planning_latency_ms": 40.0},
+            ingest_latency=812.5,
         ),
     )
     app.state.__setattr__(deps.KEY_EVENT_CLIENT, events or FakeEventClient(_seed_events()))
@@ -79,6 +80,8 @@ async def test_dashboard_all_blocks_available(clean_state: None) -> None:
     pipeline = data["pipeline"]
     assert pipeline["telemetry_points"] == 1000
     assert pipeline["kafka_consumer_lag"] == {"analytics-stream-consumer": 12}
+    # 入库延迟 P95 由 Flink data_quality_monitor→Redis 指标键透出（看板 pipeline 块只读）
+    assert pipeline["ingest_latency_ms_p95"] == pytest.approx(812.5)
     algorithm = data["algorithm"]
     assert algorithm["perception_fps_avg"] == pytest.approx(10.2)
     assert algorithm["planning_latency_ms_avg"] == pytest.approx(40.0)

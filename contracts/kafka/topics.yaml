@@ -269,6 +269,21 @@ platform_topics:
         usage: "告警聚合 → WebSocket 推送前端 + 对接 Alertmanager"
     idempotency_key: "(vehicle_id, alert_id)"
 
+  - name: algorithm_metrics
+    partitions: 6
+    acks: all
+    retention_ms: 604800000
+    retention_human: "7 天"
+    key: vehicle_id
+    producer: data-analytics
+    consumers: [data-analytics]
+    schema: schemas/algorithm_metrics.schema.json   # 字段严格对齐表列（Flink 6.2.4 算法性能监控产出）
+    description: |
+      算法指标时序（Flink algorithm_performance_monitor 按 ALGORITHM_METRICS_WINDOW_SECONDS(60s)
+      滚动窗口聚合 telemetry_clean 后投递；data-analytics 常驻消费者再落 data_analytics.algorithm_metrics）；
+      实时作业不直连库（G-13），落库经本 Topic 由服务侧消费者完成（写自身 schema，非跨 schema 越界）
+    idempotency_key: "(vehicle_id, time, module, metric_name)"
+
 # =====================================================================
 # 三、Topic 级限流（设计文档附录 D，不可放宽）
 # =====================================================================

@@ -1438,8 +1438,8 @@ x-hunter-service:
     hunter-rosbag: "按对象 Tag 区分：hunter-retention=regular 30 天过期；event 永久（G-12）"
     hunter-raw-data: "30 天自动删除"
   redis_keys:
-    note: "仅读取既有键（Redis Key 设计不可更改，禁止新增键模式）"
-    read: ["vehicle:online:set", "vehicle:status:{vehicle_id}"]
+    note: "只读键模式以 contracts/database/redis-keys.yaml 为单一事实来源（禁止服务自行新增键模式）；analytics:ingest_latency 为本服务 Flink 作业写入、看板只读的指标缓存键（已在 redis-keys.yaml 登记，pending #10 结案）"
+    read: ["vehicle:online:set", "vehicle:status:{vehicle_id}", "analytics:ingest_latency"]
   dependencies:
     - service: data-collector
       usage: "REST GET /api/v1/data/events（看板事件统计）；Kafka 平台内部 Topic 由 data-collector 产出"
@@ -1631,7 +1631,7 @@ x-hunter-realtime-jobs:
       logic:
         - "统计感知帧率 perception.fps（均值/最小值）与感知延迟 perception.latency_ms（P95）"
         - "统计规划延迟 planning.planning_latency_ms、控制误差 control.velocity_error / control.steer_error"
-        - "按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 滚动窗口聚合后批量写 data_analytics.algorithm_metrics"
+        - "按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 滚动窗口聚合后投递 Kafka Topic algorithm_metrics（不直连库，G-13）"
       outputs: [algorithm_metrics, analytics_result]
       metric_mapping:
         "perception.fps": "metric_name=fps, module=perception"
@@ -1640,7 +1640,8 @@ x-hunter-realtime-jobs:
         "control.control_latency_ms": "metric_name=control_latency_ms, module=control"
         "control.velocity_error": "metric_name=velocity_error_abs, module=control"
         "control.steer_error": "metric_name=steer_error_abs, module=control"
-      writes: "data_analytics.algorithm_metrics（executemany 批量写，ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING）"
+      emits: "Kafka Topic algorithm_metrics（契约 contracts/kafka/schemas/algorithm_metrics.schema.json；字段严格对齐表列）；实时作业不直连库（G-13）"
+      writes: "经 data-analytics-algorithm-metrics 消费组落 data_analytics.algorithm_metrics（服务侧 executemany 批量写，ON CONFLICT (time, vehicle_id, module, metric_name) DO NOTHING）"
 
     - name: collision_risk_assessment
       section: "6.2.3"
@@ -1657,10 +1658,14 @@ x-hunter-realtime-jobs:
       input: telemetry_raw
       logic:
         - "丢包率：按 seq 连续性估算（seq 缺口数 / 期望条数）"
-        - "延迟：车端 timestamp 与到达时间差（P95）"
+        - "延迟：车端 timestamp 与 Kafka 到达时间差（车队级 P95，60s 事件时间滚动窗口）"
         - "异常值占比：battery_soc 0-100、cpu_usage/gpu_usage 0-100 等物理范围外样本比例"
       outputs: [analytics_result, algorithm_metrics]
-      note: "⚠ 数据质量阈值与结果落位（是否单独报告/表）设计文档未定义：契约按 analytics_result(result_type=metric) 输出，见 pending #5"
+      side_output:
+        target: "Redis 指标键 analytics:ingest_latency（契约 redis-keys.yaml 登记，TTL 300s）"
+        value: "{metric:ingest_latency_ms_p95, p95_ms, count, window:60s, window_end} JSON"
+        note: "入库延迟 P95 子项面向看板 pipeline 块的落位（pending #10 结案：Kafka 时间戳差估算）；G-13 Flink 不直连业务库，写 Redis 指标缓存属契约批准例外；时钟超前负延迟样本丢弃（不伪造）"
+      note: "⚠ 数据质量阈值与结果落位（是否单独报告/表）设计文档未定义：契约按 analytics_result(result_type=metric) 输出，见 pending #5；入库延迟 P95 另写 Redis 指标键供看板读取，见 pending #10 结案"
 
   thresholds:
     - name: ALERT_COMMUNICATION_LOSS_SECONDS
@@ -1967,8 +1972,9 @@ x-hunter-dashboard-contract:
         - "Kafka AdminClient：消费组滞后（data-analytics-* / data-collector-*）"
         - "Kafka AdminClient：{topic}.dlq 高水位（DLQ 消息数）"
         - "data_collector.vehicle_telemetry（只读账号，count / 近似计数，按 time 分区裁剪）"
+        - "Redis analytics:ingest_latency（只读：入库延迟 P95，由本服务 Flink data_quality_monitor 写入）"
       limits: "单块聚合时间窗上限 ANALYTICS_QUERY_MAX_RANGE_DAYS(7d)；禁止全表精确 COUNT（hypertable 开销）"
-      ingest_latency: "遥测入库延迟 P95 取自监控指标（Prometheus 查询）或 Kafka 时间戳差估算（⚠ 实现方式待确认，pending #10）"
+      ingest_latency: "遥测入库延迟 P95【已结案 pending #10】：采用 Kafka 时间戳差估算——Flink data_quality_monitor 统计（车端 timestamp ↔ Kafka 到达时间差，60s 事件时间滚动窗口车队级 P95）写 Redis 指标键 analytics:ingest_latency，本服务只读展示；键缺失/过期（作业停摆 TTL 兜底）→ ingest_latency_ms_p95=null（不伪造、不取 Prometheus）"
     algorithm:
       sources:
         - "data_analytics.algorithm_metrics（module ∈ perception/planning/control，按 ALGORITHM_METRICS_WINDOW_SECONDS 聚合）"
@@ -1980,7 +1986,7 @@ x-hunter-dashboard-contract:
       note: "⚠ 平台侧 alert_event 统计（本服务生产）暂无落位（alert_event 消费方待定，pending #4）"
   response_semantics:
     partial_failure: "任一块不可用 → 200 + 该块 available=false + degraded 列表；全部不可用 → 503"
-    cache: "不引入新 Redis 键（Redis Key 设计不可更改）；如需缓存须先评审键模式（pending #11）"
+    cache: "看板响应不做 Redis 缓存（避免为缓存目的新增键模式，pending #11）；注：analytics:ingest_latency 是数据源指标键（Flink 写、看板只读），非响应缓存，已在 redis-keys.yaml 登记（pending #10 结案）"
 
 x-hunter-alert-contract:
   source: "设计文档 6.2 节（实时告警规则）+ contracts/kafka/schemas/alert_event.schema.json"
@@ -2079,6 +2085,11 @@ x-hunter-kafka:
       jobs: [perception_eval]
       enabled: true
       reason: "上传完成的传感器文件作为感知精度评估输入（MinIO 直读对象）"
+    - topic: algorithm_metrics
+      group_id: data-analytics-algorithm-metrics
+      schema: contracts/kafka/schemas/algorithm_metrics.schema.json
+      enabled: true
+      reason: "消费 Flink algorithm_performance_monitor 产出的算法指标，经 AlgorithmMetricRepository 写会话落 data_analytics.algorithm_metrics（看板 algorithm 块契约数据源；写自身 schema，非跨库越界）"
   produces:
     - topic: analytics_result
       schema: contracts/kafka/schemas/analytics_result.schema.json
@@ -2088,6 +2099,10 @@ x-hunter-kafka:
       schema: contracts/kafka/schemas/alert_event.schema.json
       key: vehicle_id
       trigger: "Flink 实时作业命中告警规则（6.2.1 / 6.2.2 / 6.2.3）"
+    - topic: algorithm_metrics
+      schema: contracts/kafka/schemas/algorithm_metrics.schema.json
+      key: vehicle_id
+      trigger: "Flink algorithm_performance_monitor 按 ALGORITHM_METRICS_WINDOW_SECONDS(60s) 窗口聚合（6.2.4）；不直连库（G-13），由 data-analytics-algorithm-metrics 组落库"
   not_owned:
     note: "以下 Topic 属其他模块，本服务不生产、不消费，禁止擅自订阅"
     topics:
@@ -2110,6 +2125,7 @@ x-hunter-kafka:
     telemetry_raw: "(vehicle_id, time)"
     event_raw: "(vehicle_id, event_type, event_time)"
     sensor_file: object_key
+    algorithm_metrics: "(vehicle_id, time, module, metric_name)"
 
 x-hunter-error-status-map:
   source: "设计文档 附录 A 错误码 + common/python/hunter_common/exceptions.py ErrorCode"
@@ -2184,8 +2200,8 @@ x-hunter-pending-confirmation:
 
     - id: 10
       question: "看板 pipeline 块「遥测入库延迟 P95」数据来源（vehicle_telemetry 无入库时间列）"
-      contract_decision: "暂定两种实现：Prometheus 查询（监控指标）或 Kafka 时间戳差估算；契约不新增列/表"
-      impact: "看板数值准确性与依赖（Prometheus 查询需额外客户端与网络策略）"
+      contract_decision: "【已结案】采用 Kafka 时间戳差估算路线（不新增列/表）：Flink data_quality_monitor 消费 telemetry_raw，按 60s 事件时间滚动窗口统计「Kafka 到达时间 − 车端 timestamp」车队级 P95，写 Redis 指标键 analytics:ingest_latency（已在 redis-keys.yaml 登记，TTL 300s 兜底），看板 pipeline 块只读展示；不采用 Prometheus 查询（避免额外客户端/网络策略）。负延迟（时钟超前）丢弃不伪造"
+      impact: "看板 ingest_latency_ms_p95 为实时估算值（作业停摆时降级 null）；新增受控指标键 analytics:ingest_latency（redis-keys.yaml pending #9 同步），不新增 DB 列/表"
 
     - id: 11
       question: "分析查询时间跨度上限与看板缓存键（设计文档未定义；Redis Key 设计不可更改）"
