@@ -131,7 +131,7 @@ class KafkaLagProbe:
         self._timeout = max(settings.dependency_timeout_seconds, 1.0)
         # 探测专用消费组；不订阅任何主题，仅取水位/提交位点
         self._conf: dict[str, Any] = {
-            "bootstrap.servers": ",".join(settings.kafka_bootstrap_servers),
+            "bootstrap.servers": ",".join(settings.kafka_bootstrap_servers_list),
             "security.protocol": settings.kafka_security_protocol,
             "group.id": "hunter-analytics-metrics-probe",
             "enable.auto.commit": False,

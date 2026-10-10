@@ -17,7 +17,7 @@ export function formatRelativeTime(epochSeconds?: number | null): string {
   if (!epochSeconds) {
     return '-'
   }
-  const diffSeconds = Math.floor(Date.now() / 1000) - epochSeconds
+  const diffSeconds = Math.floor(Date.now() / 1000 - epochSeconds)
   if (diffSeconds < 0) {
     return formatTime(epochSeconds)
   }
