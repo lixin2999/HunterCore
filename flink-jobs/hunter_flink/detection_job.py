@@ -59,9 +59,11 @@ def expand_alerts(
 
 def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内不可执行
     """PyFlink DataStream 作业提交入口（Flink 2.1）。"""
-    from pyflink.common import Types
+    from pyflink.common import Types, WatermarkStrategy
+    from pyflink.common.serialization import SimpleStringSchema
     from pyflink.datastream import StreamExecutionEnvironment
     from pyflink.datastream.connectors.kafka import (
+        KafkaOffsetResetStrategy,
         KafkaOffsetsInitializer,
         KafkaRecordSerializationSchema,
         KafkaSink,
@@ -88,27 +90,37 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
             return [json.dumps(alert, ensure_ascii=False) for alert in alerts]
 
     env = StreamExecutionEnvironment.get_execution_environment()
-    env.add_source(
+    source = (
         KafkaSource.builder()
         .set_bootstrap_servers(KAFKA_BOOTSTRAP)
         .set_topics(INPUT_TOPIC)
         .set_group_id(CONSUMER_GROUP)
-        .set_starting_offsets(KafkaOffsetsInitializer.group_offsets())
-        .value_only_decoder(Types.PRIMITIVE_STRING(Types.InformationType()))
+        # 已提交位点优先；无提交位点（首次部署 / offset 保留期已过）回落 earliest，
+        # 与契约 consumer-groups.yaml ``defaults.auto_offset_reset: earliest`` 同语义
+        # （Flink 2.x 名字：``committed_offsets``，1.x 的 ``group_offsets`` 已随 Java
+        #  ``OffsetsInitializer`` 重组删除）
+        .set_starting_offsets(
+            KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
+        )
+        # 参数位是 DeserializationSchema（不是 TypeInformation）；2.x 无 ``value_only_decoder``
+        .set_value_only_deserializer(SimpleStringSchema())
         .build()
+    )
+    # KafkaSource 是 FLIP-27 Source：必须走 ``from_source``（``add_source`` 只接受
+    # SourceFunction）；本作业不依赖事件时间，水位取 ``no_watermarks``
+    env.from_source(
+        source, WatermarkStrategy.no_watermarks(), INPUT_TOPIC, type_info=Types.STRING()
     ) \
         .key_by(lambda raw: json.loads(raw).get("vehicle_id"), key_type=Types.STRING()) \
         .flat_map(AlertFlatMap(), output_type=Types.STRING()) \
-        .sink(
+        .sink_to(  # Java ``sinkTo``：PyFlink 无 ``DataStream.sink``
             KafkaSink.builder()
             .set_bootstrap_servers(KAFKA_BOOTSTRAP)
             .set_record_serializer(
                 KafkaRecordSerializationSchema.builder()
                 .set_topic(OUTPUT_TOPIC)
-                .set_key_serialization_schema(Types.PRIMITIVE_STRING(Types.InformationType()))
-                .set_value_serialization_schema(
-                    Types.PRIMITIVE_STRING(Types.InformationType())
-                )
+                .set_key_serialization_schema(SimpleStringSchema())
+                .set_value_serialization_schema(SimpleStringSchema())
                 .build()
             )
             .build()

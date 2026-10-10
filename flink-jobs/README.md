@@ -47,8 +47,11 @@ battery_low / battery_critical 独立边沿触发（SOC 8% 时两条各一次）
 ### 提交与测试
 
 ```bash
-# 本地单测（规则核心 + 契约基准比对 + alert_event schema 校验）
+# 本地单测（规则核心 + 契约基准比对 + alert_event schema 校验 + PyFlink API 面静态校验）
 python scripts/run_unit_tests.py flink-jobs
+
+# 本地跑 API 面守卫（装了 apache-flink 才能跑；未装时自动 skip）
+python -m hunter_flink.api_guard
 
 # 仓库根构建作业镜像（compose 与 K8s 同一镜像，V1.19.2 起 compose 也已切换）
 # ⚠ 标签与镜像内 Python 必须与基座 Flink 同版本（V1.19.5 钉 Flink 2.1.1 + CPython 3.12）：
@@ -60,9 +63,16 @@ docker build -f flink-jobs/Dockerfile -t hunter-flink/jobs:2.1.1 .
 #   `flink-sql-connector-kafka-5.0.0-2.1.jar`（命名是 `<连接器版本>-<Flink 版本>`）。镜像源覆盖：
 #   docker build -f flink-jobs/Dockerfile --build-arg KAFKA_CONNECTOR_URL=<同路径镜像地址> -t … .
 
+# ⚠ 镜像内有**四道**构建期自检（V1.19.7）：① `python --version`/`pip --version`/`import ssl`；
+#   ② 开 jar 断言连接器 `KafkaSource`/`KafkaSink` 类存在；③ 依赖门禁 `pip install apache-flink==2.1.1`
+#   + `import pyflink/hunter_common/...`；④ `python -m hunter_flink.api_guard`（PyFlink API 成员名内省、不启 JVM）。
+#   仅改作业代码时，解释器/依赖/jar 等重层命中缓存，**不需要 `--no-cache`**。
+
 # compose 单机形态（生产机用 sudo，.env 为 600/root）：镜像内置 hunter_flink 与 hunter_common，
 # 提交走 -pym（官方纯 JVM 镜像无 Python，必报 `Cannot run program "python"`）
 docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --build flink-jm flink-tm
+docker compose -f infra/deploy/docker-compose.yml --project-directory . exec flink-jm \
+  python -m hunter_flink.api_guard                                                   # 提交前守卫（也可 docker exec）
 docker compose -f infra/deploy/docker-compose.yml --project-directory . exec flink-jm \
   flink run -d -m localhost:8081 -pym hunter_flink.detection_job
 # …… algorithm_performance_job / ingest_latency_job 同式各一行
@@ -76,6 +86,14 @@ docker compose -f infra/deploy/docker-compose.yml --project-directory . exec fli
 - **CI lint**：本目录已纳入流水线 lint 阶段（`.gitlab-ci.yml` → `ruff check tests common/python
   services flink-jobs`）；作业代码须与其余模块同守 ruff 规则（导入分组：第三方 `hunter_common`
   与第一方 `hunter_flink` 分块）。
+- **PyFlink API 面纪律**（V1.19.7）：`hunter_flink/api_guard.py` 是作业可用 PyFlink 模块/类/成员的**单一事实来源**，
+  仓库侧 `tests/test_pyflink_api_usage.py`（`ast` 静态校验，无 PyFlink 也能跑）与镜像内第四道自检（`hasattr` 内省）
+  共用同一份名单。`main()` 标 `pragma: no cover`，仓库单测从不执行这些行 —— 所以**凭印象写 API 名只能靠门禁拦住**：
+  新增/改名调用时先按 release-2.x 源码核实，再补白名单（含 `FLUENT_SUCCESSORS` 的链式后继类），最后改作业。
+  已知 2.x 改名/删除：`group_offsets`→`committed_offsets(KafkaOffsetResetStrategy.EARLIEST)`、
+  `value_only_decoder`→`set_value_only_deserializer(SimpleStringSchema())`、`DataStream.sink`→`sink_to`、
+  FLIP-27 Source 必走 `env.from_source(...)`、**Python 自定义 `SinkFunction`/`SourceFunction` 不再受支持**
+  （副作用写落在 `KeyedProcessFunction` 内，终端用 `print` 收口）。
 - **部署形态**（两种并存，按环境择一）：
   1. **K8s 自建集群（推荐生产）**：`infra/k8s/flink/`（`01-configmap` + `02-jobmanager`
      Deployment/Service + `03-taskmanager` Deployment + `04-submit-job` batch/v1）+ `hunter-flink/jobs:2.1.1`

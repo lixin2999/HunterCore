@@ -15,16 +15,16 @@
 #      1.20.x 到 cp311、**只有 2.1.x 才发 cp312**；③ 全系统服务基线 = python:3.12-slim（V1.16.1）。
 #   → 三者唯一交集：**Flink 2.1.1 + CPython 3.12**（作业与服务解释器对齐）。
 #   解释器不用 apt：基座 apt python3 与 3.12 无交集，改自 python:3.12-slim-bookworm 拷入自包含 CPython。
-#   ⚠ 跳发行版拷 /usr/local 时，CPython 的 `_ssl` 等扩展必须能在基座找到它链接的 OpenSSL：
+#   ⚠ 跨发行版拷 /usr/local 时，CPython 的 `_ssl` 等扩展必须能在基座找到它链接的 OpenSSL：
 #     V1.19.4 拷 bullseye（OpenSSL 1.1 / libssl.so.1.1）到旧基座时构建即报 ImportError（服务器实录），
 #     bookworm 与 2.x 基座同代 OpenSSL 3（libssl.so.3）→ 换 bookworm 即消除。任何 ABI 不匹配
-#     会在下面两道构建期自检的第一行（python --version）立即失败，不会产出坏镜像。
+#     会在下面四道构建期自检的第一行（python --version）立即失败，不会产出坏镜像。
 FROM python:3.12-slim-bookworm AS pyrel
 
 # Kafka 连接器 jar（V1.19.5 新增）：官方 flink 镜像与 apache-flink wheel **都不自带** DataStream
 # Kafka 连接器（`org.apache.flink.connector.kafka.*`），缺 jar 时作业提交后即报
 # `ClassNotFoundException: org.apache.flink.connector.kafka.source.KafkaSource`（V1.19.2~4
-# 均果在解释器层、未触达此层）。Flink 1.15 起连接器独立版本线：Flink **2.1** 对应
+# 均卡在解释器层、未触达此层）。Flink 1.15 起连接器独立版本线：Flink **2.1** 对应
 # `flink-sql-connector-kafka` **5.0.0-2.1**（已核 Maven Central，目录无 `_2.12` 后缀）。
 # 用 python 标准库下载（不依赖基座是否带 curl/wget）；内网镜像源可用 ARG 覆盖（同路径结构）：
 #   --build-arg KAFKA_CONNECTOR_URL=https://maven.aliyun.com/repository/central/org/apache/flink/flink-sql-connector-kafka/5.0.0-2.1/flink-sql-connector-kafka-5.0.0-2.1.jar
@@ -62,10 +62,11 @@ ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 # 安装 PyFlink 运行时 + 共享库 hunter_common（作业依赖其受控词表/键常量；
 # 经 hunter_common/__init__ 传递导入 sqlalchemy/redis/confluent-kafka 等，需随镜像一并提供）。
 # FLINK_HOME 复用基础镜像自带的 JVM 发行版（/opt/flink），apache-flink 仅补 Python 绑定层。
+# 第三道自检（依赖门禁）：本层末尾 import 一遍作业真实用到的包。
 # ⚠ 版本必须与基座 Flink 完全一致（1.18.1 → 曾无 cp311 轮子而默默回退 sdist 的教训）：
 #   pip 若找不到匹配 cp312 的轮子会报错/转尝试源码包，本层自检 import pyflink 会立即拉响。
 COPY common/python /opt/hunter/common/python
-# 连接器 jar 入基座 classpath（JM/TM/提交 Job 共用本镜像，三侧同时生效）+ 第三道自检：
+# 连接器 jar 入基座 classpath（JM/TM/提交 Job 共用本镜像，三侧同时生效）+ 第二道自检：
 # 直接开 jar（zip）断言两个关键类存在，避免“文件拷了但不是那个连接器”的静默失败。
 # ⚠ 同样禁止在本 RUN 续行之间写 `#` 注释。
 COPY --from=conn --chown=flink:flink /opt/flink-connector/ /opt/flink/lib/
@@ -81,6 +82,13 @@ print('job deps OK on', sys.version.split()[0])"
 COPY flink-jobs/hunter_flink /opt/hunter/jobs/hunter_flink
 ENV PYTHONPATH=/opt/hunter/jobs \
     PYTHON_HOME=/usr/local/bin/python3
+
+# 第四道自检（V1.19.7：PyFlink API 面门禁）。作业 main() 标 `pragma: no cover`（仓库内无 PyFlink
+# 运行时），故 1.x → 2.x 的改名只在**提交期**暴露（服务器实录：三个作业齐报
+# `KafkaOffsetsInitializer has no attribute 'group_offsets'`）。此处用纯 Python 属性内省
+# （不启 JVM、不建 gateway）按白名单逐个断言成员存在 + 2.x 已删名字确已消失，把同类漂移
+# 前移为构建失败；白名单单一事实来源 = hunter_flink/api_guard.py（仓库侧另有 ast 静态单测）。
+RUN python -m hunter_flink.api_guard
 
 # 运行用户：flink 官方镜像内置非 root 用户 flink（UID 9999）——与 infra/k8s/flink/ 清单
 # Pod securityContext.runAsUser 一致（verify_infra 对 Deployment 强制非 root）。

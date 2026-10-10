@@ -330,9 +330,11 @@ services:
   #   升级连带：① Kafka 连接器 jar 已内置进镜像的 /opt/flink/lib（flink-sql-connector-kafka-5.0.0-2.1，
   #     Flink 2.1 对应版本；官方基座与 apache-flink wheel 都不带）；若仍报
   #     ClassNotFoundException: org.apache.flink.connector.kafka.* → 构建时 jar 下载阶段被跳过/替换，
-  #     先查 build 日志第三道自检（kafka connector jar OK）。② Flink 2.0 做了一轮状态/检查点配置重组，
+  #     先查 build 日志第二道自检（kafka connector jar OK）。② Flink 2.0 做了一轮状态/检查点配置重组，
   #     旧的 `state.*` 键已**移除**，下方 checkpoint 目录改用新键 `execution.checkpointing.dir`；旧键会
-  #     直接拉响启动失败并提示替换项（非仅告警）。
+  #     直接拉响启动失败并提示替换项（非仅告警）。③ V1.19.7：镜像内第四道自检 `python -m hunter_flink.api_guard`
+  #     校验作业常用的 PyFlink API 成员名；若提交齐报 `AttributeError: type object 'X' has no attribute 'y'`
+  #     （1.x → 2.x 改名）则先跑该守卫，不要怀疑环境。
   flink-jm:
     image: hunter-flink/jobs:2.1.1
     build:

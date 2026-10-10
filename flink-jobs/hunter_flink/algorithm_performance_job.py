@@ -186,9 +186,11 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
     与 ``detection_job`` 同构：窗口缓冲为按 key 的算子内状态；``expand_metrics`` 纯 Python，
     仓库单测无需 PyFlink 环境。反序列化/处理失败转 ``algorithm_metrics.dlq`` 由部署侧失败处理器承担。
     """
-    from pyflink.common import Types
+    from pyflink.common import Types, WatermarkStrategy
+    from pyflink.common.serialization import SimpleStringSchema
     from pyflink.datastream import StreamExecutionEnvironment
     from pyflink.datastream.connectors.kafka import (
+        KafkaOffsetResetStrategy,
         KafkaOffsetsInitializer,
         KafkaRecordSerializationSchema,
         KafkaSink,
@@ -208,27 +210,34 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
             return [json.dumps(item, ensure_ascii=False) for item in metrics]
 
     env = StreamExecutionEnvironment.get_execution_environment()
-    env.add_source(
+    source = (
         KafkaSource.builder()
         .set_bootstrap_servers(KAFKA_BOOTSTRAP)
         .set_topics(INPUT_TOPIC)
         .set_group_id(CONSUMER_GROUP)
-        .set_starting_offsets(KafkaOffsetsInitializer.group_offsets())
-        .value_only_decoder(Types.PRIMITIVE_STRING(Types.InformationType()))
+        # 已提交位点优先，无提交位点回落 earliest（契约 defaults.auto_offset_reset；
+        # 与 detection_job 同组 data-analytics-telemetry，位点共享）
+        .set_starting_offsets(
+            KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
+        )
+        .set_value_only_deserializer(SimpleStringSchema())
         .build()
+    )
+    # FLIP-27 Source 走 from_source（add_source 仅适用 SourceFunction）；窗口划分用载荷内的
+    # 车端事件时间（expand_metrics 自管缓冲），不依赖 Flink 水位
+    env.from_source(
+        source, WatermarkStrategy.no_watermarks(), INPUT_TOPIC, type_info=Types.STRING()
     ) \
         .key_by(lambda raw: json.loads(raw).get("vehicle_id"), key_type=Types.STRING()) \
         .flat_map(MetricsFlatMap(), output_type=Types.STRING()) \
-        .sink(
+        .sink_to(
             KafkaSink.builder()
             .set_bootstrap_servers(KAFKA_BOOTSTRAP)
             .set_record_serializer(
                 KafkaRecordSerializationSchema.builder()
                 .set_topic(OUTPUT_TOPIC)
-                .set_key_serialization_schema(Types.PRIMITIVE_STRING(Types.InformationType()))
-                .set_value_serialization_schema(
-                    Types.PRIMITIVE_STRING(Types.InformationType())
-                )
+                .set_key_serialization_schema(SimpleStringSchema())
+                .set_value_serialization_schema(SimpleStringSchema())
                 .build()
             )
             .build()

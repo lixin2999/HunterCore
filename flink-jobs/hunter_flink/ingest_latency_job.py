@@ -152,77 +152,87 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink + Redis 运行时，仓
 
     拓扑（契约 data_quality_monitor「延迟」子项，pending #10 结案路线）::
 
-        Kafka telemetry_raw（group=data-analytics-telemetry-raw，携带 Kafka 记录到达时间）
-          → keyBy(常量) → expand_latency 车队窗口缓冲（跨窗口冲刷）
-          → aggregate P95 → Redis SET analytics:ingest_latency EX <ttl>
+        Kafka telemetry_raw（group=data-analytics-telemetry-raw，取 Kafka 记录时间戳为到达时间）
+          → keyBy(常量) → expand_latency 车队窗口缓冲（跨窗口冲刷）+ Redis SET 指标键
 
-    ``arrival_time`` 取 Kafka 记录时间戳（broker LogAppendTime/接收时刻），车端 ``timestamp`` 取
-    消息体；二者差即入库链路延迟。keyBy 常量以保证车队级 P95 精确（规模过大时可改近似分位聚合，
-    须回改契约）。Redis 写失败由 Sink 重试；作业停摆时键按 TTL 自然过期（看板降级 null）。
+    ``arrival_time`` 取 Kafka 记录时间戳（broker LogAppendTime / 生产者 CreateTime，经算子上下文
+    ``ctx.timestamp()`` 下传；PyFlink 无 Python 侧 ``KafkaRecordDeserializationSchema``，记录时间戳
+    只能走该路径），车端 ``timestamp`` 取消息体；二者差即入库链路延迟。无记录时间戳的样本直接丢弃
+    （不取处理时间替代、不伪造）。keyBy 常量以保证车队级 P95 精确（规模过大时可改近似分位聚合，
+    须回改契约）。Redis 写失败不吞异常：作业重启后重放（at-least-once）；作业停摆时键按 TTL
+    自然过期（看板降级 null）。
+
+    ⚠ 写入落在算子内而非 Sink：PyFlink 2.x 的 ``SinkFunction``/``SourceFunction`` 仅为 Java 包装
+    （``JavaFunctionWrapper`` 构造须传 Java 对象或 Java 类名），Python 自定义 Sink 不被支持，
+    故终端用 ``print`` 收口（每个窗口 1 行，作业停摆即无输出，兼作投递轨迹）。
     """
     import redis
-    from pyflink.common import Types
+    from pyflink.common import Types, WatermarkStrategy
+    from pyflink.common.serialization import SimpleStringSchema
     from pyflink.datastream import StreamExecutionEnvironment
     from pyflink.datastream.connectors.kafka import (
+        KafkaOffsetResetStrategy,
         KafkaOffsetsInitializer,
         KafkaSource,
     )
-    from pyflink.datastream.functions import FlatMapFunction, SinkFunction
+    from pyflink.datastream.functions import KeyedProcessFunction
 
     window_seconds = window_seconds_from_env()
 
-    class LatencyFlatMap(FlatMapFunction):
+    class LatencyProcessor(KeyedProcessFunction):
+        """车队窗口缓冲 + Redis 指标写（副作用），产出载荷供终端 sink 收口。"""
+
         def __init__(self) -> None:
             self._buffers: dict[int, list[float]] = {}
+            self._client: redis.Redis | None = None
 
-        def flat_map(self, raw: tuple[str, float]) -> Iterable[str]:
-            value, arrival_ms = raw
-            msg = json.loads(value)
+        def open(self, runtime_context: Any) -> None:
+            self._client = redis.Redis.from_url(
+                os.environ.get("REDIS_URL", "redis://redis:6379/0"), decode_responses=True
+            )
+
+        def close(self) -> None:
+            if self._client is not None:
+                self._client.close()
+                self._client = None
+
+        def process_element(self, value: str, ctx: Any):
+            arrival_ms = ctx.timestamp()
+            if not isinstance(arrival_ms, int) or arrival_ms <= 0:
+                return  # Kafka 记录时间戳缺失：丢弃该样本（禁止用处理时间伪造）
             metrics = expand_latency(
-                msg,
+                json.loads(value),
                 arrival_time=arrival_ms / 1000.0,
                 window_seconds=window_seconds,
                 buffers=self._buffers,
             )
-            return [encode_redis_value(metric) for metric in metrics]
-
-    class RedisSink(SinkFunction):
-        def __init__(self) -> None:
-            self._client: redis.Redis | None = None
-
-        def invoke(self, value: str, context: Any) -> None:
-            if self._client is None:
-                self._client = redis.Redis.from_url(
-                    os.environ.get("REDIS_URL", "redis://redis:6379/0"), decode_responses=True
-                )
-            self._client.set(REDIS_KEY, value, ex=REDIS_TTL_SECONDS)
+            assert self._client is not None  # open() 已建连
+            for metric in metrics:
+                payload = encode_redis_value(metric)
+                self._client.set(REDIS_KEY, payload, ex=REDIS_TTL_SECONDS)
+                yield payload
 
     env = StreamExecutionEnvironment.get_execution_environment()
-    # 记录到达时间来自 Kafka 时间戳：使用带时间戳的解码（value + Kafka record timestamp(ms)）
+    # 记录到达时间来自 Kafka 时间戳：FLIP-27 Source 经 from_source 下传，水位不用于本作业
     source = (
         KafkaSource.builder()
         .set_bootstrap_servers(KAFKA_BOOTSTRAP)
         .set_topics(INPUT_TOPIC)
         .set_group_id(CONSUMER_GROUP)
-        .set_starting_offsets(KafkaOffsetsInitializer.group_offsets())
-        .value_only_decoder(Types.PRIMITIVE_STRING(Types.InformationType()))
+        # 已提交位点优先，无提交位点回落 earliest（契约 defaults.auto_offset_reset）
+        .set_starting_offsets(
+            KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
+        )
+        .set_value_only_deserializer(SimpleStringSchema())
         .build()
     )
-    env.add_source(source) \
-        .assign_timestamps_and_watermarks(_arrival_watermark_strategy()) \
+    env.from_source(
+        source, WatermarkStrategy.no_watermarks(), INPUT_TOPIC, type_info=Types.STRING()
+    ) \
         .key_by(lambda _raw: "fleet", key_type=Types.STRING()) \
-        .flat_map(LatencyFlatMap(), output_type=Types.STRING()) \
-        .add_sink(RedisSink())
+        .process(LatencyProcessor(), output_type=Types.STRING()) \
+        .print("ingest_latency")
     env.execute("data_quality_monitor_ingest_latency")
-
-
-def _arrival_watermark_strategy() -> Any:  # pragma: no cover - 运行期占位（真实实现见部署侧）
-    """提取 Kafka 记录到达时间作为处理元组 ``(value, arrival_ms)`` 的水印策略占位。
-
-    真实 PyFlink 实现应通过自定义 ``KafkaRecordDeserializationSchema`` 把 ``record.timestamp()``
-    与消息体一起下传；此处仅示意拓扑，运行依赖部署侧（不在仓库单测覆盖范围）。
-    """
-    raise NotImplementedError("部署侧提供 Kafka 记录时间戳解码（见作业 README）")
 
 
 if __name__ == "__main__":  # pragma: no cover
