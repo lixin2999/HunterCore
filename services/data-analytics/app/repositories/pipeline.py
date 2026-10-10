@@ -6,6 +6,7 @@ Kafka 探测使用独立消费组 ID，不消费消息（仅取水位/提交位�
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import quote
 
@@ -66,14 +67,18 @@ class MetricsReadOnlyRepository:
         return self._pool
 
     async def telemetry_points(self, start_ts: float, end_ts: float) -> int | None:
-        """窗口内遥测样本数（时间界内 COUNT，禁止全表精确 COUNT 以保护 P95）。"""
+        """窗口内遥测样本数（时间界内 COUNT，禁止全表精确 COUNT 以保护 P95）。
+
+        ``time`` 为 TIMESTAMPTZ（data_collector.vehicle_telemetry），asyncpg 只接受
+        ``datetime`` 绑定（传 float epoch 会抛类型错→整块降级），故服务层先转 UTC datetime。
+        """
         try:
             pool = await self._get_pool()
             async with pool.acquire() as conn:
                 value = await conn.fetchval(
                     "SELECT count(*) FROM data_collector.vehicle_telemetry WHERE time >= $1 AND time < $2",
-                    start_ts,
-                    end_ts,
+                    datetime.fromtimestamp(start_ts, tz=UTC),
+                    datetime.fromtimestamp(end_ts, tz=UTC),
                 )
         except Exception:
             logger.exception("telemetry_points_query_failed")
@@ -81,7 +86,7 @@ class MetricsReadOnlyRepository:
         return int(value or 0)
 
     async def algorithm_averages(self, start_ts: float, end_ts: float) -> dict[str, float] | None:
-        """窗口内算法指标均值（{module}.{metric_name} → avg）。"""
+        """窗口内算法指标均值（{module}.{metric_name} → avg；同 telemetry_points：float→datetime）。"""
         try:
             pool = await self._get_pool()
             async with pool.acquire() as conn:
@@ -89,8 +94,8 @@ class MetricsReadOnlyRepository:
                     "SELECT module, metric_name, avg(metric_value) AS avg_value "
                     "FROM data_analytics.algorithm_metrics WHERE time >= $1 AND time < $2 "
                     "GROUP BY module, metric_name",
-                    start_ts,
-                    end_ts,
+                    datetime.fromtimestamp(start_ts, tz=UTC),
+                    datetime.fromtimestamp(end_ts, tz=UTC),
                 )
         except Exception:
             logger.exception("algorithm_averages_query_failed")

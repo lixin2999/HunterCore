@@ -8,7 +8,8 @@ from __future__ import annotations
 import json
 
 from hunter_common.config import HunterBaseConfig
-from hunter_common.logging import get_logger
+from hunter_common.internal_auth import build_identity_headers
+from hunter_common.logging import get_logger, get_trace_id
 
 logger = get_logger("app.config")
 
@@ -29,6 +30,12 @@ class Settings(HunterBaseConfig):
     dependency_timeout_seconds: float = 2.0
     dependency_max_retries: int = 1
 
+    # ---------- 服务间直连身份头（下游 data-collector/vehicle-service 要求 X-User-Id/X-Roles）----------
+    # 看板/报告以「服务身份」直连下游只读接口，不透传终端用户；roles 需同时落在
+    # data-collector data:read(admin,analyst,operator) 与 vehicle-service vehicle:read(admin,operator,analyst,viewer) 交集内。
+    internal_call_user_id: str = "data-analytics"
+    internal_call_roles: str = "analyst"
+
     # ---------- 只读数据库（hunter_analytics_ro，仅 SELECT；契约 db_access.read_only） ----------
     analytics_ro_db_user: str = ""
     analytics_ro_db_password: str = ""
@@ -40,6 +47,28 @@ class Settings(HunterBaseConfig):
             f"postgresql+asyncpg://{self.analytics_ro_db_user}:{self.analytics_ro_db_password}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    def internal_call_headers(self) -> dict[str, str]:
+        """服务间直连调用的身份头（每请求新生成）。
+
+        下游（data-collector/vehicle-service）以「网关注入 X-User-Id/X-Roles」为认证前提，
+        直连必须自带（否则 FastAPI 必填头校验直接 422）；配置 ``GATEWAY_HMAC_SECRET``（G-02）
+        时附 HMAC 签名 + 新鲜时间戳，故必须逐请求生成、不可在客户端构造期固化（否则超出
+        防重放窗口 ``gateway_identity_max_age_s`` 后被判无效）。
+        """
+        trace_id = get_trace_id() or ""
+        if self.gateway_hmac_secret:
+            return build_identity_headers(
+                self.gateway_hmac_secret,
+                user_id=self.internal_call_user_id,
+                roles=self.internal_call_roles,
+                trace_id=trace_id,
+            )
+        return {
+            "X-User-Id": self.internal_call_user_id,
+            "X-Roles": self.internal_call_roles,
+            "X-Trace-Id": trace_id,
+        }
 
     # ---------- MinIO（报告 sidecar / 评估文档；bucket 名称契约固定） ----------
     minio_bucket_reports: str = "hunter-reports"

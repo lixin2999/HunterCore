@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import httpx
@@ -47,11 +48,14 @@ class DataCollectorEventClient:
         timeout: float = 2.0,
         max_retries: int = 1,
         client: httpx.AsyncClient | None = None,
+        headers_provider: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._max_retries = max(0, max_retries)
         self._client = client or httpx.AsyncClient(timeout=timeout)
+        # 服务间直连身份头提供者（逐请求调用以生成新鲜 HMAC 时间戳）
+        self._headers_provider = headers_provider
 
     async def count(
         self,
@@ -106,7 +110,11 @@ class DataCollectorEventClient:
             return None
         for attempt in range(self._max_retries + 1):
             try:
-                resp = await self._client.get(f"{self._base_url}{self.EVENTS_PATH}", params=params)
+                resp = await self._client.get(
+                    f"{self._base_url}{self.EVENTS_PATH}",
+                    params=params,
+                    headers=self._headers_provider() if self._headers_provider is not None else None,
+                )
                 resp.raise_for_status()
                 return resp.json()
             except (httpx.HTTPError, ValueError) as exc:

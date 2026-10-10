@@ -180,6 +180,7 @@ def get_event_client(request: Request) -> DataCollectorEventClient:
             settings.data_collector_base_url,
             timeout=settings.dependency_timeout_seconds,
             max_retries=settings.dependency_max_retries,
+            headers_provider=settings.internal_call_headers,
         )
         _track_closable(request, client)
         return client
@@ -195,6 +196,7 @@ def get_vehicle_client(request: Request) -> VehicleDirectoryClient:
             settings.vehicle_service_base_url,
             timeout=settings.dependency_timeout_seconds,
             max_retries=settings.dependency_max_retries,
+            headers_provider=settings.internal_call_headers,
         )
         _track_closable(request, client)
         return client

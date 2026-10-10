@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol
 
 import httpx
@@ -29,6 +30,8 @@ class VehicleDirectoryClient:
     """vehicle-service REST 客户端（带超时；查询失败降级返回 None）。"""
 
     VEHICLE_BASE_PATH = "/api/v1/vehicle"
+    # 列表端点在 /list（GET /api/v1/vehicle 仅用于 POST provisioning，否则 405）
+    VEHICLE_LIST_PATH = "/api/v1/vehicle/list"
 
     def __init__(
         self,
@@ -37,11 +40,17 @@ class VehicleDirectoryClient:
         timeout: float = 2.0,
         max_retries: int = 1,
         client: httpx.AsyncClient | None = None,
+        headers_provider: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._max_retries = max(0, max_retries)
         self._client = client or httpx.AsyncClient(timeout=timeout)
+        # 服务间直连身份头提供者（逐请求调用以生成新鲜 HMAC 时间戳）
+        self._headers_provider = headers_provider
+
+    def _request_headers(self) -> dict[str, str] | None:
+        return self._headers_provider() if self._headers_provider is not None else None
 
     async def vehicle_exists(self, vehicle_id: str) -> bool | None:
         """车辆存在性校验（200=存在 / 404=不存在 / 其他与异常=None 延后校验）。"""
@@ -50,7 +59,9 @@ class VehicleDirectoryClient:
             return None
         for attempt in range(self._max_retries + 1):
             try:
-                resp = await self._client.get(f"{self._base_url}{self.VEHICLE_BASE_PATH}/{vehicle_id}")
+                resp = await self._client.get(
+                    f"{self._base_url}{self.VEHICLE_BASE_PATH}/{vehicle_id}", headers=self._request_headers()
+                )
             except httpx.HTTPError as exc:
                 logger.warning("vehicle_existence_check_failed", attempt=attempt, error=str(exc))
                 continue
@@ -68,7 +79,9 @@ class VehicleDirectoryClient:
             return None
         try:
             resp = await self._client.get(
-                f"{self._base_url}{self.VEHICLE_BASE_PATH}", params={"page": 1, "page_size": 1}
+                f"{self._base_url}{self.VEHICLE_LIST_PATH}",
+                params={"page": 1, "page_size": 1},
+                headers=self._request_headers(),
             )
             resp.raise_for_status()
         except httpx.HTTPError as exc:
