@@ -19,10 +19,11 @@ docs
 *.log
 release.md
 
-# ---------- 构建上下文裁剪（L1：镜像仅需 common/python + services/<service>） ----------
+# ---------- 构建上下文裁剪（L1：服务镜像仅需 common/python + services/<service>） ----------
 # 注意：禁止忽略 *.md —— common/python/pyproject.toml 的 readme 字段依赖 README.md
 contracts
-flink-jobs
+# ⚠ 禁止再排除 flink-jobs/：hunter-flink/jobs 镜像（flink-jobs/Dockerfile，compose 与 K8s 共用）
+#   需要 COPY flink-jobs/hunter_flink；L1 旧裁剪曾在首次实机构建时报 `COPY ... not found`（V1.19.3 修正）
 spark-jobs
 infra
 scripts
