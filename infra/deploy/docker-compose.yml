@@ -320,10 +320,12 @@ services:
 
   # ---------- 7. Flink 1.18（实时分析；JobManager Web UI 容器 8081 → 宿主机 8088） ----------
   # V1.19.2：镜像由官方 flink:1.18.1（纯 JVM、无任何 Python）切为代码内置作业镜像
-  # flink-jobs/Dockerfile（python3/pip + apache-flink==1.18.1 + hunter_common + PYTHONPATH，
+  # flink-jobs/Dockerfile（CPython 3.11 + apache-flink==1.18.1 + hunter_common + PYTHONPATH，
   # 与 K8s 形态 deployment.md §13.1 同一镜像）；官方镜像下 `-pym` 提交 PyFlink 作业必报
   # `Cannot run program "python"`（服务器实录）。前缀 hunter-flink/ 独立于 6 微服务模块表，
   # 标签随 Flink 运行时版本、不参与 {version} 渲染。
+  # ⚠ V1.19.4：镜像内 Python 固定 3.11（hunter_common 依赖 enum.StrEnum，基座 apt python3=3.10
+  #   会被 pip Requires-Python 门禁拒装）；镜像带构建期 import 自检，改作业/共享库后重建即可。
   flink-jm:
     image: hunter-flink/jobs:1.18.1
     build:
