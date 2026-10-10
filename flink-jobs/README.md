@@ -47,15 +47,18 @@ battery_low / battery_critical 独立边沿触发（SOC 8% 时两条各一次）
 ### 提交与测试
 
 ```bash
-# 打包（zip 即作业包；pyflink 由集群侧提供）
-cd flink-jobs && zip -r hunter_flink.zip hunter_flink
-
-# compose 单机形态（flink-jobs/ 已只读挂载至 /opt/flink/jobs）
-docker compose -f infra/deploy/docker-compose.yml exec flink-jm \
-  flink run -d -c hunter_flink.detection_job /opt/flink/jobs/hunter_flink.zip
-
-# 仓库单测（规则核心 + 契约基准比对 + alert_event schema 校验）
+# 本地单测（规则核心 + 契约基准比对 + alert_event schema 校验）
 python scripts/run_unit_tests.py flink-jobs
+
+# 仓库根构建作业镜像（compose 与 K8s 同一镜像，V1.19.2 起 compose 也已切换）
+docker build -f flink-jobs/Dockerfile -t hunter-flink/jobs:1.18.1 .
+
+# compose 单机形态（生产机用 sudo，.env 为 600/root）：镜像内置 hunter_flink 与 hunter_common，
+# 提交走 -pym（官方纯 JVM 镜像无 Python，必报 `Cannot run program "python"`）
+docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --build flink-jm flink-tm
+docker compose -f infra/deploy/docker-compose.yml --project-directory . exec flink-jm \
+  flink run -d -m localhost:8081 -pym hunter_flink.detection_job
+# …… algorithm_performance_job / ingest_latency_job 同式各一行
 ```
 
 ### 纪律与豁免登记
@@ -74,8 +77,10 @@ python scripts/run_unit_tests.py flink-jobs
      入向放行见 `infra/k8s/networkpolicies/flink.yaml`。
      ⚠ **镜像前缀必须为 `hunter-flink/`、禁止 `hunter/`**：`verify_infra`/`render_k8s` 的 6 微服务
      模块表只放行 `hunter/<svc>`，`hunter/flink-jobs` 会判「未登记微服务镜像」致 lint 失败。
-  2. **compose 单机（受控降级）**：flink-jm + 单 flink-tm，`flink-jobs/` 只读挂载至 `/opt/flink/jobs`，
-     书面豁免见 `docs/deployment.md` §12（G-13/G-28 决策①）。
+  2. **compose 单机（受控降级）**：flink-jm + 单 flink-tm，**V1.19.2 起同样使用 `hunter-flink/jobs:1.18.1`
+     内置镜像**（compose 定义已带 `build: flink-jobs/Dockerfile`，与 K8s 形态单一事实来源；旧官方镜像无
+     Python 不能跑作业），`flink-jobs/` 只读挂载保留作应急热替换；书面豁免见 `docs/deployment.md` §12
+     （G-13/G-28 决策①）。
 - **K8s 形态待人工确认项**（见 `release.md`）：`hunter-flink/jobs` 镜像仓库推送凭据、Kafka 侧
   SASL 凭据注入路径（作业当前仅读 `KAFKA_BOOTSTRAP_SERVERS`，走 broker 内部监听）、JM 高可用与
   checkpoint 持久卷（现为 `emptyDir`）。

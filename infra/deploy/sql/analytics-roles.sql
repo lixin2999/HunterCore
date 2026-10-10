@@ -16,10 +16,11 @@
 --   2) 口令来源：K8s Secret（hunter-app-secrets 的 ANALYTICS_RO_DB_PASSWORD /
 --      ANALYTICS_RW_DB_PASSWORD）或单机 .env；经 -v 注入，禁止明文写入本文件/日志。
 --
--- 执行（口令经 psql -v 注入，单引号转义）：
+-- 执行（口令经 psql -v 注入，单引号转义；⚠ 占位符换成真实口令，shell 单引号内 '<...>' 会被当作字面量口令；
+--   路径为宿主机的仓库内位置，按实际部署目录大小写为准，如 /opt/HunterCore）：
 --   docker exec -i hunter-postgres psql -U hunter -d hunter_core -v ON_ERROR_STOP=1 \
 --     -v analytics_ro_password='<RO_PWD>' -v analytics_rw_password='<RW_PWD>' \
---     < /opt/hunter-core/sql/analytics-roles.sql
+--     < /opt/HunterCore/infra/deploy/sql/analytics-roles.sql
 --
 -- ⚠ 单机默认形态可不创建本组角色（compose 默认复用 POSTGRES 超级用户）；
 --   生产加固建议执行本脚本，并把 data-analytics 的 ANALYTICS_RO_DB_* / ANALYTICS_RW_DB_* 指向本组账号。

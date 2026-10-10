@@ -14,7 +14,11 @@ USER root
 RUN set -eux; \
     apt-get update -qq; \
     apt-get install -y -qq --no-install-recommends python3 python3-pip python3-venv ca-certificates; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    # `flink run -pym` 客户端与 worker 默认查找 `python`（config 键 python.client.executable/
+    # python.executable 的默认值），Debian 只提供 python3 → 补软链，免每台环境再配 FLINK_PROPERTIES
+    ln -sf /usr/bin/python3 /usr/local/bin/python; \
+    python --version
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
     PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
