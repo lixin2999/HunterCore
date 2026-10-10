@@ -67,6 +67,13 @@ ota_versions ──< ota_tasks
 
 > 除上表外，禁止跨服务直查数据库（架构原则：模块化解耦）。新增例外必须在 `er.md` 登记并评审。
 
+> **§3 附注（data-analytics 分析账号）**：`hunter_analytics_ro` 为上表跨 schema **只读**例外账号（仅 SELECT）。另有
+> `hunter_analytics_rw`——本服务写 **自身** schema `data_analytics.algorithm_metrics`（`algorithm_metrics` Topic 落库消费者）
+> 的专用最小权限写账号，**不属于**跨库例外：仅 `GRANT USAGE ON SCHEMA data_analytics` + `GRANT INSERT ON
+> data_analytics.algorithm_metrics`，无 UPDATE/DELETE/DDL/跨 schema 权限。两账号由 `infra/deploy/sql/analytics-roles.sql`
+> 幂等创建/授权（口令经 `-v` 注入，来自 K8s Secret 或 .env）；服务读/探针走 `ANALYTICS_RO_DB_*`，写路径 `database_url`
+> 优先走 `ANALYTICS_RW_DB_*`、未配置则回落共享 `POSTGRES_USER`（向后兼容）。
+
 ## 4. 类型约定
 
 | 用途 | 类型 | 说明 |

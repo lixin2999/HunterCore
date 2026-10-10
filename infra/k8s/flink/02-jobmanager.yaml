@@ -1,0 +1,117 @@
+# =====================================================================
+# Flink JobManager（Standalone 主节点）+ Service flink-jobmanager
+# - Service 名与 data-analytics ConfigMap 的 FLINK_JOBMANAGER_URL（flink-jobmanager:8081）及
+#   flink-common-config 的 jobmanager.rpc.address 对齐（此前该 URL 悬空，本清单补齐）
+# - 镜像 hunter-flink/jobs:1.18.1（非 hunter/ 前缀，避开 6 微服务模块表；不参与 {version} 渲染，
+#   标签随 Flink 运行时版本管理）——见 flink-jobs/Dockerfile 头注释
+# - verify_infra check_workloads 对 Deployment 强制：显式版本 / requests+limits(cpu+memory) /
+#   livenessProbe+readinessProbe / 容器 drop ALL + allowPrivilegeEscalation=false / Pod 非 root
+# =====================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: flink-jobmanager
+    app.kubernetes.io/part-of: hunter-flink
+    app.kubernetes.io/component: flink
+    flink-role: jobmanager
+spec:
+  replicas: 1                              # Standalone JM 单活（高可用需 ZK 另议，见 release.md 待办）
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flink-jobmanager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flink-jobmanager
+        app.kubernetes.io/part-of: hunter-flink
+        app.kubernetes.io/component: flink
+        flink-role: jobmanager
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 9999                    # flink 镜像内置 flink 用户 UID（与 Dockerfile USER flink 一致）
+        runAsGroup: 9999
+        fsGroup: 9999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: jobmanager
+          image: "hunter-flink/jobs:1.18.1"   # 第三方独立前缀镜像，禁止改成 hunter/（CI 模块表校验）
+          imagePullPolicy: IfNotPresent
+          args: ["jobmanager"]                # flink 默认 entrypoint 依 args 选角色
+          ports:
+            - name: rest
+              containerPort: 8081
+            - name: rpc
+              containerPort: 6123
+            - name: blob
+              containerPort: 6124
+          envFrom:
+            - configMapRef:
+                name: flink-common-config
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /opt/flink/checkpoints
+            - name: log
+              mountPath: /opt/flink/log
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /overview
+              port: rest
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /overview
+              port: rest
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: checkpoints
+          emptyDir: {}                        # 生产建议改 PVC/对象存储（state.checkpoints.dir），见 release.md 待办
+        - name: log
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: flink-jobmanager
+    app.kubernetes.io/part-of: hunter-flink
+    app.kubernetes.io/component: flink
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: flink-jobmanager
+  ports:
+    - name: rest
+      port: 8081
+      targetPort: rest
+    - name: rpc
+      port: 6123
+      targetPort: rpc
+    - name: blob
+      port: 6124
+      targetPort: blob

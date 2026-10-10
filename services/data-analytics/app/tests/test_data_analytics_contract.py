@@ -784,11 +784,17 @@ def test_db_access_follows_cross_schema_exception(contract: dict[str, Any]) -> N
     assert "data_collector.vehicle_telemetry" in read_only
     assert "hunter_analytics_ro" in read_only
     assert "data_analytics.algorithm_metrics" in read_only
+    write = " ".join(service_meta["db_access"]["write"])
+    assert "hunter_analytics_rw" in write, "写自身 schema 必须声明专用最小权限写账号"
     forbidden = " ".join(service_meta["db_access"]["forbidden"])
     for table in ("data_collector.events", "scene_svc.scenes", "vehicle_svc"):
         assert table in forbidden
     er_text = ER_DOC.read_text(encoding="utf-8")
     assert "hunter_analytics_ro" in er_text, "只读例外必须已在 er.md 登记"
+    assert "hunter_analytics_rw" in er_text, "写账号最小权限必须已在 er.md 附注登记"
+    assert (ROOT / "infra" / "deploy" / "sql" / "analytics-roles.sql").is_file(), (
+        "两分析账号最小权限授权脚本必须存在"
+    )
     assert service_meta["db_tables_absent"]["status"] == "pending_confirmation"
 
 

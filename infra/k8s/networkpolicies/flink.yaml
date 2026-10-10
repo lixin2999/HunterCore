@@ -1,0 +1,47 @@
+# =====================================================================
+# Flink 集群网络策略（对齐 network-policies.yaml 的 hunter-default-deny-ingress）
+# 默认拒绝全部入向 → 必须显式放行，否则 JM↔TM 失联、data-analytics 无法编排/查询作业、提交 Job 打不到 JM
+# 仅约束 Ingress（默认策略亦只拒 Ingress）：作业出向访问 Kafka/Redis 不受此限制，无需 egress 规则
+# 放行来源：
+#   1) component=flink 自身（JM/TM/提交 Job 互连：rpc 6122/6123、blob 6124、data 6121、rest 8081）
+#   2) data-analytics 后端 Pod → JM REST 8081（作业编排/状态查询，FLINK_JOBMANAGER_URL 依赖）
+# =====================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hunter-allow-flink
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/part-of: hunter-flink
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: flink
+  policyTypes:
+    - Ingress
+  ingress:
+    # Flink 集群内部互连（JM/TM/submit 均带 component=flink 标签）
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: flink
+      ports:
+        - protocol: TCP
+          port: 6121
+        - protocol: TCP
+          port: 6122
+        - protocol: TCP
+          port: 6123
+        - protocol: TCP
+          port: 6124
+        - protocol: TCP
+          port: 8081
+    # data-analytics → JobManager REST（作业编排/监控）
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: data-analytics
+      ports:
+        - protocol: TCP
+          port: 8081

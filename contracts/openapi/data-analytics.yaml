@@ -1424,6 +1424,7 @@ x-hunter-service:
   db_access:
     write:
       - "data_analytics.algorithm_metrics（hypertable，批量 executemany + ON CONFLICT DO NOTHING）"
+      - "写账号 hunter_analytics_rw（本服务**自身** schema data_analytics，非跨库例外；最小权限见 er.md §3 附注与 infra/deploy/sql/analytics-roles.sql：仅 GRANT USAGE ON SCHEMA data_analytics + INSERT ON algorithm_metrics，禁止 UPDATE/DELETE/DDL/其他 schema；env ANALYTICS_RW_DB_USER/ANALYTICS_RW_DB_PASSWORD，未配置则回落共享 POSTGRES_USER，见 config.database_url；供 algorithm_metrics 落库消费者）"
     read_only:
       - "data_collector.vehicle_telemetry（跨 schema 只读例外：contracts/database/er.md 第 3 节，账号 hunter_analytics_ro，仅 SELECT）"
       - "data_analytics.algorithm_metrics"

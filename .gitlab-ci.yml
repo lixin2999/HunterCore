@@ -68,7 +68,7 @@ lint:
     # 基础设施清单契约：镜像 {version} 占位符 / HPA(min2-max5-70%) / PDB / 探针 / 资源配额 / Dockerfile
     - python scripts/render_k8s.py --check
     - python scripts/verify_infra.py
-    - ruff check tests common/python services
+    - ruff check tests common/python services flink-jobs
     # 仅校验 L5 测试层（存量脚本 verify_data_layer/verify_infra 的类型问题单独治理）；
     # stub 缺失（yaml/jsonschema/asyncpg）不阻塞，真实类型错误仍拦截
     - mypy --ignore-missing-imports --disable-error-code=import-untyped tests/support scripts/verify_test_layer.py
@@ -155,6 +155,15 @@ build-images:
         docker build -f "services/$svc/Dockerfile" -t "$image" .
         docker push "$image"
       done
+    # Flink PyFlink 作业镜像（代码内置形态，见 flink-jobs/Dockerfile 头注释）：
+    # 前缀 hunter-flink/ 而非 hunter/ —— 规避 6 微服务模块表；标签钉 Flink 运行时版本 1.18.1，
+    # 不参与 {version} 渲染（render_k8s 只改写 hunter/ 前缀镜像）。推送到 hunter-flink/ 需该命名空间推送凭据（人工确认项）。
+    - |
+      set -e
+      flink_image="hunter-flink/jobs:1.18.1"
+      echo "==> build $flink_image"
+      docker build -f flink-jobs/Dockerfile -t "$flink_image" .
+      docker push "$flink_image"
   rules:
     - if: $CI_COMMIT_TAG
 
@@ -203,6 +212,14 @@ deploy-prod:
     - kubectl -n hunter-core rollout status statefulset/postgres --timeout=5m
     - kubectl apply -f build/k8s/jobs/
     - kubectl -n hunter-core wait --for=condition=complete job/kafka-init --timeout=10m
+    # Flink 集群（代码内置镜像）：JM/TM 就绪后提交流作业，再拉起依赖 FLINK_JOBMANAGER_URL 的 data-analytics
+    - kubectl apply -f build/k8s/flink/01-configmap.yaml
+    - kubectl apply -f build/k8s/flink/02-jobmanager.yaml
+    - kubectl apply -f build/k8s/flink/03-taskmanager.yaml
+    - kubectl -n hunter-core rollout status deploy/flink-jobmanager --timeout=5m
+    - kubectl -n hunter-core rollout status deploy/flink-taskmanager --timeout=5m
+    - kubectl apply -f build/k8s/flink/04-submit-job.yaml
+    - kubectl -n hunter-core wait --for=condition=complete job/flink-job-submitter --timeout=10m
     - kubectl apply -f build/k8s/services/
     - kubectl -n hunter-core rollout status deploy/api-gateway --timeout=5m
     - kubectl -n hunter-core rollout status deploy/scene-service --timeout=5m

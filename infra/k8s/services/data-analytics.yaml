@@ -38,6 +38,8 @@ data:
   ANALYTICS_QUERY_MAX_RANGE_DAYS: "7"
   # 跨 schema 只读账号（contracts/database/er.md 第 3 节；口令在 Secret）
   ANALYTICS_RO_DB_USER: "hunter_analytics_ro"
+  # 写自身 schema 最小权限账号（er.md 第 3 节；algorithm_metrics 落库消费者；口令在 Secret）
+  ANALYTICS_RW_DB_USER: "hunter_analytics_rw"
   # 算法指标聚合窗口与告警窗口（6.2 节；实时告警触发延迟 ≤ 2s）
   ALGORITHM_METRICS_WINDOW_SECONDS: "60"
   ALERT_WINDOW_SECONDS: "2"

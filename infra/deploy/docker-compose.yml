@@ -526,6 +526,10 @@ services:
       # 单机部署默认复用 POSTGRES 超级用户（compose 未创建 hunter_analytics_ro 角色），生产加固应在 .env 覆盖为只读专用账号（见 er.md 第 3 节）
       ANALYTICS_RO_DB_USER: ${ANALYTICS_RO_DB_USER:-${POSTGRES_USER}}
       ANALYTICS_RO_DB_PASSWORD: ${ANALYTICS_RO_DB_PASSWORD:-${POSTGRES_PASSWORD}}
+      # 写库账号（algorithm_metrics Topic 落库消费者 INSERT data_analytics.algorithm_metrics）；
+      # 单机默认复用 POSTGRES 超级用户，生产加固：先跑 sql/analytics-roles.sql 建 hunter_analytics_rw，再在 .env 覆盖（见 er.md §3 附注）
+      ANALYTICS_RW_DB_USER: ${ANALYTICS_RW_DB_USER:-${POSTGRES_USER}}
+      ANALYTICS_RW_DB_PASSWORD: ${ANALYTICS_RW_DB_PASSWORD:-${POSTGRES_PASSWORD}}
     ports:
       - "127.0.0.1:${DATA_ANALYTICS_PORT:-8083}:8083"
     volumes:

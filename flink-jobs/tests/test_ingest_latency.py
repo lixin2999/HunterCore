@@ -125,3 +125,19 @@ def test_window_seconds_from_env_defaults_and_override() -> None:
     assert window_seconds_from_env({"INGEST_LATENCY_WINDOW_SECONDS": "30"}) == pytest.approx(30.0)
     with pytest.raises(ValueError):
         window_seconds_from_env({"INGEST_LATENCY_WINDOW_SECONDS": "0"})
+
+
+# =====================================================================
+# 键常量跨端一致性（redis-keys.yaml 受控键：单一常量源，杜绝与看板读端拼写漂移）
+# =====================================================================
+
+
+def test_redis_key_defaults_to_shared_constant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认（无环境变量覆盖时）写端键 = 共享常量 = 契约模式，与读端同源。"""
+    monkeypatch.delenv("INGEST_LATENCY_REDIS_KEY", raising=False)
+    import importlib
+
+    from hunter_common import redis_keys
+
+    module = importlib.reload(importlib.import_module("hunter_flink.ingest_latency_job"))
+    assert module.REDIS_KEY == redis_keys.ANALYTICS_INGEST_LATENCY == "analytics:ingest_latency"

@@ -1,0 +1,84 @@
+# =====================================================================
+# Flink TaskManager（工作节点，2 副本起步；扩容改 replicas 或接集群 HPA——
+# 本清单不接 HPA：verify_infra check_autoscaling 仅校验 6 微服务，Flink 不在其列，禁止误加）
+# - TM 无 REST 端点，探针用 tcpSocket:6122（taskmanager.rpc.port）——verify_infra 仅要求探针存在
+# - 连接 JM 依赖 flink-common-config 的 FLINK_PROPERTIES（jobmanager.rpc.address: flink-jobmanager）
+# =====================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: flink-taskmanager
+    app.kubernetes.io/part-of: hunter-flink
+    app.kubernetes.io/component: flink
+    flink-role: taskmanager
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flink-taskmanager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flink-taskmanager
+        app.kubernetes.io/part-of: hunter-flink
+        app.kubernetes.io/component: flink
+        flink-role: taskmanager
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 9999
+        runAsGroup: 9999
+        fsGroup: 9999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: taskmanager
+          image: "hunter-flink/jobs:1.18.1"   # 与 JM 同镜像（代码内置，worker 侧经 PYTHONPATH import hunter_flink）
+          imagePullPolicy: IfNotPresent
+          args: ["taskmanager"]
+          ports:
+            - name: rpc
+              containerPort: 6122
+            - name: data
+              containerPort: 6121
+            - name: blob
+              containerPort: 6124
+          envFrom:
+            - configMapRef:
+                name: flink-common-config
+          volumeMounts:
+            - name: log
+              mountPath: /opt/flink/log
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: log
+          emptyDir: {}

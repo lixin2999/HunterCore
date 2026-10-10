@@ -17,7 +17,9 @@
 且看板 pipeline 块仅此一个实时估算指标，属契约批准路线（pending #10 结案）。
 
 纪律：与 ``detection_job`` / ``algorithm_performance_job`` 同构——纯 Python 核心 + ``main()``
-延迟 import pyflink；仓库单测无需 PyFlink 运行时。
+延迟 import pyflink；仓库单测无需 PyFlink 运行时。仅 import 无运行时的
+``hunter_common.redis_keys``（纯字符串常量，redis-keys.yaml pending #7 落地的键构造单一事实来源），
+不 import 任何服务 ``app.*`` 包或 ``hunter_common.database`` 仓储（写侧豁免边界不变）。
 """
 from __future__ import annotations
 
@@ -27,6 +29,8 @@ import os
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from hunter_common.redis_keys import ANALYTICS_INGEST_LATENCY
+
 from hunter_flink.algorithm_performance_job import percentile_cont
 
 #: Kafka broker（standalone/compose 单机形态；K8s 由环境变量下发）
@@ -35,8 +39,9 @@ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 INPUT_TOPIC = "telemetry_raw"
 #: 消费组（契约 consumer-groups.yaml 固定）
 CONSUMER_GROUP = "data-analytics-telemetry-raw"
-#: 输出 Redis 指标键（契约 redis-keys.yaml 登记；禁止私造，见 pending #10 结案）
-REDIS_KEY = os.environ.get("INGEST_LATENCY_REDIS_KEY", "analytics:ingest_latency")
+#: 输出 Redis 指标键（契约 redis-keys.yaml 登记；与看板读端 IngestLatencyRedisReader.KEY
+#: 同引用共享常量 hunter_common.redis_keys.ANALYTICS_INGEST_LATENCY，杜绝跨端拼写漂移；允许环境变量覆盖）
+REDIS_KEY = os.environ.get("INGEST_LATENCY_REDIS_KEY", ANALYTICS_INGEST_LATENCY)
 #: Redis 值 TTL（作业停摆时键过期 → 看板 ingest_latency_ms_p95 降级为 null，杜绝陈旧展示）
 REDIS_TTL_SECONDS = int(os.environ.get("INGEST_LATENCY_TTL_SECONDS", "300"))
 

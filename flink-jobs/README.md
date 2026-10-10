@@ -63,5 +63,19 @@ python scripts/run_unit_tests.py flink-jobs
 - **写侧豁免**：本目录不是服务、不在 `services/`（verify-14 不扫描），已在
   `contracts/database/orm-mapping.md` §3.5 白名单表书面登记——作业只经 Kafka 写
   `alert_event`，禁止 import 任何服务 `app.*` 包或 `hunter_common.database.repositories`。
-- **部署形态**：compose 单机（flink-jm + 单 flink-tm）为受控降级形态，书面豁免见
-  `docs/deployment.md` §12（G-13/G-28 决策①）。
+- **CI lint**：本目录已纳入流水线 lint 阶段（`.gitlab-ci.yml` → `ruff check tests common/python
+  services flink-jobs`）；作业代码须与其余模块同守 ruff 规则（导入分组：第三方 `hunter_common`
+  与第一方 `hunter_flink` 分块）。
+- **部署形态**（两种并存，按环境择一）：
+  1. **K8s 自建集群（推荐生产）**：`infra/k8s/flink/`（`01-configmap` + `02-jobmanager`
+     Deployment/Service + `03-taskmanager` Deployment + `04-submit-job` batch/v1）+ `hunter-flink/jobs:1.18.1`
+     **代码内置镜像**（`flink-jobs/Dockerfile`）。提交 Job 经 `flink run -pym hunter_flink.<job>` 拉起三个
+     已交付流作业；`data-analytics` 的 `FLINK_JOBMANAGER_URL` 即指向此处 `flink-jobmanager:8081`。
+     入向放行见 `infra/k8s/networkpolicies/flink.yaml`。
+     ⚠ **镜像前缀必须为 `hunter-flink/`、禁止 `hunter/`**：`verify_infra`/`render_k8s` 的 6 微服务
+     模块表只放行 `hunter/<svc>`，`hunter/flink-jobs` 会判「未登记微服务镜像」致 lint 失败。
+  2. **compose 单机（受控降级）**：flink-jm + 单 flink-tm，`flink-jobs/` 只读挂载至 `/opt/flink/jobs`，
+     书面豁免见 `docs/deployment.md` §12（G-13/G-28 决策①）。
+- **K8s 形态待人工确认项**（见 `release.md`）：`hunter-flink/jobs` 镜像仓库推送凭据、Kafka 侧
+  SASL 凭据注入路径（作业当前仅读 `KAFKA_BOOTSTRAP_SERVERS`，走 broker 内部监听）、JM 高可用与
+  checkpoint 持久卷（现为 `emptyDir`）。

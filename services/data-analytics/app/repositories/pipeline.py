@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - 取决于安装的 confluent-kafka 版
         _ConsumerGroupTopicPartitions as ConsumerGroupTopicPartitions,
     )
 
+from hunter_common import redis_keys
 from hunter_common.config import HunterBaseConfig
 from hunter_common.logging import get_logger
 
@@ -290,8 +291,9 @@ class IngestLatencyRedisReader:
     绝不展示陈旧值：作业停摆时键按 TTL 自然过期）。
     """
 
-    #: 指标键（契约 redis-keys.yaml 登记的模式；与 Flink ``ingest_latency_job.REDIS_KEY`` 一致）
-    KEY = "analytics:ingest_latency"
+    #: 指标键（契约 redis-keys.yaml 登记的模式；经共享常量 :data:`hunter_common.redis_keys.ANALYTICS_INGEST_LATENCY`
+    #: 引用，与 Flink ``ingest_latency_job.REDIS_KEY`` 同源，杜绝跨端拼写漂移）
+    KEY = redis_keys.ANALYTICS_INGEST_LATENCY
 
     def __init__(self, redis: Redis | None) -> None:
         self._redis = redis

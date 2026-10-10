@@ -245,6 +245,19 @@ main() {
     apply_sql "$C_POSTGRES" "$POSTGRES_USER" "$POSTGRES_DB" "${sql_dir}/init-data.sql" || return 1
   fi
 
+  # ---------- 4b) 分析服务最小权限账号（可选加固） ----------
+  # 仅当 .env 配置了 ANALYTICS_RO_DB_PASSWORD 与 ANALYTICS_RW_DB_PASSWORD 时创建并授权
+  # hunter_analytics_ro / hunter_analytics_rw（er.md 第 3 节）；单机默认形态不配置则跳过（复用超级用户）。
+  if [ -f "${sql_dir}/analytics-roles.sql" ] \
+    && [ -n "${ANALYTICS_RO_DB_PASSWORD:-}" ] && [ -n "${ANALYTICS_RW_DB_PASSWORD:-}" ]; then
+    log_info "应用分析服务账号（hunter_analytics_ro/rw 最小权限；口令来自 .env，不落日志）"
+    apply_sql "$C_POSTGRES" "$POSTGRES_USER" "$POSTGRES_DB" "${sql_dir}/analytics-roles.sql" \
+      -v "analytics_ro_password=${ANALYTICS_RO_DB_PASSWORD}" \
+      -v "analytics_rw_password=${ANALYTICS_RW_DB_PASSWORD}" || return 1
+  else
+    log_info "跳过 analytics-roles.sql（未配置 ANALYTICS_RO_DB_PASSWORD/ANALYTICS_RW_DB_PASSWORD，单机默认复用超级用户）"
+  fi
+
   # ---------- 5) 结构与数据校验 ----------
   log_info "===== 校验结果 ====="
   schemas="$(psql_pg "SELECT count(*) FROM information_schema.schemata WHERE schema_name IN ('vehicle_svc','user_svc','scene_svc','ota_svc','data_collector','data_analytics','remote_control','gateway');")"

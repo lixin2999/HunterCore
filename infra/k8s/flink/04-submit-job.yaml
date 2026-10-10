@@ -1,0 +1,82 @@
+# =====================================================================
+# Flink 作业提交 Job（batch/v1）——把 flink-jobs 已交付的三个流作业提交到 JM
+# - Job 不在 verify_infra WORKLOAD_KINDS 内 → 免探针/资源/安全强校验；此处仍按最小权限书写
+# - 提交方式：`flink run -d -m flink-jobmanager:8081 -pym hunter_flink.<job>`（PyFlink 模块模式）
+#     代码内置镜像使 JM/TM/client 三方都能经 PYTHONPATH import hunter_flink，无需 --pyfiles 分发
+# - -d（detached）：流作业提交后在集群常驻，Job 本身随即完成（restartPolicy=OnFailure + backoff）
+# - 应用顺序：flink-jobmanager/flink-taskmanager 就绪后（脚本内置等待 JM REST 循环）
+# - 已交付作业（README「状态=已交付」）：detection_job / algorithm_performance_job / ingest_latency_job
+#     其余 x-hunter-realtime-jobs 作业为占位（后续批次），交付后在此追加一行 flink run 即可
+# =====================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flink-job-submitter
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: flink-job-submitter
+    app.kubernetes.io/part-of: hunter-flink
+    app.kubernetes.io/component: flink
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400           # 完成后保留 1 天便于日志排查
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flink-job-submitter
+        app.kubernetes.io/part-of: hunter-flink
+        app.kubernetes.io/component: flink
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 9999
+        runAsGroup: 9999
+        fsGroup: 9999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: flink-submit
+          image: "hunter-flink/jobs:1.18.1"
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              JM="flink-jobmanager:8081"
+              echo "[flink-submit] waiting for JobManager REST..."
+              ready=0
+              for i in $(seq 1 60); do
+                if curl -sf "http://${JM}/overview" >/dev/null 2>&1; then ready=1; break; fi
+                echo "[flink-submit] JM not ready ($i/60)"; sleep 5
+              done
+              [ "$ready" = "1" ] || { echo "[flink-submit] JobManager 未就绪，放弃提交"; exit 1; }
+              flink run -d -m "${JM}" -pym hunter_flink.detection_job
+              flink run -d -m "${JM}" -pym hunter_flink.algorithm_performance_job
+              flink run -d -m "${JM}" -pym hunter_flink.ingest_latency_job
+              echo "[flink-submit] submitted. list:"; flink list -m "${JM}" || true
+          envFrom:
+            - configMapRef:
+                name: flink-common-config
+          volumeMounts:
+            - name: log
+              mountPath: /opt/flink/log
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: log
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

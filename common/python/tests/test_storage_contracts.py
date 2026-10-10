@@ -15,6 +15,8 @@ from typing import Any
 
 import yaml
 
+from hunter_common import redis_keys
+
 ROOT = Path(__file__).resolve().parents[3]
 DB_DIR = ROOT / "contracts" / "database"
 OPENAPI_DIR = ROOT / "contracts" / "openapi"
@@ -217,6 +219,31 @@ def test_redis_declaration_shapes_are_normalized() -> None:
     assert loose == ["vehicle:online:set", "bogus:key"]
     assert set(loose) - set(contract_keys()) == {"bogus:key"}
     assert normalize_redis_declarations(None) == ([], [])
+
+
+def test_redis_key_builder_module_mirrors_contract() -> None:
+    """键构造常量模块（redis-keys.yaml pending #7 落地）与契约键模式集完全一致。
+
+    跨端（微服务写方 / Flink 作业 / 看板读方）均引用 ``hunter_common.redis_keys`` 常量，
+    禁止散落键字面量造成拼写漂移（如入库延迟指标键写读不一致会导致看板恒 null）。
+    """
+    keys = contract_keys()
+    # 受控键模式全集 = 契约 keys[].pattern（新增/改名须先改契约）
+    assert redis_keys.CONTROLLED_PATTERNS == set(keys)
+    # 构造函数产出的实际键与契约命名语义逐条一致（占位符替换正确）
+    assert redis_keys.session_key("u1") == "session:u1"
+    assert redis_keys.vehicle_status_key("v1") == "vehicle:status:v1"
+    assert redis_keys.rate_limit_key("1.2.3.4", "get_/x") == "rate_limit:1.2.3.4:get_/x"
+    assert redis_keys.ota_progress_key(7) == "ota:progress:7"
+    assert redis_keys.rc_session_key("v1") == "rc:session:v1"
+    assert redis_keys.cache_scene_key("s1") == "cache:scene:s1"
+    assert redis_keys.rc_lock_key("v1") == "rc:lock:v1"
+    assert redis_keys.ANALYTICS_INGEST_LATENCY == "analytics:ingest_latency"
+    # 无占位符固定键：原样等于契约模式
+    assert redis_keys.VEHICLE_ONLINE_SET == "vehicle:online:set"
+    # 实际键必须仍命中命名正则（花括号占位符已替换）
+    for built in (redis_keys.session_key("u1"), redis_keys.rc_lock_key("v1")):
+        assert REDIS_KEY_NAMING_RE.match(built), built
 
 
 def test_object_storage_bucket_contract_values() -> None:

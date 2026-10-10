@@ -78,3 +78,11 @@ async def test_non_numeric_p95_returns_none() -> None:
 async def test_redis_error_degrades_to_none() -> None:
     reader = IngestLatencyRedisReader(_FakeRedis(error=ConnectionError("redis down")))
     assert await reader.p95_ms() is None
+
+
+def test_reader_key_uses_shared_constant() -> None:
+    """读端键 = 共享常量 = 契约模式（与 Flink 写端同源，杜绝拼写漂移致看板恒 null）。"""
+    from hunter_common import redis_keys
+
+    assert IngestLatencyRedisReader.KEY == redis_keys.ANALYTICS_INGEST_LATENCY
+    assert IngestLatencyRedisReader.KEY == "analytics:ingest_latency"

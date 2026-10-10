@@ -1,0 +1,36 @@
+# =====================================================================
+# Flink 1.18 Standalone（k8s 自建集群形态）—— 公共配置
+# - 代码内置镜像 hunter-flink/jobs（见 flink-jobs/Dockerfile），JM/TM/提交 Job 共用
+# - 命名/标签统一 component=flink，供 networkpolicies/flink.yaml 最小入向放行
+# - ⚠ 本 ConfigMap 禁止写入任何口令/SASL 凭据（verify_infra check_configmaps 强制）：
+#     敏感项一律走 hunter-app-secrets 的 secretKeyRef
+# - 作业连接项对齐 flink-jobs 代码实际读取的环境变量（thresholds/job 仅读 bootstrap/redis/window，
+#     走 broker 内部明文监听；Kafka SASL 侧作业尚无凭据读取路径，见 release.md 待办）
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-common-config
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: flink-config
+    app.kubernetes.io/part-of: hunter-flink
+    app.kubernetes.io/component: flink
+data:
+  # Flink 运行时公共配置（docker-entrypoint 追加至 flink-conf.yaml）；JM/TM 共用同一 rpc 地址（Service DNS）
+  FLINK_PROPERTIES: |
+    jobmanager.rpc.address: flink-jobmanager
+    jobmanager.rpc.port: 6123
+    rest.address: 0.0.0.0
+    rest.port: 8081
+    blob.server.port: 6124
+    taskmanager.rpc.port: 6122
+    classloader.check-leaked-classloader: false
+    state.checkpoints.dir: file:///opt/flink/checkpoints
+    execution.checkpointing.interval: 10000
+  # 作业消费端连接项（对齐 flink-jobs/hunter_flink/*.py 读取的环境变量名，禁止改拼写）
+  KAFKA_BOOTSTRAP_SERVERS: "kafka-0.kafka-headless.hunter-core.svc.cluster.local:9092"
+  REDIS_URL: "redis://redis-master.hunter-core.svc.cluster.local:6379/0"
+  # 入库延迟统计作业窗口/ TTL（缺省即代码内置默认，此处显式登记便于运维调参；见 ingest_latency_job.py）
+  INGEST_LATENCY_TTL_SECONDS: "300"
+  INGEST_LATENCY_WINDOW_SECONDS: "60"

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import quote
 
 from hunter_common.config import HunterBaseConfig
 from hunter_common.internal_auth import build_identity_headers
@@ -38,9 +39,32 @@ class Settings(HunterBaseConfig):
 
     # ---------- 只读数据库（hunter_analytics_ro，仅 SELECT；契约 db_access.read_only） ----------
     # 读路径与就绪探针一律走此账号（审查 Y10：最小权限）；写路径仅落本服务自身 schema
-    # （algorithm_metrics，经 DatabaseSessionManager + RW POSTGRES_USER/PASSWORD，见 main 装配）
+    # （algorithm_metrics，经 DatabaseSessionManager + RW 账号，见下 write 配置与 main 装配）
     analytics_ro_db_user: str = ""
     analytics_ro_db_password: str = ""
+
+    # ---------- RW 写账号（仅写自身 schema data_analytics.algorithm_metrics；契约 db_access.write） ----------
+    # 生产加固应指向最小权限专用账号 hunter_analytics_rw（er.md 第 3 节登记：
+    # GRANT USAGE ON SCHEMA data_analytics + GRANT INSERT ON data_analytics.algorithm_metrics，
+    # 禁止 UPDATE/DELETE/DDL 与其他 schema）；未配置 ANALYTICS_RW_DB_USER 时回落共享
+    # POSTGRES_USER（开发/单机形态，向后兼容），见 database_url 重写。
+    analytics_rw_db_user: str = ""
+    analytics_rw_db_password: str = ""
+
+    @property
+    def database_url(self) -> str:
+        """写路径连接串（DatabaseSessionManager 用，落自身 schema algorithm_metrics）。
+
+        仅覆盖写路径：配置了 ``ANALYTICS_RW_DB_USER`` 则走最小权限写账号，否则回落
+        基类共享 POSTGRES_USER（向后兼容）。读路径/就绪探针另走 ``read_only_database_url``
+        （hunter_analytics_ro，审查 Y10），不受本属性影响。
+        """
+        if self.analytics_rw_db_user:
+            return (
+                f"postgresql+asyncpg://{quote(self.analytics_rw_db_user)}:{quote(self.analytics_rw_db_password)}"
+                f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+            )
+        return super().database_url
 
     @property
     def read_only_database_url(self) -> str:

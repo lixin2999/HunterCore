@@ -8,7 +8,7 @@
 #
 # 规则（禁止绕过）：
 #   1) 本文件的键模式是唯一来源：禁止在任何服务中新增键模式或改写拼写（含大小写与分隔符）
-#   2) 键值拼接必须经共享库键构造常量（Step 2 落地），业务代码禁止硬编码键字面量
+#   2) 键值拼接必须经共享库键构造常量 hunter_common/redis_keys.py（已落地），业务代码禁止硬编码键字面量
 #   3) 变更顺序：先改本文件 → 再改受影响服务契约（x-hunter-service.redis_keys）→ 最后改实现
 # =====================================================================
 
@@ -27,9 +27,9 @@ naming:
 
 key_builder:
   runtime_helper: "hunter_common.redis.RedisManager（get/set/delete/exists/incr_with_expire/acquire_lock）"
-  constants_module: null
-  status: pending_confirmation
-  note: "⚠ 键构造常量的模块位置与函数签名（如 hunter_common/redis_keys.py 的 vehicle_status_key()）在 Step 2 落地并回填本字段"
+  constants_module: "hunter_common/redis_keys.py（受控键模式常量 + 占位符构造函数，键字面量的单一代码来源）"
+  status: resolved
+  note: "跨端引用（微服务写方 / Flink 作业 / 看板读方）必须 from hunter_common import redis_keys；禁止散落键字面量。common/python/tests/test_storage_contracts.py 断言 redis_keys.CONTROLLED_PATTERNS == 本文件 keys[].pattern（新增/改名先改本契约再改常量模块）"
 
 common_rules:
   - "禁止在任何键值中写入明文密码/私钥/证书；session:{user_id} 值为 JWT，必须受日志脱敏规则保护（不落日志/审计/异常响应）"
@@ -208,7 +208,6 @@ keys:
     lifecycle: "每窗口冲刷（跨窗口边界）SET analytics:ingest_latency EX 300 覆盖；无主动删除，依赖 TTL 过期（缺失即降级 null）"
     sensitive: false
     ops: ["SET key json EX 300", "GET", "TTL"]
-    status: pending_confirmation
     refs:
       - "contracts/openapi/data-analytics.yaml#x-hunter-service.redis_keys"
       - "contracts/openapi/data-analytics.yaml#x-hunter-dashboard-contract.pipeline.ingest_latency"
@@ -233,6 +232,7 @@ cross_check:
     - contracts/openapi/remote-control.yaml
   runtime:
     - common/python/hunter_common/redis.py
+    - common/python/hunter_common/redis_keys.py
   infra:
     - infra/k8s/base/01-configmap-common.yaml
     - infra/k8s/statefulsets/redis.yaml
@@ -265,16 +265,16 @@ x-hunter-pending-confirmation:
       impact: "阻塞（blocking）：登出后旧 Token 在有效期内仍可调用业务接口（安全缺陷，违反 9 章认证要求）"
       contract_decision: "三选一：①新增受控键模式（先改系统约束第 8 条与本契约）②复用 session:{user_id} 语义（删除会话 + jti 校验替代黑名单）③黑名单键由网关定义并登记回本契约；禁止实现阶段自行发明键名"
     - id: 7
-      question: "键构造常量模块位置与函数签名未定（当前 key_builder.constants_module = null，待 Step 2 落地）"
-      impact: "非阻塞：常量散落各服务会造成键拼写漂移（如 session 与 session: 前缀不一致）"
-      contract_decision: "确认常量/构造函数放置位置（建议 hunter_common/redis_keys.py）与命名（如 vehicle_status_key()、rate_limit_key(ip, api)）"
+      question: "【已结案】键构造常量模块位置与函数签名（原 key_builder.constants_module = null，已于 hunter_common/redis_keys.py 落地）"
+      impact: "非阻塞（历史）：常量散落各服务会造成键拼写漂移（如 session 与 session: 前缀不一致）"
+      contract_decision: "【已结案】落地 hunter_common/redis_keys.py：受控键模式常量集 CONTROLLED_PATTERNS + 构造函数（session_key/vehicle_status_key/rate_limit_key/ota_progress_key/rc_session_key/cache_scene_key/rc_lock_key + 固定键 ANALYTICS_INGEST_LATENCY）；写入端与读取端引用同一常量，test_storage_contracts.py 断言 CONTROLLED_PATTERNS == keys[].pattern"
     - id: 8
       question: "各服务 Redis 键声明结构不统一：data-collector / ota-service / remote-control / scene-service 用「对象列表（pattern/type/ttl_seconds）」，data-analytics 用「read: [key, ...]」字符串列表"
       impact: "非阻塞：校验器与测试需同时兼容两种形态，字段级比对在字符串列表形态下无法进行（丢失去重/类型校验能力）"
       contract_decision: "统一为对象列表（推荐）或在校验器与测试中同时支持两种形式；统一后各服务契约同步调整"
     - id: 9
-      question: "analytics:ingest_latency 未在系统约束第 8 条登记（由 data-analytics Flink data_quality_monitor 作业的入库延迟 P95 指标派生，pending #10 结案路线：Kafka 时间戳差 → Flink 流式统计 → Redis 指标键）"
-      impact: "非阻塞：看板 pipeline 块「入库延迟 P95」子项数据源；键模式冻结前改名会造成 Flink 写方与 data-analytics 读方拼写漂移，看板该字段恒降级 null"
-      contract_decision: "确认是否将该指标键正式纳入系统约束第 8 条受控键集（与 rc:lock 同属派生键）；确认后键模式冻结，各服务契约与 verify_data_layer.py/test_storage_contracts.py 受控键集同步回填"
+      question: "【已结案】analytics:ingest_latency 已正式纳入系统约束第 8 条受控键集（原为 data-analytics Flink data_quality_monitor 入库延迟 P95 指标派生键，pending #10 结案路线：Kafka 时间戳差 → Flink 流式统计 → Redis 指标键）"
+      impact: "非阻塞（历史）：键模式未冻结前改名会造成 Flink 写方与 data-analytics 读方拼写漂移，看板该字段恒降级 null"
+      contract_decision: "【已结案】正式纳入约束第 8 条受控键集，键模式冻结；两端经共享常量 hunter_common.redis_keys.ANALYTICS_INGEST_LATENCY 引用（pending #7 落地），消除拼写漂移；verify_data_layer.py / test_storage_contracts.py 受控键集同步回填"
 
 
