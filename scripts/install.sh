@@ -75,7 +75,7 @@ STEP_DESCRIPTIONS=(
   "构建业务服务镜像（docker compose build --parallel）"
   "启动中间件（PostgreSQL/TimescaleDB/Redis/ZooKeeper/Kafka/MinIO/SRS）"
   "初始化数据库（schema/timescaledb/初始数据）"
-  "初始化 Kafka 内部 Topic（6 个，契约分区与保留时间）"
+  "初始化 Kafka 内部 Topic（7 个平台 Topic + 7 个死信，契约分区与保留时间）"
   "初始化 MinIO Bucket（7 个）与生命周期规则"
   "启动业务服务（采集/分析/Flink/场景/OTA/远程操控/网关/前端）"
   "全栈健康检查（容器/HTTP/DB/Redis/Kafka/MinIO/资源）"
@@ -210,15 +210,18 @@ port_owned_by_project() {
 }
 
 check_public_ports() {
-  local failures=0 item port_spec desc proto port owner_note
+  local failures=0 item port_spec desc proto port owner_note port_detail
   log_info "检查对外端口占用（被占用则终止部署；本项目容器占用视为通过）"
   for item in "${UFW_RULES[@]}"; do
     port_spec="${item%%:*}"
     desc="${item#*:}"
     port="${port_spec%%/*}"
     proto="${port_spec#*/}"
+    port_detail=""
     if [ "$proto" = "tcp" ]; then
-      if check_port "$port"; then
+      # quiet 模式：占用明细只拿回不打印——下面还有“本项目容器占用”这一层豁免，
+      #   先打 ERROR 会把一次正常续跑刷成假故障（V1.19.17 实录）
+      if port_detail="$(check_port "$port" quiet)"; then
         log_success "端口可用：${port}/tcp（${desc}）"
         continue
       fi
@@ -233,7 +236,7 @@ check_public_ports() {
       log_info "端口 ${port} 由本项目容器占用（${owner_note}），视为通过（重复部署/续跑场景）"
       continue
     fi
-    log_error "端口 ${port}/${proto} 已被非本项目进程占用（${desc}）"
+    log_error "端口 ${port}/${proto} 已被非本项目进程占用（${desc}）${port_detail:+：${port_detail}}"
     failures=1
   done
   if [ "$failures" -ne 0 ]; then

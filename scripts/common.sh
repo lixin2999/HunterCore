@@ -171,10 +171,13 @@ version_ge() {
   [ "$(printf '%s\n%s\n' "$base" "$given" | sort -V | head -n1)" = "$base" ]
 }
 
-# check_port <port>：端口未被占用返回 0；被占用返回 1 并打印占用进程
+# check_port <port> [quiet]：端口未被占用返回 0；被占用返回 1
+#   默认把占用明细按 ERROR 打印（供 require_port_free 这类“占用即故障”的调用方）。
+#   传 quiet 时只回传状态、明细写 stdout，**由调用方定级**：install.sh 的端口预检有
+#   “本项目容器占用视为通过”的豁免分支，若此处先打 ERROR，一次正常续跑会刷出多条
+#   假故障（V1.19.17 服务器实录：`[ERROR] 端口 80 已被占用` 紧跟 `[INFO] …视为通过`）。
 check_port() {
-  local port="${1:?check_port 需要端口参数}"
-  local detail=""
+  local port="${1:?check_port 需要端口参数}" quiet="${2:-}" detail=""
   if command_exists ss; then
     detail="$(ss -Hltn "sport = :${port}" 2>/dev/null | head -n3)"
   elif command_exists netstat; then
@@ -182,11 +185,20 @@ check_port() {
   elif command_exists lsof; then
     detail="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | head -n3)"
   else
-    log_warn "缺少 ss/netstat/lsof，跳过端口 ${port} 占用检查（请安装 iproute2）"
+    # quiet 模式下本函数处于命令替换中（stdout 被捕获），提醒必须走 stderr，否则会被默默吞掉
+    if [ "$quiet" = "quiet" ]; then
+      log_warn "缺少 ss/netstat/lsof，跳过端口 ${port} 占用检查（请安装 iproute2）" >&2
+    else
+      log_warn "缺少 ss/netstat/lsof，跳过端口 ${port} 占用检查（请安装 iproute2）"
+    fi
     return 0
   fi
   if [ -n "$detail" ]; then
-    log_error "端口 ${port} 已被占用：$(printf '%s' "$detail" | tr '\n' ';')"
+    if [ "$quiet" = "quiet" ]; then
+      printf '端口 %s 已被占用：%s\n' "$port" "$(printf '%s' "$detail" | tr '\n' ';')"
+    else
+      log_error "端口 ${port} 已被占用：$(printf '%s' "$detail" | tr '\n' ';')"
+    fi
     return 1
   fi
   return 0
@@ -741,7 +753,7 @@ HunterCore 部署脚本公共库 common.sh（库文件，禁止直接执行）
 用途：
   为所有部署/运维脚本提供统一日志、检查与辅助函数：
     - 日志：log_info / log_success / log_warn / log_error（终端彩色 + 日志文件无色）
-    - 检查：check_root / command_exists / check_port / check_disk_space / wait_for / confirm
+    - 检查：check_root / command_exists / check_port（可 quiet 交调用方定级）/ check_disk_space / wait_for / confirm
     - 环境：load_env（加载 ${APP_DIR}/.env）/ env_value / require_env / env_creds_missing
       （⚠ .env 权限 600、仅 root 可读：非 root 跑口令类探针会因 load_env 失败而得到**错误结论**）
     - 辅助：compose / container_health / hc_run_logged / service_health_ok

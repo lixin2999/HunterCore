@@ -593,9 +593,15 @@ check_flink_checkpoint_dir() {
     writable=1
   fi
   if [ "$writable" = "1" ]; then
-    record_result "PASS" "Flink 检查点目录" "容器内 uid=${uid}:${gid} 对 ${cdir}（${cud}:${cgid} ${cmode}）可写，可在其下创建 ${target}"
+    # 文案分两种读数：探测目录就是 target 时不能说“在其下创建 target”（会把同一路径重复两遍，
+    #   V1.19.16 实录即为「对 /opt/flink/data/checkpoints 可写，可在其下创建 /opt/flink/data/checkpoints」）
+    if [ "$cdir" = "$target" ]; then
+      record_result "PASS" "Flink 检查点目录" "容器内 uid=${uid}:${gid} 对 ${cdir}（${cud}:${cgid} ${cmode}；宿主 ${host}）可写，Flink 可直接在此创建检查点"
+    else
+      record_result "PASS" "Flink 检查点目录" "容器内 uid=${uid}:${gid} 对最近存在的祖先 ${cdir}（${cud}:${cgid} ${cmode}；宿主 ${host}）可写，可在其下创建 ${target}"
+    fi
   else
-    record_result "FAIL" "Flink 检查点目录" "**不可写**：容器内以 uid=${uid}:${gid} 运行，而 ${cdir}（宿主 ${host}）属 ${cud}:${cgid} ${cmode}，Flink 建不了 ${target} ⇒ 报错 Failed to create directory for shared state，**全部作业提交期失败**（不是单个作业的问题）。修复：sudo chown -R ${uid}:${gid} ${host} && sudo chmod 755 ${host}（bind 目录改属主即时生效，**无需重建容器**，但需重新提交作业）；宿主侧预建已改由 install.sh Step 3 按容器 UID 归属，重跑 sudo bash scripts/install.sh --step 3 可自愈"
+    record_result "FAIL" "Flink 检查点目录" "**不可写**：容器内以 uid=${uid}:${gid} 运行，而 ${cdir}（宿主 ${host}）属 ${cud}:${cgid} ${cmode}，Flink 建不了 ${target} ⇒ 报错 Failed to create directory for shared state，**全部作业提交期失败**（不是单个作业的问题）。修复：sudo chown -R ${uid}:${gid} ${host} && sudo chmod 755 ${host}（bind 目录改属主即时生效，**无需重建容器**，但需重新提交作业）；宿主侧预建已改由 install.sh Step 3 按容器 UID 归属，重跑 sudo bash scripts/install.sh --step 3 -y 可自愈（**非交互下 -y 不可省**，否则会停在确认环“未执行任何步骤”）"
   fi
   return 0
 }
