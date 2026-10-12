@@ -609,6 +609,11 @@ def check_kafka_cli_required_args() -> None:
     `init-kafka.sh` 的 `create_scram_user` 都漏了 ①——命令从未真正执行成功，而巡检把它伪装成
     “该消费组尚无 offset 提交”（归因完全错）；V1.19.13 又发现漏 ② 会被数成“只有 1 个 Topic”。
     只靠人记忆不可靠，固化为门禁。
+
+    **口径（V1.19.16 用户裁定：文档与程序脱钩）**：docs/README 是供开发者/运维/使用方熟悉系统的材料，
+    校验器**不因文档存在与否给出任何结论或读数**（早期版本把“脚本+文档”混成一个总数，已被误读两次）。
+    文档**存在时顺带扫一遍**，只为拦住“写给人敲的命令漏参数”这类错（V1.19.9~11 的真实成因），
+    缺失时静默跳过；输出的计数只统计运维脚本。
     """
     targets: list[Path] = sorted((ROOT / "scripts").glob("*.sh"))
     targets.append(ROOT / "README.md")
@@ -616,11 +621,9 @@ def check_kafka_cli_required_args() -> None:
     if docs_dir.is_dir():
         targets.extend(sorted(docs_dir.glob("*.md")))
     problems: list[str] = []
-    scanned = 0
     for path in targets:
         if not path.is_file():
             continue
-        scanned += 1
         for lineno, statement in _shell_statements(path.read_text(encoding="utf-8")):
             via_wrapper = bool(KAFKA_CLI_VIA_WRAPPER.search(statement))
             if not (via_wrapper or KAFKA_CLI_DIRECT.search(statement)):
@@ -637,9 +640,98 @@ def check_kafka_cli_required_args() -> None:
         for item in problems:
             fail(item)
     else:
+        # 只报脚本数：文档份数不参与判据、不出现于读数（V1.19.16）——否则“总数变了”会被当成
+        #   脚本版本指纹（V1.19.15 误读一次）或被用来做同步检查（用户已明确不要）。
+        n_scripts = sum(1 for p in targets if p.suffix == ".sh" and p.is_file())
         ok(
             "Kafka 运维命令参数齐备（--bootstrap-server 必需；裸命令另需认证参数 "
-            f"{'/'.join(KAFKA_CLI_AUTH_MARKERS[:2])}，{scanned} 个脚本/文档）"
+            f"{'/'.join(KAFKA_CLI_AUTH_MARKERS[:2])}；已校验运维脚本 {n_scripts} 个）"
+        )
+
+
+#: Flink 数据目录属主（V1.19.16）：必须与容器内运行用户同值，两处编排不得漂移
+FLINK_DIR_OWNER_LINE = re.compile(r'ensure_dir\s+"\$\{DATA_DIR\}/flink"\s+[^"]*"([^"]+)"')
+FLINK_OWNER_FN = re.compile(r"flink_container_owner\(\)\s*\{(.*?)\n\}", re.DOTALL)
+FLINK_OWNER_DEFAULT = re.compile(r"printf '(\d+):(\d+)'")
+#: compose 侧的两条约定（JM 与 TM 各一份）：检查点目录必须落在 bind 卷内
+COMPOSE_CHECKPOINT_DIR = "execution.checkpointing.dir: file:///opt/flink/data/checkpoints"
+COMPOSE_FLINK_VOLUME = "${DATA_DIR:-/data}/flink:/opt/flink/data"
+
+
+def check_flink_checkpoint_owner_contract() -> None:
+    """校验「Flink 数据目录属主 == 容器运行用户」在 install.sh / compose / K8s 三处同值。
+
+    历史故障（V1.19.16 现场）：install.sh 把 ${DATA_DIR}/flink 预建为 root:root 0755，而 JM/TM
+    以非 root 的 flink 用户（UID 9999）运行——一开周期性检查点，Flink 就建不了
+    `file:/opt/flink/data/checkpoints/<job>/shared`，三个作业全死在提交期。这条假设在「从未
+    真正做过检查点」的时期不会被任何路径验证，只靠人记忆不可靠，固化为门禁。
+    """
+    install_sh = ROOT / "scripts" / "install.sh"
+    if not install_sh.is_file():
+        fail("scripts/install.sh 不存在（无法校验 Flink 数据目录属主）")
+        return
+    text = install_sh.read_text(encoding="utf-8")
+    match = FLINK_DIR_OWNER_LINE.search(text)
+    if not match:
+        fail('scripts/install.sh 未找到 ensure_dir "${DATA_DIR}/flink" …（Flink 数据目录必须显式预建属主）')
+        return
+    owner_arg = match.group(1)
+    if "flink_container_owner" not in owner_arg:
+        fail(
+            f"scripts/install.sh 的 flink 数据目录属主为字面量 {owner_arg}：容器以非 root 运行，"
+            "root:root 会让检查点建目录失败（必须由 flink_container_owner 探测，兜底与 K8s runAsUser 同值）"
+        )
+        return
+    fn_body = FLINK_OWNER_FN.search(text)
+    default_match = FLINK_OWNER_DEFAULT.search(fn_body.group(1)) if fn_body else None
+    if not fn_body or not default_match:
+        fail("scripts/install.sh 的 flink_container_owner() 缺少 `printf 'uid:gid'` 兜底值")
+        return
+    uid, gid = default_match.group(1), default_match.group(2)
+
+    problems: list[str] = []
+    k8s_owners: set[tuple[str, str]] = set()
+    for name in ("02-jobmanager.yaml", "03-taskmanager.yaml"):
+        path = K8S_DIR / "flink" / name
+        if not path.is_file():
+            problems.append(f"{rel(path)} 不存在")
+            continue
+        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+            # 同文件常附带 Service（02-jobmanager.yaml 里就有），它们没有 Pod 模板，不参与归属对账
+            if not isinstance(doc, dict) or doc.get("kind") not in ("Deployment", "StatefulSet"):
+                continue
+            sc = ((((doc.get("spec") or {}).get("template") or {}).get("spec") or {}).get("securityContext")) or {}
+            if not sc:
+                problems.append(f"{rel(path)}: 缺 pod securityContext（挂载卷的属主只能靠 fsGroup）")
+                continue
+            if not sc.get("runAsNonRoot"):
+                problems.append(f"{rel(path)}: Flink 容器未声明 runAsNonRoot: true")
+            if sc.get("fsGroup") is None:
+                problems.append(f"{rel(path)}: 缺 fsGroup（挂载卷对新 Pod 内进程不可写）")
+            k8s_owners.add((str(sc.get("runAsUser")), str(sc.get("runAsGroup"))))
+    if k8s_owners and k8s_owners != {(uid, gid)}:
+        problems.append(
+            "flink 运行用户 UID/GID 两处不一致："
+            f"install.sh 兜底 {uid}:{gid} vs K8s {sorted(k8s_owners)}（compose 侧 bind 目录按前者归属）"
+        )
+
+    compose = ROOT / "infra" / "deploy" / "docker-compose.yml"
+    if compose.is_file():
+        compose_text = compose.read_text(encoding="utf-8")
+        for needle, want in ((COMPOSE_CHECKPOINT_DIR, 2), (COMPOSE_FLINK_VOLUME, 2)):
+            got = compose_text.count(needle)
+            if got != want:
+                problems.append(f"compose 侧 {needle!r} 出现 {got} 次（期望 {want}：JM 与 TM 各一份）")
+    else:
+        problems.append("infra/deploy/docker-compose.yml 不存在")
+
+    for item in problems:
+        fail(item)
+    if not problems:
+        ok(
+            "Flink 检查点目录契约三处对齐"
+            f"（install.sh 兜底属主 {uid}:{gid} == K8s runAsUser/runAsGroup，"
+            "JM/TM 的 checkpoint dir 均在 bind 卷内）"
         )
 
 
@@ -662,6 +754,7 @@ def main() -> int:
     check_dockerfiles()
     check_monitoring_configs()
     check_kafka_cli_required_args()
+    check_flink_checkpoint_owner_contract()
 
     for line in checks:
         print(line)

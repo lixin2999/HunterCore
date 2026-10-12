@@ -23,6 +23,11 @@ metadata:
     app.kubernetes.io/part-of: hunter-flink
     app.kubernetes.io/component: flink
 data:
+  # ⚠ 检查点目录：K8s 与 compose 形态**不等价**，且本目录尚未实机验证（V1.19.16 登记为待办）：
+  #   compose 把 ${DATA_DIR}/flink 同时 bind 给 JM 与 TM（同一宿主目录，TM 能直接写 shared state）；
+  #   而下方 dir 指向 JM Pod 的 emptyDir——**emptyDir 不跨 Pod 共享**，且 03-taskmanager.yaml 未挂该
+  #   路径 ⇒ 真开周期性检查点时 TM 侧写 shared state 大概率失败。K8s 形态启用前必须先换成
+  #   共享存储（ReadWriteMany PVC 或 s3:// 对象存储），不得照抄 compose 的结论。
   # Flink 运行时公共配置（docker-entrypoint 追加至 flink-conf.yaml）；JM/TM 共用同一 rpc 地址（Service DNS）
   FLINK_PROPERTIES: |
     jobmanager.rpc.address: flink-jobmanager

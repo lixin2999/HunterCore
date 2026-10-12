@@ -78,6 +78,14 @@ battery_low / battery_critical 独立边沿触发（SOC 8% 时两条各一次）
 - 只开周期、不动其他检查点参数：模式取 PyFlink 默认 `EXACTLY_ONCE`，三个作业的 sink 均为
   `AT_LEAST_ONCE` 投递（无事务、无 `transactional.id`），开检查点**不改变端到端投递语义**，
   只增加位点提交与状态快照。
+- **开检查点的前提是目录真的可写**（V1.19.16 实机教训）：compose 把宿主 `${DATA_DIR}/flink` bind 到容器内
+  `/opt/flink/data`，而 JM/TM 以镜像内**非 root** 的 `flink`（UID 9999）运行——宿主侧曾按 `root:root 0755` 预建，
+  代码侧一开周期就在**提交期**报 `Failed to create directory for shared state: …/shared`，三个作业一起挂。
+  这条前提不在作业代码里，桩测与静态对账都覆盖不到，现由三处固化：`scripts/install.sh` Step 3（按容器 UID
+  预建，优先从镜像探测）、巡检 ⑮（容器内 uid/gid vs 目录属主，只读）、`scripts/verify_infra.py`
+  （install.sh 兜底 UID == K8s `runAsUser`；JM/TM 的 `checkpointing.dir` 均在 bind 卷内）。
+  K8s 形态仍有一处未闭合：dir 指向 JM Pod 的 emptyDir，**跨 Pod 不共享且 TM 未挂该路径** ⇒ 启用前需换成
+  RWX PVC 或 `s3://`（登记为待办，未落地前不要给 K8s 配 `interval`）。
 
 ### 提交与测试
 
@@ -136,6 +144,10 @@ docker exec hunter-redis sh -c 'p=$(tr "\0" "\n" </proc/1/cmdline | grep -A1 -- 
   用 `awk '/Caused by/{last=NR} {l[NR]=$0} END{for(i=last;i<=NR;i++) print l[i]}'` 把它连同后续栈帧读完）。
   ⚠ 不要把窗口夹住：能定性的最内层 `Caused by`（区分 Topic 缺失还是 ACL 拒绝的就那一行）常在该行之后
   60~120 行，`-A40` / `tail -n 80` / `head` 都会把它切掉，切了即白跑一轮。
+- **空列表是合法读数**（V1.19.16）：作业在**提交期**就失败时从未进入 RUNNING，连 FAILED 终态行都不会出现，
+  `flink list -a` 只打 `No running jobs.`——此时没有 `switched from RUNNING to FAILED` 可取证，
+  改成看提交回显或 `sudo docker logs hunter-flink-jm 2>&1 | grep -E 'Failed to create|JobInitializationException'`。
+  巡检 ⑭ 已按 `RUNNING=0 < 期望值` 判 FAIL（旧版拿“有没有表头”当有效性门禁，把三作业全灭读成“未判定”）。
 - **RUNNING 不等于位点在提交**（V1.19.15 实机教训，上两条的第三族）：作业 RUNNING、产物键有值、
   看板 lag 显示 0，而消费组在集群上 `does not exist` —— 三者可以同时成立，因为**没有检查点就没有位点提交**。
   新增作业必须经 `hunter_flink.checkpointing.enable_checkpointing(env)`，不要只在部署侧加 `interval`。

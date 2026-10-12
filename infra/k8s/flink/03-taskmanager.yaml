@@ -58,6 +58,10 @@ spec:
           volumeMounts:
             - name: log
               mountPath: /opt/flink/log
+            # ⚠ 本清单**不挂**检查点目录：flink-common-config 的 execution.checkpointing.dir 指向 JM Pod 的
+            #   emptyDir，跨 Pod 不共享，在此加一个自己的 emptyDir 反而会让 JM/TM 读到两个不同目录（更错）。
+            #   K8s 形态要开检查点，必须先把 dir 换成 JM/TM 都能看见的共享存储（RWX PVC 或 s3://）；
+            #   已登记为待办（见 release.md V1.19.16），未落地前不要给 K8s 配 interval。
           resources:
             requests:
               cpu: "1"

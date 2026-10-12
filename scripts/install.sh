@@ -390,6 +390,30 @@ ensure_data_dir() {
   log_success "初始化数据目录属主/权限：${dir} → ${owner} ${mode}"
 }
 
+# flink_container_owner：输出容器内 flink 运行用户的 uid:gid（Flink 数据目录的属主必须与之一致）。
+#   优先从本地镜像探测（基座升级后 UID 可能漂移），镜像尚未构建/不可用时退回 9999:9999
+#   （flink 官方镜像内置 flink 用户，与 infra/k8s/flink/0*.yaml 的 runAsUser/fsGroup 同值；
+#   两处一致性由 scripts/verify_infra.py 强制）。显式覆盖：FLINK_DATA_OWNER=uid:gid
+flink_container_owner() {
+  local override="${FLINK_DATA_OWNER:-}" image="${FLINK_JOB_IMAGE:-hunter-flink/jobs:2.1.1}" out uid gid
+  if [ -n "$override" ]; then
+    printf '%s' "$override"
+    return 0
+  fi
+  if command -v docker >/dev/null 2>&1 && docker image inspect "$image" >/dev/null 2>&1; then
+    out="$(docker run --rm --entrypoint id "$image" 2>/dev/null || true)"
+    uid="$(printf '%s' "$out" | sed -n 's/^uid=\([0-9][0-9]*\).*/\1/p')"
+    gid="$(printf '%s' "$out" | sed -n 's/.*gid=\([0-9][0-9]*\).*/\1/p')"
+    if [ -n "$uid" ] && [ -n "$gid" ]; then
+      printf '%s:%s' "$uid" "$gid"
+      log_info "flink 容器运行用户（已从镜像 ${image} 探测）：${uid}:${gid}"
+      return 0
+    fi
+    log_warn "无法从镜像 ${image} 解析 flink 用户 uid/gid（输出：${out:-<空>}），退回默认 9999:9999"
+  fi
+  printf '9999:9999'
+}
+
 # =====================================================================
 # Step 1：系统初始化
 # =====================================================================
@@ -790,7 +814,13 @@ step_3_prepare_dirs() {
   ensure_data_dir "${DATA_DIR}/zookeeper" "1001:1001" "0755"
   ensure_data_dir "${DATA_DIR}/minio" "1001:1001" "0755"
   ensure_dir "${DATA_DIR}/srs" "root:root" "0755"
-  ensure_dir "${DATA_DIR}/flink" "root:root" "0755"
+  # Flink 数据目录（V1.19.16）：compose 把本目录 bind 成容器内 /opt/flink/data，而 JM/TM 以**非 root**
+  #   的 flink 用户运行——曾按 root:root 预建，在「从未真正做过检查点」的时期看不出问题；
+  #   一旦开启周期性检查点就建不了目录：`Failed to create directory for shared state:
+  #   file:/opt/flink/data/checkpoints/<job>/shared` ⇒ 三个作业全部提交失败（实录）。因此属主必须
+  #   是容器内运行用户（与 K8s 侧 runAsUser/fsGroup 同值）；ensure_dir 对已存在但属主不符的目录会
+  #   递归修正，所以存量环境重跑 Step 3 即可自愈。
+  ensure_dir "${DATA_DIR}/flink" "$(flink_container_owner)" "0755"
   ensure_dir "${DATA_DIR}/backups" "root:root" "0755"
 
   # 业务服务本地 Kafka 磁盘缓冲目录：容器以非 root uid 10001（appuser）运行，bind 源必须由宿主预建并 chown 10001；
@@ -807,7 +837,7 @@ step_3_prepare_dirs() {
   ensure_dir "${APP_DIR}/sql" "root:root" "0755"
   ensure_dir "${APP_DIR}/nginx" "root:root" "0755"
 
-  log_success "目录准备完成（数据目录属主由容器管理，空目录初始化：PG/Timescale/Redis=999:999，Kafka/ZK/MinIO=1001:1001；srs/flink/backups 及 APP_DIR 子目录=root:root）"
+  log_success "目录准备完成（数据目录属主由容器管理，空目录初始化：PG/Timescale/Redis=999:999，Kafka/ZK/MinIO=1001:1001，flink=容器内运行用户（探测值，默认 9999:9999）；srs/backups 及 APP_DIR 子目录=root:root）"
 }
 
 # =====================================================================

@@ -5,7 +5,7 @@
 # 用途：一次性核对容器 / HTTP 探针 / 数据库 / Redis / Kafka / MinIO / 磁盘与内存 / 消费积压，
 #       输出 [PASS] [WARN] [FAIL] 明细与汇总，并给出退出码（供 install.sh、巡检脚本、CI 调用）。
 #
-# 检查项（共 15 类，⓪ 必须排第一）：
+# 检查项（共 16 类，⓪ 必须排第一）：
 #   ⓪ 环境凭据（.env）：口令类变量为空即 FAIL（典型成因：没加 sudo，.env 权限 600）；
 #      ⚠ 本项 FAIL 时，Redis / Kafka / MinIO 的相关结论一律降为「未判定」，不得当服务异常（V1.19.13）
 #   ① 容器运行状态与 Docker healthcheck（缺失/非 healthy/未运行 → FAIL）
@@ -25,7 +25,13 @@
 #   ⑭ Flink 作业健康（V1.19.13）：**flink list -a** 统计 RUNNING 数与 FAILED/CANCELED 终态
 #      ⚠ 不加 -a 时 FAILED 作业**从列表里静默消失**（默认只列 Running/Restarting 与 Scheduled）；
 #      判据是「提交数 == RUNNING 数」（默认期望 3，可用 FLINK_EXPECTED_RUNNING 覆盖）；
-#      ⑬ 的服务容器清单不含 flink-jm/flink-tm，作业侧的 Kafka 写失败只有本项能抓到
+#      ⑬ 的服务容器清单不含 flink-jm/flink-tm，作业侧的 Kafka 写失败只有本项能抓到；
+#      ⚠ 作业**提交期**失败时连终态行都没有，列表只打 `No running jobs.`（不含表头）——
+#      V1.19.13 拿“有没有表头”当有效性门禁，使零作业被读成 WARN「未判定」、汇总写“失败 0 项”
+#      （第八类假绿：恰好把三个全挂掩盖成“没取到样本”），V1.19.16 已把空列表归为合法读数判 FAIL
+#   ⑮ Flink 检查点目录（V1.19.16）：在**容器内**比对运行用户 uid 与检查点目录（及其最近存在
+#      祖先）的属主/权限，只读不写探针——compose 把 ${DATA_DIR}/flink 绑成 /opt/flink/data，而 JM/TM
+#      以非 root 的 flink 用户运行，目录归 root 时作业会死在 `Failed to create directory for shared state`
 #
 # ⚠ 必须用 sudo 跑：.env 权限 600（install.sh / gen-passwords.sh 设定）仅 root 可读；
 #   非 root 时 [ -f .env ] 仍为真但 source 失败 ⇒ 口令全空 ⇒ 本脚本会给出一串
@@ -42,6 +48,8 @@
 #
 # 环境变量（可选）：
 #   FLINK_JM_CONTAINER（默认 hunter-flink-jm）/ FLINK_EXPECTED_RUNNING（默认 3）
+#   FLINK_CHECKPOINT_DIR（默认 /opt/flink/data/checkpoints，**容器内路径**；K8s 形态为
+#     /opt/flink/checkpoints，不自动探测——集群由运维显式设置，两处不一致已登记为待办）
 #
 # 退出码：0 = 全部通过；1 = 存在告警（WARN）；2 = 存在失败（FAIL）
 #
@@ -80,7 +88,7 @@ usage() {
 HunterCore 全栈健康检查脚本
 
 用途：
-  检查 15 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
+  检查 16 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
   退出码：0=全部通过，1=有告警，2=有失败。
 
 ⚠ 请用 sudo 执行：.env 权限 600 仅 root 可读，非 root 时口令类探针会给出错的 FAIL
@@ -501,8 +509,20 @@ check_flink_jobs() {
     return 0
   fi
   out="$(docker exec "$container" flink list -a 2>&1 || true)"
+  # JVM 启动噪声（WARNING: Unknown module: jdk.compiler ... is not exported by this version of the JDK）
+  #   是 flink CLI 的 stderr，既不含表头也不含作业行；留着会占满下面 200 字符的详情窗口，
+  #   把真正有定性的报错顶掉（实录里 WARN 详情只能看到噪声，看不到任何原因）
+  out="$(printf '%s\n' "$out" | grep -vE '^(WARNING: |SLF4J:)' || true)"
+
+  # 空列表是**合法读数**（V1.19.16）：提交期就失败的作业连 FAILED 终态都不登记，列表只打
+  #   `No running jobs.`。V1.19.13 把“没表头”一律当命令失败判 WARN，于是三个作业全挂时
+  #   汇总写成「失败 0 项」——本仓第八类假绿，且恰好发生在最严重的那一档
+  if printf '%s\n' "$out" | grep -qE 'No running jobs\.'; then
+    record_result "FAIL" "Flink 作业数" "RUNNING=0 < ${expected}：JM 明确返回 No running jobs.（合法空列表，不是未判定）。列表里也没有 FAILED 终态行 ⇒ 典型为**提交期失败**（作业从未进入 RUNNING）：先看本巡检 ⑮「Flink 检查点目录」是否可写，再查堆栈（不截断窗口）——sudo docker logs ${container} 2>&1 后接 awk '/switched from RUNNING to FAILED/{f=1} f' 落盘，读**最后一条** Caused by 及其后续行（提取命令见运维手册 §3.6）"
+    return 0
+  fi
   if ! printf '%s\n' "$out" | grep -qE 'Running/Restarting Jobs'; then
-    record_result "WARN" "Flink 作业健康" "**未判定**：flink list -a 没返回作业表头（JM REST 未就绪或命令失败）：$(printf '%.200s' "${out:-<无输出>}")"
+    record_result "WARN" "Flink 作业健康" "**未判定**：flink list -a 既无作业表头也无 'No running jobs.'（JM REST 未就绪或命令失败）：$(printf '%.200s' "${out:-<无输出>}")"
     return 0
   fi
   running="$(printf '%s\n' "$out" | grep -cE '\((RUNNING|RESTARTING)\)' || true)"
@@ -522,6 +542,60 @@ check_flink_jobs() {
     record_result "FAIL" "Flink 作业数" "RUNNING=${running:-0} < ${expected}（契约已交付三作业：driving_anomaly_detection / algorithm_performance_monitor / data_quality_monitor_ingest_latency；判据是提交数 == RUNNING 数；改期望值可设 FLINK_EXPECTED_RUNNING）"
   elif [ -z "$bad" ]; then
     record_result "PASS" "Flink 作业健康" "RUNNING=${running}（期望 ${expected}），无 FAILED/CANCELED 终态"
+  fi
+  return 0
+}
+
+# ⑮ Flink 检查点目录可写（V1.19.16）：不可写时**所有**作业都死在提交期
+# ⚠ 只读探测：不往检查点目录写探针文件（残留文件可能被 Flink 当成状态）；可写性由
+#   「最近存在的祖先 + 容器内运行用户 uid/gid + mode」推得。目录归 root 而容器以非 root 的
+#   flink 用户运行时，报错是 `Failed to create directory for shared state: file:/opt/flink/data/…`
+#   ——先于任何算子代码，因此与具体作业无关（实录：三个作业同时挂）
+check_flink_checkpoint_dir() {
+  local container="${FLINK_JM_CONTAINER:-hunter-flink-jm}"
+  local target="${FLINK_CHECKPOINT_DIR:-/opt/flink/data/checkpoints}"
+  local probe uid gid cdir own cud cgid cmode host="" writable=0
+  if ! command_exists docker || ! docker inspect "$container" >/dev/null 2>&1; then
+    record_result "WARN" "Flink 检查点目录" "容器 ${container} 不存在或无 docker 权限（未部署 flink-jm 时可忽略）"
+    return 0
+  fi
+  probe="$(docker exec "$container" sh -c '
+      p="$1"
+      while [ ! -d "$p" ] && [ "$p" != "/" ]; do p="$(dirname "$p")"; done
+      printf "uid=%s\n" "$(id -u)"
+      printf "gid=%s\n" "$(id -g)"
+      printf "dir=%s\n" "$p"
+      printf "own=%s\n" "$(stat -c "%u %g %a" "$p" 2>/dev/null || echo unknown)"
+    ' sh "$target" 2>&1 || true)"
+  uid="$(printf '%s\n' "$probe" | sed -n 's/^uid=//p')"
+  gid="$(printf '%s\n' "$probe" | sed -n 's/^gid=//p')"
+  cdir="$(printf '%s\n' "$probe" | sed -n 's/^dir=//p')"
+  own="$(printf '%s\n' "$probe" | sed -n 's/^own=//p')"
+  if [ -z "$uid" ] || [ -z "$gid" ] || [ -z "$cdir" ]; then
+    record_result "WARN" "Flink 检查点目录" "**未判定**：容器内探测失败（${probe:-<无输出>}）"
+    return 0
+  fi
+  cud="${own%% *}"; own="${own#* }"; cgid="${own%% *}"; cmode="${own##* }"
+  if [ "$cud" = "unknown" ] || [ -z "$cgid" ] || [ -z "$cmode" ]; then
+    record_result "WARN" "Flink 检查点目录" "**未判定**：容器内读不到 ${cdir} 的属主/权限（镜像无 GNU stat？）：$(printf '%.120s' "$probe")"
+    return 0
+  fi
+  # 宿主侧对应路径（compose: ${DATA_DIR}/flink → 容器 /opt/flink/data），只为了把修复命令写完整
+  case "$cdir" in
+    /opt/flink/data*) host="${DATA_DIR:-/data}/flink${cdir#/opt/flink/data}" ;;
+    *) host="${cdir}（容器内，未能映射到宿主路径）" ;;
+  esac
+  if [ "$cud" = "$uid" ] && [ $((8#$cmode & 8#200)) -ne 0 ]; then
+    writable=1
+  elif [ "$cgid" = "$gid" ] && [ $((8#$cmode & 8#020)) -ne 0 ]; then
+    writable=1
+  elif [ $((8#$cmode & 8#002)) -ne 0 ]; then
+    writable=1
+  fi
+  if [ "$writable" = "1" ]; then
+    record_result "PASS" "Flink 检查点目录" "容器内 uid=${uid}:${gid} 对 ${cdir}（${cud}:${cgid} ${cmode}）可写，可在其下创建 ${target}"
+  else
+    record_result "FAIL" "Flink 检查点目录" "**不可写**：容器内以 uid=${uid}:${gid} 运行，而 ${cdir}（宿主 ${host}）属 ${cud}:${cgid} ${cmode}，Flink 建不了 ${target} ⇒ 报错 Failed to create directory for shared state，**全部作业提交期失败**（不是单个作业的问题）。修复：sudo chown -R ${uid}:${gid} ${host} && sudo chmod 755 ${host}（bind 目录改属主即时生效，**无需重建容器**，但需重新提交作业）；宿主侧预建已改由 install.sh Step 3 按容器 UID 归属，重跑 sudo bash scripts/install.sh --step 3 可自愈"
   fi
   return 0
 }
@@ -701,7 +775,7 @@ check_service_error_logs() {
   return 0
 }
 
-# run_all_health_checks：执行全部 15 类检查（供 daily-check 与 main 复用）
+# run_all_health_checks：执行全部 16 类检查（供 daily-check 与 main 复用）
 # ⚠ 顺序有语义：「环境凭据（.env）」必须排第一——后面的 Redis / Kafka / MinIO 靠它判断
 #   “服务异常”还是“根本没带凭据”（V1.19.13）。
 # 各项均以“失败被测试”的上下文调用（if ! f）：bash 在该上下文中会关闭 errexit，
@@ -713,7 +787,7 @@ run_all_health_checks() {
   for check in check_env_credentials check_compose_override check_containers check_http_endpoints \
     check_databases check_redis check_kafka_topics check_minio_buckets check_disk_usage \
     check_memory_usage check_kafka_lag check_kafka_broker_cert check_service_error_logs \
-    check_flink_jobs; do
+    check_flink_jobs check_flink_checkpoint_dir; do
     if ! "$check"; then
       record_result "WARN" "检查项未完成（${check}）" "该项内部命令返回非 0（已继续执行余下检查，stderr 有具体报错行）"
     fi
