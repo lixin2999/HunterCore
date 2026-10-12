@@ -16,6 +16,11 @@
  12. PDB 契约：无状态服务齐备，minAvailable 必须小于 Deployment 基线副本数
  13. Dockerfile 多阶段 / 非 root / 端口 / 容器级健康检查（exec 形式，兼容 distroless）
  14. Kafka 运维命令必带 --bootstrap-server（脚本与文档同一口径；缺它被 usage 刷屏、与集群健康无关）
+ 15. Flink 检查点目录契约三处对齐（V1.19.16，见 check_flink_checkpoint_owner_contract）
+ 16. 被命令替换捕获的 shell 函数不得往 stdout 打日志（V1.19.17，见
+     check_captured_function_stdout_purity；本清单为摘要，与输出行数不一一对应）
+ 17. install.sh 步数常量 / 描述表 / case 分派 / 长选项文档一一对账（V1.19.19，见
+     check_install_step_dispatch_coverage）
 
 用法：python scripts/verify_infra.py
 退出码：0 全部通过；1 存在失败项
@@ -735,6 +740,198 @@ def check_flink_checkpoint_owner_contract() -> None:
         )
 
 
+#: 函数定义行（`name() {`）——用于圈出函数体范围
+FUNC_DEF_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{")
+#: 走 stdout 的日志级别（common.sh 的 `_hc_emit` 只把 ERROR 送 stderr，其余均在 stdout）
+STDOUT_LOG_RE = re.compile(r"\blog_(info|success|warn|debug)\b")
+#: `$(func …)` 命令替换——返回值就是该函数写到 stdout 的全部内容
+CAPTURE_RE = re.compile(r"\$\(\s*([A-Za-z_][A-Za-z0-9_]*)\b")
+#: 显式豁免标记（同 `# shellcheck disable=` 的用法）：必须附理由
+STDOUT_OK_MARK = "# stdout-ok"
+
+
+def check_captured_function_stdout_purity() -> None:
+    """被 `$(func)` 捕获的 shell 函数，stdout 只能写返回值（日志一律 >&2）。
+
+    现场（V1.19.17 实录）：`install.sh` 的 `flink_container_owner()` 在 `printf` 之后调了
+    `log_info`（INFO/SUCCESS/WARN 都走 stdout），于是 `$(flink_container_owner)` 拿到的是
+    「9999:9999 + 整行日志」；这串东西直接当 chown 的属主参数 ⇒ `chown: 无效的组`，
+    而当时的 `ensure_dir` 不看退出码照样报 SUCCESS ⇒ **Step 3 的属主自愈从未生效**。
+    这类缺陷“值本身是对的”，静态对账（check_flink_checkpoint_owner_contract）看不出来，只能拿形状判据拦住。
+    """
+    scripts = sorted((ROOT / "scripts").glob("*.sh"))
+    if not scripts:
+        fail("未找到 scripts/*.sh（无法校验命令替换的 stdout 纯度）")
+        return
+    bodies: dict[str, tuple[str, list[int]]] = {}
+    captured: set[str] = set()
+    for path in scripts:
+        current: str | None = None
+        hits: list[int] = []
+        for idx, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            captured.update(name for name in CAPTURE_RE.findall(line) if "stdout-ok" not in line)
+            if current is None:
+                m = FUNC_DEF_RE.match(line)
+                if m:
+                    current, hits = m.group(1), []
+                continue
+            if STDOUT_LOG_RE.search(line) and ">&2" not in line and STDOUT_OK_MARK not in line:
+                hits.append(idx)
+            if line.startswith("}"):
+                bodies.setdefault(current, (path.name, hits))
+                current = None
+    offenders = [(n, bodies[n]) for n in sorted(bodies) if bodies[n][1] and n in captured]
+    if offenders:
+        detail = "；".join(
+            f"{fname}:{','.join(map(str, hits))} 被 $({name} …) 捕获" for name, (fname, hits) in offenders
+        )
+        fail(
+            "命令替换捕获的函数向 stdout 打日志（返回值会被拼上整行日志，当参数用就是坏数据）："
+            f"{detail} => 改 >&2；确属不可达分支则加 '{STDOUT_OK_MARK} 理由'"
+        )
+    else:
+        ok(
+            f"被命令替换捕获的 shell 函数 stdout 纯净（已解析 {len(bodies)} 个函数、"
+            f"{len(captured & set(bodies))} 个被捕获调用，日志均走 >&2 或已显式豁免）"
+        )
+
+
+#: install.sh 步骤调度契约（V1.19.19）：步数常量 / 描述表 / case 臂三者必须一一对账
+INSTALL_TOTAL_STEPS_RE = re.compile(r"^TOTAL_STEPS=(\d+)", re.MULTILINE)
+INSTALL_DESC_BLOCK_RE = re.compile(r"^STEP_DESCRIPTIONS=\(\n(.*?)\n\)", re.MULTILINE | re.DOTALL)
+INSTALL_DESC_ITEM_RE = re.compile(r'^\s*"([^"]+)"\s*$', re.MULTILINE)
+INSTALL_CASE_ARM_RE = re.compile(
+    r'^\s*(\d+)\)\s+run_step\s+(\d+)\s+"\$\{STEP_DESCRIPTIONS\[(\d+)\]\}"\s+(step_\w+)', re.MULTILINE
+)
+
+
+def _shell_function_body(text: str, name: str) -> str | None:
+    """取 shell `name() { … }` 的函数体（结束于首个行首 `}`）；未定义返回 None。"""
+    lines = text.splitlines()
+    start: int | None = None
+    for idx, line in enumerate(lines):
+        m = FUNC_DEF_RE.match(line)
+        if start is None:
+            if m and m.group(1) == name:
+                start = idx + 1
+            continue
+        if line.startswith("}"):
+            return "\n".join(lines[start:idx])
+    return None
+
+
+def check_install_step_dispatch_coverage() -> None:
+    """install.sh 的步数常量 / 描述表 / case 分派 / 参数文档必须互相对账。
+
+    拦住两类“静默跑错”：
+      ① 加了 Step 14（TOTAL_STEPS / STEP_DESCRIPTIONS）却漏了 `run_all_steps` 的 case 臂，
+         或臂里的 `run_step N` / `STEP_DESCRIPTIONS[i]` 与步号错位 ⇒ 该步要么报“内部错误”
+         要么被跳掉而日志文案说的是另一个步；
+      ② run_all_steps 缺下界（--step）或上界（--only-step）判定 ⇒ “只跑一步”会跟成“跑完整链”
+         （V1.19.17 实录：本意重跑 Step 3，实际重建了镜像并 recreate 了 flink-jm/flink-tm）；
+      ③ parse_args 新增长选项却漏写 usage —— 运维照帮助敲不到，或照手册敲成“未知参数”。
+    只靠人记忆不可靠，固化为门禁。
+    """
+    path = ROOT / "scripts" / "install.sh"
+    if not path.is_file():
+        fail("未找到 scripts/install.sh（无法校验步骤分派覆盖）")
+        return
+    text = path.read_text(encoding="utf-8", errors="replace")
+    problems: list[str] = []
+    total = 0
+    descs: list[str] = []
+    seen_steps: list[int] = []
+
+    m_step = INSTALL_TOTAL_STEPS_RE.search(text)
+    if m_step is None:
+        problems.append("解析不到 `TOTAL_STEPS=<n>`")
+    else:
+        total = int(m_step.group(1))
+
+    m_desc = INSTALL_DESC_BLOCK_RE.search(text)
+    if m_desc is None:
+        problems.append("解析不到 STEP_DESCRIPTIONS 数组")
+    else:
+        descs = INSTALL_DESC_ITEM_RE.findall(m_desc.group(1))
+        if total and len(descs) != total:
+            problems.append(f"STEP_DESCRIPTIONS 有条目 {len(descs)} 个，TOTAL_STEPS={total}")
+
+    body = _shell_function_body(text, "run_all_steps")
+    if body is None:
+        problems.append("解析不到 run_all_steps() 函数体")
+    else:
+        seen_fns: dict[str, int] = {}
+        for case_s, step_s, idx_s, fn_s in INSTALL_CASE_ARM_RE.findall(body):
+            case_no, step_no, desc_idx = int(case_s), int(step_s), int(idx_s)
+            if case_no != step_no:
+                problems.append(f"case 臂 {case_no}) 调用的是 run_step {step_no}（分支与步号不一致）")
+            if desc_idx + 1 != step_no:
+                problems.append(f"Step {step_no} 取 STEP_DESCRIPTIONS[{desc_idx}]（描述与步号错位）")
+            if fn_s in seen_fns:
+                problems.append(f"步骤函数 {fn_s} 被 {seen_fns[fn_s]} 与 {step_no} 两个臂引用")
+            seen_fns[fn_s] = step_no
+            seen_steps.append(step_no)
+        if total:
+            missing = sorted(set(range(1, total + 1)) - set(seen_steps))
+            extra = sorted(set(seen_steps) - set(range(1, total + 1)))
+            if missing:
+                problems.append(
+                    f"run_all_steps 缺少步号分派：{missing}（这些步只会落到 `*)` 内部错误，或被静默跳过而脚本照报成功）"
+                )
+            if extra:
+                problems.append(f"run_all_steps 分派了区间外的步号：{extra}（TOTAL_STEPS={total}）")
+        defined = {fm.group(1) for line in text.splitlines() if (fm := FUNC_DEF_RE.match(line))}
+        undefined = sorted(fn for fn in seen_fns if fn not in defined)
+        if undefined:
+            problems.append(f"case 臂引用的步骤函数未定义：{undefined}")
+        for pattern, label in (
+            (r'-lt "\$START_STEP"', "下界跳过（--step 续跑）"),
+            (r'-gt "\$STOP_STEP"', "上界跳过（--only-step 单步）"),
+        ):
+            if not re.search(pattern, body):
+                problems.append(f"run_all_steps 缺少{label}判定 `{pattern}`——单步/续跑会跑成整链")
+
+    pa_body = _shell_function_body(text, "parse_args")
+    usage_body = _shell_function_body(text, "usage")
+    if pa_body is None or usage_body is None:
+        problems.append("解析不到 parse_args()/usage() 函数体")
+    else:
+        opts: list[str] = []
+        for line in pa_body.splitlines():
+            stripped = line.strip()
+            if not stripped.endswith(")") or stripped.startswith("#"):
+                continue
+            toks = [t.strip() for t in stripped[:-1].split("|")]
+            if not toks or not all(t.startswith("-") or t == "*" for t in toks):
+                continue
+            opts.extend(t for t in toks if t.startswith("--"))
+        undocumented = sorted({o for o in opts if o not in usage_body})
+        if undocumented:
+            problems.append(f"长选项未写进 usage()：{undocumented}")
+
+    if problems:
+        for item in problems:
+            fail(item)
+    else:
+        ok(
+            f"install.sh 步骤分派与参数文档对齐（{total} 步 / {len(descs)} 条描述 / "
+            f"{len(seen_steps)} 个 case 臂，上下界跳过判定与 usage 齐备）"
+        )
+
+
+def _emit_line(line: str) -> None:
+    """输出单行结论；控制台码页编不出某个符号时降级替换，**绝不让校验器因 print 崩掉**。
+
+    （Windows 默认 GBK 码页装不下 `⇒` 这类箭头——实录：新门禁一上，整个校验器在
+    `print(line)` 处抛 UnicodeEncodeError，前面 18 项的结论全部丢。结论比字形重要。）
+    """
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(line.encode(enc, "replace").decode(enc, "replace"))
+
+
 def main() -> int:
     documents = load_documents()
     if not documents:
@@ -755,14 +952,16 @@ def main() -> int:
     check_monitoring_configs()
     check_kafka_cli_required_args()
     check_flink_checkpoint_owner_contract()
+    check_captured_function_stdout_purity()
+    check_install_step_dispatch_coverage()
 
     for line in checks:
-        print(line)
+        _emit_line(line)
     print()
     if failures:
-        print(f"结论：{len(failures)} 项校验失败")
+        _emit_line(f"结论：{len(failures)} 项校验失败")
         return 1
-    print("结论：全部校验通过")
+    _emit_line("结论：全部校验通过")
     return 0
 
 

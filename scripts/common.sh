@@ -176,6 +176,9 @@ version_ge() {
 #   传 quiet 时只回传状态、明细写 stdout，**由调用方定级**：install.sh 的端口预检有
 #   “本项目容器占用视为通过”的豁免分支，若此处先打 ERROR，一次正常续跑会刷出多条
 #   假故障（V1.19.17 服务器实录：`[ERROR] 端口 80 已被占用` 紧跟 `[INFO] …视为通过`）。
+#   输出纪律：**stdout 只写占用明细（quiet 模式），“其余提醒一律 stderr”**——本函数会被
+#   `$(check_port … quiet)` 捕获，任何写到 stdout 的文字都变成返回值的一部分（同一个
+#   坑在 install.sh 的 flink_container_owner 上烧过一次：V1.19.17 实录）。
 check_port() {
   local port="${1:?check_port 需要端口参数}" quiet="${2:-}" detail=""
   if command_exists ss; then
@@ -185,12 +188,10 @@ check_port() {
   elif command_exists lsof; then
     detail="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | head -n3)"
   else
-    # quiet 模式下本函数处于命令替换中（stdout 被捕获），提醒必须走 stderr，否则会被默默吞掉
-    if [ "$quiet" = "quiet" ]; then
-      log_warn "缺少 ss/netstat/lsof，跳过端口 ${port} 占用检查（请安装 iproute2）" >&2
-    else
-      log_warn "缺少 ss/netstat/lsof，跳过端口 ${port} 占用检查（请安装 iproute2）"
-    fi
+    # 无论哪种模式都走 stderr：“缺工具”只是一句提醒，不该出现在返回值里——quiet 时 stdout 被命令替换
+    #   捕获（写进去就成了返回值的一部分），默认时调用方虽不接返回值，但也保证本函数
+    #   “stdout 只写占用明细、其余一律 stderr”的形状不变量（verify_infra 第 19 项门禁）。
+    log_warn "缺少 ss/netstat/lsof，跳过端口 ${port} 占用检查（请安装 iproute2）" >&2
     return 0
   fi
   if [ -n "$detail" ]; then

@@ -17,13 +17,15 @@
 #   --skip-build      跳过镜像构建（镜像已存在且版本一致时使用）
 #   --env <file>      指定 .env 路径（默认 ${APP_DIR}/.env，即 /opt/hunter-core/.env）
 #   --ip <address>    指定 SERVER_IP（默认自动探测 hostname -I 首个地址；写入 .env 与证书 SAN）
-#   --step <n>        从第 n 步开始执行（1-13，用于失败后续跑）
+#   --step <n>        从第 n 步开始**续跑到底**（1-13）——不是“只跑第 n 步”
+#   --only-step <n>   **只跑**第 n 步（1-13）就收尾退出（与 --step 互斥；不构建镜像、不启动服务、不体检）
 #   -y, --yes         非交互模式：跳过所有确认
 #
 # 示例：
 #   sudo bash /opt/hunter-core/scripts/install.sh                 # 全流程交互式部署
 #   sudo bash /opt/hunter-core/scripts/install.sh -y              # 全流程非交互（CI/自动化）
 #   sudo bash /opt/hunter-core/scripts/install.sh --step 6 -y     # 镜像已改，从构建续跑
+#   sudo bash /opt/hunter-core/scripts/install.sh --only-step 3 -y   # 只重做目录/属主校正
 #   sudo bash /opt/hunter-core/scripts/install.sh --skip-docker --skip-build -y
 #
 # 关键路径（docs/01-部署概述与环境要求.md §1.2/§5）：
@@ -51,6 +53,10 @@ ASSUME_YES=0
 SKIP_DOCKER=0
 SKIP_BUILD=0
 START_STEP=1
+STOP_STEP="$TOTAL_STEPS"   # 上界：默认跑到底；--only-step 把它收紧为同一个步号
+ONLY_STEP=0                # >0 表示 --only-step 传入的步号
+STEP_GIVEN=0               # 是否显式传了 --step（与 --only-step 互斥）
+ONLY_GIVEN=0               # 是否显式传了 --only-step
 OPT_IP=""
 ENV_FILE_ARG=""
 DEPLOY_LOG_DIR="${LOG_DIR}/deploy"   # 部署日志目录（docs/01 §5：deploy/build.log）
@@ -102,13 +108,17 @@ HunterCore 单机一键部署脚本
   --skip-build      跳过镜像构建（复用现有 hunter/* 镜像）
   --env <file>      指定 .env 文件路径（默认 /opt/hunter-core/.env）
   --ip <address>    指定 SERVER_IP（默认自动探测；影响 Kafka 9093 advertised 与证书 SAN）
-  --step <n>        从第 n 步开始（1-13）
-  -y, --yes         非交互模式（自动确认）
+  --step <n>        从第 n 步开始**续跑到底**（1-13）——不是“只跑第 n 步”
+  --only-step <n>   **只跑**第 n 步（1-13）就收尾退出（与 --step 互斥；不会构建镜像/启动服务/全栈体检）
+  -y, --yes         非交互模式（自动确认）。⚠ 终端里粘贴命令时忘了 -y，脚本会停在确认环
+                    并回显“未执行任何步骤”——那就是一个步骤也没做，别误读成“已修好”
 
 示例：
   sudo bash scripts/install.sh                      # 交互式全流程
   sudo bash scripts/install.sh -y --ip 192.168.1.10
   sudo bash scripts/install.sh --step 7 -y          # 中间件启动失败修复后续跑
+  sudo bash scripts/install.sh --only-step 3 -y     # 只重做目录/属主校正（不跑其余任何一步）
+  sudo bash scripts/install.sh --step 3 --skip-build -y   # 校属主并续跑整链（不重建镜像⇒一般不 recreate flink 容器）
   sudo bash scripts/install.sh --skip-docker --skip-build -y
 
 部署后：
@@ -147,6 +157,13 @@ parse_args() {
       --step)
         [ $# -ge 2 ] || die "--step 需要一个步骤号（1-${TOTAL_STEPS}）"
         START_STEP="$2"
+        STEP_GIVEN=1
+        shift 2
+        ;;
+      --only-step)
+        [ $# -ge 2 ] || die "--only-step 需要一个步骤号（1-${TOTAL_STEPS}）"
+        ONLY_STEP="$2"
+        ONLY_GIVEN=1
         shift 2
         ;;
       -y | --yes)
@@ -160,11 +177,25 @@ parse_args() {
         ;;
     esac
   done
+  if [ "$STEP_GIVEN" -eq 1 ] && [ "$ONLY_GIVEN" -eq 1 ]; then
+    die "--step 与 --only-step 互斥：前者从第 N 步续跑到底，后者只跑第 N 步（收到 --step ${START_STEP} --only-step ${ONLY_STEP}）"
+  fi
   case "$START_STEP" in
     '' | *[!0-9]*) die "--step 必须为 1-${TOTAL_STEPS} 的整数（收到：${START_STEP}）" ;;
   esac
   if [ "$START_STEP" -lt 1 ] || [ "$START_STEP" -gt "$TOTAL_STEPS" ]; then
     die "--step 取值范围为 1-${TOTAL_STEPS}（收到：${START_STEP}）"
+  fi
+  if [ "$ONLY_GIVEN" -eq 1 ]; then
+    case "$ONLY_STEP" in
+      '' | *[!0-9]*) die "--only-step 必须为 1-${TOTAL_STEPS} 的整数（收到：${ONLY_STEP}）" ;;
+    esac
+    if [ "$ONLY_STEP" -lt 1 ] || [ "$ONLY_STEP" -gt "$TOTAL_STEPS" ]; then
+      die "--only-step 取值范围为 1-${TOTAL_STEPS}（收到：${ONLY_STEP}）"
+    fi
+    START_STEP="$ONLY_STEP"
+    STOP_STEP="$ONLY_STEP"
+    log_info "--only-step ${ONLY_STEP}：只执行第 ${ONLY_STEP} 步，其余步骤全部跳过（不构建镜像、不启动服务、不做全栈体检）"
   fi
   if [ -n "$ENV_FILE_ARG" ]; then
     HUNTER_ENV_FILE="$ENV_FILE_ARG"
@@ -289,8 +320,11 @@ show_plan() {
     idx=$((n - 1))
     desc="${STEP_DESCRIPTIONS[$idx]}"
     flag=""
+    # 跳过标记按本次实际执行区间 [START_STEP, STOP_STEP] 生成：--step 只收紧下界，--only-step 同时收紧上下界
     if [ "$n" -lt "$START_STEP" ]; then
-      flag=" [跳过：--step ${START_STEP}]"
+      flag=" [跳过：起点 Step ${START_STEP}]"
+    elif [ "$n" -gt "$STOP_STEP" ]; then
+      flag=" [跳过：终点 Step ${STOP_STEP}]"
     fi
     if [ "$n" -eq 2 ] && [ "$SKIP_DOCKER" -eq 1 ]; then
       flag=" [跳过：--skip-docker]"
@@ -305,8 +339,20 @@ show_plan() {
   log_info "数据根目录：${DATA_DIR}（本次部署要求可用空间 ≥50GB）"
   log_info "部署日志：${LOG_FILE}；构建日志：${BUILD_LOG}"
   log_warn "部署将修改系统配置（apt 源/时区/主机名/内核参数/swap/ufw）并创建、重启 Docker 容器"
+  if [ "$ONLY_GIVEN" -eq 1 ]; then
+    # 单步模式：明确告知“只跑一步”，避免用户把 --only-step 3 的输出去对照全流程判据
+    log_warn "--only-step ${ONLY_STEP}：本次**只执行 Step ${ONLY_STEP}**，其余 ${TOTAL_STEPS} 步全部跳过 ⇒ 不构建镜像、不启动/重启服务、不做全栈体检"
+  elif [ "$START_STEP" -gt 1 ]; then
+    # `--step N` 的语义是“从 N 跑到 13”，不是“只跑 N”：续跑会重建镜像（Step 6）并 recreate 容器（Step 11），
+    #   flink-jm/flink-tm 一重建，standalone（无 HA）下已提交的作业全部丢失⇒ 巡检 ⑭ 会报 RUNNING=0。
+    #   V1.19.17 实录：本意只是“重跑 Step 3 验证属主自愈”，实际跑了一次全栈部署。
+    log_warn "--step ${START_STEP} = 从第 ${START_STEP} 步**续跑到底**（直至 Step ${TOTAL_STEPS}），不是只跑这一步；只跑一步请用 --only-step"
+    if [ "$START_STEP" -le 11 ]; then
+      log_warn "  后续含 Step 6（构建镜像）与 Step 11（启动服务）：镜像变化会 recreate flink-jm/flink-tm ⇒ **已提交的 Flink 作业会丢**（无 HA），跑完需重新提交；只想校目录属主请用 --only-step 3，或 --step 3 --skip-build"
+    fi
+  fi
   if ! confirm "确认开始部署？"; then
-    log_info "用户取消部署：未执行任何步骤（使用 --help 查看可用参数）"
+    log_info "用户取消部署：未执行任何步骤（非交互请加 -y；用 --help 查看可用参数）"
     exit 0
   fi
 }
@@ -364,15 +410,38 @@ set_sysctl_conf_key() {
 }
 
 # ensure_dir <dir> <owner> <mode>：创建目录并校正属主/权限（幂等，用于宿主机自有目录）
+# ⚠ 本函数常在 `"$@" || rc=$?`（run_step）的上下文里执行——那种上下文会**关掉 set -e**，
+#   所以每条命令都得自己看退出码。V1.19.17 实录：`chown: 无效的组: "9999:9999…` 已经失败，
+#   下一行却照打 `[SUCCESS] 已设置属主：/data/flink → 9999:9999` ⇒ **自愈路径假成功**（属主没改）。
 ensure_dir() {
-  local dir="$1" owner="$2" mode="$3" current=""
-  install -d -m "$mode" "$dir"
-  current="$(stat -c '%u:%g' "$dir")"
-  if [ "$current" != "$owner" ]; then
-    chown -R "$owner" "$dir"
+  local dir="$1" owner="$2" mode="$3" name_ids="" num_ids=""
+  case "$owner" in
+    *[!A-Za-z0-9_.:-]*)
+      log_error "ensure_dir 属主参数非法（多半是被命令替换污染：函数内日志写到了 stdout）：$(printf '%q' "$owner") → ${dir}"
+      return 1
+      ;;
+  esac
+  if ! install -d -m "$mode" "$dir"; then
+    log_error "创建目录失败：${dir}（mode=${mode}）"
+    return 1
+  fi
+  # 属主比对走两套口径：owner 传符号名（root:root）时 %U:%G 才相等，传数字（9999:9999）时 %u:%g 才相等。
+  #   只比一套会让符号名永远“不符”⇒ 每次续跑都无谓 chown 一遍（实录里 srs/backups 恒打 SUCCESS）。
+  if ! name_ids="$(stat -c '%U:%G' "$dir")" || ! num_ids="$(stat -c '%u:%g' "$dir")"; then
+    log_error "读取属主失败：${dir}"
+    return 1
+  fi
+  if [ "$name_ids" != "$owner" ] && [ "$num_ids" != "$owner" ]; then
+    if ! chown -R "$owner" "$dir"; then
+      log_error "设置属主失败：${dir} → ${owner}（当前 ${num_ids}）。本步必须失败——否则容器起来后建不了目录（如 /data/flink 的检查点目录）而且日志里看不出来"
+      return 1
+    fi
     log_success "已设置属主：${dir} → ${owner}"
   fi
-  chmod "$mode" "$dir"
+  if ! chmod "$mode" "$dir"; then
+    log_error "设置权限失败：${dir}（mode=${mode}）"
+    return 1
+  fi
   return 0
 }
 
@@ -388,8 +457,8 @@ ensure_data_dir() {
     log_info "数据目录非空，属主交由容器内部管理，跳过 host 侧 chown/chmod：${dir}"
     return 0
   fi
-  install -d -m "$mode" "$dir"
-  chown "$owner" "$dir"
+  install -d -m "$mode" "$dir" || { log_error "创建数据目录失败：${dir}（mode=${mode}）"; return 1; }
+  chown "$owner" "$dir" || { log_error "初始化数据目录属主失败：${dir} → ${owner}（只有空目录才会走到这一步，设不上就是真坏了）"; return 1; }
   log_success "初始化数据目录属主/权限：${dir} → ${owner} ${mode}"
 }
 
@@ -397,11 +466,23 @@ ensure_data_dir() {
 #   优先从本地镜像探测（基座升级后 UID 可能漂移），镜像尚未构建/不可用时退回 9999:9999
 #   （flink 官方镜像内置 flink 用户，与 infra/k8s/flink/0*.yaml 的 runAsUser/fsGroup 同值；
 #   两处一致性由 scripts/verify_infra.py 强制）。显式覆盖：FLINK_DATA_OWNER=uid:gid
+# ⚠ 调用形如 `$(flink_container_owner)` ⇒ **stdout 只准写那一个 uid:gid，日志必须 >&2**。
+#   V1.19.17 实录：函数内那行日志走了 stdout，返回值变成
+#   `9999:9999[时间戳] [INFO] flink 容器运行用户（已从镜像 hunter-flink/jobs:2.1.1 探测）：9999:9999`
+#   （`printf` 无行尾换行，日志直接拼在后面）⇒ chown 解析不出 user:group，报
+#   `chown: 无效的组: "…"`（引号里回显的就是被污染的实参）；参数解析先于任何 chown 调用，
+#   所以**整条中止、一个字节都没改**，而当时的 ensure_dir 不查退出码 ⇒ 下一行照报 SUCCESS。
+#   这条静态判据已进 verify_infra 第 19 项（被命令替换捕获的函数不得往 stdout 打日志）。
 flink_container_owner() {
   local override="${FLINK_DATA_OWNER:-}" image="${FLINK_JOB_IMAGE:-hunter-flink/jobs:2.1.1}" out uid gid
   if [ -n "$override" ]; then
-    printf '%s' "$override"
-    return 0
+    case "$override" in
+      *[!A-Za-z0-9_.:-]*)
+        log_warn "FLINK_DATA_OWNER 取值非法（$(printf '%q' "$override")），忽略并改用探测值" >&2 ;;
+      *)
+        printf '%s' "$override"
+        return 0 ;;
+    esac
   fi
   if command -v docker >/dev/null 2>&1 && docker image inspect "$image" >/dev/null 2>&1; then
     out="$(docker run --rm --entrypoint id "$image" 2>/dev/null || true)"
@@ -409,10 +490,10 @@ flink_container_owner() {
     gid="$(printf '%s' "$out" | sed -n 's/.*gid=\([0-9][0-9]*\).*/\1/p')"
     if [ -n "$uid" ] && [ -n "$gid" ]; then
       printf '%s:%s' "$uid" "$gid"
-      log_info "flink 容器运行用户（已从镜像 ${image} 探测）：${uid}:${gid}"
+      log_info "flink 容器运行用户（已从镜像 ${image} 探测）：${uid}:${gid}" >&2
       return 0
     fi
-    log_warn "无法从镜像 ${image} 解析 flink 用户 uid/gid（输出：${out:-<空>}），退回默认 9999:9999"
+    log_warn "无法从镜像 ${image} 解析 flink 用户 uid/gid（输出：${out:-<空>}），退回默认 9999:9999" >&2
   fi
   printf '9999:9999'
 }
@@ -810,35 +891,38 @@ step_3_prepare_dirs() {
 
   # 数据目录属主交由容器内部管理（uid 依镜像而异：Alpine timescale 的 postgres=70、bitnami=1001、redis=999）
   #   非空目录绝不全量 chown，避免与运行中进程 uid 冲突导致数据库 Permission denied/PANIC
-  ensure_data_dir "${DATA_DIR}/postgresql" "999:999" "0700"
-  ensure_data_dir "${DATA_DIR}/timescale" "999:999" "0700"
-  ensure_data_dir "${DATA_DIR}/redis" "999:999" "0755"
-  ensure_data_dir "${DATA_DIR}/kafka" "1001:1001" "0755"
-  ensure_data_dir "${DATA_DIR}/zookeeper" "1001:1001" "0755"
-  ensure_data_dir "${DATA_DIR}/minio" "1001:1001" "0755"
-  ensure_dir "${DATA_DIR}/srs" "root:root" "0755"
+  ensure_data_dir "${DATA_DIR}/postgresql" "999:999" "0700" || return 1
+  ensure_data_dir "${DATA_DIR}/timescale" "999:999" "0700" || return 1
+  ensure_data_dir "${DATA_DIR}/redis" "999:999" "0755" || return 1
+  ensure_data_dir "${DATA_DIR}/kafka" "1001:1001" "0755" || return 1
+  ensure_data_dir "${DATA_DIR}/zookeeper" "1001:1001" "0755" || return 1
+  ensure_data_dir "${DATA_DIR}/minio" "1001:1001" "0755" || return 1
+  ensure_dir "${DATA_DIR}/srs" "root:root" "0755" || return 1
   # Flink 数据目录（V1.19.16）：compose 把本目录 bind 成容器内 /opt/flink/data，而 JM/TM 以**非 root**
   #   的 flink 用户运行——曾按 root:root 预建，在「从未真正做过检查点」的时期看不出问题；
   #   一旦开启周期性检查点就建不了目录：`Failed to create directory for shared state:
   #   file:/opt/flink/data/checkpoints/<job>/shared` ⇒ 三个作业全部提交失败（实录）。因此属主必须
   #   是容器内运行用户（与 K8s 侧 runAsUser/fsGroup 同值）；ensure_dir 对已存在但属主不符的目录会
-  #   递归修正，所以存量环境重跑 Step 3 即可自愈。
-  ensure_dir "${DATA_DIR}/flink" "$(flink_container_owner)" "0755"
-  ensure_dir "${DATA_DIR}/backups" "root:root" "0755"
+  #   递归修正，所以存量环境重跑 Step 3 即可自愈。⚠ 重跑请配 `--skip-build`：`--step 3` 是从第 3 步
+  #   **续跑到底**，Step 6 会重建镜像、Step 11 会 recreate flink-jm/flink-tm ⇒ 已提交的作业全丢（V1.19.17 实录）。
+  ensure_dir "${DATA_DIR}/flink" "$(flink_container_owner)" "0755" || return 1
+  ensure_dir "${DATA_DIR}/backups" "root:root" "0755" || return 1
 
   # 业务服务本地 Kafka 磁盘缓冲目录：容器以非 root uid 10001（appuser）运行，bind 源必须由宿主预建并 chown 10001；
   # 否则目录缺失时 Docker 会以 root 自动创建，导致 LocalDiskBuffer.mkdir 报 PermissionDenied 启动失败。
   log_info "创建业务服务 Kafka 缓冲目录（属主 10001:10001，供非 root 容器写入）"
+  # 以下每一项都是“设不上就必然留下隐性坏环境”的前提，所以逐个 `|| return 1`：
+  #   `run_step` 用 `"$@" || rc=$?` 调步函数，那个上下文会**关掉 set -e**——不显式接返值就一路跑到底。
   for d in api-gateway data-collector data-analytics ota-service remote-control scene-service vehicle-service; do
-    ensure_dir "${DATA_DIR}/kafka-buffer/${d}" "10001:10001" "0755"
+    ensure_dir "${DATA_DIR}/kafka-buffer/${d}" "10001:10001" "0755" || return 1
   done
   # vehicle-service 专有：每车客户端证书输出目录（gid 10001 可写；契约 x-hunter-cert-policy.storage_layout）
-  ensure_dir "${DATA_DIR}/vehicle-certs" "10001:10001" "0750"
-  ensure_dir "${APP_DIR}/config" "root:root" "0755"
-  ensure_dir "${APP_DIR}/scripts" "root:root" "0755"
-  ensure_dir "${APP_DIR}/certs" "root:root" "0755"
-  ensure_dir "${APP_DIR}/sql" "root:root" "0755"
-  ensure_dir "${APP_DIR}/nginx" "root:root" "0755"
+  ensure_dir "${DATA_DIR}/vehicle-certs" "10001:10001" "0750" || return 1
+  ensure_dir "${APP_DIR}/config" "root:root" "0755" || return 1
+  ensure_dir "${APP_DIR}/scripts" "root:root" "0755" || return 1
+  ensure_dir "${APP_DIR}/certs" "root:root" "0755" || return 1
+  ensure_dir "${APP_DIR}/sql" "root:root" "0755" || return 1
+  ensure_dir "${APP_DIR}/nginx" "root:root" "0755" || return 1
 
   log_success "目录准备完成（数据目录属主由容器管理，空目录初始化：PG/Timescale/Redis=999:999，Kafka/ZK/MinIO=1001:1001，flink=容器内运行用户（探测值，默认 9999:9999）；srs/backups 及 APP_DIR 子目录=root:root）"
 }
@@ -1391,7 +1475,7 @@ step_9_init_kafka() {
     log_error "缺少脚本：${INIT_KAFKA_SH}（请确认部署包 scripts/ 完整）"
     return 1
   fi
-  hc_run_logged "创建 Kafka 内部 Topic（6 个）" bash "$INIT_KAFKA_SH" || {
+  hc_run_logged "创建 Kafka 内部 Topic（7 个平台 Topic + 7 个死信）" bash "$INIT_KAFKA_SH" || {
     log_error "Kafka Topic 初始化失败：请检查 broker 日志（docker logs ${C_KAFKA} --tail=100）与认证配置（KAFKA_INTERNAL_SECURITY_PROTOCOL）"
     return 1
   }
@@ -1559,7 +1643,7 @@ run_step() {
   log_error "  1) 查看完整日志：${LOG_FILE}；构建日志：${BUILD_LOG}"
   log_error "  2) 查看容器状态：cd ${APP_DIR} && docker compose ps"
   log_error "  3) 查看容器日志：cd ${APP_DIR} && docker compose logs --tail=200 <service>"
-  log_error "  4) 修复后从该步续跑：bash $0 --step ${step_no} -y"
+  log_error "  4) 修复后从该步续跑：bash $0 --step ${step_no} -y（续跑到底）；只重跑该步：bash $0 --only-step ${step_no} -y"
   log_error "  5) 需要重来时先卸载（保留数据）：bash ${UNINSTALL_SH} --keep-data"
   exit 1
 }
@@ -1568,7 +1652,13 @@ run_all_steps() {
   local n
   for n in $(seq 1 "$TOTAL_STEPS"); do
     if [ "$n" -lt "$START_STEP" ]; then
-      log_info "跳过 Step ${n}/${TOTAL_STEPS}（--step ${START_STEP}）：${STEP_DESCRIPTIONS[$((n - 1))]}"
+      log_info "跳过 Step ${n}/${TOTAL_STEPS}（起点 ${START_STEP}）：${STEP_DESCRIPTIONS[$((n - 1))]}"
+      continue
+    fi
+    # 上界跳过必须写成独立 if：`[ "$n" -gt "$STOP_STEP" ] && continue` 这类写法在 set -e 下
+    #   会因条件为假返回 1 而直接终止脚本（末步必然踩到）。
+    if [ "$n" -gt "$STOP_STEP" ]; then
+      log_info "跳过 Step ${n}/${TOTAL_STEPS}（终点 ${STOP_STEP}）：${STEP_DESCRIPTIONS[$((n - 1))]}"
       continue
     fi
     case "$n" in
@@ -1610,7 +1700,15 @@ main() {
   run_all_steps
 
   elapsed=$(( $(date +%s) - start_ts ))
-  log_success "全部 ${TOTAL_STEPS} 个步骤执行完成，总耗时 ${elapsed}s"
+  if [ "$START_STEP" -gt 1 ] || [ "$STOP_STEP" -lt "$TOTAL_STEPS" ]; then
+    # 非全流程（--step 续跑 / --only-step 单步）不得报“全部 13 步完成”；--skip-* 仍是走满 13 步（步内自行跳过）
+    log_success "已执行 Step ${START_STEP}-${STOP_STEP}（${TOTAL_STEPS} 步中的 $(( STOP_STEP - START_STEP + 1 )) 步），耗时 ${elapsed}s——本次不是全流程部署"
+    if [ "$STOP_STEP" -lt "$TOTAL_STEPS" ]; then
+      log_info "如需继续执行后续步骤：bash $0 --step $(( STOP_STEP + 1 )) -y"
+    fi
+  else
+    log_success "全部 ${TOTAL_STEPS} 个步骤执行完成，总耗时 ${elapsed}s"
+  fi
   log_info "结束时间：$(date '+%Y-%m-%d %H:%M:%S')"
   log_info "后续运维：health-check.sh（健康检查）/ daily-check.sh（日巡检）/ backup.sh（备份）/ collect-logs.sh（日志收集）"
 }
