@@ -149,7 +149,7 @@ verify_topic() {
     return 0
   fi
   log_warn "Topic 配置与契约不一致：${name}（实际 partitions=${actual_partitions:-N/A}, retention.ms=${actual_retention:-N/A}；期望 ${expect_partitions}/${expect_retention}）"
-  log_warn "如需对齐：kafka-configs.sh --alter --entity-type topics --entity-name ${name} --add-config retention.ms=${expect_retention}（分区数不可减少）"
+  log_warn "如需对齐：kafka_configs_cli --alter --entity-type topics --entity-name ${name} --add-config retention.ms=${expect_retention}（分区数不可减少）"
   return 1
 }
 
@@ -160,7 +160,9 @@ create_scram_user() {
     log_warn "SCRAM 账号参数为空，跳过（请检查 .env 的 KAFKA_SASL_* 变量）"
     return 0
   fi
-  if kafka_tool_cli kafka-configs.sh --alter --entity-type users --entity-name "$username" \
+  # ℞ V1.19.12：原走 kafka_tool_cli 而未带 --bootstrap-server（对 kafka-configs.sh 属 REQUIRED），
+  #   命令以退出码 2 结束 → 本函数**从未成功过**（一直走下面的“创建失败”分支）；改走 kafka_configs_cli 封装。
+  if kafka_configs_cli --alter --entity-type users --entity-name "$username" \
     --add-config "SCRAM-SHA-512=[password=${password}]"; then
     log_success "已创建/更新 SCRAM 账号：${username}（密文不落日志）"
     return 0

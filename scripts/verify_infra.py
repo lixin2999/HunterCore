@@ -15,6 +15,7 @@
  11. HPA 契约：6 个微服务齐备，minReplicas=2 / maxReplicas=5 / CPU 目标 70% / 缩容稳定窗口
  12. PDB 契约：无状态服务齐备，minAvailable 必须小于 Deployment 基线副本数
  13. Dockerfile 多阶段 / 非 root / 端口 / 容器级健康检查（exec 形式，兼容 distroless）
+ 14. Kafka 运维命令必带 --bootstrap-server（脚本与文档同一口径；缺它被 usage 刷屏、与集群健康无关）
 
 用法：python scripts/verify_infra.py
 退出码：0 全部通过；1 存在失败项
@@ -550,6 +551,76 @@ def check_disruption_budgets(documents: list[tuple[Path, dict[str, Any]]]) -> No
         ok(f"PDB 校验完成（{len(covered)} 个微服务，minAvailable < 基线副本数）")
 
 
+#: Kafka 官方 CLI 中 --bootstrap-server 属 **REQUIRED** 的工具
+#   （℞ V1.19.12：漏它不会得到“消费组不存在”，而是 `Missing required argument` + 整份 usage + 退出码 2；
+#    运维侧极易误读为集群故障，而脚本里的消费组 LAG 探则因 `2>/dev/null` 默默拿到空输出）
+KAFKA_CLI_TOOLS = (
+    r"kafka-topics\.sh|kafka-consumer-groups\.sh|kafka-get-offsets\.sh|"
+    r"kafka-configs\.sh|kafka-console-consumer\.sh|kafka-console-producer\.sh"
+)
+#: 调用形式 A：经 common.sh 的低层入口 kafka_tool_cli <tool>（**只补 --command-config，不补 --bootstrap-server**）
+KAFKA_CLI_VIA_WRAPPER = re.compile(rf"kafka_tool_cli\s+({KAFKA_CLI_TOOLS})")
+#: 调用形式 B：直接写工具名（含绝对路径）并紧跟参数——文档里最常见的形态
+KAFKA_CLI_DIRECT = re.compile(rf"(?:[\w./-]+/)?(?:{KAFKA_CLI_TOOLS})\s+--")
+
+
+def _shell_statements(text: str) -> list[tuple[int, str]]:
+    """把脚本/文档正文切成语句：行尾反斜杠续行归并，返回（起始行号，语句）。
+
+    跳过 shell 注释行（它们通常是“怎么敲会错”的说明，不是命令本身）。
+    """
+    statements: list[tuple[int, str]] = []
+    start, buf = 0, ""
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.rstrip()
+        if not buf:
+            if not line or line.lstrip().startswith("#"):
+                continue
+            start = lineno
+        buf = f"{buf} {line.rstrip(chr(92)).strip()}".strip()
+        if line.endswith("\\"):
+            continue
+        statements.append((start, buf))
+        buf = ""
+    if buf:
+        statements.append((start, buf))
+    return statements
+
+
+def check_kafka_cli_required_args() -> None:
+    """校验 Kafka 运维命令（脚本 + README + docs）都带 --bootstrap-server。
+
+    历史故障：V1.19.9~11 交付给服务器的消费组排查命令、以及 `common.sh` 的 `kafka_consumer_lag`
+    与 `init-kafka.sh` 的 `create_scram_user`，都漏了这个 REQUIRED 参数——命令从未真正执行成功，
+    而巡检把它伪装成了“该消费组尚无 offset 提交”（归因方完全错）。只靠人记忆不可靠，固化为门禁。
+    """
+    targets: list[Path] = sorted((ROOT / "scripts").glob("*.sh"))
+    targets.append(ROOT / "README.md")
+    docs_dir = ROOT / "docs"
+    if docs_dir.is_dir():
+        targets.extend(sorted(docs_dir.glob("*.md")))
+    problems: list[str] = []
+    scanned = 0
+    for path in targets:
+        if not path.is_file():
+            continue
+        scanned += 1
+        for lineno, statement in _shell_statements(path.read_text(encoding="utf-8")):
+            if not (KAFKA_CLI_VIA_WRAPPER.search(statement) or KAFKA_CLI_DIRECT.search(statement)):
+                continue
+            if "--bootstrap-server" in statement:
+                continue
+            problems.append(
+                f"{rel(path)}:{lineno}: Kafka CLI 缺 REQUIRED 参数 --bootstrap-server："
+                f"{statement[:110]}"
+            )
+    if problems:
+        for item in problems:
+            fail(item)
+    else:
+        ok(f"Kafka 运维命令均带 --bootstrap-server（{scanned} 个脚本/文档）")
+
+
 def main() -> int:
     documents = load_documents()
     if not documents:
@@ -568,6 +639,7 @@ def main() -> int:
         check_minio_buckets_contract(documents)
     check_dockerfiles()
     check_monitoring_configs()
+    check_kafka_cli_required_args()
 
     for line in checks:
         print(line)

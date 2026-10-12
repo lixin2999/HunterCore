@@ -527,8 +527,14 @@ ssl.truststore.location=${KAFKA_CMD_TRUSTSTORE_PEM}
   printf '%s\n%s\n' "--command-config" "$conf_path"
 }
 
-# kafka_tool_cli <tool> [args...]：在 Kafka 容器内执行 <tool>（自动附带认证参数 + 二进制路径回退）
-#   例：kafka_tool_cli kafka-configs.sh --describe --entity-type users
+# kafka_tool_cli <tool> [args...]：在 Kafka 容器内执行 <tool>（自动附带 **认证** 参数 + 二进制路径回退）
+#   例：kafka_tool_cli kafka-configs.sh --bootstrap-server localhost:9092 --describe --entity-type users
+# ℞ V1.19.12：本函数**只补 --command-config，不补 --bootstrap-server**，而后者对
+#   kafka-topics/consumer-groups/get-offsets/configs 全部是 **REQUIRED**。直接调用而漏它时，
+#   工具会把「Missing required argument "[bootstrap-server]"」+ 整份 usage 打到 stderr 并以
+#   退出码 2 结束——**与集群健康无关**，却极易被读成“消费组查不到/Kafka 有问题”。
+#   运维命令请一律走下面的 kafka_topics_cli / kafka_groups_cli / kafka_offsets_cli /
+#   kafka_configs_cli 四个封装（它们自动附带 --bootstrap-server）。
 kafka_tool_cli() {
   local tool="${1:?kafka_tool_cli 需要工具名（如 kafka-topics.sh）}"
   shift
@@ -544,6 +550,24 @@ kafka_tool_cli() {
 kafka_topics_cli() {
   local bootstrap="${KAFKA_BOOTSTRAP:-localhost:9092}"
   kafka_tool_cli kafka-topics.sh --bootstrap-server "$bootstrap" "$@"
+}
+
+# kafka_groups_cli [args...]：kafka-consumer-groups.sh 封装（--describe / --reset-offsets / --list）
+kafka_groups_cli() {
+  local bootstrap="${KAFKA_BOOTSTRAP:-localhost:9092}"
+  kafka_tool_cli kafka-consumer-groups.sh --bootstrap-server "$bootstrap" "$@"
+}
+
+# kafka_offsets_cli [args...]：kafka-get-offsets.sh 封装（查 Topic 末端水位，判断“有没有数据”）
+kafka_offsets_cli() {
+  local bootstrap="${KAFKA_BOOTSTRAP:-localhost:9092}"
+  kafka_tool_cli kafka-get-offsets.sh --bootstrap-server "$bootstrap" "$@"
+}
+
+# kafka_configs_cli [args...]：kafka-configs.sh 封装（Topic 配置 / SCRAM 账号）
+kafka_configs_cli() {
+  local bootstrap="${KAFKA_BOOTSTRAP:-localhost:9092}"
+  kafka_tool_cli kafka-configs.sh --bootstrap-server "$bootstrap" "$@"
 }
 
 # kafka_broker_ready <container>：broker 是否可连接（先试 kafka-topics.sh，再退回端口探活，认证无关）
@@ -630,12 +654,22 @@ minio_bucket_count() {
   printf '%s' "$(printf '%s\n' "$out" | grep -c '/$' || true)"
 }
 
-# kafka_consumer_lag <group_id>：该消费组所有分区 LAG 之和（消费组不存在输出 -1 并返回 1）
+# kafka_consumer_lag <group_id>：该消费组所有分区 LAG 之和（消费组不存在/查不到输出 -1 并返回 1）
 kafka_consumer_lag() {
   local group="${1:?kafka_consumer_lag 需要消费组名}"
   local out total
-  out="$(kafka_tool_cli kafka-consumer-groups.sh --describe --group "$group" 2>/dev/null || true)"
+  # ℞ V1.19.12①：原为 kafka_tool_cli …，缺 --bootstrap-server（REQUIRED）→ 命令从未成功执行过，
+  #   health-check.sh ⑩ 的“Kafka 消费积压”项因此恒为固定结论（WARN「尚无 offset 提交」），
+  #   把“运维命令写错”误报成“车辆未上报/服务未消费”。改走 kafka_groups_cli 封装。
+  out="$(kafka_groups_cli --describe --group "$group" 2>/dev/null || true)"
   if [ -z "$out" ] || printf '%s' "$out" | grep -q "does not exist"; then
+    printf '%s' "-1"
+    return 1
+  fi
+  # ℞ V1.19.12②：必须区分“LAG 真的是 0”与“输出根本不是 describe 结果”（认证失败/参数错/工具
+  #   异常都会往 stdout 落一段文字，旧实现逐行找不到 LAG 列即求和得 0 → 巡检报 **PASS LAG=0** 假绿）。
+  #   真结果必以表头行 GROUP…TOPIC…LAG… 开头；无表头一律按“没查到”报 -1，禁止当 0。
+  if ! printf '%s\n' "$out" | grep -qE '^GROUP[[:space:]]+TOPIC'; then
     printf '%s' "-1"
     return 1
   fi
@@ -669,7 +703,11 @@ HunterCore 部署脚本公共库 common.sh（库文件，禁止直接执行）
     - 日志：log_info / log_success / log_warn / log_error（终端彩色 + 日志文件无色）
     - 检查：check_root / command_exists / check_port / check_disk_space / wait_for / confirm
     - 环境：load_env（加载 ${APP_DIR}/.env）/ env_value / require_env
-    - 辅助：compose / container_health / kafka_topics_cli / hc_run_logged / service_health_ok
+    - 辅助：compose / container_health / hc_run_logged / service_health_ok
+    - Kafka CLI 封装（**运维请优先用这四个，它们自动附带 --bootstrap-server**）：
+      kafka_topics_cli / kafka_groups_cli / kafka_offsets_cli / kafka_configs_cli；
+      低层入口 kafka_tool_cli 只补 --command-config（认证），不补 --bootstrap-server（REQUIRED）；
+      另有 kafka_consumer_lag / kafka_topic_count / kafka_broker_ready / kafka_auth_args
 
 用法：
   . "${SCRIPT_DIR}/common.sh"      # 在脚本中 source（不要用 bash 执行）

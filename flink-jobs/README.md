@@ -103,6 +103,11 @@ docker exec hunter-redis sh -c 'p=$(tr "\0" "\n" </proc/1/cmdline | grep -A1 -- 
 - **判“已出数”不看 RUNNING**（V1.19.8 实机教训）：无凭据时作业不会报错、不重启，`flink list` 永远全绿，
   只是 fetch 不到数据。真判据只有两个：TM 日志里 `security.protocol` / `sasl.mechanism` / `sasl.jaas.config = [hidden]`
   三行取值齐备，以及上面的产物键有值（完整四步口径见 `docs/故障排查指南.md`）。
+- **`flink list` 不列 FAILED 作业**（V1.19.12 实机教训，与上条同族但成因不同）：`flink list` 默认**只列
+  Running/Restarting 与 Scheduled**，已进入 `FAILED` 终态的作业会**从列表静默消失**（实机：提交时三条
+  RUNNING，次日只剩两条，`algorithm_performance_monitor` 已失败且无任何提示）。查状态一律用
+  **`flink list -a`**，判据是**“提交数 == RUNNING 数”**；失败堆栈只能在 **recreate 前**从 JM 日志取
+  （`grep -B3 -A40 "switched from RUNNING to FAILED"`），容器重建即丢。
 - **写侧豁免**：本目录不是服务、不在 `services/`（verify-14 不扫描），已在
   `contracts/database/orm-mapping.md` §3.5 白名单表书面登记——作业只经 Kafka 写
   `alert_event`，禁止 import 任何服务 `app.*` 包或 `hunter_common.database.repositories`。

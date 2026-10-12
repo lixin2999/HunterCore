@@ -230,7 +230,7 @@ ruff check tests common/python services           # Lint（CI 同款命令）
 静态校验与部署命令：
 
 ```bash
-# 静态校验（无需集群）：API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约一致性
+# 静态校验（无需集群）：API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约一致性/Kafka CLI 必带 --bootstrap-server
 python scripts/render_k8s.py --check    # 镜像 {version} 占位符契约（6 个微服务）
 python scripts/verify_infra.py
 
@@ -477,7 +477,8 @@ python scripts/verify_test_layer.py
 | 测试层自检 | `python scripts/verify_test_layer.py`（标记/阈值来源/模板占位符/用例号） |
 | 基础设施健康 | `docker compose ps` |
 | TimescaleDB 扩展 | `docker exec hunter-postgres psql -U hunter -d hunter_core -c "SELECT extname FROM pg_extension WHERE extname='timescaledb';"` |
-| Kafka 平台内部 Topic | `docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --command-config /tmp/hunter-client.properties --list`（内部监听 9092 为 SASL_PLAINTEXT，**缺 `--command-config` 会报 `Timed out waiting for a node assignment`**；参数生成见 `scripts/common.sh` 的 `kafka_tool_cli`） |
+| Kafka 平台内部 Topic | `docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --command-config /tmp/hunter-client.properties --list`（内部监听 9092 为 SASL_PLAINTEXT，**缺 `--command-config` 会报 `Timed out waiting for a node assignment`**；参数生成见 `scripts/common.sh`）——运维更推荐直接走封装：`sudo bash -c 'source scripts/common.sh; load_env; kafka_topics_cli --list'` |
+| Kafka 消费组 / 位点 | `sudo bash -c 'source scripts/common.sh; load_env; kafka_groups_cli --describe --group <组>'`（四个封装 `kafka_topics_cli` / `kafka_groups_cli` / `kafka_offsets_cli` / `kafka_configs_cli` **自动附带 `--bootstrap-server`**；低层入口 `kafka_tool_cli` 只补认证参数，漏 `--bootstrap-server`（REQUIRED）只会刷出整份 usage，**与集群健康无关**） |
 | MinIO Bucket | 浏览器打开 `http://localhost:9001`（7 个 Bucket：hunter-raw-data / rosbag / video / ota-packages / reports / logs / scene-assets） |
 | Redis | `bash scripts/health-check.sh`（看 Redis 行。⚠ 开了 `requirepass`，裸 `redis-cli ping` 只会回 `NOAUTH`；直接取键值的完整命令见运维手册 §3.6） |
 | 共享库测试 | `pytest common/python/tests -q` |
@@ -498,7 +499,7 @@ python scripts/verify_test_layer.py
 | 服务健康探针 | `curl http://localhost:<port>/healthz` |
 | 服务单元测试 | `cd services/<service> && pytest -q` |
 | 指标端点 | `curl http://localhost:<port>/metrics`（Prometheus 文本格式，含 `hunter_` 前缀指标） |
-| K8s/监控清单静态校验 | `python scripts/verify_infra.py`（85 个文档：API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约） |
+| K8s/监控清单静态校验 | `python scripts/verify_infra.py`（91 个文档 + 部署脚本与运维文档：API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约/Kafka CLI 必带 `--bootstrap-server`） |
 | K8s 清单版本渲染 | `python scripts/render_k8s.py --check` / `--version 0.1.0`（镜像 `{version}` 占位符 → 渲染产物 `build/k8s/`） |
 | 容器镜像构建 | `docker build -f services/<service>/Dockerfile -t hunter/<service>:$VERSION .`（禁止 latest，与清单同源） |
 | 前端类型检查 | `cd frontend && npm run type-check`（vue-tsc 严格模式，0 error） |
