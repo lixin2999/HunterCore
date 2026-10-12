@@ -59,6 +59,10 @@ spec:
           envFrom:
             - configMapRef:
                 name: flink-common-config
+            # ⚠ 关键：`flink run -pym` 的作业 main() 在**本提交 Pod** 里执行，
+            #   kafka_sasl_properties()/redis_url() 在此求值 → SASL 凭据缺到这里就提交期直接失败
+            - secretRef:
+                name: hunter-app-secrets
           volumeMounts:
             - name: log
               mountPath: /opt/flink/log

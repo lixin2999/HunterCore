@@ -24,6 +24,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+from hunter_flink.job_conn import apply_kafka_properties, kafka_sasl_properties
 from hunter_flink.rules import VehicleAnomalyTracker, build_alert
 from hunter_flink.thresholds import AlertThresholds
 
@@ -90,30 +91,31 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
             return [json.dumps(alert, ensure_ascii=False) for alert in alerts]
 
     env = StreamExecutionEnvironment.get_execution_environment()
-    source = (
-        KafkaSource.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
-        .set_topics(INPUT_TOPIC)
-        .set_group_id(CONSUMER_GROUP)
-        # 已提交位点优先；无提交位点（首次部署 / offset 保留期已过）回落 earliest，
-        # 与契约 consumer-groups.yaml ``defaults.auto_offset_reset: earliest`` 同语义
-        # （Flink 2.x 名字：``committed_offsets``，1.x 的 ``group_offsets`` 已随 Java
-        #  ``OffsetsInitializer`` 重组删除）
-        .set_starting_offsets(
-            KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
-        )
-        # 参数位是 DeserializationSchema（不是 TypeInformation）；2.x 无 ``value_only_decoder``
-        .set_value_only_deserializer(SimpleStringSchema())
-        .build()
+    # Kafka 客户端 SASL 属性（V1.19.8）：broker 内部监听 9092 是 SASL_PLAINTEXT + SCRAM-SHA-512，
+    # 作业必须同协议同凭据（否则不报错但 **静默空转**：fetch 不到数据而作业仍 RUNNING）；
+    # 明文环境返回 {} 保持原行为，声明了 SASL 却缺凭据则在此抛错（提交期失败优于运行期假绿）。
+    sasl_props = kafka_sasl_properties()
+    source_builder = apply_kafka_properties(
+        (
+            KafkaSource.builder()
+            .set_bootstrap_servers(KAFKA_BOOTSTRAP)
+            .set_topics(INPUT_TOPIC)
+            .set_group_id(CONSUMER_GROUP)
+            # 已提交位点优先；无提交位点（首次部署 / offset 保留期已过）回落 earliest，
+            # 与契约 consumer-groups.yaml ``defaults.auto_offset_reset: earliest`` 同语义
+            # （Flink 2.x 名字：``committed_offsets``，1.x 的 ``group_offsets`` 已随 Java
+            #  ``OffsetsInitializer`` 重组删除）
+            .set_starting_offsets(
+                KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
+            )
+            # 参数位是 DeserializationSchema（不是 TypeInformation）；2.x 无 ``value_only_decoder``
+            .set_value_only_deserializer(SimpleStringSchema())
+        ),
+        sasl_props,
     )
-    # KafkaSource 是 FLIP-27 Source：必须走 ``from_source``（``add_source`` 只接受
-    # SourceFunction）；本作业不依赖事件时间，水位取 ``no_watermarks``
-    env.from_source(
-        source, WatermarkStrategy.no_watermarks(), INPUT_TOPIC, type_info=Types.STRING()
-    ) \
-        .key_by(lambda raw: json.loads(raw).get("vehicle_id"), key_type=Types.STRING()) \
-        .flat_map(AlertFlatMap(), output_type=Types.STRING()) \
-        .sink_to(  # Java ``sinkTo``：PyFlink 无 ``DataStream.sink``
+    source = source_builder.build()
+    sink_builder = apply_kafka_properties(
+        (
             KafkaSink.builder()
             .set_bootstrap_servers(KAFKA_BOOTSTRAP)
             .set_record_serializer(
@@ -123,8 +125,17 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
                 .set_value_serialization_schema(SimpleStringSchema())
                 .build()
             )
-            .build()
-        )
+        ),
+        sasl_props,
+    )
+    # KafkaSource 是 FLIP-27 Source：必须走 ``from_source``（``add_source`` 只接受
+    # SourceFunction）；本作业不依赖事件时间，水位取 ``no_watermarks``
+    env.from_source(
+        source, WatermarkStrategy.no_watermarks(), INPUT_TOPIC, type_info=Types.STRING()
+    ) \
+        .key_by(lambda raw: json.loads(raw).get("vehicle_id"), key_type=Types.STRING()) \
+        .flat_map(AlertFlatMap(), output_type=Types.STRING()) \
+        .sink_to(sink_builder.build())  # Java ``sinkTo``：PyFlink 无 ``DataStream.sink``
     env.execute("driving_anomaly_detection")
 
 

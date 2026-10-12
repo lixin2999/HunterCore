@@ -102,13 +102,20 @@ def test_job_avoids_removed_or_invented_pyflink_names(job_file: str) -> None:
 
 
 def test_three_jobs_share_the_same_source_sink_shape() -> None:
-    """三个作业必须走同一套已验证入口：from_source + sink_to（或 print 收口）。"""
+    """三个作业必须走同一套已验证入口：from_source + sink_to（或 print 收口）+ SASL 下发。"""
     for job_file in JOB_FILES:
         main = _main_node(JOBS_DIR / job_file)
         text = ast.dump(main)
         assert "from_source" in text, f"{job_file} 未用 from_source（FLIP-27 Source 唯一入口）"
         assert "set_value_only_deserializer" in text, f"{job_file} 缺少值反序列化 schema"
         assert "set_starting_offsets" in text, f"{job_file} 未显式声明起始位点策略"
+        # V1.19.8：broker 内部监听是 SASL，三作业都不得漏掉凭据装配（漏了会静默空转不出数）
+        assert "kafka_sasl_properties" in text, f"{job_file} 未装配 Kafka SASL 属性"
+        assert "apply_kafka_properties" in text, f"{job_file} 未把 SASL 属性 set 到 builder"
+        if job_file != "ingest_latency_job.py":
+            assert text.count("apply_kafka_properties") >= 2 or "sink_builder" in text, (
+                f"{job_file} 的 sink builder 也需 SASL 属性（写侧同样走内部监听）"
+            )
 
 
 def test_api_guard_whitelist_is_self_consistent() -> None:

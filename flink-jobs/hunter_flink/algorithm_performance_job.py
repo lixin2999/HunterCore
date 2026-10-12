@@ -26,6 +26,7 @@ from typing import Any
 
 from hunter_common.database.enums import MetricModule
 
+from hunter_flink.job_conn import apply_kafka_properties, kafka_sasl_properties
 from hunter_flink.thresholds import AlertThresholds
 
 #: Kafka broker（standalone/compose 单机形态；K8s 由环境变量下发）
@@ -210,27 +211,26 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
             return [json.dumps(item, ensure_ascii=False) for item in metrics]
 
     env = StreamExecutionEnvironment.get_execution_environment()
-    source = (
-        KafkaSource.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
-        .set_topics(INPUT_TOPIC)
-        .set_group_id(CONSUMER_GROUP)
-        # 已提交位点优先，无提交位点回落 earliest（契约 defaults.auto_offset_reset；
-        # 与 detection_job 同组 data-analytics-telemetry，位点共享）
-        .set_starting_offsets(
-            KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
-        )
-        .set_value_only_deserializer(SimpleStringSchema())
-        .build()
+    # SASL 属性随作业图下发（与 detection_job 同一套变量/语义，见 hunter_flink.job_conn）
+    sasl_props = kafka_sasl_properties()
+    source_builder = apply_kafka_properties(
+        (
+            KafkaSource.builder()
+            .set_bootstrap_servers(KAFKA_BOOTSTRAP)
+            .set_topics(INPUT_TOPIC)
+            .set_group_id(CONSUMER_GROUP)
+            # 已提交位点优先，无提交位点回落 earliest（契约 defaults.auto_offset_reset；
+            # 与 detection_job 同组 data-analytics-telemetry，位点共享）
+            .set_starting_offsets(
+                KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
+            )
+            .set_value_only_deserializer(SimpleStringSchema())
+        ),
+        sasl_props,
     )
-    # FLIP-27 Source 走 from_source（add_source 仅适用 SourceFunction）；窗口划分用载荷内的
-    # 车端事件时间（expand_metrics 自管缓冲），不依赖 Flink 水位
-    env.from_source(
-        source, WatermarkStrategy.no_watermarks(), INPUT_TOPIC, type_info=Types.STRING()
-    ) \
-        .key_by(lambda raw: json.loads(raw).get("vehicle_id"), key_type=Types.STRING()) \
-        .flat_map(MetricsFlatMap(), output_type=Types.STRING()) \
-        .sink_to(
+    source = source_builder.build()
+    sink_builder = apply_kafka_properties(
+        (
             KafkaSink.builder()
             .set_bootstrap_servers(KAFKA_BOOTSTRAP)
             .set_record_serializer(
@@ -240,8 +240,17 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
                 .set_value_serialization_schema(SimpleStringSchema())
                 .build()
             )
-            .build()
-        )
+        ),
+        sasl_props,
+    )
+    # FLIP-27 Source 走 from_source（add_source 仅适用 SourceFunction）；窗口划分用载荷内的
+    # 车端事件时间（expand_metrics 自管缓冲），不依赖 Flink 水位
+    env.from_source(
+        source, WatermarkStrategy.no_watermarks(), INPUT_TOPIC, type_info=Types.STRING()
+    ) \
+        .key_by(lambda raw: json.loads(raw).get("vehicle_id"), key_type=Types.STRING()) \
+        .flat_map(MetricsFlatMap(), output_type=Types.STRING()) \
+        .sink_to(sink_builder.build())
     env.execute("algorithm_performance_monitor")
 
 

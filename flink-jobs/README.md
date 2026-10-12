@@ -42,7 +42,13 @@ battery_low / battery_critical 独立边沿触发（SOC 8% 时两条各一次）
 `ALERT_HARSH_TURN_RAD_S`、`ALERT_OVER_SPEED_RATIO`、`ALERT_BATTERY_LOW_SOC`、`ALERT_BATTERY_CRITICAL_SOC`、
 `ALERT_COLLISION_TTC_CRITICAL_SECONDS`、`ALERT_COLLISION_TTC_WARNING_SECONDS`、`ALGORITHM_METRICS_WINDOW_SECONDS`、
 `ALERT_WINDOW_SECONDS`；另有可选 `ALERT_OVER_SPEED_LIMIT_MPS`（注入固定限速以启用 over_speed 规则，缺省跳过）。
-连接参数走 `KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）。
+
+连接参数统一由 `hunter_flink/job_conn.py` 装配（V1.19.8），变量名与六个业务服务的 `x-business-env` **同拼写**：
+`KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`KAFKA_SECURITY_PROTOCOL`、`KAFKA_SASL_MECHANISM`、
+`KAFKA_SASL_USERNAME`、`KAFKA_SASL_PASSWORD`（可选 `KAFKA_SASL_LOGIN_MODULE` 覆盖 JAAS 类名）、
+`REDIS_HOST`/`REDIS_PORT`/`REDIS_PASSWORD`/`REDIS_DB`（无分段变量时回退 `REDIS_URL`）。
+⚠ broker 内部监听是 **SASL_PLAINTEXT**：作业明文连接时**不报错但静默空转**（RUNNING 而不出数），
+所以声明了 SASL 却缺凭据会直接在提交期 `ValueError`。
 
 ### 提交与测试
 

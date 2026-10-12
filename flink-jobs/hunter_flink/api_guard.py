@@ -69,6 +69,7 @@ API_WHITELIST: dict[str, dict[str, tuple[str, ...]]] = {
             "set_group_id",
             "set_starting_offsets",
             "set_value_only_deserializer",
+            "set_property",  # V1.19.8：下发 security.protocol / sasl.* 到 Kafka 客户端
             "build",
         ),
         "KafkaOffsetsInitializer": (
@@ -82,6 +83,7 @@ API_WHITELIST: dict[str, dict[str, tuple[str, ...]]] = {
         "KafkaSinkBuilder": (
             "set_bootstrap_servers",
             "set_record_serializer",
+            "set_property",  # V1.19.8：写入侧同样需 SASL 凭据
             "build",
         ),
         "KafkaRecordSerializationSchema": ("builder",),

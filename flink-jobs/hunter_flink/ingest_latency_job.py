@@ -32,6 +32,11 @@ from typing import Any
 from hunter_common.redis_keys import ANALYTICS_INGEST_LATENCY
 
 from hunter_flink.algorithm_performance_job import percentile_cont
+from hunter_flink.job_conn import (
+    apply_kafka_properties,
+    kafka_sasl_properties,
+    redis_url,
+)
 
 #: Kafka broker（standalone/compose 单机形态；K8s 由环境变量下发）
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -187,9 +192,9 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink + Redis 运行时，仓
             self._client: redis.Redis | None = None
 
         def open(self, runtime_context: Any) -> None:
-            self._client = redis.Redis.from_url(
-                os.environ.get("REDIS_URL", "redis://redis:6379/0"), decode_responses=True
-            )
+            # 口令由 redis_url() 从 REDIS_HOST/REDIS_PORT/REDIS_PASSWORD 拼装（已 URL 编码）；
+            # compose 的 Redis 开了 requirepass，缺凭据时首条记录就会报错（不静默丢指标）
+            self._client = redis.Redis.from_url(redis_url(), decode_responses=True)
 
         def close(self) -> None:
             if self._client is not None:
@@ -213,19 +218,24 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink + Redis 运行时，仓
                 yield payload
 
     env = StreamExecutionEnvironment.get_execution_environment()
+    # SASL 属性随作业图下发（语义同 detection_job，见 hunter_flink.job_conn）
+    sasl_props = kafka_sasl_properties()
     # 记录到达时间来自 Kafka 时间戳：FLIP-27 Source 经 from_source 下传，水位不用于本作业
-    source = (
-        KafkaSource.builder()
-        .set_bootstrap_servers(KAFKA_BOOTSTRAP)
-        .set_topics(INPUT_TOPIC)
-        .set_group_id(CONSUMER_GROUP)
-        # 已提交位点优先，无提交位点回落 earliest（契约 defaults.auto_offset_reset）
-        .set_starting_offsets(
-            KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
-        )
-        .set_value_only_deserializer(SimpleStringSchema())
-        .build()
+    source_builder = apply_kafka_properties(
+        (
+            KafkaSource.builder()
+            .set_bootstrap_servers(KAFKA_BOOTSTRAP)
+            .set_topics(INPUT_TOPIC)
+            .set_group_id(CONSUMER_GROUP)
+            # 已提交位点优先，无提交位点回落 earliest（契约 defaults.auto_offset_reset）
+            .set_starting_offsets(
+                KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
+            )
+            .set_value_only_deserializer(SimpleStringSchema())
+        ),
+        sasl_props,
     )
+    source = source_builder.build()
     env.from_source(
         source, WatermarkStrategy.no_watermarks(), INPUT_TOPIC, type_info=Types.STRING()
     ) \

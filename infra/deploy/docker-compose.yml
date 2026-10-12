@@ -349,6 +349,20 @@ services:
         classloader.check-leaked-classloader: false
         execution.checkpointing.dir: file:///opt/flink/data/checkpoints
       TZ: ${TZ:-Asia/Shanghai}
+      # 作业连接项（V1.19.8）：变量名与 x-business-env 同一套拼写，避坑“Flink 侧自成一套”。
+      # ⚠ broker 内部监听 9092 = SASL_PLAINTEXT + SCRAM-SHA-512，作业无凭据时不会报错而是**静默空转**
+      #   （fetch 不到数据而 `flink list` 仍显示 RUNNING）；这些值在提交进程（本容器）求值后写入
+      #   JobGraph，故 JM 必带；TM 同步下发以便排障与日志一致性。
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_SECURITY_PROTOCOL: ${KAFKA_INTERNAL_SECURITY_PROTOCOL:-SASL_PLAINTEXT}
+      KAFKA_SASL_MECHANISM: ${KAFKA_SASL_MECHANISM:-SCRAM-SHA-512}
+      KAFKA_SASL_USERNAME: ${KAFKA_SASL_USER}
+      KAFKA_SASL_PASSWORD: ${KAFKA_SASL_PASSWORD}
+      # Redis 开了 requirepass：缺 REDIS_PASSWORD 时作业写指标会报 NOAUTH（实录）
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB: ${REDIS_DB:-0}
     ports:
       - "127.0.0.1:${FLINK_UI_HOST_PORT:-8088}:8081"
     volumes:
@@ -385,6 +399,16 @@ services:
         classloader.check-leaked-classloader: false
         execution.checkpointing.dir: file:///opt/flink/data/checkpoints
       TZ: ${TZ:-Asia/Shanghai}
+      # 与 flink-jm 同一套作业连接项（V1.19.8，语义/拼写见 JM 侧注释与 hunter_flink/job_conn.py）
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_SECURITY_PROTOCOL: ${KAFKA_INTERNAL_SECURITY_PROTOCOL:-SASL_PLAINTEXT}
+      KAFKA_SASL_MECHANISM: ${KAFKA_SASL_MECHANISM:-SCRAM-SHA-512}
+      KAFKA_SASL_USERNAME: ${KAFKA_SASL_USER}
+      KAFKA_SASL_PASSWORD: ${KAFKA_SASL_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_DB: ${REDIS_DB:-0}
     volumes:
       - ${DATA_DIR:-/data}/flink:/opt/flink/data
     restart: unless-stopped

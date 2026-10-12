@@ -51,6 +51,10 @@ spec:
           envFrom:
             - configMapRef:
                 name: flink-common-config
+            # V1.19.8：ingest_latency 在算子 open()（跑在 TM）里读 REDIS_PASSWORD 拼装连接串，
+            #   故 TM 也需挂 secret；Kafka 侧 SASL 属性已随 JobGraph 下发，此处只为日志/排障对称
+            - secretRef:
+                name: hunter-app-secrets
           volumeMounts:
             - name: log
               mountPath: /opt/flink/log

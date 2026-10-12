@@ -7,8 +7,11 @@
 # - 命名/标签统一 component=flink，供 networkpolicies/flink.yaml 最小入向放行
 # - ⚠ 本 ConfigMap 禁止写入任何口令/SASL 凭据（verify_infra check_configmaps 强制）：
 #     敏感项一律走 hunter-app-secrets 的 secretKeyRef
-# - 作业连接项对齐 flink-jobs 代码实际读取的环境变量（thresholds/job 仅读 bootstrap/redis/window，
-#     走 broker 内部明文监听；Kafka SASL 侧作业尚无凭据读取路径，见 release.md 待办）
+# - 作业连接项对齐 flink-jobs 代码实际读取的环境变量（hunter_flink/job_conn.py）：
+#     非敏感项在本 ConfigMap，凭据（KAFKA_SASL_USERNAME|PASSWORD / REDIS_PASSWORD）一律来自
+#     hunter-app-secrets 的 secretRef（见 02/03/04 的 envFrom）——V1.19.8 已打通 SASL 凭据读取路径
+# - ⚠ 本 ConfigMap **不得再写 REDIS_URL**：job_conn.redis_url() 优先用分段变量组装（带口令），
+#     遗留的无口令 REDIS_URL 会抢在分段变量之前生效并造成 NOAUTH 假象
 # =====================================================================
 apiVersion: v1
 kind: ConfigMap
@@ -31,9 +34,15 @@ data:
     classloader.check-leaked-classloader: false
     execution.checkpointing.dir: file:///opt/flink/checkpoints
     execution.checkpointing.interval: 10000
-  # 作业消费端连接项（对齐 flink-jobs/hunter_flink/*.py 读取的环境变量名，禁止改拼写）
+  # 作业消费端连接项（对齐 hunter_flink/job_conn.py 与各作业读取的环境变量名，禁止改拼写）
   KAFKA_BOOTSTRAP_SERVERS: "kafka-0.kafka-headless.hunter-core.svc.cluster.local:9092"
-  REDIS_URL: "redis://redis-master.hunter-core.svc.cluster.local:6379/0"
+  # 内部监听 9092 强制 SASL；凭据由 hunter-app-secrets 下发（缺凭据时作业提交期即报 ValueError，
+  # 不会退化成明文连接后静默空转）
+  KAFKA_SECURITY_PROTOCOL: "SASL_PLAINTEXT"
+  KAFKA_SASL_MECHANISM: "SCRAM-SHA-512"
+  REDIS_HOST: "redis-master.hunter-core.svc.cluster.local"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
   # 入库延迟统计作业窗口/ TTL（缺省即代码内置默认，此处显式登记便于运维调参；见 ingest_latency_job.py）
   INGEST_LATENCY_TTL_SECONDS: "300"
   INGEST_LATENCY_WINDOW_SECONDS: "60"

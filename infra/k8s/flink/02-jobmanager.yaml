@@ -54,6 +54,9 @@ spec:
           envFrom:
             - configMapRef:
                 name: flink-common-config
+            # 作业 SASL/Redis 凭据（V1.19.8）：提交在 JM 进程求值后写进 JobGraph，此处必挂
+            - secretRef:
+                name: hunter-app-secrets
           volumeMounts:
             - name: checkpoints
               mountPath: /opt/flink/checkpoints
