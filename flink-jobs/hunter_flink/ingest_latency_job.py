@@ -32,6 +32,7 @@ from typing import Any
 from hunter_common.redis_keys import ANALYTICS_INGEST_LATENCY
 
 from hunter_flink.algorithm_performance_job import percentile_cont
+from hunter_flink.checkpointing import enable_checkpointing
 from hunter_flink.job_conn import (
     apply_kafka_properties,
     kafka_sasl_properties,
@@ -218,6 +219,8 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink + Redis 运行时，仓
                 yield payload
 
     env = StreamExecutionEnvironment.get_execution_environment()
+    # 检查点（V1.19.15）：不开则本组永无提交位点（详见 hunter_flink.checkpointing 模块头）
+    enable_checkpointing(env)
     # SASL 属性随作业图下发（语义同 detection_job，见 hunter_flink.job_conn）
     sasl_props = kafka_sasl_properties()
     # 记录到达时间来自 Kafka 时间戳：FLIP-27 Source 经 from_source 下传，水位不用于本作业

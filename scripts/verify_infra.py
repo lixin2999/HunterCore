@@ -562,6 +562,15 @@ KAFKA_CLI_TOOLS = (
 KAFKA_CLI_VIA_WRAPPER = re.compile(rf"kafka_tool_cli\s+({KAFKA_CLI_TOOLS})")
 #: 调用形式 B：直接写工具名（含绝对路径）并紧跟参数——文档里最常见的形态
 KAFKA_CLI_DIRECT = re.compile(rf"(?:[\w./-]+/)?(?:{KAFKA_CLI_TOOLS})\s+--")
+#: 本部署的 broker 内部监听（9092）**固定为 SASL_PLAINTEXT**（compose 硬编码）：
+#   裸命令还必须带认证参数，否则不报权限错而是 `Timed out waiting for a node assignment`
+#   （℞ V1.19.13：health-check 的「Kafka Topic 数 1 < 6」就是把这种认证失败数成了“只有 1 个 Topic”）
+KAFKA_CLI_NEEDS_AUTH_NOTE = (
+    "本部署内部监听固定 SASL_PLAINTEXT，裸命令还需认证参数 --command-config"
+    "（或手册约定的 $KC / 改走 kafka_*_cli 封装）"
+)
+#: 认证参数的等价写法：字面量参数、手册 §1 约定的 `$KC` 简写、脚本里的封装函数名，都视为已带认证
+KAFKA_CLI_AUTH_MARKERS = ("--command-config", "$KC", "${KC}", "kafka_auth_args")
 
 
 def _shell_statements(text: str) -> list[tuple[int, str]]:
@@ -588,11 +597,18 @@ def _shell_statements(text: str) -> list[tuple[int, str]]:
 
 
 def check_kafka_cli_required_args() -> None:
-    """校验 Kafka 运维命令（脚本 + README + docs）都带 --bootstrap-server。
+    """校验 Kafka 运维命令（脚本 + README + docs）的参数齐备性。
 
-    历史故障：V1.19.9~11 交付给服务器的消费组排查命令、以及 `common.sh` 的 `kafka_consumer_lag`
-    与 `init-kafka.sh` 的 `create_scram_user`，都漏了这个 REQUIRED 参数——命令从未真正执行成功，
-    而巡检把它伪装成了“该消费组尚无 offset 提交”（归因方完全错）。只靠人记忆不可靠，固化为门禁。
+    两条硬规则（都是实测过的坑）：
+    ① **所有** Kafka CLI 调用必须带 REQUIRED 的 `--bootstrap-server`；
+    ② **裸写工具名**（不经封装）还必须带认证参数（`--command-config`，或手册约定的 `$KC`），
+       因为本部署内部监听固定 SASL_PLAINTEXT。
+       经 `kafka_tool_cli` / `kafka_*_cli` 封装的调用不要求 ②（认证参数由 `kafka_auth_args` 自动注入）。
+
+    历史故障：V1.19.9~11 交付给服务器的消费组排查命令、`common.sh` 的 `kafka_consumer_lag`、
+    `init-kafka.sh` 的 `create_scram_user` 都漏了 ①——命令从未真正执行成功，而巡检把它伪装成
+    “该消费组尚无 offset 提交”（归因完全错）；V1.19.13 又发现漏 ② 会被数成“只有 1 个 Topic”。
+    只靠人记忆不可靠，固化为门禁。
     """
     targets: list[Path] = sorted((ROOT / "scripts").glob("*.sh"))
     targets.append(ROOT / "README.md")
@@ -606,19 +622,25 @@ def check_kafka_cli_required_args() -> None:
             continue
         scanned += 1
         for lineno, statement in _shell_statements(path.read_text(encoding="utf-8")):
-            if not (KAFKA_CLI_VIA_WRAPPER.search(statement) or KAFKA_CLI_DIRECT.search(statement)):
+            via_wrapper = bool(KAFKA_CLI_VIA_WRAPPER.search(statement))
+            if not (via_wrapper or KAFKA_CLI_DIRECT.search(statement)):
                 continue
-            if "--bootstrap-server" in statement:
+            if "--bootstrap-server" not in statement:
+                problems.append(
+                    f"{rel(path)}:{lineno}: Kafka CLI 缺 REQUIRED 参数 --bootstrap-server："
+                    f"{statement[:110]}"
+                )
                 continue
-            problems.append(
-                f"{rel(path)}:{lineno}: Kafka CLI 缺 REQUIRED 参数 --bootstrap-server："
-                f"{statement[:110]}"
-            )
+            if not via_wrapper and not any(m in statement for m in KAFKA_CLI_AUTH_MARKERS):
+                problems.append(f"{rel(path)}:{lineno}: {KAFKA_CLI_NEEDS_AUTH_NOTE}：{statement[:110]}")
     if problems:
         for item in problems:
             fail(item)
     else:
-        ok(f"Kafka 运维命令均带 --bootstrap-server（{scanned} 个脚本/文档）")
+        ok(
+            "Kafka 运维命令参数齐备（--bootstrap-server 必需；裸命令另需认证参数 "
+            f"{'/'.join(KAFKA_CLI_AUTH_MARKERS[:2])}，{scanned} 个脚本/文档）"
+        )
 
 
 def main() -> int:

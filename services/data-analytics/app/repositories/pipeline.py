@@ -41,8 +41,12 @@ class PipelineSource(Protocol):
         """窗口内算法指标均值（失败返回 None）。"""
         ...
 
-    async def consumer_lag(self) -> dict[str, int] | None:
-        """按消费组的消息滞后（失败返回 None）。"""
+    async def consumer_lag(self) -> tuple[dict[str, int], list[str]] | None:
+        """按消费组的消息滞后（失败返回 None）。
+
+        成功时返回 ``(group → lag 映射, 未判定组清单)``：**未进映射的组一律不可读成「零积压」**
+        （组不存在 / 从未提交位点 / 水位不可取，见 :meth:`KafkaLagProbe._lag_sync`）。
+        """
         ...
 
     async def dlq_depth(self) -> dict[str, int] | None:
@@ -208,26 +212,75 @@ class KafkaLagProbe:
                 }
             )
 
-    def _lag_sync(self) -> dict[str, int]:
+    def _group_inventory(self, admin: AdminClient) -> set[str] | None:
+        """集群侧实际存在的消费组清单（只用于给「未判定」区分成因，不参与滞后计算）。
+
+        列举失败（group 级 ACL、超时、confluent-kafka 小版本 API 差异）返回 ``None``，
+        语义是**「无能力断言存在性」**而非「组都不存在」：调用方仍须把空位点组记为
+        未判定，绝不能反过来据此写 0（宁可未判定，不可假绿）。
+
+        confluent-kafka 2.15 实测：future 结果是 ``ListConsumerGroupsResult`` 对象
+        （``.valid`` / ``.errors``）而**不是**裸 list；条目名称字段是 ``group_id``。两处形状
+        差异都会默默让集合变空（进而把所有组错标为 group_not_found），故此处兼容取值 +
+        部分失败时直接拒答。
+        """
+        try:
+            listing = admin.list_consumer_groups().result(timeout=self._timeout)
+        except Exception:  # noqa: BLE001 - 辅助信息，失败不阻断滞后探测（成因退化为 no_committed_offsets）
+            logger.warning("consumer_group_inventory_failed")
+            return None
+        if getattr(listing, "errors", None):  # 清单不完整时不能拿“没列出”当“不存在”
+            logger.warning("consumer_group_inventory_partial", errors=len(listing.errors))
+            return None
+        entries = getattr(listing, "valid", listing)
+        inventory: set[str] = set()
+        for item in entries or []:
+            name = getattr(item, "group_id", None) or getattr(item, "group", None)
+            if name:
+                inventory.add(str(name))
+        return inventory
+
+    def _lag_sync(self) -> tuple[dict[str, int], list[str]]:
         """同步读取各消费组提交位点与末端水位差（仅阻塞工作线程，不阻塞事件循环）。
 
         confluent-kafka（2.16 实测）的 ``list_consumer_group_offsets`` 单次仅支持
         **一个**消费组，传多组会即时抛 ``ValueError: Currently we support listing offsets
         for a single consumer group only``，故此处逐组各调一次（单组异常不阻塞其余组）。
+
+        ℞ V1.19.14（第七类假绿）：**空分区列表不等于零积压**。Kafka 对「组不存在」与
+        「组存在但从未提交位点」都返回**空分区列表且不报错**（``list_consumer_group_offsets``
+        对拼错的组名同样不抛错），旧实现遂逐组 ``result[group] = 0``，看板永远显示「各组零延迟」
+        （V1.19.11 登记为待办③，现场兑现于 V1.19.13 实录：四个组 ``--describe`` 全部
+        ``does not exist``，看板却回四个 ``0``）。现把「无位点」「水位全取不到」「位点读取失败」
+        三类一律归入第二个返回值（未判定组清单），不再进入 lag 映射。
         """
         admin = AdminClient(self._conf)
         consumer = Consumer(self._conf)
         result: dict[str, int] = {}
+        unknown: list[str] = []
         try:
+            inventory = self._group_inventory(admin)
             for group in self._groups:
                 try:
                     futmap = admin.list_consumer_group_offsets([ConsumerGroupTopicPartitions(group)])
                     offsets = next(iter(futmap.values())).result(timeout=self._timeout)
                 except Exception:  # 单组位点失败不阻塞其余消费组探测（带异常上下文便于定位）
                     logger.exception("consumer_group_offset_fetch_failed", group=group)
+                    unknown.append(group)
+                    continue
+                partitions = list(getattr(offsets, "partitions", None) or [])
+                if not partitions:
+                    logger.info(
+                        "consumer_group_lag_undetermined",
+                        group=group,
+                        cause="group_not_found" if inventory is not None and group not in inventory
+                        else "no_committed_offsets",
+                    )
+                    unknown.append(group)
                     continue
                 total_lag = 0
-                for tp in getattr(offsets, "partitions", []) or []:
+                measured = 0
+                for tp in partitions:
                     committed = tp.offset
                     try:
                         low, high = consumer.get_watermark_offsets(
@@ -236,11 +289,16 @@ class KafkaLagProbe:
                     except Exception:  # noqa: BLE001 - 单分区水位失败跳过，保证整体 lag 可得
                         logger.debug("watermark_fetch_failed", topic=tp.topic, partition=tp.partition)
                         continue
+                    measured += 1
                     # OFFSET_INVALID（无提交位点）时以 low 为基准
                     base = low if committed in (None, OFFSET_INVALID) else committed
                     total_lag += max(0, high - base)
+                if not measured:  # 有位点却一个水位都取不到：与「零积压」无关，同样不得写 0
+                    logger.info("consumer_group_lag_undetermined", group=group, cause="watermark_unavailable")
+                    unknown.append(group)
+                    continue
                 result[group] = total_lag
-            return result
+            return result, unknown
         finally:
             consumer.close()
 
@@ -267,7 +325,7 @@ class KafkaLagProbe:
         finally:
             consumer.close()
 
-    async def consumer_lag(self) -> dict[str, int] | None:
+    async def consumer_lag(self) -> tuple[dict[str, int], list[str]] | None:
         try:
             return await asyncio.wait_for(asyncio.to_thread(self._lag_sync), timeout=self._timeout + 1.0)
         except Exception:  # 探测失败降级为 None（上层按不可用处理），不向请求路径抛出；带堆栈便于定位真因
@@ -335,7 +393,7 @@ class PipelineRepository:
     async def algorithm_averages(self, start_ts: float, end_ts: float) -> dict[str, float] | None:
         return await self._db.algorithm_averages(start_ts, end_ts)
 
-    async def consumer_lag(self) -> dict[str, int] | None:
+    async def consumer_lag(self) -> tuple[dict[str, int], list[str]] | None:
         return await self._kafka.consumer_lag()
 
     async def dlq_depth(self) -> dict[str, int] | None:

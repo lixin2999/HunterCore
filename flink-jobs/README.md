@@ -56,6 +56,29 @@ battery_low / battery_critical 独立边沿触发（SOC 8% 时两条各一次）
 ⚠ broker 内部监听是 **SASL_PLAINTEXT**：作业明文连接时**不报错但静默空转**（RUNNING 而不出数），
 所以声明了 SASL 却缺凭据会直接在提交期 `ValueError`。
 
+### 检查点与位点提交（V1.19.15）
+
+`hunter_flink/checkpointing.py` 由三个作业在 `get_execution_environment()` 之后统一调用
+`enable_checkpointing(env)`，**周期写在作业代码里**（默认 `10_000` ms，可由
+`FLINK_CHECKPOINTING_INTERVAL_MS` 覆盖；非整数/非正数在 `flink run` 当场 `ValueError`，不静默退回默认）。
+
+为什么必须写在代码里（服务器实录定性）：Flink 的 `KafkaSource` **只在检查点完成时提交消费位点**
+（`commit.offsets.on.checkpoint` 默认 `true`，没有其他提交路径）。而单机 compose 的
+`FLINK_PROPERTIES` 长期只有 `execution.checkpointing.dir`（目录）、**没有 `interval`（周期）**
+⇒ 根本不做检查点 ⇒ 位点永不提交 ⇒ 四个契约消费组在集群上一直是 `does not exist`、积压不可观测、
+作业每次重启都回落 `earliest` 重放整个保留窗口、60s 窗口状态随故障全丢。K8s 形态
+`infra/k8s/flink/01-configmap.yaml` 早就设了 `execution.checkpointing.interval: 10000` ——
+**只有单机漏配**，属本仓库反复踩过的「同一件事两处编排漂移」。
+
+- 判「位点到底提没提交」的**唯一**证据是消费组在集群上存在：
+  `sudo bash -c 'source scripts/common.sh; load_env; kafka_groups_cli --describe --group data-analytics-telemetry-alert'`
+  （看板侧的 `lag=0` 曾对不存在的组也回 0，该读数口径已于 V1.19.14 修为 `unknown_groups`）。
+- 部署侧同名配置（compose `FLINK_CHECKPOINTING_INTERVAL_MS`、K8s `execution.checkpointing.interval`）
+  只作兜底，**代码值优先**；两处必须同值，由 `flink-jobs/tests/test_checkpointing.py` 静态对账。
+- 只开周期、不动其他检查点参数：模式取 PyFlink 默认 `EXACTLY_ONCE`，三个作业的 sink 均为
+  `AT_LEAST_ONCE` 投递（无事务、无 `transactional.id`），开检查点**不改变端到端投递语义**，
+  只增加位点提交与状态快照。
+
 ### 提交与测试
 
 ```bash
@@ -88,6 +111,8 @@ docker compose -f infra/deploy/docker-compose.yml --project-directory . exec fli
 docker compose -f infra/deploy/docker-compose.yml --project-directory . exec flink-jm \
   flink run -d -m localhost:8081 -pym hunter_flink.detection_job
 # …… algorithm_performance_job / ingest_latency_job 同式各一行
+#   提交成功的标志里应有一行 `[hunter_flink] checkpointing enabled: interval_ms=10000`（V1.19.15）：
+#   它是「检查点真的被作业代码开启了」的第一手证据，缺失即说明跑的还是旧镜像。
 
 # 出数核验（等 1~2 个 60s 窗口）。⚠ 口令从运行中容器的进程参数取：不解析 .env（引号/CRLF/重复键
 # 都会污染 grep|cut 的结果）、也不依赖 .env 与容器同代（只重建 flink 时口令可能漂移）
@@ -107,7 +132,13 @@ docker exec hunter-redis sh -c 'p=$(tr "\0" "\n" </proc/1/cmdline | grep -A1 -- 
   Running/Restarting 与 Scheduled**，已进入 `FAILED` 终态的作业会**从列表静默消失**（实机：提交时三条
   RUNNING，次日只剩两条，`algorithm_performance_monitor` 已失败且无任何提示）。查状态一律用
   **`flink list -a`**，判据是**“提交数 == RUNNING 数”**；失败堆栈只能在 **recreate 前**从 JM 日志取
-  （`grep -B3 -A40 "switched from RUNNING to FAILED"`），容器重建即丢。
+  （`awk '/switched from RUNNING to FAILED/{f=1} f' > /tmp/flink-failed.txt`，再 `grep -n 'Caused by'` 定位**最后一条**，
+  用 `awk '/Caused by/{last=NR} {l[NR]=$0} END{for(i=last;i<=NR;i++) print l[i]}'` 把它连同后续栈帧读完）。
+  ⚠ 不要把窗口夹住：能定性的最内层 `Caused by`（区分 Topic 缺失还是 ACL 拒绝的就那一行）常在该行之后
+  60~120 行，`-A40` / `tail -n 80` / `head` 都会把它切掉，切了即白跑一轮。
+- **RUNNING 不等于位点在提交**（V1.19.15 实机教训，上两条的第三族）：作业 RUNNING、产物键有值、
+  看板 lag 显示 0，而消费组在集群上 `does not exist` —— 三者可以同时成立，因为**没有检查点就没有位点提交**。
+  新增作业必须经 `hunter_flink.checkpointing.enable_checkpointing(env)`，不要只在部署侧加 `interval`。
 - **写侧豁免**：本目录不是服务、不在 `services/`（verify-14 不扫描），已在
   `contracts/database/orm-mapping.md` §3.5 白名单表书面登记——作业只经 Kafka 写
   `alert_event`，禁止 import 任何服务 `app.*` 包或 `hunter_common.database.repositories`。

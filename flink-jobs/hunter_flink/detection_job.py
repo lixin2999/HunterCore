@@ -24,6 +24,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+from hunter_flink.checkpointing import enable_checkpointing
 from hunter_flink.job_conn import apply_kafka_properties, kafka_sasl_properties
 from hunter_flink.rules import VehicleAnomalyTracker, build_alert
 from hunter_flink.thresholds import AlertThresholds
@@ -94,6 +95,10 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
             return [json.dumps(alert, ensure_ascii=False) for alert in alerts]
 
     env = StreamExecutionEnvironment.get_execution_environment()
+    # 检查点（V1.19.15）：KafkaSource **只在检查点提交位点**，不开检查点 ⇒ 本组在集群上永远
+    # 不存在（`--describe` 报 does not exist）、积压不可观测、重启一律回落 earliest 重放。
+    # 写在这里而不是只靠部署侧配置：compose 曾漏配 execution.checkpointing.interval 而 K8s 配了。
+    enable_checkpointing(env)
     # Kafka 客户端 SASL 属性（V1.19.8）：broker 内部监听 9092 是 SASL_PLAINTEXT + SCRAM-SHA-512，
     # 作业必须同协议同凭据（否则不报错但 **静默空转**：fetch 不到数据而作业仍 RUNNING）；
     # 明文环境返回 {} 保持原行为，声明了 SASL 却缺凭据则在此抛错（提交期失败优于运行期假绿）。

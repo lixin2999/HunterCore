@@ -29,14 +29,20 @@
 # 参数：
 #   --help              显示本帮助
 #   --env <file>        指定 .env 路径
+#   --check-only        **只读对账**（V1.19.15）：不创建、不修改，只输出三类清单——
+#                       ① 契约要求但集群缺失的 Topic；② 已存在但分区数/retention.ms 与契约不符；
+#                       ③ 集群里存在但不在契约内的 Topic（车端 hunter.* 与 __* 系统 Topic 除外）。
+#                       存在缺失/偏差时退出码非 0；**查不到清单不会当成“Topic 没建”**（同 V1.19.13
+#                       的输出形态门禁），取证与升级前体检请优先跑这一项。
 #   --scram-users       额外创建/更新车端 SCRAM 账号（hunter-client / hunter-vehicle）
 #                       ⚠ 前置条件：broker 已存在可用的管理员 SCRAM 凭据（KAFKA_SASL_USER）
 #
 # 示例：
 #   sudo bash /opt/hunter-core/scripts/init-kafka.sh
+#   sudo bash /opt/hunter-core/scripts/init-kafka.sh --check-only
 #   sudo bash /opt/hunter-core/scripts/init-kafka.sh --scram-users
 #
-# 幂等：--create --if-not-exists（已存在 Topic 不报错、不修改配置）。
+# 幂等：--create --if-not-exists（已存在 Topic 不报错、不修改配置）；--check-only 完全只读。
 # 依赖：common.sh（同目录）、容器 hunter-kafka
 # 日期：2026-09-19  |  目标系统：Ubuntu 22.04 LTS
 # =====================================================================
@@ -49,6 +55,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ENV_FILE_ARG=""
 CREATE_SCRAM_USERS=0
+CHECK_ONLY=0
 # Topic 定义（名称:分区数:保留毫秒）—— 单一事实来源：contracts/kafka/topics.yaml
 TOPIC_SPECS=(
   "telemetry_raw:12:604800000"      # 7 天
@@ -78,16 +85,21 @@ HunterCore Kafka 内部 Topic 初始化脚本
 参数：
   --help          显示本帮助
   --env <file>    .env 路径（默认 /opt/hunter-core/.env）
+  --check-only    **只读对账**：只报「缺哪几个 / 哪几个配置不符 / 哪几个不在契约内」，不建不改；
+                  存在缺失或偏差则退出码非 0（查不到清单另报，不会归成“Topic 没建”）
   --scram-users   额外创建/更新车端 SCRAM 账号（需 broker 已有可用管理员凭据）
 
 示例：
   sudo bash /opt/hunter-core/scripts/init-kafka.sh
+  sudo bash /opt/hunter-core/scripts/init-kafka.sh --check-only     # 取证/体检用这个
   sudo bash /opt/hunter-core/scripts/init-kafka.sh --scram-users
 
 校验：
-  docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
-  （裸写 kafka-topics.sh 在 docker exec 的 shell 里找不到：bitnami 仅在 entrypoint 环境设该 PATH）
-  （内部监听为 SASL_PLAINTEXT 时需附带 --command-config，详见脚本输出）
+  （推荐走 common.sh 封装，**自动附带 --bootstrap-server 与 --command-config**）
+  sudo bash -c 'source scripts/common.sh; load_env; kafka_topics_cli --list'
+  （裸写时两个参数都不可缺：docker exec 的 shell 里找不到 kafka-topics.sh（bitnami 仅在
+    entrypoint 环境设该 PATH），而内部监听固定 SASL_PLAINTEXT——缺 --command-config 不会报
+    权限错，而是报 `Timed out waiting for a node assignment`，极易误读为 broker 未就绪）
 EOF
 }
 
@@ -102,6 +114,10 @@ parse_args() {
         [ $# -ge 2 ] || die "--env 需要一个文件路径参数"
         ENV_FILE_ARG="$2"
         shift 2
+        ;;
+      --check-only)
+        CHECK_ONLY=1
+        shift
         ;;
       --scram-users)
         CREATE_SCRAM_USERS=1
@@ -153,6 +169,68 @@ verify_topic() {
   return 1
 }
 
+# check_only_alignment：**只读对账**（V1.19.15）——不建不改，只输出三类清单：
+#   ① 契约要求但集群缺失的 Topic；② 存在但分区数/retention.ms 与契约不符；③ 契约外 Topic。
+# 返回 1 表示「有缺失/偏差」或「根本没读到清单」（两者文案不同，结论不可合并）。
+check_only_alignment() {
+  local raw names lines spec name partitions retention listed total
+  local missing=0 drifted=0 extra=0
+  local -a expected=()
+
+  raw="$(kafka_topics_cli --list 2>&1 || true)"
+  lines="$(printf '%s\n' "$raw" | grep -cE '[^[:space:]]' || true)"
+  names="$(printf '%s\n' "$raw" | grep -E '^[A-Za-z0-9._-]+$' || true)"
+  # 形态门禁（与 common.sh 的 kafka_topic_count 同源，V1.19.13）：一行不像 Topic 名就是「没查到清单」，
+  #   绝不能把认证失败/参数错的报错文本当成「Topic 都没建」——那会把运维引导去建 Topic 而不是查凭据。
+  if [ "${lines:-0}" -le 0 ] || \
+    [ "$(printf '%s\n' "$names" | grep -cE '[^[:space:]]' || true)" != "$lines" ]; then
+    log_error "读不到集群 Topic 清单（下面就是原始输出，**按它归因**而不是按“Topic 缺失”归因）："
+    printf '%s\n' "$raw" | sed 's/^/  /' >&2
+    log_error "常见成因：未 sudo（.env 权限 600、仅 root 可读）/ KAFKA_SASL_USER 与 .env 漂移 / broker 未就绪"
+    return 1
+  fi
+
+  for spec in "${TOPIC_SPECS[@]}"; do
+    expected+=("$spec")
+    expected+=("${spec%%:*}.dlq:$(printf '%s' "$spec" | cut -d: -f2):${DLQ_RETENTION_MS}")
+  done
+
+  log_info "===== 只读对账（契约：contracts/kafka/topics.yaml；不创建、不修改）====="
+  for spec in "${expected[@]}"; do
+    name="${spec%%:*}"
+    partitions="$(printf '%s' "$spec" | cut -d: -f2)"
+    retention="$(printf '%s' "$spec" | cut -d: -f3)"
+    if ! printf '%s\n' "$names" | grep -Fxq "$name"; then
+      log_warn "缺失 Topic：${name}（契约期望 partitions=${partitions}, retention.ms=${retention}）"
+      missing=$((missing + 1))
+      continue
+    fi
+    verify_topic "$name" "$partitions" "$retention" || drifted=$((drifted + 1))
+  done
+
+  # 契约外：既不是 14 个契约 Topic，也不是车端 hunter.*（车辆注册时创建）与 __*（系统 Topic）
+  while IFS= read -r listed; do
+    [ -n "$listed" ] || continue
+    case "$listed" in
+      __* | hunter.*) continue ;;
+    esac
+    if ! printf '%s\n' "${expected[@]}" | cut -d: -f1 | grep -Fxq "$listed"; then
+      log_warn "契约外 Topic（本脚本不删除，请人工确认来源）：${listed}"
+      extra=$((extra + 1))
+    fi
+  done <<< "$names"
+
+  total="$(printf '%s\n' "$names" | grep -cE '[^[:space:]]' || true)"
+  log_info "对账汇总：契约要求 ${#expected[@]} 个（含死信）｜缺失 ${missing}｜配置偏差 ${drifted}"
+  log_info "　　　　集群实际 ${total} 个 Topic，其中契约外 ${extra} 个（未计 hunter.* 与 __*）"
+  if [ "$missing" -ne 0 ] || [ "$drifted" -ne 0 ]; then
+    log_error "只读对账不通过（缺失 ${missing} / 偏差 ${drifted}）：补齐请跑 sudo bash scripts/init-kafka.sh（幂等）"
+    return 1
+  fi
+  log_success "集群 Topic 与契约一致（${#expected[@]} 个齐备、配置无偏差）"
+  return 0
+}
+
 # create_scram_user <username> <password>：创建/更新 SCRAM-SHA-512 账号
 create_scram_user() {
   local username="$1" password="$2"
@@ -197,6 +275,14 @@ main() {
   # ---------- 1) 等待 broker 就绪（最多 60s） ----------
   if ! wait_for "kafka_broker_ready ${C_KAFKA}" "Kafka broker（容器 ${C_KAFKA}）" 60; then
     log_error "Kafka broker 未就绪：docker logs ${C_KAFKA} --tail=100"
+    return 1
+  fi
+
+  # ---------- 1b) 只读对账模式（--check-only）：给出「差哪几个」的结论，不动集群 ----------
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    if check_only_alignment; then
+      return 0
+    fi
     return 1
   fi
 

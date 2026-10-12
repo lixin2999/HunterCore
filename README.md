@@ -82,9 +82,9 @@ HunterCore/
 | `gen-passwords.sh` | 生成 `.env` 强随机口令（幂等；`--force` 轮换）+ `passwords.txt`(600)，口令不入日志 |
 | `gen-kafka-certs.sh` | 生成 Kafka SASL_SSL 全套证书（CA/broker/client + JKS + P12），校验 SAN 含全部车端接入地址（`--san-ip/--san-dns`/`KAFKA_CERT_SAN_*`）；地址变更用 `--broker-only` 复用 CA 仅重签 broker |
 | `init-db.sh` | 应用 `schema.sql`/`timescaledb.sql`/`init-data.sql` 并校验（8 schema / 11 表 / 2 hypertable），可选注入 admin 口令 |
-| `init-kafka.sh` | 创建 6 个契约 Topic（分区/保留时间校验），可选 `--scram-users` |
+| `init-kafka.sh` | 按契约创建 7 个平台内部 Topic + 7 个死信（分区/保留时间校验），可选 `--scram-users`；`--check-only` **只读对账**（不创建，缺失/偏差逐项点名；读不到清单时照贴原始输出、不给出“Topic 缺失”结论，V1.19.15） |
 | `init-minio.sh` | 创建 7 个 Bucket 与生命周期规则（30/90 天与永久） |
-| `health-check.sh` | 全栈健康检查（13 类，`[PASS]/[WARN]/[FAIL]`，退出码 0/1/2；含车端接入证书 SAN 全集比对（`SERVER_IP` + `KAFKA_CERT_SAN_IPS/DNS`）与有效期、服务运行期错误日志巡检（订阅未命中这类“探针全绿但从未消费”的故障只有日志有痕迹），单项内部报错不中断整轮），可被其他脚本 source 复用 |
+| `health-check.sh` | 全栈健康检查（**15 类**，`[PASS]/[WARN]/[FAIL]`，退出码 0/1/2；**必须 `sudo`——`.env` 是 600/root，非 root 下凭据全空会被误读成基础设施故障**；含车端接入证书 SAN 全集比对（`SERVER_IP` + `KAFKA_CERT_SAN_IPS/DNS`）与有效期、服务运行期错误日志巡检（订阅未命中这类“探针全绿但从未消费”的故障只有日志有痕迹）、环境凭据前置校验与 Flink 作业健康（`flink list -a`，V1.19.13），单项内部报错不中断整轮），可被其他脚本 source 复用 |
 | `daily-check.sh` | 日常巡检（复用健康检查 + critical 事件/DB 连接数/容器重启次数/容量），报告写入 `/var/log/hunter-core/check/` |
 | `backup.sh` | 备份 PostgreSQL 全量 + 时序热数据 + 配置 + Redis RDB，按保留天数清理，输出 MinIO `mc mirror` 指引 |
 | `uninstall.sh` | 卸载（默认保留数据；`--all` 需输入 `DELETE-ALL`，含受保护路径护栏） |
@@ -93,9 +93,9 @@ HunterCore/
 ```bash
 # 部署（服务器上脚本位于 /opt/hunter-core/scripts/）
 sudo bash /opt/hunter-core/scripts/install.sh -y --ip <服务器IP>
-# 运维
-bash /opt/hunter-core/scripts/health-check.sh     # 健康检查（exit 0/1/2）
-bash /opt/hunter-core/scripts/daily-check.sh      # 日常巡检（生成报告）
+# 运维（⚠ 必须 sudo：`.env` 权限 600、只有 root 可读）
+sudo bash /opt/hunter-core/scripts/health-check.sh   # 健康检查（exit 0/1/2）
+sudo bash /opt/hunter-core/scripts/daily-check.sh    # 日常巡检（生成报告）
 bash /opt/hunter-core/scripts/backup.sh           # 数据备份
 bash /opt/hunter-core/scripts/collect-logs.sh     # 收集日志供排障
 ```
@@ -230,7 +230,8 @@ ruff check tests common/python services           # Lint（CI 同款命令）
 静态校验与部署命令：
 
 ```bash
-# 静态校验（无需集群）：API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约一致性/Kafka CLI 必带 --bootstrap-server
+# 静态校验（无需集群）：API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约一致性/Kafka CLI 参数齐备（--bootstrap-server + 认证参数）
+# ⚠ 在 Ubuntu 服务器上这些命令要写 `python3 scripts/...`（服务器无 `python` 别名）
 python scripts/render_k8s.py --check    # 镜像 {version} 占位符契约（6 个微服务）
 python scripts/verify_infra.py
 
@@ -327,7 +328,7 @@ Kafka 契约驱动的生产/消费（共享库 `hunter_common.kafka`）要点：
   整批处理后手动提交 offset（at-least-once）；可注入 `IdempotencyGuard` 跳过重复消息；每批刷新 `hunter_kafka_consumer_lag`
 - **⚠ 死信 Topic 必须显式创建**：`{topic}.dlq` 派生名不会自动存在（broker 关 `auto.create.topics.enable`），
   由五处共同保证：`topics.yaml#naming` ↔ `infra/docker/kafka/create-topics.sh` ↔ `infra/k8s/jobs/kafka-init-job.yaml` ↔
-  `scripts/init-kafka.sh`（平台内部 6 + 死信 6）↔ 车辆 provisioning `kafka_admin`（每车 8 源 + 8 死信）；
+  `scripts/init-kafka.sh`（平台内部 7 + 死信 7）↔ 车辆 provisioning `kafka_admin`（每车 8 源 + 8 死信）；
   缺失时转投报 `_UNKNOWN_TOPIC`（不可重试）→ 旧版会“报错但仍提交位点”而**静默丢弃**非法消息（`contracts/kafka/README.md` 已登记）
 - **通配订阅转正则**（⚠ 易错点）：librdkafka **只把以 `^` 开头的订阅项当正则**，其余一律视为字面 Topic 名；
   因此契约写法 `hunter.*.telemetry` 下发前必须经 `contracts.subscription_term()` 转成 `^hunter\.[^.]+\.telemetry$`
@@ -478,7 +479,7 @@ python scripts/verify_test_layer.py
 | 基础设施健康 | `docker compose ps` |
 | TimescaleDB 扩展 | `docker exec hunter-postgres psql -U hunter -d hunter_core -c "SELECT extname FROM pg_extension WHERE extname='timescaledb';"` |
 | Kafka 平台内部 Topic | `docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --command-config /tmp/hunter-client.properties --list`（内部监听 9092 为 SASL_PLAINTEXT，**缺 `--command-config` 会报 `Timed out waiting for a node assignment`**；参数生成见 `scripts/common.sh`）——运维更推荐直接走封装：`sudo bash -c 'source scripts/common.sh; load_env; kafka_topics_cli --list'` |
-| Kafka 消费组 / 位点 | `sudo bash -c 'source scripts/common.sh; load_env; kafka_groups_cli --describe --group <组>'`（四个封装 `kafka_topics_cli` / `kafka_groups_cli` / `kafka_offsets_cli` / `kafka_configs_cli` **自动附带 `--bootstrap-server`**；低层入口 `kafka_tool_cli` 只补认证参数，漏 `--bootstrap-server`（REQUIRED）只会刷出整份 usage，**与集群健康无关**） |
+| Kafka 消费组 / 位点 | `sudo bash -c 'source scripts/common.sh; load_env; kafka_groups_cli --describe --group <组>'`（四个封装 `kafka_topics_cli` / `kafka_groups_cli` / `kafka_offsets_cli` / `kafka_configs_cli` **自动附带 `--bootstrap-server`**；低层入口 `kafka_tool_cli` 只补认证参数，漏 `--bootstrap-server`（REQUIRED）只会刷出整份 usage，**与集群健康无关**）。⚠ `data-analytics-*` 四个组由 Flink 消费，**位点只在检查点提交**（V1.19.15）：组报 `does not exist` 而作业 RUNNING 时，查的是检查点而不是数据流（口径见运维手册 §7.9） |
 | MinIO Bucket | 浏览器打开 `http://localhost:9001`（7 个 Bucket：hunter-raw-data / rosbag / video / ota-packages / reports / logs / scene-assets） |
 | Redis | `bash scripts/health-check.sh`（看 Redis 行。⚠ 开了 `requirepass`，裸 `redis-cli ping` 只会回 `NOAUTH`；直接取键值的完整命令见运维手册 §3.6） |
 | 共享库测试 | `pytest common/python/tests -q` |

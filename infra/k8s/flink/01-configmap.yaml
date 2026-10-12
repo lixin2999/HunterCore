@@ -46,3 +46,8 @@ data:
   # 入库延迟统计作业窗口/ TTL（缺省即代码内置默认，此处显式登记便于运维调参；见 ingest_latency_job.py）
   INGEST_LATENCY_TTL_SECONDS: "300"
   INGEST_LATENCY_WINDOW_SECONDS: "60"
+  # 检查点周期（V1.19.15）：读取方是作业代码 hunter_flink.checkpointing（变量缺失则用代码默认 10000）。
+  #   上方 execution.checkpointing.interval 属集群兜底、**代码值优先**，两处必须同值——由
+  #   flink-jobs/tests/test_checkpointing.py 静态对账（单机 compose 形态曾只配 dir 漏配 interval，
+  #   导致 KafkaSource 永不在检查点提交位点）。
+  FLINK_CHECKPOINTING_INTERVAL_MS: "10000"

@@ -80,6 +80,7 @@ async def test_dashboard_all_blocks_available(clean_state: None) -> None:
     pipeline = data["pipeline"]
     assert pipeline["telemetry_points"] == 1000
     assert pipeline["kafka_consumer_lag"] == {"analytics-stream-consumer": 12}
+    assert pipeline["unknown_groups"] == []  # 齐位点时不应凭空多出未判定组
     # 入库延迟 P95 由 Flink data_quality_monitor→Redis 指标键透出（看板 pipeline 块只读）
     assert pipeline["ingest_latency_ms_p95"] == pytest.approx(812.5)
     algorithm = data["algorithm"]
@@ -120,6 +121,39 @@ async def test_dashboard_all_degraded_service_unavailable(clean_state: None) -> 
         resp = await client.get("/api/v1/analytics/dashboard", headers=ANALYST_HEADERS)
     assert resp.status_code == 503
     assert resp.json()["code"] == 5001
+
+
+@pytest.mark.asyncio
+async def test_dashboard_pipeline_unknown_groups_are_not_reported_as_zero(clean_state: None) -> None:
+    """组不存在/无提交位点 → 不进 kafka_consumer_lag、只进 unknown_groups（V1.19.14 第七类假绿）。
+
+    旧行为：四个组全部回 `0` 且 `available=true`，运维把「什么都没消费过」读成「零积压」。
+    现要求两者**互斥**（同一组不得同时出现在映射与清单里），且 Kafka 仍可达 ⇒ 不算块降级。
+    """
+    _seed_dashboard(
+        pipeline=FakePipelineRepository(
+            points=1000,
+            lag={"data-collector-telemetry": 7},
+            unknown_groups=[
+                "data-analytics-telemetry-alert",
+                "data-analytics-telemetry-algo",
+                "data-analytics-telemetry-raw",
+                "data-analytics-algorithm-metrics",
+            ],
+            dlq={},
+            averages={},
+            ingest_latency=None,
+        )
+    )
+    async with api() as client:
+        resp = await client.get("/api/v1/analytics/dashboard", headers=ANALYST_HEADERS)
+    assert resp.status_code == 200
+    pipeline = resp.json()["data"]["pipeline"]
+    assert pipeline["available"] is True, "Kafka 可达而仅缺位点，不应把整块标为降级"
+    assert pipeline["kafka_consumer_lag"] == {"data-collector-telemetry": 7}
+    assert "data-analytics-telemetry-algo" in pipeline["unknown_groups"]
+    assert not set(pipeline["kafka_consumer_lag"]) & set(pipeline["unknown_groups"]), "映射与清单必须互斥"
+    assert 0 not in pipeline["kafka_consumer_lag"].values(), "未判定的组不得以 lag=0 混进映射"
 
 
 @pytest.mark.asyncio

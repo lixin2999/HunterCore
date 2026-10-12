@@ -44,7 +44,15 @@ class PipelineStats(BaseModel):
         description="遥测入库延迟 P95（ms）：Flink data_quality_monitor 统计 Kafka 时间戳差→Redis 指标键，未产出/过期为 null",
     )
     kafka_consumer_lag: dict[str, int] = Field(
-        default_factory=dict, description="按消费组的消息滞后总数（group → lag）"
+        default_factory=dict,
+        description="按消费组的消息滞后总数（group → lag）；**仅包含确有提交位点的组**，无位点组见 unknown_groups",
+    )
+    unknown_groups: list[str] = Field(
+        default_factory=list,
+        description=(
+            "本轮无法确定滞后的消费组（组不存在 / 从未提交位点 / 水位不可取）；"
+            "这些组**不在** kafka_consumer_lag 中，绝不可读成「零积压」（V1.19.14）"
+        ),
     )
     dlq_messages: dict[str, int] = Field(default_factory=dict, description="DLQ（dead_letter_queue）消息堆积数")
 

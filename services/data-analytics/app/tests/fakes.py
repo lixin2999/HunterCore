@@ -60,6 +60,7 @@ class FakePipelineRepository:
         *,
         points: int | None = 1000,
         lag: dict[str, int] | None = None,
+        unknown_groups: list[str] | None = None,
         dlq: dict[str, int] | None = None,
         averages: dict[str, float] | None = None,
         ingest_latency: float | None = None,
@@ -68,6 +69,7 @@ class FakePipelineRepository:
         # 需要默认可用数据时由调用方显式传入。
         self.points = points
         self.lag = lag
+        self.unknown_groups = unknown_groups or []
         self.dlq = dlq
         self.averages = averages
         self.ingest_latency = ingest_latency
@@ -78,8 +80,11 @@ class FakePipelineRepository:
     async def algorithm_averages(self, start_ts: float, end_ts: float) -> dict[str, float] | None:
         return self.averages
 
-    async def consumer_lag(self) -> dict[str, int] | None:
-        return self.lag
+    async def consumer_lag(self) -> tuple[dict[str, int], list[str]] | None:
+        # 探测整体不可达（None）与“读不到位点”（unknown_groups）是两条不同降级路径（V1.19.14）
+        if self.lag is None:
+            return None
+        return dict(self.lag), list(self.unknown_groups)
 
     async def dlq_depth(self) -> dict[str, int] | None:
         return self.dlq

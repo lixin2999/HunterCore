@@ -33,6 +33,7 @@ from hunter_common.exceptions import ErrorCode
 from app.config import Settings
 from app.core.error_handlers import HTTP_STATUS_BY_CODE
 from app.main import app
+from app.schemas.dashboard import PipelineStats
 
 ROOT = Path(__file__).resolve().parents[4]
 CONTRACT_PATH = ROOT / "contracts" / "openapi" / "data-analytics.yaml"
@@ -988,6 +989,30 @@ def test_kafka_lag_probe_monitors_real_contract_groups() -> None:
         "corner-case-miner-consumer",
     }
     assert not ghost & set(monitored), f"LAG 探测仍监控契约外的幽灵消费组: {sorted(ghost & set(monitored))}"
+
+
+def test_dashboard_pipeline_lag_separates_unknown_groups_from_zero(contract: dict[str, Any]) -> None:
+    """「组不存在」必须与「零积压」分两个字段表达（V1.19.14，第七类假绿）。
+
+    Kafka 的 ``list_consumer_group_offsets`` 对不存在的组返回**空分区列表且不报错**，
+    只改组名清单（V1.19.11）并不能防住同类问题——下次拼错又是四个 0。
+    所以返回体本身必须能区分两者，且契约/实现两边得一起改。
+    """
+    props = contract["components"]["schemas"]["PipelineStats"]["properties"]
+    unknown = props["unknown_groups"]
+    assert unknown["type"] == "array" and unknown["items"] == {"type": "string"}
+    assert "不得读成零积压" in props["kafka_consumer_lag"]["description"], "lag 映射的语义边界必须在契约里说清"
+    assert "unknown_groups" in unknown["description"] or "无法确定滞后" in unknown["description"]
+
+    # 实现侧同形：字段存在且默认空列表（新字段不得变成必填）
+    assert "unknown_groups" in PipelineStats.model_fields
+    assert PipelineStats.model_fields["unknown_groups"].default_factory is not None
+    assert PipelineStats(available=True).unknown_groups == []
+
+    # 降级路径不得合并：available=false 只给“Kafka 不可达”，不能拿块降级当“无位点”信号
+    semantics = contract["x-hunter-dashboard-contract"]["blocks"]["pipeline"]["lag_semantics"]
+    assert "空分区列表" in semantics and "unknown_groups" in semantics
+    assert "整体不可达" in semantics, "必须区分「Kafka 不可达」与「读不到位点」两条降级路径"
 
 
 def test_k8s_manifest_matches_service_meta(contract: dict[str, Any]) -> None:

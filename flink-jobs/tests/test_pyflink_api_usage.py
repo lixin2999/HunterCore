@@ -118,6 +118,24 @@ def test_three_jobs_share_the_same_source_sink_shape() -> None:
             )
 
 
+@pytest.mark.parametrize("job_file", JOB_FILES)
+def test_job_enables_checkpointing(job_file: str) -> None:
+    """三个作业都必须显式开检查点（V1.19.15）。
+
+    KafkaSource **只在检查点完成时提交位点**：不开则消费组在集群上永不出现（`--describe` 报
+    does not exist）、积压不可观测、重启一律回落 earliest 重放。本仓库已经因此产出一整类看板
+    假绿（V1.19.14），所以把“开了没”当形状约束钉住：新增作业忘了开即失败。
+    """
+    main = _main_node(JOBS_DIR / job_file)
+    assert "enable_checkpointing" in ast.dump(main), f"{job_file} 未启用检查点（位点将永不提交）"
+
+
+def test_checkpointing_member_is_in_image_guard() -> None:
+    """`enable_checkpointing` 必须同时在白名单里（否则镜像内第四道自检验不到它）。"""
+    members = api_guard.API_WHITELIST["pyflink.datastream"]["StreamExecutionEnvironment"]
+    assert "enable_checkpointing" in members
+
+
 def test_api_guard_whitelist_is_self_consistent() -> None:
     """白名单自身可导航：每个点路径都有宿主条目、成员不重复、2.x 已删名字都指向白名单内的类。"""
     assert api_guard.API_WHITELIST, "白名单不得为空"

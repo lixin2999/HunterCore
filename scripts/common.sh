@@ -290,6 +290,14 @@ load_env() {
     return 1
   fi
   hc_normalize_env_file "$env_file" || return 1
+  # ℞ V1.19.13：先区分“不可读”与“语法错”。.env 由 install.sh / gen-passwords.sh 落为 **600、属主 root**，
+  #   非 root 执行时 `[ -f ]` 仍为真、`source` 报 Permission denied，而旧文案只说“请检查语法”，
+  #   会把运维带去改 .env 而不是补 sudo（现场实录：由此得到三项假 FAIL）。
+  if [ ! -r "$env_file" ]; then
+    log_error "环境变量文件不可读：${env_file}（权限 600、只有属主 root 可读，当前 UID=$(id -u) 非 root）"
+    log_error "请改用 root 执行：sudo bash ${0##*/} …（不要用 chmod 放宽 .env 权限）"
+    return 1
+  fi
   set -a
   # shellcheck source=/dev/null  # .env 由部署时生成（gen-passwords.sh），非仓库文件
   if ! . "$env_file"; then
@@ -311,6 +319,22 @@ load_env() {
   HUNTER_ENV_FILE="$env_file"
   export HUNTER_ENV_FILE APP_DIR DATA_DIR LOG_DIR LOG_FILE
   log_info "已加载环境变量：${env_file}"
+}
+
+# env_creds_missing：输出当前为空的口令类变量名（空格分隔；全齐则输出空串）
+# ℞ V1.19.13：.env 权限 **600**（install.sh / gen-passwords.sh 设定），**非 root 根本读不到**。
+#   而 `[ -f .env ]` 只看目录权限、照样为真，于是 load_env 在“存在但不可读”处失败；
+#   health-check 过去只把这句归成一句 log_warn 就继续跑，于是 Redis PING / Kafka CLI / MinIO mc
+#   三项全按“内置默认值”跑出 **FAIL**，把“没带凭据”报成“服务挂了”。口令缺失必须先被看出来。
+env_creds_missing() {
+  local name missing=""
+  for name in REDIS_PASSWORD KAFKA_SASL_USER KAFKA_SASL_PASSWORD MINIO_ROOT_USER \
+              MINIO_ROOT_PASSWORD POSTGRES_PASSWORD; do
+    case "${!name:-}" in
+      "" | CHANGE_ME_*) missing="${missing}${missing:+ }${name}" ;;
+    esac
+  done
+  printf '%s' "$missing"
 }
 
 # env_value <VAR> <默认值>：取变量值（未设置或为空时返回默认值）
@@ -643,15 +667,21 @@ minio_mc() {
     "$MINIO_MC_IMAGE" "$@"
 }
 
-# minio_bucket_count：当前 Bucket 数量（失败输出 -1）
+# minio_bucket_count：当前 Bucket 数量（**没查到一律 -1**，禁止与“确实是 0 个桶”混为一谈）
 minio_bucket_count() {
-  local out
-  out="$(minio_mc ls local 2>/dev/null || true)"
-  if [ -z "$out" ]; then
-    printf '%s' "-1"
-    return 1
+  local out buckets lines
+  # ℞ V1.19.13：原来只吃 stdout（stderr 丢弃）→ mc 的报错文本、镜像未拉取、凭据为空都会
+  #   变成“空输出”或“一行噪声”，调用方读不出是“没查到”。改 2>&1 + 形态门禁：
+  #   mc ls 的桶行以 / 结尾；一行桶行都没有就是“没查到”（-1），不假定成功。
+  out="$(minio_mc ls local 2>&1 || true)"
+  buckets="$(printf '%s\n' "$out" | grep -cE '/$' || true)"
+  lines="$(printf '%s\n' "$out" | grep -cE '[^[:space:]]' || true)"
+  if [ "${buckets:-0}" -gt 0 ] && [ "${buckets:-0}" -le "${lines:-0}" ]; then
+    printf '%s' "$buckets"
+    return 0
   fi
-  printf '%s' "$(printf '%s\n' "$out" | grep -c '/$' || true)"
+  printf '%s' "-1"
+  return 1
 }
 
 # kafka_consumer_lag <group_id>：该消费组所有分区 LAG 之和（消费组不存在/查不到输出 -1 并返回 1）
@@ -680,15 +710,25 @@ kafka_consumer_lag() {
   printf '%s' "${total:-0}"
 }
 
-# kafka_topic_count：Topic 总数（失败输出 -1）
+# kafka_topic_count：Topic 总数（**没查到一律 -1**）
 kafka_topic_count() {
-  local out
-  out="$(kafka_topics_cli --list 2>/dev/null || true)"
-  if [ -z "$out" ]; then
+  local out names lines
+  # ℞ V1.19.13：旧实现“非空行数即 Topic 数”，而 kafka-topics.sh 失败时往 stdout 落的
+  #   **一行报错文本**会被数成“1 个 Topic”→ 巡检报「Kafka Topic 数 1 < 6（契约内部 Topic
+  #   未创建完整）」，把“认证不可用/.env 未加载”误报成“Topic 没建”（本仓库第五例同类假信号）。
+  #   现加形态门禁：--list 的合法输出每行只能是 Topic 名（字母数字与 . _ -），任一行不符即 -1。
+  out="$(kafka_topics_cli --list 2>&1 || true)"
+  names="$(printf '%s\n' "$out" | grep -E '^[A-Za-z0-9._-]+$' || true)"
+  lines="$(printf '%s\n' "$out" | grep -cE '[^[:space:]]' || true)"
+  if [ "${lines:-0}" -le 0 ]; then
     printf '%s' "-1"
     return 1
   fi
-  printf '%s' "$(printf '%s\n' "$out" | grep -cE '[^[:space:]]' || true)"
+  if [ "$(printf '%s\n' "$names" | grep -cE '[^[:space:]]' || true)" != "$lines" ]; then
+    printf '%s' "-1"
+    return 1
+  fi
+  printf '%s' "$lines"
 }
 
 # ---------------------------------------------------------------------
@@ -702,7 +742,8 @@ HunterCore 部署脚本公共库 common.sh（库文件，禁止直接执行）
   为所有部署/运维脚本提供统一日志、检查与辅助函数：
     - 日志：log_info / log_success / log_warn / log_error（终端彩色 + 日志文件无色）
     - 检查：check_root / command_exists / check_port / check_disk_space / wait_for / confirm
-    - 环境：load_env（加载 ${APP_DIR}/.env）/ env_value / require_env
+    - 环境：load_env（加载 ${APP_DIR}/.env）/ env_value / require_env / env_creds_missing
+      （⚠ .env 权限 600、仅 root 可读：非 root 跑口令类探针会因 load_env 失败而得到**错误结论**）
     - 辅助：compose / container_health / hc_run_logged / service_health_ok
     - Kafka CLI 封装（**运维请优先用这四个，它们自动附带 --bootstrap-server**）：
       kafka_topics_cli / kafka_groups_cli / kafka_offsets_cli / kafka_configs_cli；

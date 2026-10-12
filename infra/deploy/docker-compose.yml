@@ -343,6 +343,12 @@ services:
     container_name: hunter-flink-jm
     command: jobmanager
     environment:
+      # ⚠ 下面只给检查点「目录」、不给「周期」是故意的（V1.19.15）：周期由作业代码
+      #   hunter_flink.checkpointing.enable_checkpointing() 显式开启（可由 FLINK_CHECKPOINTING_INTERVAL_MS 覆盖）。
+      #   本键曾长期是唯一检查点配置而**无周期** ⇒ 根本不做检查点，而 KafkaSource 只在检查点提交位点
+      #   ⇒ 消费组永不在集群上出现、积压不可观测、重启一律回落 earliest 从头重放。
+      #   （注：这段说明只能放在 YAML 注释里，不能放进 FLINK_PROPERTIES 块——后者会原样写入容器内
+      #   Flink 配置文件，本环境无 Docker 无法实机验证其解析。）
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jm
         jobmanager.memory.process.size: ${FLINK_JM_PROCESS_MEM:-2048m}
@@ -363,6 +369,9 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       REDIS_DB: ${REDIS_DB:-0}
+      # 检查点周期（毫秒）覆盖入口（V1.19.15）：读取方是提交进程里的作业代码（本容器），
+      # 留空即取代码默认 10000；非整数/非正数会在 `flink run` 当场报错（不静默退回默认）。
+      FLINK_CHECKPOINTING_INTERVAL_MS: ${FLINK_CHECKPOINTING_INTERVAL_MS:-}
     ports:
       - "127.0.0.1:${FLINK_UI_HOST_PORT:-8088}:8081"
     volumes:
@@ -409,6 +418,8 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       REDIS_DB: ${REDIS_DB:-0}
+      # 检查点周期变量同步下发（V1.19.15；语义见 flink-jm 侧注释）
+      FLINK_CHECKPOINTING_INTERVAL_MS: ${FLINK_CHECKPOINTING_INTERVAL_MS:-}
     volumes:
       - ${DATA_DIR:-/data}/flink:/opt/flink/data
     restart: unless-stopped

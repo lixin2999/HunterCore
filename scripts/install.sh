@@ -113,7 +113,7 @@ HunterCore 单机一键部署脚本
 
 部署后：
   前端 http://<SERVER_IP>/    API 网关 http://<SERVER_IP>:8080
-  继续执行：bash scripts/health-check.sh（健康检查）、bash scripts/daily-check.sh（日常巡检）
+  继续执行：sudo bash scripts/health-check.sh（健康检查，⚠ 必须 sudo：.env 权限 600）、sudo bash scripts/daily-check.sh（日常巡检）
 
 日志：/var/log/hunter-core-install.log（完整输出）、/var/log/hunter-core/deploy/build.log（构建日志）
 EOF

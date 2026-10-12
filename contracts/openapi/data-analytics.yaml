@@ -986,7 +986,19 @@ components:
         kafka_consumer_lag:
           type: object
           additionalProperties: { type: integer }
-          description: 各消费组滞后（data-analytics-* 组 → 滞后条数）
+          description: |
+            各消费组滞后（data-analytics-* 组 → 滞后条数）。
+            ⚠ **仅包含确有提交位点的组**（V1.19.14）：某组不在此映射且出现在
+            `unknown_groups` 里，含义是「无法判定」，**不得读成零积压**。
+        unknown_groups:
+          type: array
+          items: { type: string }
+          description: |
+            本轮无法确定滞后的消费组（组不存在 / 从未提交位点 / 末端水位不可取）。
+            Kafka 对不存在的组返回空分区列表而**不报错**，旧实现遂把它折算成 `lag=0`（假绿）；
+            现一律列入本字段。成因（group_not_found / no_committed_offsets / watermark_unavailable）
+            记在服务日志事件 `consumer_group_lag_undetermined`。运维对账以
+            `kafka-consumer-groups.sh --describe`（本仓推荐走 `kafka_groups_cli` 封装）为准。
         dlq_messages:
           type: object
           additionalProperties: { type: integer }
@@ -1987,6 +1999,7 @@ x-hunter-dashboard-contract:
         - "data_collector.vehicle_telemetry（只读账号，count / 近似计数，按 time 分区裁剪）"
         - "Redis analytics:ingest_latency（只读：入库延迟 P95，由本服务 Flink data_quality_monitor 写入）"
       limits: "单块聚合时间窗上限 ANALYTICS_QUERY_MAX_RANGE_DAYS(7d)；禁止全表精确 COUNT（hypertable 开销）"
+      lag_semantics: "【已结案 V1.19.14】消费组滞后只返「已确证」的组：Kafka 对不存在的组 / 从未提交位点的组都返回空分区列表而不报错，因此这类组**不写 lag=0**，而是列入 `unknown_groups`（两者互斥）；`available=false` 仅用于 Kafka 整体不可达，与「读不到位点」分属两条降级路径（旧行为：看板永远显示各组零积压）"
       ingest_latency: "遥测入库延迟 P95【已结案 pending #10】：采用 Kafka 时间戳差估算——Flink data_quality_monitor 统计（车端 timestamp ↔ Kafka 到达时间差，60s 事件时间滚动窗口车队级 P95）写 Redis 指标键 analytics:ingest_latency，本服务只读展示；键缺失/过期（作业停摆 TTL 兜底）→ ingest_latency_ms_p95=null（不伪造、不取 Prometheus）"
     algorithm:
       sources:

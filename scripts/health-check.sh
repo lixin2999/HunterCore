@@ -5,20 +5,32 @@
 # 用途：一次性核对容器 / HTTP 探针 / 数据库 / Redis / Kafka / MinIO / 磁盘与内存 / 消费积压，
 #       输出 [PASS] [WARN] [FAIL] 明细与汇总，并给出退出码（供 install.sh、巡检脚本、CI 调用）。
 #
-# 检查项（共 13 类）：
+# 检查项（共 15 类，⓪ 必须排第一）：
+#   ⓪ 环境凭据（.env）：口令类变量为空即 FAIL（典型成因：没加 sudo，.env 权限 600）；
+#      ⚠ 本项 FAIL 时，Redis / Kafka / MinIO 的相关结论一律降为「未判定」，不得当服务异常（V1.19.13）
 #   ① 容器运行状态与 Docker healthcheck（缺失/非 healthy/未运行 → FAIL）
 #   ② HTTP 探针：api-gateway/scene/collector/analytics/ota/remote（/healthz）、web-portal、
 #      MinIO(/minio/health/live)、SRS(/api/v1/versions)、Flink UI(/overview)
 #   ③ PostgreSQL：pg_isready       ④ TimescaleDB：pg_isready（存在独立实例时）
-#   ⑤ Redis：redis-cli PING        ⑥ Kafka：Topic 数 ≥6
+#   ⑤ Redis：redis-cli PING（区分 WRONGPASS / NOAUTH / 空口令）  ⑥ Kafka：Topic 数 ≥6
 #   ⑦ MinIO：Bucket 数 ≥7          ⑧ 磁盘：/data 使用率（>85% WARN，>95% FAIL）
 #   ⑨ 内存使用率（>90% WARN）      ⑩ Kafka 消费积压：data-collector-telemetry LAG（>10000 WARN）
+#      ⚠ 三分语义：没查到（-1）/ 积压为 0 / 超阈值，“没查到”不再说成“车辆未上报”（V1.19.13）
 #   ⑪ 配置漂移硬闸（G-03）：docker-compose.override.yml 存在即 FAIL（HUNTER_ALLOW_OVERRIDE=1 降为 WARN）；
 #      并按容器 label 判定实际生效的编排文件（防裸跑 docker compose 命中仓库根开发版编排）
 #   ⑫ 车端接入证书：broker 证书 SAN 必须含 SERVER_IP（车端 https 主机名校验只比 SAN）；CA/broker 有效期预警
 #   ⑬ 服务运行期错误日志：扫描各服务容器近期 error/critical/Traceback（探针类检查永远看不到的一类故障：
 #      消费者进程活着、/healthz 200，但订阅从未命中——只有日志里有痕迹）；订阅/Topic 类致命错直接 FAIL；
 #      窗口由 ERROR_LOG_WINDOW 控制（默认 15m）
+#   ⑭ Flink 作业健康（V1.19.13）：**flink list -a** 统计 RUNNING 数与 FAILED/CANCELED 终态
+#      ⚠ 不加 -a 时 FAILED 作业**从列表里静默消失**（默认只列 Running/Restarting 与 Scheduled）；
+#      判据是「提交数 == RUNNING 数」（默认期望 3，可用 FLINK_EXPECTED_RUNNING 覆盖）；
+#      ⑬ 的服务容器清单不含 flink-jm/flink-tm，作业侧的 Kafka 写失败只有本项能抓到
+#
+# ⚠ 必须用 sudo 跑：.env 权限 600（install.sh / gen-passwords.sh 设定）仅 root 可读；
+#   非 root 时 [ -f .env ] 仍为真但 source 失败 ⇒ 口令全空 ⇒ 本脚本会给出一串
+#   “看起来像基础设施故障”的 FAIL（实测：Redis PING / Kafka Topic 数 / MinIO Bucket 数）。
+#   现由 ⓪ 环境凭据项直接拦住并把依赖口令的项降为 WARN（V1.19.13）。
 #
 # 用法：
 #   sudo bash scripts/health-check.sh [选项]
@@ -27,6 +39,9 @@
 #   --help             显示本帮助
 #   --env <file>       指定 .env 路径
 #   --lag-threshold N  消费积压告警阈值（默认 10000）
+#
+# 环境变量（可选）：
+#   FLINK_JM_CONTAINER（默认 hunter-flink-jm）/ FLINK_EXPECTED_RUNNING（默认 3）
 #
 # 退出码：0 = 全部通过；1 = 存在告警（WARN）；2 = 存在失败（FAIL）
 #
@@ -65,8 +80,11 @@ usage() {
 HunterCore 全栈健康检查脚本
 
 用途：
-  检查 13 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
+  检查 15 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
   退出码：0=全部通过，1=有告警，2=有失败。
+
+⚠ 请用 sudo 执行：.env 权限 600 仅 root 可读，非 root 时口令类探针会给出错的 FAIL
+  （典型：Redis PING / Kafka Topic 数 / MinIO Bucket 数）；现由「环境凭据（.env）」项先行识别并降级为未判定。
 
 用法：
   sudo bash scripts/health-check.sh [选项]
@@ -79,12 +97,13 @@ HunterCore 全栈健康检查脚本
 示例：
   sudo bash scripts/health-check.sh
   sudo bash scripts/health-check.sh --lag-threshold 5000
-  bash scripts/health-check.sh && echo "全栈健康"
+  sudo bash scripts/health-check.sh && echo "全栈健康"   # ⚠ 不要省略 sudo（否则口令类项结论不可信）
 
 检查项：
-  容器状态/Docker healthcheck、服务 HTTP 探针、PostgreSQL、TimescaleDB、Redis、
+  环境凭据（.env）、容器状态/Docker healthcheck、服务 HTTP 探针、PostgreSQL、TimescaleDB、Redis、
   Kafka Topic 数、MinIO Bucket 数、/data 磁盘使用率、内存使用率、Kafka 消费积压、
-  配置漂移硬闸、车端接入证书（broker 证书 SAN 与有效期）、服务运行期错误日志。
+  配置漂移硬闸、车端接入证书（broker 证书 SAN 与有效期）、服务运行期错误日志、
+  Flink 作业健康（flink list -a：FAILED 不会被默认列表列出）。
 EOF
 }
 
@@ -315,6 +334,36 @@ check_databases() {
   return 0
 }
 
+# ⓪ 环境凭据（.env）——必须排在一切口令类探针之前（V1.19.13）
+# 现场：非 sudo 跑本脚本时实测同时出现三项 FAIL（Redis PING 失败 / Kafka Topic 数 1 < 6 /
+#   MinIO Bucket 数 -1），而同一时刻用 sudo 复核 kafka_consumer_lag 却拿到真值 0——
+#   三项 FAIL 全部是“没读到 .env（权限 600）”造成的，与基础设施无关。旧版本只打一句
+#   log_warn（会被 tail 掉）就继续跑，结论看上去像服务挂了，属于“把命令层错误报成业务层故障”。
+check_env_credentials() {
+  local missing
+  # 直接执行时由 main 预算并 export；被 source 复用（daily-check.sh）时本函数自行探测
+  if [ -z "${CREDS_MISSING+set}" ]; then
+    CREDS_MISSING="$(env_creds_missing)"
+    export CREDS_MISSING
+  fi
+  missing="${CREDS_MISSING:-}"
+  if [ -z "$missing" ]; then
+    record_result "PASS" "环境凭据（.env）" "口令类变量齐备（来源：${HUNTER_ENV_FILE:-<未记录>}）"
+    return 0
+  fi
+  record_result "FAIL" "环境凭据（.env）" \
+    "为空：${missing} → 典型成因是**没加 sudo**（.env 权限 600 仅 root 可读），请改用：sudo bash scripts/health-check.sh；⚠ 在此之前，Redis / Kafka / MinIO 相关结论一律不可信（本项已把它们降为未判定）"
+  return 0
+}
+
+# 口令类探针的统一降级：CREDS_MISSING 非空时不下“服务异常”结论（避免假故障）
+hc_skip_without_creds() {
+  local item="$1" hint="${2:-}"
+  [ -n "${CREDS_MISSING:-}" ] || return 1
+  record_result "WARN" "${item}" "未判定：口令类变量为空（${CREDS_MISSING}），非服务异常；请 sudo bash scripts/health-check.sh 重跑${hint:+（${hint}）}"
+  return 0
+}
+
 # ⑤ Redis
 check_redis() {
   local reply
@@ -322,25 +371,41 @@ check_redis() {
     record_result "FAIL" "Redis" "容器 hunter-redis 不存在"
     return 0
   fi
-  reply="$(docker exec "hunter-redis" redis-cli --no-auth-warning -a "${REDIS_PASSWORD:-}" ping 2>/dev/null || true)"
+  hc_skip_without_creds "Redis" "或临时：sudo bash -c 'source scripts/common.sh; load_env; docker exec hunter-redis redis-cli --no-auth-warning -a \"\${REDIS_PASSWORD}\" ping'" && return 0
+  # ℞ V1.19.13：旧写法 2>/dev/null + “不含 PONG 就说 PING 失败”，把 NOAUTH / WRONGPASS / 空口令
+  #   三成因合并不说（本项已挂两轮没分流）。现回原始回复（只回回复，不回显口令）。
+  if [ -z "${REDIS_PASSWORD:-}" ]; then
+    reply="$(docker exec "hunter-redis" redis-cli --no-auth-warning ping 2>&1 || true)"
+  else
+    reply="$(docker exec "hunter-redis" redis-cli --no-auth-warning -a "$REDIS_PASSWORD" ping 2>&1 || true)"
+  fi
   if printf '%s' "$reply" | grep -q PONG; then
     record_result "PASS" "Redis" "PING → PONG（AOF 已启用详见 .env REDIS_APPENDONLY）"
+  elif printf '%s' "$reply" | grep -qi WRONGPASS; then
+    record_result "FAIL" "Redis" "WRONGPASS invalid username-password pair：.env 的 REDIS_PASSWORD 与 broker 现存口令不一致（典型：改过 .env 但未重建容器）→ 核对 sudo grep '^REDIS_PASSWORD' ${HUNTER_ENV_FILE:-/opt/HunterCore/.env} 与 docker inspect hunter-redis 的 REDIS_PASSWORD；不一致则 restart redis 并同步各服务"
+  elif printf '%s' "$reply" | grep -qi NOAUTH; then
+    record_result "FAIL" "Redis" "NOAUTH（未带口令，但本项已确认 REDIS_PASSWORD 非空）：检查变量是否被导出：docker exec hunter-redis env | grep -i redis"
   else
-    record_result "FAIL" "Redis" "PING 失败（检查 REDIS_PASSWORD 与容器日志）"
+    record_result "FAIL" "Redis" "PING 失败，原始回复：$(printf '%.160s' "${reply:-<无输出>}")（docker logs hunter-redis --tail=50）"
   fi
   return 0
 }
 
 # ⑥ Kafka Topic 数
 check_kafka_topics() {
-  local count minimum=6
+  local raw count minimum=6
   if ! docker inspect "hunter-kafka" >/dev/null 2>&1; then
     record_result "FAIL" "Kafka" "容器 hunter-kafka 不存在"
     return 0
   fi
+  hc_skip_without_creds "Kafka Topic 数" && return 0
+  # 取一份带 stderr 的原始输出，仅用于“没查到”时把成因说出来（计数仍走 common.sh 的形态门禁）
+  raw="$(kafka_topics_cli --list 2>&1 || true)"
   count="$(kafka_topic_count)"
-  if [ "${count:-0}" -lt "$minimum" ]; then
-    record_result "FAIL" "Kafka Topic 数" "${count:-0} < ${minimum}（契约内部 Topic 未创建完整，见 init-kafka.sh）"
+  if [ "${count:-0}" -lt 0 ]; then
+    record_result "FAIL" "Kafka Topic 数" "**查不到清单**（不是“Topic 没建完”）：$(printf '%.200s' "${raw:-<无输出>}") → 优先查认证：内部监听固定 SASL_PLAINTEXT，缺 --command-config / 凭据不对时报的是 node assignment 超时而非权限错"
+  elif [ "${count:-0}" -lt "$minimum" ]; then
+    record_result "FAIL" "Kafka Topic 数" "${count} < ${minimum}（清单已读到，确实不足：见 init-kafka.sh）"
   else
     record_result "PASS" "Kafka Topic 数" "${count}（契约 ≥${minimum}，含 __consumer_offsets）"
   fi
@@ -349,14 +414,18 @@ check_kafka_topics() {
 
 # ⑦ MinIO Bucket 数
 check_minio_buckets() {
-  local count minimum=7
+  local raw count minimum=7
   if ! docker inspect "hunter-minio" >/dev/null 2>&1; then
     record_result "FAIL" "MinIO" "容器 hunter-minio 不存在"
     return 0
   fi
+  hc_skip_without_creds "MinIO Bucket 数" && return 0
+  raw="$(minio_mc ls local 2>&1 || true)"
   count="$(minio_bucket_count)"
-  if [ "${count:-0}" -lt "$minimum" ]; then
-    record_result "FAIL" "MinIO Bucket 数" "${count:-0} < ${minimum}（见 init-minio.sh）"
+  if [ "${count:-0}" -lt 0 ]; then
+    record_result "FAIL" "MinIO Bucket 数" "**查不到清单**（不是“桶没建”）：$(printf '%.200s' "${raw:-<无输出>}") → 常见成因：MINIO_ROOT_USER/PASSWORD 不对、mc 镜像未拉取（${MINIO_MC_IMAGE:-minio/mc}）"
+  elif [ "${count:-0}" -lt "$minimum" ]; then
+    record_result "FAIL" "MinIO Bucket 数" "${count} < ${minimum}（清单已读到，确实不足：见 init-minio.sh）"
   else
     record_result "PASS" "MinIO Bucket 数" "${count}（契约 ${minimum} 个）"
   fi
@@ -406,13 +475,53 @@ check_kafka_lag() {
     record_result "WARN" "Kafka 消费积压" "Kafka 容器不存在，跳过积压检查"
     return 0
   fi
+  hc_skip_without_creds "Kafka 消费积压" && return 0
   lag="$(kafka_consumer_lag "$group" 2>/dev/null)"; [ -z "$lag" ] && lag="-1"
   if [ "$lag" -lt 0 ]; then
-    record_result "WARN" "Kafka 消费积压" "消费组 ${group} 尚无 offset 提交（车辆未上报或 data-collector 未消费）"
+    # ℞ V1.19.13：旧文案把“没查到”直接说成“车辆未上报或 data-collector 未消费”，而归因其实是
+    #   命令本身（缺 --bootstrap-server / 认证不可用 / 输出不是 describe 结果）。kafka_consumer_lag
+    #   现已区分“LAG 真的是 0”与“根本没查到”，文案必须跟着改口径。
+    record_result "WARN" "Kafka 消费积压" "**没能读到消费组 ${group} 的清单**（不是“积压为 0”，也不是“车辆未上报”）→ 先用封装自查可用性：sudo bash -c 'source scripts/common.sh; load_env; kafka_groups_cli --describe --group <组>'（无表头 / 报 does not exist / 刷 usage 都属本类）"
   elif [ "$lag" -gt "$LAG_THRESHOLD" ]; then
     record_result "WARN" "Kafka 消费积压" "${group} LAG=${lag} > ${LAG_THRESHOLD}：检查 data-collector 消费能力与批写性能（入库 ≤1s）"
   else
     record_result "PASS" "Kafka 消费积压" "${group} LAG=${lag}（阈值 ${LAG_THRESHOLD}）"
+  fi
+  return 0
+}
+
+# ⑭ Flink 作业健康（V1.19.13）：flink list -a 不只要看“有没有 RUNNING”，更要看“有没有终态”
+# ⚠ 不加 -a 时 FAILED/CANCELED/FINISHED 仍**根本不出现**在输出里（默认只列 Running/Restarting
+#   与 Scheduled），于是“列表里没异常”会被读成“作业都健康”——本仓第六例同类假信号。
+check_flink_jobs() {
+  local container="${FLINK_JM_CONTAINER:-hunter-flink-jm}"
+  local expected="${FLINK_EXPECTED_RUNNING:-3}" out running bad name stack line
+  if ! command_exists docker || ! docker inspect "$container" >/dev/null 2>&1; then
+    record_result "WARN" "Flink 作业健康" "容器 ${container} 不存在或无 docker 权限（未部署 flink-jm 时可忽略）"
+    return 0
+  fi
+  out="$(docker exec "$container" flink list -a 2>&1 || true)"
+  if ! printf '%s\n' "$out" | grep -qE 'Running/Restarting Jobs'; then
+    record_result "WARN" "Flink 作业健康" "**未判定**：flink list -a 没返回作业表头（JM REST 未就绪或命令失败）：$(printf '%.200s' "${out:-<无输出>}")"
+    return 0
+  fi
+  running="$(printf '%s\n' "$out" | grep -cE '\((RUNNING|RESTARTING)\)' || true)"
+  bad="$(printf '%s\n' "$out" | grep -E '\((FAILED|CANCELED)\)' || true)"
+  stack=""
+  if [ -n "$bad" ]; then
+    stack="$(docker logs --since "${FLINK_LOG_WINDOW:-24h}" "$container" 2>&1 \
+      | grep -m1 'switched from RUNNING to FAILED' || true)"
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      name="$(printf '%s' "$line" | sed -E 's/.*: +([^ ]+) +\((FAILED|CANCELED)\).*/\1/')"
+      record_result "FAIL" "Flink 作业健康（${name}）" \
+        "已进入终态：$(printf '%.120s' "$line") → ⚠ **不加 -a 的 flink list 根本看不见它**；取堆栈要**现在**做（JM 无 HA，容器一重建日志即丢），且**不要截断窗口**——能定性的最内层 Caused by 常在 100 行之后：sudo docker logs ${container} 2>&1 | awk '/switched from RUNNING to FAILED/{f=1} f' > /tmp/flink-failed.txt 后读**最后一条** Caused by 及其后续行（不是第一条，也不要再夹 head/tail 窗口；提取命令见运维手册 §3.6）；$(printf '%.180s' "${stack:-<窗口内无 FAILED 日志，可放宽 FLINK_LOG_WINDOW>}")"
+    done <<<"$bad"
+  fi
+  if [ "${running:-0}" -lt "$expected" ]; then
+    record_result "FAIL" "Flink 作业数" "RUNNING=${running:-0} < ${expected}（契约已交付三作业：driving_anomaly_detection / algorithm_performance_monitor / data_quality_monitor_ingest_latency；判据是提交数 == RUNNING 数；改期望值可设 FLINK_EXPECTED_RUNNING）"
+  elif [ -z "$bad" ]; then
+    record_result "PASS" "Flink 作业健康" "RUNNING=${running}（期望 ${expected}），无 FAILED/CANCELED 终态"
   fi
   return 0
 }
@@ -592,16 +701,19 @@ check_service_error_logs() {
   return 0
 }
 
-# run_all_health_checks：执行全部 13 类检查（供 daily-check 与 main 复用）
+# run_all_health_checks：执行全部 15 类检查（供 daily-check 与 main 复用）
+# ⚠ 顺序有语义：「环境凭据（.env）」必须排第一——后面的 Redis / Kafka / MinIO 靠它判断
+#   “服务异常”还是“根本没带凭据”（V1.19.13）。
 # 各项均以“失败被测试”的上下文调用（if ! f）：bash 在该上下文中会关闭 errexit，
 # 使某项内部命令报错不再中断整轮检查（历史现象：脚本中途退出，导致后面的
 # “车端接入证书 SAN”硬闸静默缺失，运维只看到前面几项而误以为全部通过）。
 # 未完成项记为 WARN，汇总里能直接看出“哪项没跑完”。
 run_all_health_checks() {
   local check
-  for check in check_compose_override check_containers check_http_endpoints check_databases \
-    check_redis check_kafka_topics check_minio_buckets check_disk_usage check_memory_usage \
-    check_kafka_lag check_kafka_broker_cert check_service_error_logs; do
+  for check in check_env_credentials check_compose_override check_containers check_http_endpoints \
+    check_databases check_redis check_kafka_topics check_minio_buckets check_disk_usage \
+    check_memory_usage check_kafka_lag check_kafka_broker_cert check_service_error_logs \
+    check_flink_jobs; do
     if ! "$check"; then
       record_result "WARN" "检查项未完成（${check}）" "该项内部命令返回非 0（已继续执行余下检查，stderr 有具体报错行）"
     fi
@@ -619,12 +731,20 @@ main() {
 
   env_file="${ENV_FILE_ARG:-${HUNTER_ENV_FILE:-${APP_DIR}/.env}}"
   if [ -f "$env_file" ]; then
-    load_env "$env_file" >/dev/null 2>&1 || log_warn "加载 ${env_file} 失败：使用内置默认值"
+    # ℞ V1.19.13：不再把加载失败归成一句会被 tail 掉、也不进健康项的 log_warn：
+    #   [ -f ] 只看目录权限，.env（600）对非 root 照样“存在”，但 source 会因 EACCES 失败。
+    #   load_env 现在自己区分“不可读”与“语法错”，故不再吞掉它的输出
+    if ! load_env "$env_file"; then
+      log_error "承上：口令类探针本轮不可信，请改用 sudo bash scripts/health-check.sh"
+    fi
   else
-    log_warn ".env 不存在（${env_file}）：使用内置默认值（口令类探针可能失败）"
+    log_warn ".env 不存在（${env_file}）：使用内置默认值（口令类探针会失败）"
   fi
   HUNTER_ENV_FILE="$env_file"
   export HUNTER_ENV_FILE
+  # 口令类变量实际取值情况（供 ⓪ 环境凭据项与各探针降级使用）
+  CREDS_MISSING="$(env_creds_missing 2>/dev/null || printf '')"
+  export CREDS_MISSING
 
   log_info "===== HunterCore 全栈健康检查（开始：$(date '+%Y-%m-%d %H:%M:%S')）====="
   health_init_counters

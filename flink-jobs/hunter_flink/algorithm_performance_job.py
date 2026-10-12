@@ -26,6 +26,7 @@ from typing import Any
 
 from hunter_common.database.enums import MetricModule
 
+from hunter_flink.checkpointing import enable_checkpointing
 from hunter_flink.job_conn import apply_kafka_properties, kafka_sasl_properties
 from hunter_flink.thresholds import AlertThresholds
 
@@ -213,6 +214,9 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
             return [json.dumps(item, ensure_ascii=False) for item in metrics]
 
     env = StreamExecutionEnvironment.get_execution_environment()
+    # 检查点（V1.19.15）：不开则本组永无提交位点（详见 hunter_flink.checkpointing 模块头）；
+    # 本作业的 60s 窗口缓冲是算子内状态，同时也只有开检查点才能在失败恢复时不丢已完成窗口。
+    enable_checkpointing(env)
     # SASL 属性随作业图下发（与 detection_job 同一套变量/语义，见 hunter_flink.job_conn）
     sasl_props = kafka_sasl_properties()
     source_builder = apply_kafka_properties(

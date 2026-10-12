@@ -101,16 +101,19 @@ class DashboardService:
 
     async def _pipeline_block(self, start: float, end: float) -> PipelineStats:
         """管道块：遥测样本数 + 消费组滞后 + DLQ 水位 + 入库延迟 P95（任一不可用仅降级该字段）。"""
-        points, lag, dlq, latency = await asyncio.gather(
+        points, lag_probe, dlq, latency = await asyncio.gather(
             self._pipeline.telemetry_points(start, end),
             self._pipeline.consumer_lag(),
             self._pipeline.dlq_depth(),
             self._pipeline.ingest_latency_p95(),
         )
+        # ℞ V1.19.14：探测侧已把「组不存在 / 无提交位点」从 lag 映射里剔出，此处只负责原样透出；
+        #   lag_probe is None 才是「Kafka 整体不可达」（走降级），与「读不到位点」不是同一回事。
+        lag_map, unknown_groups = lag_probe if lag_probe is not None else ({}, [])
         reasons: list[str] = []
         if points is None:
             reasons.append("database unavailable")
-        if lag is None or dlq is None:
+        if lag_probe is None or dlq is None:
             reasons.append("kafka unavailable")
         # latency 为可选指标（Flink 入库延迟作业未产出/键过期时为 None）：不计入降级理由
         return PipelineStats(
@@ -118,7 +121,8 @@ class DashboardService:
             reason="; ".join(dict.fromkeys(reasons)) if reasons else None,
             telemetry_points=points,
             ingest_latency_ms_p95=latency,
-            kafka_consumer_lag=lag or {},
+            kafka_consumer_lag=lag_map,
+            unknown_groups=unknown_groups,
             dlq_messages=dlq or {},
         )
 

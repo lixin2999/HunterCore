@@ -102,8 +102,10 @@ export interface PipelineStats {
   telemetry_points?: number
   /** 入库延迟 P95（SLO ≤ 1s） */
   ingest_latency_ms_p95?: number | null
-  /** Kafka consumer lag（按 topic/partition） */
-  kafka_consumer_lag?: Record<string, unknown>
+  /** Kafka consumer lag（仅包含确有提交位点的组，V1.19.14） */
+  kafka_consumer_lag?: Record<string, number>
+  /** 无法确定滞后的消费组（不存在 / 无位点 / 水位不可取）——不在 lag 映射里，不得当零积压 */
+  unknown_groups?: string[]
   dlq_messages?: Record<string, unknown>
 }
 

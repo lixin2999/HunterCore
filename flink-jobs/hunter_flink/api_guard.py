@@ -41,6 +41,7 @@ API_WHITELIST: dict[str, dict[str, tuple[str, ...]]] = {
             "get_execution_environment",
             "from_source",
             "execute",
+            "enable_checkpointing",  # V1.19.15：位点只在检查点提交，三个作业都必须开
         ),
     },
     "pyflink.datastream.data_stream": {
