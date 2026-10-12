@@ -1,7 +1,7 @@
 """``driving_anomaly_detection``（6.2.2 异常驾驶检测）Flink 2.1 作业入口。
 
 拓扑（契约 x-hunter-realtime-jobs）：
-    Kafka telemetry_clean（group=data-analytics-telemetry）
+    Kafka telemetry_clean（group=data-analytics-telemetry-alert）
       → keyBy(vehicle_id) → VehicleAnomalyTracker（单车状态算子，无平行倾斜）
       → build_alert + JSON 序列化 → Kafka alert_event（key=vehicle_id）
 
@@ -31,7 +31,10 @@ from hunter_flink.thresholds import AlertThresholds
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 INPUT_TOPIC = "telemetry_clean"
 OUTPUT_TOPIC = "alert_event"
-CONSUMER_GROUP = "data-analytics-telemetry"
+# 一组一作业（V1.19.10）：原与 algorithm_performance_job 共用 data-analytics-telemetry，两个独立
+# KafkaConsumer 共用 group.id 会使提交位点互相覆盖（LAG 监控失真、冷启动起点被带偏），若分区交由
+# broker 分配则两作业各只拿到一半分区。现已拆组；契约对应 consumer-groups.yaml 的同名条目。
+CONSUMER_GROUP = "data-analytics-telemetry-alert"
 
 
 def expand_alerts(

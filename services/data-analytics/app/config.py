@@ -116,10 +116,17 @@ class Settings(HunterBaseConfig):
     # 事件类型分布抓取条数上限（≤200，与 BaseRepository.MAX_PAGE_SIZE 对齐）
     dashboard_event_fetch_size: int = 200
 
-    # ---------- Kafka 管道健康（x-hunter-kafka.groups / topics，命名不可更改） ----------
+    # ---------- Kafka 管道健康（组名唯一来源：contracts/kafka/consumer-groups.yaml） ----------
+    # ℞ V1.19.11：原默认值的六个组名（analytics-stream-consumer / alert-engine-consumer / ota-status-consumer /
+    #   telemetry-clean-group / telemetry-raw-failure-group / corner-case-miner-consumer）**在契约里全都不存在**。
+    #   Kafka 对不存在的组 list_consumer_group_offsets 返回**空分区列表而不报错**，KafkaLagProbe._lag_sync
+    #   遂逐组算得 total_lag=0 并正常返回 ⇒ 看板 pipeline 块长期显示“六个组全部 0 延迟”的**假绿**：
+    #   监控的是幽灵组，真实积压永远看不见。现改为契约中**已交付/部分交付**的 data-analytics 组
+    #   （占位组 -state/-collision 不列入，避免只刷 consumer_group_offset_fetch_failed 日志）；
+    #   与 consumer-groups.yaml 的 status 逐项比对由契约用例强制，**新增作业上线时必须同步本清单**。
     kafka_consumer_groups: str = (
-        "analytics-stream-consumer,alert-engine-consumer,ota-status-consumer,"
-        "telemetry-clean-group,telemetry-raw-failure-group,corner-case-miner-consumer"
+        "data-analytics-telemetry-alert,data-analytics-telemetry-algo,"
+        "data-analytics-telemetry-raw,data-analytics-algorithm-metrics"
     )
     dlq_topic: str = "dead_letter_queue"
 
@@ -154,7 +161,7 @@ class Settings(HunterBaseConfig):
 
     @property
     def kafka_consumer_group_list(self) -> list[str]:
-        """消费组清单（契约 x-hunter-kafka.groups，顺序无关）。"""
+        """消费组清单（来源 contracts/kafka/consumer-groups.yaml，顺序无关；见上方 ℞ 注释）。"""
         return [group.strip() for group in self.kafka_consumer_groups.split(",") if group.strip()]
 
     def estimated_ready_seconds(self, report_type: str) -> int | None:

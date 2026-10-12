@@ -1465,7 +1465,8 @@ x-hunter-service:
     - KAFKA_CONSUMER_TOPIC_TELEMETRY_RAW
     - KAFKA_CONSUMER_TOPIC_EVENT_RAW
     - KAFKA_CONSUMER_TOPIC_SENSOR_FILE
-    - KAFKA_CONSUMER_GROUP_TELEMETRY
+    # ℞ V1.19.10：删除 KAFKA_CONSUMER_GROUP_TELEMETRY（原 data-analytics-telemetry 已拆为四组，
+    #   且服务代码不读该变量）；Flink 作业消费组以 contracts/kafka/consumer-groups.yaml 为单一事实来源
     - KAFKA_CONSUMER_GROUP_TELEMETRY_RAW
     - KAFKA_CONSUMER_GROUP_EVENTS
     - KAFKA_CONSUMER_GROUP_SENSOR_FILE
@@ -1578,9 +1579,20 @@ x-hunter-realtime-jobs:
   source: "设计文档 6.2 节（Flink 实时分析任务：车辆状态监控 / 异常驾驶检测 / 算法性能监控 / 碰撞风险评估 / 数据质量监控）"
   engine: "Flink 2.1（DataStream API，作业目录 flink-jobs/）"  # V1.19.5：随镜像基座 1.18.1 → 2.1.1（对齐 Python 3.12 基线）
   input:
+    # ℞ V1.19.10：一个 group_id 只承载一个作业（共用 group 会使提交位点互相覆盖、也可能被 broker 拆分
+    #   分区）；四个作业同订阅 telemetry_clean 但各用自己的组。详见 contracts/kafka/consumer-groups.yaml 同注。
     - topic: telemetry_clean
-      consumer_group: data-analytics-telemetry
-      jobs: [vehicle_state_monitor, driving_anomaly_detection, collision_risk_assessment, algorithm_performance_monitor]
+      consumer_group: data-analytics-telemetry-state
+      jobs: [vehicle_state_monitor]
+    - topic: telemetry_clean
+      consumer_group: data-analytics-telemetry-alert
+      jobs: [driving_anomaly_detection]
+    - topic: telemetry_clean
+      consumer_group: data-analytics-telemetry-collision
+      jobs: [collision_risk_assessment]
+    - topic: telemetry_clean
+      consumer_group: data-analytics-telemetry-algo
+      jobs: [algorithm_performance_monitor]
     - topic: telemetry_raw
       consumer_group: data-analytics-telemetry-raw
       jobs: [data_quality_monitor]
@@ -2065,10 +2077,28 @@ x-hunter-rate-limits:
 x-hunter-kafka:
   source: "contracts/kafka/{topics,consumer-groups}.yaml（双向一致，禁止另立事实来源）"
   consumes:
+    # ℞ V1.19.10：telemetry_clean 由四个作业**各自一个组**消费（原单组 data-analytics-telemetry 已拆）
     - topic: telemetry_clean
-      group_id: data-analytics-telemetry
+      group_id: data-analytics-telemetry-state
       schema: contracts/kafka/schemas/telemetry.schema.json
-      jobs: [vehicle_state_monitor, driving_anomaly_detection, collision_risk_assessment, algorithm_performance_monitor]
+      jobs: [vehicle_state_monitor]
+      enabled: false
+      reason: "作业尚未实现（占位），组存在但不启用"
+    - topic: telemetry_clean
+      group_id: data-analytics-telemetry-alert
+      schema: contracts/kafka/schemas/telemetry.schema.json
+      jobs: [driving_anomaly_detection]
+      enabled: true
+    - topic: telemetry_clean
+      group_id: data-analytics-telemetry-collision
+      schema: contracts/kafka/schemas/telemetry.schema.json
+      jobs: [collision_risk_assessment]
+      enabled: false
+      reason: "作业尚未实现（占位），组存在但不启用"
+    - topic: telemetry_clean
+      group_id: data-analytics-telemetry-algo
+      schema: contracts/kafka/schemas/telemetry.schema.json
+      jobs: [algorithm_performance_monitor]
       enabled: true
     - topic: telemetry_raw
       group_id: data-analytics-telemetry-raw
@@ -2212,6 +2242,7 @@ x-hunter-pending-confirmation:
     - id: 12
       question: "consumer-groups.yaml 的 data-analytics 消费组契约修正（原 data-analytics-telemetry 订阅 telemetry_raw 且声明生产 telemetry_clean，与 topics.yaml「telemetry_clean 生产者 = data-collector」冲突；原 data-analytics-telemetry-clean 与之重复消费同一 Topic）"
       contract_decision: "按 6.2 节作业输入归并为 4 组：telemetry_clean → data-analytics-telemetry（4 作业）、telemetry_raw → data-analytics-telemetry-raw（数据质量监控）、event_raw → data-analytics-events、sensor_file → data-analytics-sensor-file；不再声明本服务生产 telemetry_clean"
+      contract_revision: "V1.19.10 续修：上述“telemetry_clean → 单组 4 作业”不成立（Kafka 的 group.id 是提交位点的命名空间，不是逻辑标签），已拆为 data-analytics-telemetry-{state,alert,collision,algo} 四组、一组一作业；本条其余归并结论不变"
       impact: "实时分析作业的 Topic 订阅与消费位点（独立 offset 才可对比原始/清洗数据）；若设计文档另有归属（如 data-analytics 负责清洗）需回改 topics.yaml 与两侧契约"
 
     - id: 13

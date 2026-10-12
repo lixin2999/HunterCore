@@ -2,7 +2,7 @@
 # HunterCore Kafka 消费者组契约
 # 来源：系统上下文基座（Kafka Topic 表）+ 服务职责（模块划分表）
 # 命名规范：<service-name>-<domain>[-<purpose>]，全小写中划线分隔
-#   - 每个 (服务, 数据域) 一个消费组，保证各域 offset 独立、互不阻塞
+#   - 一个消费组只承载**一个作业/消费任务**（V1.19.10 确立；原「每个 (服务, 数据域) 一组」会让同域多作业挤到一组）
 #   - 车端按 vehicle_id 哈希分区，同一消费组内单车辆消息严格有序
 # ⚠ 需核对：消费组命名规范与「上层业务 / 告警处理」消费方的落位服务（设计文档 5.3 节未给出）
 # =====================================================================
@@ -54,19 +54,55 @@ groups:
   #   x-hunter-pending-confirmation）：原 data-analytics-telemetry 订阅 telemetry_raw 且声明「生产 telemetry_clean」，
   #   与 topics.yaml（telemetry_clean 生产者 = data-collector）冲突；且原 data-analytics-telemetry-clean 与之重复消费。
   #   现按设计文档 6.2 节作业输入归并为 4 组：清洗后遥测承担 4 个作业，原始遥测仅数据质量监控（对比丢包率）。
-  - group_id: data-analytics-telemetry
+  # ℞ V1.19.10 契约修正：**一个 group_id 只允许承载一个作业**（原 data-analytics-telemetry 同时挂 4 个作业）。
+  #   根因：Kafka 的 group.id 是**消费进度（committed offset）的命名空间**，而非逻辑分组标签。两个独立作业
+  #   （各自的 KafkaConsumer 实例）共用同一 group 时：① 提交位点互相覆盖 → 组 LAG 监控失真、冷启动
+  #   committed_offsets(EARLIEST) 的起点可能被另一作业带偏；② 若分区分配交由 broker，则两作业**各只拿到
+  #   一半分区**（数据被静默切分，告警覆盖面腰斩且无任何报错）。两者都是“运行中但结果错”的不可接受形态。
+  #   逻辑归属仍靠 group_id 后缀与 service/engine 字段体现；新增作业必须新开一组，不得复用现有 group_id。
+  - group_id: data-analytics-telemetry-state
     service: data-analytics
     subscribes: [telemetry_clean]
-    produces: [alert_event, analytics_result, algorithm_metrics]
-    engine: Flink 2.1 (DataStream)          # 引擎版本与镜像基座同源（V1.19.5：1.18.1 → 2.1.1，为对齐 Python 3.12 基线）
-    jobs:
-      - vehicle_state_monitor            # 6.2.1 心跳/状态变更 → communication_loss
-      - driving_anomaly_detection        # 6.2.2 急加速/急减速/急转弯/超速/低电量
-      - collision_risk_assessment        # 6.2.3 TTC 计算 → collision_warning
-      - algorithm_performance_monitor    # 6.2.4 感知帧率/规划延迟/控制误差 → algorithm_metrics（投 Kafka，不直连库 G-13）
+    produces: [alert_event, analytics_result]
+    engine: Flink 2.1 (DataStream)
+    jobs: [vehicle_state_monitor]      # 6.2.1 心跳/状态变更 → communication_loss
     idempotency_key: "(vehicle_id, time)"
     target_latency: "实时告警触发 ≤ 2s"
-    notes: "实时流处理：阈值取 contracts/database/enums.md 第 3 节，不可放宽（禁止自行新增/改等级）；算法指标经 algorithm_metrics Topic 投递，由 data-analytics-algorithm-metrics 组落库"
+    status: 占位（待实现）
+    notes: "原 data-analytics-telemetry 拆分而来（V1.19.10）；阈值取 contracts/database/enums.md 第 3 节，不可放宽"
+
+  - group_id: data-analytics-telemetry-alert
+    service: data-analytics
+    subscribes: [telemetry_clean]
+    produces: [alert_event]
+    engine: Flink 2.1 (DataStream)          # 引擎版本与镜像基座同源（V1.19.5：1.18.1 → 2.1.1，为对齐 Python 3.12 基线）
+    jobs: [driving_anomaly_detection]  # 6.2.2 急加速/急减速/急转弯/超速/低电量
+    idempotency_key: "(vehicle_id, time)"
+    target_latency: "实时告警触发 ≤ 2s"
+    status: 已交付（flink-jobs/hunter_flink/detection_job.py）
+    notes: "原 data-analytics-telemetry 拆分而来（V1.19.10）；实现侧常量 CONSUMER_GROUP 与本组名逐项比对（flink-jobs 契约用例）"
+
+  - group_id: data-analytics-telemetry-collision
+    service: data-analytics
+    subscribes: [telemetry_clean]
+    produces: [alert_event, analytics_result]
+    engine: Flink 2.1 (DataStream)
+    jobs: [collision_risk_assessment]  # 6.2.3 TTC 计算 → collision_warning
+    idempotency_key: "(vehicle_id, time)"
+    target_latency: "实时告警触发 ≤ 2s"
+    status: 占位（待实现）
+    notes: "原 data-analytics-telemetry 拆分而来（V1.19.10）"
+
+  - group_id: data-analytics-telemetry-algo
+    service: data-analytics
+    subscribes: [telemetry_clean]
+    produces: [algorithm_metrics]
+    engine: Flink 2.1 (DataStream)
+    jobs: [algorithm_performance_monitor]   # 6.2.4 感知帧率/规划延迟/控制误差→algorithm_metrics（投 Kafka，不直连库 G-13）
+    idempotency_key: "(vehicle_id, time)"
+    target_latency: "实时告警触发 ≤ 2s"
+    status: 已交付（flink-jobs/hunter_flink/algorithm_performance_job.py）
+    notes: "原 data-analytics-telemetry 拆分而来（V1.19.10）；算法指标经 algorithm_metrics Topic 投递，由 data-analytics-algorithm-metrics 组落库"
 
   - group_id: data-analytics-algorithm-metrics
     service: data-analytics
@@ -75,6 +111,7 @@ groups:
     writes: [data_analytics.algorithm_metrics]
     engine: "data-analytics 常驻 Kafka 消费者（非 Flink；经 AlgorithmMetricRepository 写会话）"
     idempotency_key: "(vehicle_id, time, module, metric_name)"
+    status: 已交付（services/data-analytics/app/consumers/algorithm_metrics.py AlgorithmMetricsConsumer）
     notes: "消费 Flink algorithm_performance_monitor 产出的 algorithm_metrics Topic，批量落 data_analytics.algorithm_metrics（ON CONFLICT DO NOTHING，写自身 schema 非跨库越界）；运营看板 algorithm 块契约数据源"
 
   - group_id: data-analytics-telemetry-raw
@@ -84,6 +121,7 @@ groups:
     engine: Flink 2.1 (DataStream)
     jobs: [data_quality_monitor]
     idempotency_key: "(vehicle_id, time)"
+    status: 部分交付（flink-jobs/hunter_flink/ingest_latency_job.py，仅 6.2.5 的「入库延迟」子项；丢包率/异常值占比待实现）
     notes: "6.2.5 数据质量监控：消费原始遥测统计丢包率/延迟/异常值 → analytics_result(result_type=metric)；需与 telemetry_clean 独立 offset 才可对比"
 
   - group_id: data-analytics-events

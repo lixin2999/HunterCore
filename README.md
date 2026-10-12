@@ -477,9 +477,9 @@ python scripts/verify_test_layer.py
 | 测试层自检 | `python scripts/verify_test_layer.py`（标记/阈值来源/模板占位符/用例号） |
 | 基础设施健康 | `docker compose ps` |
 | TimescaleDB 扩展 | `docker exec hunter-postgres psql -U hunter -d hunter_core -c "SELECT extname FROM pg_extension WHERE extname='timescaledb';"` |
-| Kafka 平台内部 Topic | `docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list` |
+| Kafka 平台内部 Topic | `docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --command-config /tmp/hunter-client.properties --list`（内部监听 9092 为 SASL_PLAINTEXT，**缺 `--command-config` 会报 `Timed out waiting for a node assignment`**；参数生成见 `scripts/common.sh` 的 `kafka_tool_cli`） |
 | MinIO Bucket | 浏览器打开 `http://localhost:9001`（7 个 Bucket：hunter-raw-data / rosbag / video / ota-packages / reports / logs / scene-assets） |
-| Redis | `docker exec hunter-redis redis-cli ping` |
+| Redis | `bash scripts/health-check.sh`（看 Redis 行。⚠ 开了 `requirepass`，裸 `redis-cli ping` 只会回 `NOAUTH`；直接取键值的完整命令见运维手册 §3.6） |
 | 共享库测试 | `pytest common/python/tests -q` |
 | 数据层契约校验 | `python scripts/verify_data_layer.py`（DDL ↔ ORM ↔ Alembic + Kafka Topic/JSON Schema + Redis Key + MinIO + Repository 专属方法双向一致 + 服务→Repository 白名单 + 写路径纪律声明，34 项） |
 | 存储契约单元测试 | `pytest common/python/tests/test_storage_contracts.py -q`（Redis Key / MinIO Bucket ↔ 服务声明 ↔ 初始化脚本，9 项） |

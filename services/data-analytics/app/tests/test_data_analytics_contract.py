@@ -30,6 +30,7 @@ from hunter_common.database.enums import EVENT_LEVEL_BY_TYPE, EventLevel, EventT
 from hunter_common.database.repository import MAX_PAGE_SIZE
 from hunter_common.exceptions import ErrorCode
 
+from app.config import Settings
 from app.core.error_handlers import HTTP_STATUS_BY_CODE
 from app.main import app
 
@@ -451,7 +452,9 @@ def test_realtime_job_inputs_match_consumer_groups(contract: dict[str, Any]) -> 
         for group in load_yaml(CONSUMER_GROUPS)["groups"]
         if group["service"] == "data-analytics"
     }
-    assert len(groups) == 5, f"data-analytics 消费组数量异常: {sorted(groups)}"
+    # ℞ V1.19.10：原单组 data-analytics-telemetry（1 组挂 4 作业）已拆为 4 个独立组，
+    #   telemetry_clean 侧 -state/-alert/-collision/-algo + 未动的 -raw/-algorithm-metrics/-events/-sensor-file = 8
+    assert len(groups) == 8, f"data-analytics 消费组数量异常: {sorted(groups)}"
     for entry in realtime["input"]:
         group = groups[entry["consumer_group"]]
         assert group["subscribes"] == [entry["topic"]]
@@ -463,12 +466,31 @@ def test_realtime_job_inputs_match_consumer_groups(contract: dict[str, Any]) -> 
         assert "telemetry_clean" not in group["produces"], (
             "telemetry_clean 生产者为 data-collector（topics.yaml），data-analytics 不得声明生产"
         )
-    assert set(groups["data-analytics-telemetry"]["jobs"]) == {
+    # ℞ V1.19.10 一组一作业：Kafka 的 group.id 是提交位点（committed offset）的命名空间，
+    #   不是逻辑归属标签。两个独立作业共用组时位点互相覆盖（LAG 失真、冷启动起点被带偏），
+    #   分区交由 broker 分配时更会各只拿到一半分区且不报错——故硬性固化下述三条不变式。
+    clean_groups = {
+        gid: group for gid, group in groups.items() if group["subscribes"] == ["telemetry_clean"]
+    }
+    assert set(clean_groups) == {
+        "data-analytics-telemetry-state",
+        "data-analytics-telemetry-alert",
+        "data-analytics-telemetry-collision",
+        "data-analytics-telemetry-algo",
+    }, f"telemetry_clean 消费组拆分异常: {sorted(clean_groups)}"
+    for gid, group in clean_groups.items():
+        assert len(group["jobs"]) == 1, f"{gid} 承载多个作业，违反一组一作业: {group['jobs']}"
+    assert {group["jobs"][0] for group in clean_groups.values()} == {
         "vehicle_state_monitor",
         "driving_anomaly_detection",
         "collision_risk_assessment",
         "algorithm_performance_monitor",
     }
+    # 契约 status 与实现状态可追溯：已交付组必须点名作业文件
+    for gid, group in clean_groups.items():
+        status = str(group.get("status", ""))
+        if status.startswith("已交付"):
+            assert "flink-jobs/hunter_flink/" in status, f"{gid} 已交付但未点名实现文件: {status}"
 
 
 def test_driving_anomaly_rules_match_event_contract(contract: dict[str, Any]) -> None:
@@ -842,7 +864,11 @@ def test_kafka_participation_matches_contracts(contract: dict[str, Any]) -> None
     for entry in kafka["consumes"]:
         assert entry["topic"] in platform, entry["topic"]
         assert (ROOT / entry["schema"]).is_file(), entry["schema"]
-        assert entry["enabled"] is True
+        # ℞ V1.19.10：拆组后未实现作业的组仍登记但置 enabled=false（占位），
+        #   不再断言全部 True；但不启用必须给理由，禁止静默消失。
+        assert entry["enabled"] in (True, False), entry["group_id"]
+        if not entry["enabled"]:
+            assert "尚未实现" in str(entry.get("reason", "")), entry["group_id"]
     produced = {entry["topic"] for entry in kafka["produces"]}
     assert produced == {"analytics_result", "alert_event", "algorithm_metrics"}
     for entry in kafka["produces"]:
@@ -865,6 +891,11 @@ def test_kafka_participation_matches_contracts(contract: dict[str, Any]) -> None
             groups[entry["group_id"]]["idempotency_key"]
             == kafka["idempotency_keys"][entry["topic"]]
         )
+    # enabled 必须与 consumer-groups.yaml 的 status 逐项一致（单一事实来源不得两处各自声明）
+    for entry in kafka["consumes"]:
+        status = str(groups[entry["group_id"]].get("status", ""))
+        if status:
+            assert entry["enabled"] is status.startswith(("已交付", "部分交付")), entry["group_id"]
     result_schema = load_json(SCHEMA_DIR / "analytics_result.schema.json")
     assert "metric" in result_schema["properties"]["result_type"]["enum"]
 
@@ -921,6 +952,42 @@ def test_required_env_keys_are_wired(contract: dict[str, Any]) -> None:
     offline_envs = [job["schedule"]["env"] for job in contract["x-hunter-offline-jobs"]["jobs"]]
     for name in list(EXPECTED_REALTIME_THRESHOLDS) + offline_envs:
         assert name in service_config, f"ConfigMap 缺少 {name}"
+
+
+def test_kafka_lag_probe_monitors_real_contract_groups() -> None:
+    """看板 pipeline 的 LAG 探测清单必须 == 契约中已交付/部分交付的 data-analytics 消费组（V1.19.11）。
+
+    臆造组名不会报错：Kafka 对不存在的组 ``list_consumer_group_offsets`` 返回**空分区列表**，
+    探测会把这些组一律读成 0 延迟（假绿），所以必须做集合级强绑定——契约新增已交付组
+    而本清单未同步时直接红。
+    """
+    default = Settings.model_fields["kafka_consumer_groups"].default
+    monitored = [item.strip() for item in str(default).split(",") if item.strip()]
+    groups = {
+        group["group_id"]: group
+        for group in load_yaml(CONSUMER_GROUPS)["groups"]
+        if group["service"] == "data-analytics"
+    }
+    delivered = {
+        gid
+        for gid, group in groups.items()
+        if str(group.get("status", "")).startswith(("已交付", "部分交付"))
+    }
+    assert set(monitored) == delivered, (
+        f"LAG 探测清单与契约不一致：缺 {sorted(delivered - set(monitored))}，"
+        f"多 {sorted(set(monitored) - delivered)}"
+    )
+    assert len(monitored) == len(set(monitored)), "LAG 探测清单存在重复组名"
+    # 历史上的臆造名（从未出现在任何契约中）不得残留
+    ghost = {
+        "analytics-stream-consumer",
+        "alert-engine-consumer",
+        "ota-status-consumer",
+        "telemetry-clean-group",
+        "telemetry-raw-failure-group",
+        "corner-case-miner-consumer",
+    }
+    assert not ghost & set(monitored), f"LAG 探测仍监控契约外的幽灵消费组: {sorted(ghost & set(monitored))}"
 
 
 def test_k8s_manifest_matches_service_meta(contract: dict[str, Any]) -> None:

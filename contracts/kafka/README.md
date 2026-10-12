@@ -38,16 +38,23 @@ Topic 命名规范：`<domain>.<entity>.<type>`，全小写，点分隔；车端
 
 ## data-analytics 消费组（6.2 节实时作业输入，⚠ 契约修正已登记）
 
-| 消费组 | 订阅 Topic | 作业 | 输出 |
-|--------|-----------|------|------|
-| `data-analytics-telemetry` | `telemetry_clean` | 车辆状态监控 / 异常驾驶检测 / 碰撞风险评估 / 算法性能监控 | `alert_event` + `analytics_result` + `algorithm_metrics` |
-| `data-analytics-telemetry-raw` | `telemetry_raw` | 数据质量监控 | `analytics_result`（指标） |
-| `data-analytics-events` | `event_raw` | 事件统计 / Corner Case 挖掘 | `analytics_result` |
-| `data-analytics-sensor-file` | `sensor_file` | 感知精度评估输入 | `analytics_result` |
+> **一组一作业**（V1.19.10）：`group.id` 是提交位点的命名空间，不是逻辑归属标签——一个组只能承载一个作业。
 
-> 原 `data-analytics-telemetry` 订阅 `telemetry_raw` 且声明生产 `telemetry_clean`（与 topics.yaml 冲突）、
+| 消费组 | 订阅 Topic | 作业 | 输出 | 状态 |
+|--------|-----------|------|------|------|
+| `data-analytics-telemetry-state` | `telemetry_clean` | 车辆状态监控 | `alert_event` + `analytics_result` | 占位 |
+| `data-analytics-telemetry-alert` | `telemetry_clean` | 异常驾驶检测 | `alert_event` | 已交付 |
+| `data-analytics-telemetry-collision` | `telemetry_clean` | 碰撞风险评估 | `alert_event` + `analytics_result` | 占位 |
+| `data-analytics-telemetry-algo` | `telemetry_clean` | 算法性能监控 | `algorithm_metrics` | 已交付 |
+| `data-analytics-telemetry-raw` | `telemetry_raw` | 数据质量监控 | `analytics_result`（指标） | 部分交付（入库延迟子项） |
+| `data-analytics-algorithm-metrics` | `algorithm_metrics` | 算法指标落库（常驻消费者，非 Flink） | 写 `data_analytics.algorithm_metrics` | 已交付 |
+| `data-analytics-events` | `event_raw` | Corner Case 挖掘 | `analytics_result` | 占位 |
+| `data-analytics-sensor-file` | `sensor_file` | 感知精度评估输入 | `analytics_result` | 占位 |
+
+> 历史修正两层：① 原 `data-analytics-telemetry` 订阅 `telemetry_raw` 且声明生产 `telemetry_clean`（与 topics.yaml 冲突）、
 > 原 `data-analytics-telemetry-clean` 与之重复消费，均由 data-analytics 契约 Step 1 归并修正
-> （见 `contracts/openapi/data-analytics.yaml` 的 `x-hunter-pending-confirmation` #12）。
+> （见 `contracts/openapi/data-analytics.yaml` 的 `x-hunter-pending-confirmation` #12）；
+> ② V1.19.10 再把归并后的单组 `data-analytics-telemetry`（1 组 4 作业）拆为 `-state`/`-alert`/`-collision`/`-algo`。
 
 ## 一致性校验（必须保持同步的 5 处）
 

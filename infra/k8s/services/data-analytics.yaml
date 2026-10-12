@@ -17,12 +17,15 @@ data:
   DB_MAX_OVERFLOW: "5"
   # Flink 2.1 实时作业（flink-jobs/ 目录作业提交目标）
   FLINK_JOBMANAGER_URL: "http://flink-jobmanager.hunter-core.svc.cluster.local:8081"
-  # 实时分析输入 Topic 与消费组（contracts/kafka/consumer-groups.yaml，禁止自行更改）
+  # 实时分析输入 Topic（contracts/kafka/consumer-groups.yaml，禁止自行更改）
+  # ℞ V1.19.10：删除原 KAFKA_CONSUMER_GROUP_TELEMETRY: data-analytics-telemetry——该组已拆为
+  #   telemetry-{state,alert,collision,algo} 四组，且本服务代码不读该变量（只读 KAFKA_CONSUMER_GROUPS 逗号清单）。
+  #   **Flink 作业的消费组 以 contracts/kafka/consumer-groups.yaml 为唯一事实来源**，实现侧常量在各作业文件的
+  #   CONSUMER_GROUP（由 flink-jobs/tests/test_consumer_group_contract.py 逐项比对），不在此重复登记。
   KAFKA_CONSUMER_TOPIC_TELEMETRY_CLEAN: "telemetry_clean"
   KAFKA_CONSUMER_TOPIC_TELEMETRY_RAW: "telemetry_raw"
   KAFKA_CONSUMER_TOPIC_EVENT_RAW: "event_raw"
   KAFKA_CONSUMER_TOPIC_SENSOR_FILE: "sensor_file"
-  KAFKA_CONSUMER_GROUP_TELEMETRY: "data-analytics-telemetry"
   KAFKA_CONSUMER_GROUP_TELEMETRY_RAW: "data-analytics-telemetry-raw"
   KAFKA_CONSUMER_GROUP_EVENTS: "data-analytics-events"
   KAFKA_CONSUMER_GROUP_SENSOR_FILE: "data-analytics-sensor-file"

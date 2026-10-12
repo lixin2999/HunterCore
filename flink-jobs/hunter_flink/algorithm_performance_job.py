@@ -34,8 +34,10 @@ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
 #: 输出 Topic（契约 topics.yaml platform_topics；与 data-analytics 消费者一致）
 OUTPUT_TOPIC = "algorithm_metrics"
-#: 消费组（契约 consumer-groups.yaml：Flink 组，produces algorithm_metrics）
-CONSUMER_GROUP = "data-analytics-telemetry"
+#: 消费组（契约 consumer-groups.yaml：一组一作业，V1.19.10；produces algorithm_metrics）
+# 原与 detection_job 共用 data-analytics-telemetry，已拆为独立组（共用会使两侧
+# 提交位点互相覆盖，且可能由 broker 把 12 个分区拆给两个作业）。
+CONSUMER_GROUP = "data-analytics-telemetry-algo"
 #: 输入 Topic（清洗后遥测）
 INPUT_TOPIC = "telemetry_clean"
 
@@ -180,7 +182,7 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
 
     拓扑（契约 x-hunter-realtime-jobs algorithm_performance_monitor）::
 
-        Kafka telemetry_clean（group=data-analytics-telemetry）
+        Kafka telemetry_clean（group=data-analytics-telemetry-algo）
           → keyBy(vehicle_id) → 60s 事件时间滚动窗口聚合（expand_metrics 缓冲）
           → JSON 序列化 → Kafka algorithm_metrics（key=vehicle_id）
 
@@ -220,7 +222,7 @@ def main() -> None:  # pragma: no cover - 需要 PyFlink 运行时，仓库内�
             .set_topics(INPUT_TOPIC)
             .set_group_id(CONSUMER_GROUP)
             # 已提交位点优先，无提交位点回落 earliest（契约 defaults.auto_offset_reset；
-            # 与 detection_job 同组 data-analytics-telemetry，位点共享）
+            # 本组专用，不与 detection_job 互抖位点——V1.19.10 拆组的主要动机）
             .set_starting_offsets(
                 KafkaOffsetsInitializer.committed_offsets(KafkaOffsetResetStrategy.EARLIEST)
             )

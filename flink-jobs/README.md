@@ -7,11 +7,17 @@
 
 | 作业 | 输入（消费组） | 输出 | 说明 | 状态 |
 |------|---------------|------|------|------|
-| `vehicle_state_monitor` | `telemetry_clean`（`data-analytics-telemetry`） | `alert_event` + `algorithm_metrics` | 6.2.1 心跳检测（>10s → `communication_loss`）+ 状态变更检测 | 占位（后续批次） |
-| `driving_anomaly_detection` | `telemetry_clean`（同上） | `alert_event` | 6.2.2 急加速/急减速/急转弯/超速/低电量（阈值 3.0 m/s²、0.5s、0.8 rad/s、1.1 倍、SOC 20%/10%） | **已交付（G-13）**：`hunter_flink/` |
-| `algorithm_performance_monitor` | `telemetry_clean`（同上） | `algorithm_metrics` + `analytics_result` | 感知帧率/延迟、规划延迟、控制误差（60s 滚动窗口） | 占位（后续批次） |
-| `collision_risk_assessment` | `telemetry_clean`（同上） | `alert_event` + `analytics_result` | 6.2.3 TTC = d / v_rel；<1.5s → `collision_warning`(critical) | 占位（后续批次） |
-| `data_quality_monitor` | `telemetry_raw`（`data-analytics-telemetry-raw`） | `analytics_result` | 6.2.5 丢包率/延迟/异常值占比（需与清洗后数据对比） | 占位（后续批次） |
+| `vehicle_state_monitor` | `telemetry_clean`（`data-analytics-telemetry-state`） | `alert_event` + `analytics_result` | 6.2.1 心跳检测（>10s → `communication_loss`）+ 状态变更检测 | 占位（后续批次） |
+| `driving_anomaly_detection` | `telemetry_clean`（`data-analytics-telemetry-alert`） | `alert_event` | 6.2.2 急加速/急减速/急转弯/超速/低电量（阈值 3.0 m/s²、0.5s、0.8 rad/s、1.1 倍、SOC 20%/10%） | **已交付（G-13）**：`hunter_flink/` |
+| `algorithm_performance_monitor` | `telemetry_clean`（`data-analytics-telemetry-algo`） | `algorithm_metrics` | 感知帧率/延迟、规划延迟、控制误差（60s 滚动窗口） | **已交付**：`hunter_flink/` |
+| `collision_risk_assessment` | `telemetry_clean`（`data-analytics-telemetry-collision`） | `alert_event` + `analytics_result` | 6.2.3 TTC = d / v_rel；<1.5s → `collision_warning`(critical) | 占位（后续批次） |
+| `data_quality_monitor` | `telemetry_raw`（`data-analytics-telemetry-raw`） | `analytics_result` + Redis 指标键 | 6.2.5 丢包率/延迟/异常值占比（需与清洗后数据对比） | 部分交付：入库延迟子项 `ingest_latency_job`（G-19） |
+
+> ⚠ **一组一作业**（V1.19.10）：上表五个组是从原单组 `data-analytics-telemetry` 拆出的。Kafka 的
+> `group.id` 是**提交位点的命名空间**，不是逻辑标签：两个独立作业共用一个组时位点会互相覆盖
+> （LAG 监控失真、冷启动 `committed_offsets(EARLIEST)` 起点被另一作业带偏），且若分区分配交由
+> broker，两作业会**各只拿到一半分区且不报错**。新增作业必须新开一组并同步改
+> `contracts/kafka/consumer-groups.yaml` 与 `contracts/openapi/data-analytics.yaml` 两处。
 
 约定：
 
@@ -82,10 +88,21 @@ docker compose -f infra/deploy/docker-compose.yml --project-directory . exec fli
 docker compose -f infra/deploy/docker-compose.yml --project-directory . exec flink-jm \
   flink run -d -m localhost:8081 -pym hunter_flink.detection_job
 # …… algorithm_performance_job / ingest_latency_job 同式各一行
+
+# 出数核验（等 1~2 个 60s 窗口）。⚠ 口令从运行中容器的进程参数取：不解析 .env（引号/CRLF/重复键
+# 都会污染 grep|cut 的结果）、也不依赖 .env 与容器同代（只重建 flink 时口令可能漂移）
+docker exec hunter-redis sh -c 'p=$(tr "\0" "\n" </proc/1/cmdline | grep -A1 -- --requirepass | tail -1); \
+  redis-cli --no-auth-warning -a "$p" GET analytics:ingest_latency'
 ```
 
 ### 纪律与豁免登记
 
+- **取消作业的时机**（V1.19.9）：compose 形态 JM 为 standalone **无 HA**，`up -d --force-recreate flink-jm`
+  会把上一轮作业连内存一起丢掉，**之后**再 `flink cancel <旧 JobID>` 必然刷约 100 行 `FlinkJobNotFoundException`
+  栈（无害但易误判为新故障）。需保留状态就先 `savepoint` 再 cancel 后重建；否则直接 recreate（无需 cancel）。
+- **判“已出数”不看 RUNNING**（V1.19.8 实机教训）：无凭据时作业不会报错、不重启，`flink list` 永远全绿，
+  只是 fetch 不到数据。真判据只有两个：TM 日志里 `security.protocol` / `sasl.mechanism` / `sasl.jaas.config = [hidden]`
+  三行取值齐备，以及上面的产物键有值（完整四步口径见 `docs/故障排查指南.md`）。
 - **写侧豁免**：本目录不是服务、不在 `services/`（verify-14 不扫描），已在
   `contracts/database/orm-mapping.md` §3.5 白名单表书面登记——作业只经 Kafka 写
   `alert_event`，禁止 import 任何服务 `app.*` 包或 `hunter_common.database.repositories`。
@@ -112,6 +129,7 @@ docker compose -f infra/deploy/docker-compose.yml --project-directory . exec fli
      内置镜像**（compose 定义已带 `build: flink-jobs/Dockerfile`，与 K8s 形态单一事实来源；旧官方镜像无
      Python 不能跑作业），`flink-jobs/` 只读挂载保留作应急热替换；书面豁免见 `docs/deployment.md` §12
      （G-13/G-28 决策①）。
-- **K8s 形态待人工确认项**（见 `release.md`）：`hunter-flink/jobs` 镜像仓库推送凭据、Kafka 侧
-  SASL 凭据注入路径（作业当前仅读 `KAFKA_BOOTSTRAP_SERVERS`，走 broker 内部监听）、JM 高可用与
-  checkpoint 持久卷（现为 `emptyDir`）。
+- **K8s 形态待人工确认项**（见 `release.md`）：`hunter-flink/jobs` 镜像仓库推送凭据、JM 高可用与
+  checkpoint 持久卷（现为 `emptyDir`）。（原登记的「Kafka SASL 凭据注入路径缺失」**已于 V1.19.8 关闭**：
+  作业改由 `hunter_flink/job_conn.py` 读 `KAFKA_SECURITY_PROTOCOL|SASL_*`，K8s 侧由 `01-configmap`
+  （非敏感）+ `hunter-app-secrets`（02/03/04 的 `secretRef`）下发；compose 侧 flink-jm/flink-tm 各 9 个 env。）
