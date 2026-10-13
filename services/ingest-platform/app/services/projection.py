@@ -187,15 +187,12 @@ class ProjectionService:
         if float(bag.duration_s) < self._settings.ready_min_duration_s:
             return
 
-        # 创建任务图（§7.1 task_graph 配置模板）
-        task_types = [TaskType.VERIFY, TaskType.ALIGN, TaskType.QC, TaskType.SLICE]
-        if self._settings.enrich_worker_enabled:
-            task_types.append(TaskType.ENRICH)
-
-        for task_type in task_types:
-            created = await task_repo.create(bag_id, input_rev, task_type)
-            if created:
-                logger.info("task_created", bag_id=bag_id, task_type=task_type.value, input_rev=input_rev)
+        # 创建任务图首节点（§7.1：verify_assets after ready）；
+        # 后继 align/qc/slice 由 orchestrator 在前置任务 done 后按依赖序推进（app.services.task_graph），
+        # ENRICH 为 optional 项（M4/M5），worker 未实现前不创建。
+        created = await task_repo.create(bag_id, input_rev, TaskType.VERIFY)
+        if created:
+            logger.info("task_created", bag_id=bag_id, task_type=TaskType.VERIFY.value, input_rev=input_rev)
 
 
 __all__ = ["ProjectionService", "compute_input_rev"]

@@ -1,8 +1,8 @@
 """ingest-platform — FastAPI 应用入口。
 
 车端 rosbag 消费解析与处理平台：
-- 7 个 Kafka 消费者（vehicle.bag.* / vehicle.agent.*）
-- PG advisory lock 单主 orchestrator（align/slice/qc 任务编排）
+- 7 个 Kafka 消费者（vehicle.bag.* / vehicle.agent.*，入口 events 事件仓层1去重）
+- orchestrator（每轮事务内 advisory xact 锁仲裁，verify/align/slice/qc 任务编排，§7.1 依赖序）
 - REST 查询/导出 API（§8.1）
 
 lifespan 装配清单：
@@ -12,7 +12,7 @@ lifespan 装配清单：
 - projection：ProjectionService（§5.2）
 - cmd_service：CmdService（§9.4）
 - dataset_service：DatasetService（§8.2）
-- orchestrator：Orchestrator（§3.1 任务主循环）
+- orchestrator：Orchestrator（§9.1 任务主循环）
 - 7 个 _SupervisedConsumer（崩溃重启）
 """
 from __future__ import annotations
@@ -51,6 +51,7 @@ from app.services.orchestrator import Orchestrator
 from app.services.projection import ProjectionService
 from app.services.qc_worker import QcWorker
 from app.services.slice_worker import SliceWorker
+from app.services.verify_worker import VerifyWorker
 from app.storage.minio_client import LakeStorage
 
 logger = get_logger("app.main")
@@ -108,22 +109,22 @@ def _build_consumers(
 
     if cfg.manifest_consumer_enabled:
         supervisors.append(_SupervisedConsumer(
-            lambda: ManifestConsumer(cfg, projection),
+            lambda: ManifestConsumer(cfg, db_mgr, projection),
             ManifestConsumer.group_id,
         ))
     if cfg.task_status_consumer_enabled:
         supervisors.append(_SupervisedConsumer(
-            lambda: TaskStatusConsumer(cfg, projection),
+            lambda: TaskStatusConsumer(cfg, db_mgr, projection),
             TaskStatusConsumer.group_id,
         ))
     if cfg.parse_progress_consumer_enabled:
         supervisors.append(_SupervisedConsumer(
-            lambda: ParseProgressConsumer(cfg),
+            lambda: ParseProgressConsumer(cfg, db_mgr),
             ParseProgressConsumer.group_id,
         ))
     if cfg.artifact_consumer_enabled:
         supervisors.append(_SupervisedConsumer(
-            lambda: ArtifactConsumer(cfg, projection),
+            lambda: ArtifactConsumer(cfg, db_mgr, projection),
             ArtifactConsumer.group_id,
         ))
     if cfg.heartbeat_consumer_enabled:
@@ -133,12 +134,12 @@ def _build_consumers(
         ))
     if cfg.alert_consumer_enabled:
         supervisors.append(_SupervisedConsumer(
-            lambda: AlertConsumer(cfg),
+            lambda: AlertConsumer(cfg, db_mgr),
             AlertConsumer.group_id,
         ))
     if cfg.cmd_ack_consumer_enabled:
         supervisors.append(_SupervisedConsumer(
-            lambda: CmdAckConsumer(cfg, cmd_service),
+            lambda: CmdAckConsumer(cfg, db_mgr, cmd_service),
             CmdAckConsumer.group_id,
         ))
 
@@ -181,14 +182,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.dataset_service = dataset_service
 
     # ---------- Workers（由 orchestrator 调用，共享服务实例） ----------
+    verify_worker = VerifyWorker(settings, storage, app.state.db)
     align_worker = AlignWorker(settings, storage, app.state.db, producer)
     slice_worker = SliceWorker(settings, storage, app.state.db, producer)
     qc_worker = QcWorker(settings, storage, app.state.db, producer)
 
-    # ---------- Orchestrator（§9.1 单主 + lease 队列） ----------
+    # ---------- Orchestrator（§9.1 事务锁仲裁 + lease 队列 + §7.1 依赖序） ----------
     orchestrator = Orchestrator(
         settings=settings,
         db_session=app.state.db.session_factory,  # session_factory（手动 commit）
+        verify_worker=verify_worker,
         align_worker=align_worker,
         slice_worker=slice_worker,
         qc_worker=qc_worker,

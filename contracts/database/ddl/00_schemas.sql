@@ -21,6 +21,7 @@ CREATE SCHEMA IF NOT EXISTS data_analytics;   -- 分析结果（algorithm_metric
 CREATE SCHEMA IF NOT EXISTS ota_svc;          -- OTA（ota_versions/ota_tasks/ota_records）
 CREATE SCHEMA IF NOT EXISTS remote_control;   -- 预留：操控会话归档（录像落 MinIO hunter-video，Redis 存会话态）
 CREATE SCHEMA IF NOT EXISTS gateway;          -- 预留：网关审计（当前仅 Redis/日志，后续按契约建表）
+CREATE SCHEMA IF NOT EXISTS ingest_platform;  -- 数据消费解析与处理（见 06_ingest_platform.sql）
 
 -- ---------- 公共函数：update_time 自动维护 ----------
 -- 场景等含 create_time/update_time 的表通过触发器维护 update_time，

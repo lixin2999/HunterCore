@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -204,6 +205,11 @@ class LakeStorage:
     def head_parsed(self, key: str) -> ObjectMeta | None:
         """HEAD parsed 层对象；不存在返回 None。"""
         return self._head(self._settings.minio_bucket_parsed, key)
+
+    async def ahead_parsed(self, key: str) -> ObjectMeta | None:
+        """HEAD parsed 层对象（异步：boto3 同步调用投递到线程池，避免阻塞事件循环）。"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self.head_parsed, key)
 
     def head_derived(self, key: str) -> ObjectMeta | None:
         """HEAD derived 层对象。"""

@@ -119,7 +119,8 @@ class Settings(HunterBaseConfig):
     align_worker_enabled: bool = True
     slice_worker_enabled: bool = True
     qc_worker_enabled: bool = True
-    enrich_worker_enabled: bool = True       # 轨迹重建（可选）
+    # 预留：enrich_traj（§7.1 optional，M4/M5）worker 未实现，task_graph 不会创建该类型任务
+    enrich_worker_enabled: bool = False
 
     # ---------- orchestrator 主循环 ----------
     orchestrator_poll_interval_s: float = 2.0

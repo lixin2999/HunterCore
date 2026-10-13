@@ -291,6 +291,9 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
     # 唯一约束在 DDL 中已声明：uq_tasks_bag_type_rev (bag_id, task_type, input_rev)
 
 

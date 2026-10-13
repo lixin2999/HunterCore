@@ -1,6 +1,12 @@
 """任务编排服务（§3.1 orchestrator + §9.1 主循环）。
 
-单主（PG advisory lock 选主），从 tasks 表领取任务并派发给各 worker。
+主仲裁语义：每轮在**单个事务内**用 ``pg_try_advisory_xact_lock`` 争锁，
+抢到锁的进程才执行 claim/lease 回收；提交即释放锁 ⇒ 多实例并发轮询时
+同一时刻至多一个实例在做编排动作，且不存在"连接池里持锁的僵尸会话"。
+锁随事务结束自然释放，进程崩溃/丢锁自动降级为普通轮询参与者（下轮重新争锁）。
+
+任务派发遵循 §7.1 依赖序：前置任务 done 后在同一事务内创建后继任务
+（仅派发给已注册 worker 的类型，ENRICH 等未接入 worker 不创建）。
 """
 from __future__ import annotations
 
@@ -9,16 +15,17 @@ import os
 import socket
 from typing import Any
 
+from hunter_common.logging import get_logger
 from sqlalchemy import text
 
-from hunter_common.logging import get_logger
-
 from app.config import Settings
-from app.models.ingest import Task, TaskState, TaskType
+from app.models.ingest import Task, TaskType
 from app.repositories.tasks import TaskRepository
 from app.services.align_worker import AlignWorker
 from app.services.qc_worker import QcWorker
 from app.services.slice_worker import SliceWorker
+from app.services.task_graph import next_tasks
+from app.services.verify_worker import VerifyWorker
 
 logger = get_logger("app.services.orchestrator")
 
@@ -27,12 +34,13 @@ _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{os.urandom(4).hex()}"
 
 
 class Orchestrator:
-    """orchestrator 主循环（单主 + lease 回收）。"""
+    """orchestrator 主循环（每轮事务争锁 + lease 队列 + 任务图推进）。"""
 
     def __init__(
         self,
         settings: Settings,
         db_session: Any,          # session_factory（async_sessionmaker[AsyncSession]）
+        verify_worker: VerifyWorker,
         align_worker: AlignWorker,
         slice_worker: SliceWorker,
         qc_worker: QcWorker,
@@ -40,15 +48,16 @@ class Orchestrator:
         self._settings = settings
         self._db = db_session
         self._workers: dict[TaskType, Any] = {
+            TaskType.VERIFY: verify_worker,
             TaskType.ALIGN: align_worker,
             TaskType.SLICE: slice_worker,
             TaskType.QC: qc_worker,
         }
         self._running = False
+        #: 上一轮争锁结果（仅用于观测/日志，不作为跳过检查的依据）
         self._is_leader = False
 
     async def start(self) -> None:
-        """尝试获取 advisory lock 成为 leader，然后进入主循环。"""
         self._running = True
         asyncio.create_task(self._main_loop(), name="orchestrator-loop")
         asyncio.create_task(self._lease_gc_loop(), name="lease-gc")
@@ -56,30 +65,20 @@ class Orchestrator:
     async def stop(self) -> None:
         self._running = False
 
-    async def _try_acquire_lock(self) -> bool:
-        """尝试获取 PG advisory lock（§3.2 orchestrator 单主）。"""
-        try:
-            async with self._db() as session:
-                result = await session.execute(
-                    text("SELECT pg_try_advisory_lock(:key)"),
-                    {"key": self._settings.orchestrator_advisory_lock_key},
-                )
-                acquired: bool = bool(result.scalar())
-                if acquired:
-                    logger.info("orchestrator_became_leader")
-                return acquired
-        except Exception as exc:
-            logger.warning("advisory_lock_failed", error=str(exc))
-            return False
+    async def _try_xact_lock(self, session: Any) -> bool:
+        """在当前事务内尝试 advisory xact 锁；返回 False = 本轮未抢到（丢主降级）。"""
+        result = await session.execute(
+            text("SELECT pg_try_advisory_xact_lock(:key)"),
+            {"key": self._settings.orchestrator_advisory_lock_key},
+        )
+        acquired = bool(result.scalar())
+        if acquired and not self._is_leader:
+            logger.info("orchestrator_acquired_round_lock")
+        self._is_leader = acquired
+        return acquired
 
     async def _main_loop(self) -> None:
         while self._running:
-            if not self._is_leader:
-                self._is_leader = await self._try_acquire_lock()
-                if not self._is_leader:
-                    await asyncio.sleep(self._settings.orchestrator_poll_interval_s * 2)
-                    continue
-
             try:
                 await self._process_one_task()
             except Exception:
@@ -87,13 +86,17 @@ class Orchestrator:
             await asyncio.sleep(self._settings.orchestrator_poll_interval_s)
 
     async def _process_one_task(self) -> None:
-        """领取并执行一个任务（§9.1）。"""
+        """事务内争锁 → 领取一个任务；提交释放锁后再执行 worker（§9.1）。"""
+        task: Task | None = None
         async with self._db() as session:
+            if not await self._try_xact_lock(session):
+                return
             repo = TaskRepository(session)
             task = await repo.claim_next(_WORKER_ID, lease_s=self._settings.task_lease_timeout_s)
-            if task is None:
-                return
-            await session.commit()
+            await session.commit()  # xact 锁随提交释放
+
+        if task is None:
+            return
 
         worker = self._workers.get(task.task_type)
         if worker is None:
@@ -109,6 +112,7 @@ class Orchestrator:
             async with self._db() as session:
                 repo = TaskRepository(session)
                 await repo.complete(task.task_id, _WORKER_ID, result)
+                await self._advance_task_graph(repo, task)
                 await session.commit()
             logger.info("task_done", task_id=task.task_id, task_type=task.task_type.value)
         except Exception as exc:
@@ -123,14 +127,36 @@ class Orchestrator:
                 )
                 await session.commit()
 
+    async def _advance_task_graph(self, repo: TaskRepository, task: Task) -> None:
+        """前置任务 done → 创建后继任务（§7.1 依赖序 + §5.2 层3 唯一键幂等）。
+
+        仅创建已注册 worker 的任务类型；重复触发由 uq_tasks_bag_type_rev 去重。
+        与 complete 同事务提交。
+        """
+        if not task.bag_id or not task.input_rev:
+            return
+        for successor in next_tasks(task.task_type):
+            if successor not in self._workers:
+                continue
+            created = await repo.create(task.bag_id, task.input_rev, successor)
+            if created:
+                logger.info(
+                    "task_created",
+                    bag_id=task.bag_id,
+                    task_type=successor.value,
+                    input_rev=task.input_rev,
+                    after=task.task_type.value,
+                )
+
     async def _lease_gc_loop(self) -> None:
-        """周期性回收过期 lease（§9.1 worker 崩溃安全）。"""
+        """周期性回收过期 lease（§9.1 worker 崩溃安全），同样受事务锁仲裁。"""
         while self._running:
             await asyncio.sleep(self._settings.task_lease_timeout_s)
-            if not self._is_leader:
-                continue
             try:
                 async with self._db() as session:
+                    if not await self._try_xact_lock(session):
+                        await session.rollback()
+                        continue
                     repo = TaskRepository(session)
                     recovered = await repo.recover_lease_expired()
                     await session.commit()

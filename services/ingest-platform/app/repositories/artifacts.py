@@ -34,6 +34,13 @@ class ArtifactRepository:
         )
         await self._session.execute(stmt)
 
+    async def set_corrupt(self, object_key: str) -> None:
+        """核验不通过（如声明 size 与实际不符）→ 置 corrupt（§7.1 verify）。"""
+        stmt = update(Artifact).where(Artifact.object_key == object_key).values(
+            upload_state=UploadState.CORRUPT
+        )
+        await self._session.execute(stmt)
+
     async def get_by_key(self, object_key: str) -> Artifact | None:
         result = await self._session.execute(
             select(Artifact).where(Artifact.object_key == object_key)

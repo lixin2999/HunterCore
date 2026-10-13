@@ -29,8 +29,8 @@ class ManifestConsumer(BaseIngestConsumer):
     group_id: ClassVar[str] = "g.ingest.manifest"
     subscribe_topic: ClassVar[str] = "vehicle.bag.manifest"
 
-    def __init__(self, settings: Any, projection: ProjectionService) -> None:
-        super().__init__(settings)
+    def __init__(self, settings: Any, db_mgr: DatabaseSessionManager, projection: ProjectionService) -> None:
+        super().__init__(settings, db_mgr)
         self._projection = projection
 
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
@@ -43,8 +43,8 @@ class TaskStatusConsumer(BaseIngestConsumer):
     group_id: ClassVar[str] = "g.ingest.projection"
     subscribe_topic: ClassVar[str] = "vehicle.bag.task.status"
 
-    def __init__(self, settings: Any, projection: ProjectionService) -> None:
-        super().__init__(settings)
+    def __init__(self, settings: Any, db_mgr: DatabaseSessionManager, projection: ProjectionService) -> None:
+        super().__init__(settings, db_mgr)
         self._projection = projection
 
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
@@ -57,8 +57,8 @@ class ParseProgressConsumer(BaseIngestConsumer):
     group_id: ClassVar[str] = "g.ingest.progress"
     subscribe_topic: ClassVar[str] = "vehicle.bag.parse.progress"
 
-    def __init__(self, settings: Any) -> None:
-        super().__init__(settings)
+    def __init__(self, settings: Any, db_mgr: DatabaseSessionManager) -> None:
+        super().__init__(settings, db_mgr)
 
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
         bag_id = payload.get("bag_id", "")
@@ -73,8 +73,8 @@ class ArtifactConsumer(BaseIngestConsumer):
     group_id: ClassVar[str] = "g.ingest.artifact"
     subscribe_topic: ClassVar[str] = "vehicle.bag.artifact.uploaded"
 
-    def __init__(self, settings: Any, projection: ProjectionService) -> None:
-        super().__init__(settings)
+    def __init__(self, settings: Any, db_mgr: DatabaseSessionManager, projection: ProjectionService) -> None:
+        super().__init__(settings, db_mgr)
         self._projection = projection
 
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
@@ -88,8 +88,7 @@ class HeartbeatConsumer(BaseIngestConsumer):
     subscribe_topic: ClassVar[str] = "vehicle.agent.heartbeat"
 
     def __init__(self, settings: Any, db_mgr: DatabaseSessionManager) -> None:
-        super().__init__(settings)
-        self._db_mgr = db_mgr
+        super().__init__(settings, db_mgr)
 
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
         vehicle_id = payload.get("vehicle_id", "")
@@ -112,8 +111,8 @@ class AlertConsumer(BaseIngestConsumer):
     group_id: ClassVar[str] = "g.ingest.alert"
     subscribe_topic: ClassVar[str] = "vehicle.agent.alert"
 
-    def __init__(self, settings: Any) -> None:
-        super().__init__(settings)
+    def __init__(self, settings: Any, db_mgr: DatabaseSessionManager) -> None:
+        super().__init__(settings, db_mgr)
 
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
         vehicle_id = payload.get("vehicle_id", "")
@@ -132,8 +131,8 @@ class CmdAckConsumer(BaseIngestConsumer):
     group_id: ClassVar[str] = "g.ingest.cmdack"
     subscribe_topic: ClassVar[str] = "vehicle.agent.cmd.ack"
 
-    def __init__(self, settings: Any, cmd_service: CmdService) -> None:
-        super().__init__(settings)
+    def __init__(self, settings: Any, db_mgr: DatabaseSessionManager, cmd_service: CmdService) -> None:
+        super().__init__(settings, db_mgr)
         self._cmd_service = cmd_service
 
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
