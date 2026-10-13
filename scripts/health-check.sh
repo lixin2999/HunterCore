@@ -518,7 +518,7 @@ check_flink_jobs() {
   #   `No running jobs.`。V1.19.13 把“没表头”一律当命令失败判 WARN，于是三个作业全挂时
   #   汇总写成「失败 0 项」——本仓第八类假绿，且恰好发生在最严重的那一档
   if printf '%s\n' "$out" | grep -qE 'No running jobs\.'; then
-    record_result "FAIL" "Flink 作业数" "RUNNING=0 < ${expected}：JM 明确返回 No running jobs.（合法空列表，不是未判定）。列表里也没有 FAILED 终态行 ⇒ 典型为**提交期失败**（作业从未进入 RUNNING）：先看本巡检 ⑮「Flink 检查点目录」是否可写，再查堆栈（不截断窗口）——sudo docker logs ${container} 2>&1 后接 awk '/switched from RUNNING to FAILED/{f=1} f' 落盘，读**最后一条** Caused by 及其后续行（提取命令见运维手册 §3.6）"
+    record_result "FAIL" "Flink 作业数" "RUNNING=0 < ${expected}：JM 明确返回 No running jobs.（合法空列表，不是未判定）。列表里也没有 FAILED 终态行 ⇒ 典型为**从未提交或提交期失败**（V1.19.20 起 Step 11 已自动提交，若此处仍为空先看是否只跑了 --only-step 跳过 Step 11）：恢复用 sudo bash ${SCRIPT_DIR}/submit-flink-jobs.sh（幂等）；提交期失败则先看本巡检 ⑮「Flink 检查点目录」是否可写，再查堆栈（不截断窗口）——sudo docker logs ${container} 2>&1 后接 awk '/switched from RUNNING to FAILED/{f=1} f' 落盘，读**最后一条** Caused by 及其后续行（提取命令见运维手册 §3.6）"
     return 0
   fi
   if ! printf '%s\n' "$out" | grep -qE 'Running/Restarting Jobs'; then

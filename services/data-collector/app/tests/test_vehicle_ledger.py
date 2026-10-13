@@ -20,6 +20,7 @@ from app.config import Settings
 from app.repositories.vehicle_ledger import VehicleLedgerRepositoryAdapter
 from app.services.vehicle_ledger import (
     MAX_TRACKED_VEHICLES,
+    NAME_CACHE_TTL_SECONDS,
     OFFLINE_STATUS_NAME,
     VehicleLedgerWriter,
 )
@@ -213,6 +214,54 @@ async def test_empty_vehicle_id_is_rejected() -> None:
     assert await writer.record_seen("") is False
     assert await writer.mark_offline("") is False
     assert repo.status_calls == [] and repo.touch_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 台账名称查询（V1.19.20：读模型 vehicle_name 字段的取数来源）
+# ---------------------------------------------------------------------------
+async def test_vehicle_name_cached_within_ttl_and_refreshed_after_expiry() -> None:
+    """消费路径为 1Hz×N 车：TTL 窗口内只查一次，超窗后重新查询（改名不至于永久旧）。"""
+    repo = FakeVehicleLedgerRepository()
+    repo.names = {VEHICLE: "山猫一号"}
+    clock = FakeClock()
+    writer = make_writer(repo, clock)
+
+    assert await writer.vehicle_name(VEHICLE) == "山猫一号"
+    clock.advance(1)
+    assert await writer.vehicle_name(VEHICLE) == "山猫一号"
+    assert repo.name_calls == [VEHICLE]                     # 第 2 次走缓存，未再打库
+
+    clock.advance(NAME_CACHE_TTL_SECONDS)                   # 超窗 → 重新查询
+    repo.names[VEHICLE] = "山猫二号"
+    assert await writer.vehicle_name(VEHICLE) == "山猫二号"
+    assert len(repo.name_calls) == 2
+
+
+async def test_vehicle_name_failure_keeps_last_value_without_storm() -> None:
+    """DB 故障：不上抛、保留旧值（瞬时抖动不得抹掉读模型名称）；失败同样计入 TTL 窗口。"""
+    repo = FakeVehicleLedgerRepository()
+    repo.names = {VEHICLE: "山猫一号"}
+    clock = FakeClock()
+    writer = make_writer(repo, clock)
+
+    assert await writer.vehicle_name(VEHICLE) == "山猫一号"
+
+    repo.fail_with = RuntimeError("database unavailable")
+    clock.advance(NAME_CACHE_TTL_SECONDS + 1)               # 超窗，触发一次真实查询
+    assert await writer.vehicle_name(VEHICLE) == "山猫一号"  # 失败回退旧值，不冒泡
+    clock.advance(1)
+    assert await writer.vehicle_name(VEHICLE) == "山猫一号"
+    assert len(repo.name_calls) == 1                        # 失败也计窗口，未退化为每消息一次 SELECT
+
+
+async def test_vehicle_name_unknown_vehicle_returns_none() -> None:
+    """查无此车返回 None（调用方不写字段，禁止伪造默认值）；空标识不触碰 DB。"""
+    repo = FakeVehicleLedgerRepository()
+    writer = make_writer(repo, FakeClock())
+
+    assert await writer.vehicle_name("NOT-EXIST") is None
+    assert await writer.vehicle_name("") is None
+    assert repo.name_calls == ["NOT-EXIST"]
 
 
 def test_offline_status_name_matches_reader_model_constant() -> None:

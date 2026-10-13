@@ -349,13 +349,17 @@ class FakePipelineProducer:
 
 
 class FakeVehicleLedgerRepository:
-    """车辆台账仓储替身（只实现回写器用到的两个方法，可注入 DB 故障）。"""
+    """车辆台账仓储替身（只实现回写器用到的三个方法，可注入 DB 故障）。"""
 
     def __init__(self, *, fail_with: Exception | None = None) -> None:
         #: update_status 调用记录：(vehicle_id, status, last_online_time)
         self.status_calls: list[tuple[str, Any, Any]] = []
         #: touch_last_online_time 调用记录：(vehicle_id, seen_at)
         self.touch_calls: list[tuple[str, Any]] = []
+        #: get_name 调用记录（次数即缓存生效判据）
+        self.name_calls: list[str] = []
+        #: vehicle_id → 台账名称（未配置 = 查无此车，返回 None）
+        self.names: dict[str, str] = {}
         self.fail_with = fail_with
         #: 台账中存在的车辆（None = 全部存在）；不在其中则返回 False
         self.known_vehicles: set[str] | None = None
@@ -375,6 +379,12 @@ class FakeVehicleLedgerRepository:
         if self.known_vehicles is None:
             return True
         return vehicle_id in self.known_vehicles
+
+    async def get_name(self, vehicle_id: str) -> str | None:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.name_calls.append(vehicle_id)
+        return self.names.get(vehicle_id)
 
 
 class FakeEventIngestRepository:

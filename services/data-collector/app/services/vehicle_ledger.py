@@ -45,6 +45,10 @@ MAX_TRACKED_VEHICLES = 10_000
 #: 本模块**不得**反向 import 该模块——读模型写入器依赖本模块，导入会形成循环）
 OFFLINE_STATUS_NAME = "offline"
 
+#: 台账名称查询缓存 TTL（秒）：vehicle_name 属低频变更的台账数据，而消费路径为 1Hz×N 车，
+#: 不做缓存就是每秒一次无效 SELECT（V1.19.20：读模型 ``vehicle_name`` 字段的取数来源）
+NAME_CACHE_TTL_SECONDS = 600
+
 
 class VehicleLedgerRepository(Protocol):
     """台账回写所需能力（:class:`hunter_common.database.VehicleRepository` 的子集）。"""
@@ -59,6 +63,10 @@ class VehicleLedgerRepository(Protocol):
         ...
 
     async def touch_last_online_time(self, vehicle_id: str, *, seen_at: datetime) -> bool:
+        ...  # pragma: no cover - 协议声明
+
+    async def get_name(self, vehicle_id: str) -> str | None:
+        """按主键读取台账名称；车辆不存在返回 ``None``（禁止伪造默认值）。"""
         ...  # pragma: no cover - 协议声明
 
 
@@ -80,6 +88,8 @@ class VehicleLedgerWriter:
         self._status_writes: dict[str, tuple[str, float]] = {}
         #: vehicle_id → 最近一次 last_online_time 写入尝试时刻
         self._seen_writes: dict[str, float] = {}
+        #: vehicle_id → (台账名称, 最近一次查询尝试时刻)
+        self._name_cache: dict[str, tuple[str | None, float]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -150,6 +160,39 @@ class VehicleLedgerWriter:
             vehicle_id=vehicle_id,
         )
 
+    async def vehicle_name(self, vehicle_id: str, *, now: float | None = None) -> str | None:
+        """查询台账名称（供读模型补写 ``vehicle_name`` 字段）；带 TTL 缓存与异常隔离。
+
+        - 读模型此前**没有任何 ``vehicle_name`` 写方**，而 remote-control/看板按该字段取数
+          → 名称恒为空（实录 2026-10-13）。契约规定本服务是该键唯一写方，故名称只能
+          在此经台账查询补齐；
+        - 查询失败/车辆不存在返回 ``None``——调用方**不写字段**（禁止伪造默认值）；
+          缓存已有旧值时保留旧值，避免瞬时 DB 抖动把名称从读模型抹掉；
+        - 失败同样计入 TTL 窗口：DB 故障时不会退化为每条消息一次 SELECT（写风暴）。
+        """
+        current = float(self._clock()) if now is None else now
+        if not vehicle_id:
+            return None
+        cached = self._name_cache.get(vehicle_id)
+        if cached is not None and (current - cached[1]) < NAME_CACHE_TTL_SECONDS:
+            return cached[0]
+        try:
+            name = await self._repo.get_name(vehicle_id)
+        except Exception as exc:  # noqa: BLE001 — 名称查询失败不得影响遥测消费（同约束 1）
+            logger.warning(
+                "vehicle_ledger_name_query_failed",
+                vehicle_id=vehicle_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc) or "<empty>",
+            )
+            self._name_cache[vehicle_id] = (cached[0] if cached else None, current)
+            self._prune()
+            return self._name_cache[vehicle_id][0]
+        value = str(name) if name else None
+        self._name_cache[vehicle_id] = (value, current)
+        self._prune()
+        return value
+
     def _within_interval(self, last_attempt: float, current: float) -> bool:
         """节流判定：``interval=0`` 表示不节流（每条都写，仅用于本地调试/压测）。"""
         return self._interval > 0 and (current - last_attempt) < self._interval
@@ -174,7 +217,11 @@ class VehicleLedgerWriter:
 
     def _prune(self) -> None:
         """跟踪表有界（防外部可控 vehicle_id 造成内存无界增长）。"""
-        for store in (self._status_writes, self._seen_writes):
+        for store in (
+            self._status_writes,
+            self._seen_writes,
+            self._name_cache,
+        ):
             while len(store) > MAX_TRACKED_VEHICLES:
                 store.pop(next(iter(store)))
 
@@ -194,6 +241,7 @@ def _to_datetime(epoch: float) -> datetime:
 
 __all__ = [
     "MAX_TRACKED_VEHICLES",
+    "NAME_CACHE_TTL_SECONDS",
     "OFFLINE_STATUS_NAME",
     "VehicleLedgerRepository",
     "VehicleLedgerWriter",

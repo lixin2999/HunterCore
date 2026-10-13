@@ -304,7 +304,9 @@ def seed_vehicle(
         "status": status,
         "battery_soc": "80",
         "velocity": "0.0",
-        "last_online_time": "1724035200.0",
+        # 字段名与唯一写方 data-collector 对齐（V1.19.20）：写方只写 last_seen_at，
+        # 旧替身直接塞 last_online_time 属 Mock 陷阱——读方改字段前单测永远绿、真机永远 1970
+        "last_seen_at": "1724035200.0",
         "vehicle_name": f"车 {vehicle_id}",
         "model": "HUNTER_SE",
     }

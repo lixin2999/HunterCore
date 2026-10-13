@@ -178,10 +178,10 @@ onMounted(() => {
       </el-col>
       <el-col :span="6">
         <StatCard
-          title="入库延迟 P95"
+          title="入库延迟"
           :value="formatNumber(dashboard?.pipeline.ingest_latency_ms_p95 ?? null, 0)"
-          unit="ms"
-          :tone="(dashboard?.pipeline.ingest_latency_ms_p95 ?? 0) > 1000 ? 'danger' : 'success'"
+          :unit="dashboard?.pipeline.ingest_latency_ms_p95 != null ? 'ms' : ''"
+          :tone="dashboard?.pipeline.ingest_latency_ms_p95 == null ? 'info' : dashboard.pipeline.ingest_latency_ms_p95 > 1000 ? 'danger' : 'success'"
           :available="dashboard?.pipeline.available ?? true"
           :reason="dashboard?.pipeline.reason"
           hint="SLO ≤ 1000 ms（系统约束第 10 条）"
@@ -251,7 +251,9 @@ onMounted(() => {
     <el-card shadow="never" header="车辆明细（Redis 读模型）">
       <el-table :data="vehicleStore.vehicles" size="small" empty-text="暂无车辆数据">
         <el-table-column prop="vehicle_id" label="车辆 ID" width="150" />
-        <el-table-column prop="vehicle_name" label="名称" width="150" />
+        <el-table-column label="名称" width="150">
+          <template #default="{ row }">{{ row.vehicle_name || row.vehicle_id }}</template>
+        </el-table-column>
         <el-table-column label="状态" width="120">
           <template #default="{ row }">
             <StatusTag kind="vehicle" :value="row.status" />
@@ -264,7 +266,7 @@ onMounted(() => {
           <template #default="{ row }">{{ formatNumber(row.velocity ?? null, 2) }} m/s</template>
         </el-table-column>
         <el-table-column label="最近在线" width="180">
-          <template #default="{ row }">{{ formatTime(row.last_online_time) }}</template>
+          <template #default="{ row }">{{ row.last_online_time > 0 ? formatTime(row.last_online_time) : '尚未上线' }}</template>
         </el-table-column>
         <el-table-column label="操作" min-width="140">
           <template #default="{ row }">

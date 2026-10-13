@@ -2,8 +2,12 @@
 
 只读消费（Key 由 data-collector 遥测消费链路维护，本服务禁止写入）：
 - 在线判定：``vehicle:online:set``（Set）成员命中；
-- 状态明细：``vehicle:status:{vehicle_id}``（Hash）—— status/battery_soc/velocity/
-  last_online_time/vehicle_name/model（字段名以契约为准，pending #2）；
+- 状态明细：``vehicle:status:{vehicle_id}``（Hash）——字段名以**唯一写方 data-collector
+  实际写入的字段**为准（redis-keys.yaml fields_draft，pending #1/#2）：
+  status / battery_soc / velocity / last_seen_at / vehicle_name / model；
+  ⚠ 本读方曾按 ``last_online_time`` 取数——Hash 里从未有写方写该字段，
+  致看板/操控台「最近在线」恒兜底为 0 → 展示 1970-01-01 08:00:00（响应字段名不变，
+  只改 Hash 取数源）；
 - 活跃会话：``rc:session:{vehicle_id}``（Hash，本服务写）交叉判定互斥。
 
 BlockReason → 错误码映射（契约 x-hunter-remote-session-lifecycle.responses）：
@@ -24,11 +28,12 @@ KEY_ONLINE_SET = "vehicle:online:set"
 KEY_VEHICLE_STATUS = "vehicle:status:{vehicle_id}"
 KEY_RC_SESSION = "rc:session:{vehicle_id}"
 
-#: Hash 字段名（data-collector 写入侧约定；缺失字段容错，契约必填字段以 0 兜底）
+#: Hash 字段名（data-collector 写入侧实际字段；缺失字段容错，契约必填字段以 0 兜底）
 _FIELD_STATUS = "status"
 _FIELD_SOC = "battery_soc"
 _FIELD_VELOCITY = "velocity"
-_FIELD_LAST_ONLINE = "last_online_time"
+#: 最近在线取数源 = 写方实际维护的 ``last_seen_at``（health/telemetry 每次 HSET 刷新）
+_FIELD_LAST_ONLINE = "last_seen_at"
 _FIELD_VEHICLE_NAME = "vehicle_name"
 _FIELD_MODEL = "model"
 

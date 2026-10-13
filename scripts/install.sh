@@ -1525,6 +1525,14 @@ step_11_start_services() {
   # 11.2 Flink 2.1（镜像 hunter-flink/jobs:2.1.1，含 CPython 3.12 + 作业依赖；JobManager 容器内 8081 → 宿主机 8088）
   hc_run_logged "启动 flink-jm flink-tm" compose up -d flink-jm flink-tm || return 1
   wait_for "curl -sf -m 5 $(flink_ui_url)/overview >/dev/null" "Flink JobManager UI（$(flink_ui_url)）" 120 || return 1
+  # 提交三个已交付流作业（V1.19.20）：compose 形态此前**没有任何提交入口**（K8s 有 04-submit-job.yaml），
+  #   作业全靠人工照 README 敲 `flink run`——漏提即巡检 ⑭ 恒报 RUNNING=0；而 standalone 无 HA，
+  #   本步的 `up -d` 一旦 recreate flink-jm/tm 也会冲掉已提交作业。脚本幂等（按作业名去重），
+  #   重复续跑 Step 11 不会重复提交；提交失败（凭据/检查点目录/API 改名）在本步真失败，不留到巡检才暴露。
+  hc_run_logged "提交 Flink 流作业（幂等）" bash "$SUBMIT_FLINK_JOBS_SH" --env "$env_file" || {
+    log_error "Flink 作业提交失败：看上方 submit-flink-jobs.sh 输出的排查建议；修复后可单独重跑 bash ${SUBMIT_FLINK_JOBS_SH}（不需重跑整步）"
+    return 1
+  }
 
   # 11.3 业务服务（场景 / OTA / 远程操控 / 车辆接入 provisioning）
   hc_run_logged "启动 scene-service ota-service remote-control vehicle-service" \

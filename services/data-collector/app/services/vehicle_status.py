@@ -14,6 +14,10 @@
   OTA 的 ``vehicle_parked`` / ``storage`` 两项在缺数据时仍拒绝（安全默认）；
 - **G-11：``lat`` / ``lng``（GPS WGS84 度）由 health 顶层可选字段提供**（同 G-08 模式，
   车端排期上报；不写入未上报的 field），供 remote-control 地理围栏接管门禁只读消费；
+- **``vehicle_name``（V1.19.20）**：读方（remote-control 读模型视图/看板）按该字段取名，
+  但消息体不携带名称、此前也无任何写方 → 名称恒为空。现由本模块经台账查询
+  （:meth:`VehicleLedgerWriter.vehicle_name`，TTL 缓存）补写；台账不可用/查无此车时
+  不写字段（禁止伪造默认值）；
 - ``last_seen_seconds`` 由 ``last_seen_at`` 与当前时间推导（:class:`VehicleStatusSweeper`
   周期刷新并在超阈值时移出在线集合，实现「遥测中断 > 10s → 离线」约束）。
 
@@ -124,6 +128,9 @@ class VehicleStatusWriter:
             mapping["lat_lng_at"] = f"{current:.3f}"
         if timestamp > 0:
             mapping["vehicle_ts"] = f"{timestamp:.3f}"
+        name = await self._lookup_name(vehicle_id, current)
+        if name:
+            mapping["vehicle_name"] = name
         await self._redis.hset(status_key(vehicle_id), mapping=mapping)
         if status == OFFLINE_STATUS:
             await self._redis.srem(ONLINE_SET_KEY, vehicle_id)
@@ -162,11 +169,23 @@ class VehicleStatusWriter:
             value = chassis.get(field)
             if value is not None:
                 mapping[field] = str(value)
+        name = await self._lookup_name(vehicle_id, current)
+        if name:
+            mapping["vehicle_name"] = name
         await self._redis.hset(status_key(vehicle_id), mapping=mapping)
         await self._redis.sadd(ONLINE_SET_KEY, vehicle_id)
         if self._ledger is not None:
             # 遥测只证明“在上报”→ 仅刷新 last_online_time，不改业务状态
             await self._ledger.record_seen(vehicle_id, now=current)
+
+    async def _lookup_name(self, vehicle_id: str, current: float) -> str | None:
+        """台账名称查询（未注入回写器时返回 ``None``，行为与旧调用方一致）。
+
+        内部已有 TTL 缓存与异常隔离，消费路径上每车 ≤ 1 次/600s 的 SELECT。
+        """
+        if self._ledger is None:
+            return None
+        return await self._ledger.vehicle_name(vehicle_id, now=current)
 
     async def mark_offline(self, vehicle_id: str, *, now: float | None = None) -> None:
         """标记车辆离线（心跳超阈值 / 通信中断；由守护任务调用）。"""

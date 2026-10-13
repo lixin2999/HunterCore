@@ -45,5 +45,11 @@ class VehicleLedgerRepositoryAdapter:
                 vehicle_id, seen_at=seen_at
             )
 
+    async def get_name(self, vehicle_id: str) -> str | None:
+        """按主键读台账名称；车辆不存在返回 ``None``（纯读，不开写事务）。"""
+        async with self._db.session() as session:
+            vehicle = await VehicleRepository(session).get(vehicle_id)
+            return vehicle.vehicle_name if vehicle is not None else None
+
 
 __all__ = ["VehicleLedgerRepositoryAdapter"]

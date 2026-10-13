@@ -75,11 +75,19 @@ keys:
       - {name: gear, type: "enum(P/R/N/D)", source: "health.gear（G-08 决策①；OTA 升级/回滚门禁 P 档静止权威判定；车端排期上报，未上报则缺数据即拒绝）", status: pending}
       - {name: free_storage_mb, type: integer, source: "health.free_storage_mb（G-08 决策①；OTA 存储门禁 ≥2048MB；车端排期上报）", status: pending}
       - {name: updated_at, type: "epoch seconds", source: "health.timestamp（陈旧判定依据）", status: required}
+      - {name: last_seen_at, type: "epoch seconds", source: "data-collector 写入时刻（health/telemetry 每次 HSET 刷新；remote-control 读模型「最近在线」取数字段，V1.19.20——此前读方误取从未写入的 last_online_time 导致恒显 1970-01-01）", status: required}
+      - {name: last_seen_seconds, type: "number >=0", source: "data-collector VehicleStatusSweeper 周期推导（current - last_seen_at），OTA 网络稳定性门禁判定依据", status: pending}
+      - {name: vehicle_ts, type: "epoch seconds", source: "health.timestamp >0 时写入（车端时间戳，与 last_seen_at 区分 ingestion 与源头时刻）", status: pending}
+      - {name: vehicle_name, type: string, source: "data-collector 经台账查询回写（vehicle_svc.vehicles.vehicle_name，TTL 缓存 600s；V1.19.20——此前无任何写方，看板/remote-control 名称恒空；查无此车不写字段）", status: pending}
       - {name: network_latency_ms, type: number, source: "health.system.network_latency_ms", status: pending}
       - {name: cpu_usage, type: "number 0..100", source: "health.system.cpu_usage", status: pending}
       - {name: gpu_usage, type: "number 0..100", source: "health.system.gpu_usage", status: pending}
       - {name: memory_usage_mb, type: integer, source: "health.system.memory_usage_mb", status: pending}
+      - {name: gpu_temp, type: number, source: "health.system.gpu_temp", status: pending}
+      - {name: cpu_temp, type: number, source: "health.system.cpu_temp", status: pending}
+      - {name: network_rssi, type: number, source: "health.system.network_rssi", status: pending}
       - {name: velocity, type: number, source: "telemetry.chassis.velocity（操控接管前速度判定 ≤2.0 m/s）", status: pending}
+      - {name: battery_voltage, type: number, source: "telemetry.chassis.battery_voltage", status: pending}
       - {name: lat, type: "number -90..90（WGS84 度）", source: "health.lat（G-11 地理围栏接管门禁判定输入；车端排期上报，未上报则配置围栏的车辆拒绝创建会话——安全默认）", status: pending}
       - {name: lng, type: "number -180..180（WGS84 度）", source: "health.lng（G-11；与 lat 成对，缺一即视为无定位）", status: pending}
       - {name: lat_lng_at, type: "epoch seconds", source: "data-collector 写入 lat/lng 同批携带的写入时刻（G-11；remote-control 围栏判定新鲜度依据，超 VEHICLE_OFFLINE_THRESHOLD_SECONDS 视为定位陈旧）", status: pending}
@@ -241,7 +249,7 @@ x-hunter-pending-confirmation:
   # 结构对齐各服务 OpenAPI 既有约定：{id, question, impact, contract_decision}（禁止自行发明键名）
   items:
     - id: 1
-      question: "vehicle:status:{vehicle_id} Hash 字段清单未定稿（当前 fields_draft 12 个字段，仅 status/battery_soc/vehicle_state/updated_at 标记 required，其余 pending）"
+      question: "vehicle:status:{vehicle_id} Hash 字段清单未定稿（当前 fields_draft 25 个字段，已按 data-collector 实际写入行为回填全量字段名；仅 status/battery_soc/vehicle_state/updated_at/last_seen_at 标记 required，其余 pending）"
       impact: "阻塞（blocking）：写入方 data-collector health 消费与读取方 data-analytics 看板 / ota-service 门禁 / remote-control 接管判定均依赖字段名，字段改名会造成跨服务静默破读；remote-control 契约 pending #2 同步等待"
       contract_decision: "与写入方及三个读取方确认最终字段集与字段名，定稿后回填本文件 fields（去掉 draft 标记）与各服务契约；一经定稿不得再改"
     - id: 2

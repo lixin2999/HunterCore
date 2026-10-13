@@ -360,6 +360,36 @@ async def test_status_writer_hooks_ledger_writeback() -> None:
     assert repo.status_calls[-1][1].value == OFFLINE_STATUS
 
 
+async def test_status_writer_writes_vehicle_name_from_ledger() -> None:
+    """读模型补写 vehicle_name（V1.19.20：此前无任何写方，看板/remote-control 名称恒空）。"""
+    redis = FakeRedisHash()
+    repo = FakeVehicleLedgerRepository()
+    repo.names = {"HUNTER-001": "山猫一号"}
+    writer = VehicleStatusWriter(redis, make_ledger_writer(repo))
+
+    await writer.update_from_health(
+        {"vehicle_id": "HUNTER-001", "status": "auto_driving", "system": {}, "timestamp": NOW},
+        now=NOW,
+    )
+    assert redis.hashes[status_key("HUNTER-001")]["vehicle_name"] == "山猫一号"
+
+    await writer.update_from_telemetry(telemetry_payload(), now=NOW + 1)
+    assert redis.hashes[status_key("HUNTER-001")]["vehicle_name"] == "山猫一号"
+
+
+async def test_status_writer_omits_vehicle_name_when_ledger_has_no_row() -> None:
+    """台账查无此车/未注入回写器：不写 vehicle_name 字段（禁止伪造默认值）。"""
+    redis = FakeRedisHash()
+    repo = FakeVehicleLedgerRepository()          # names 为空 = 查无此车
+    writer = VehicleStatusWriter(redis, make_ledger_writer(repo))
+
+    await writer.update_from_health(
+        {"vehicle_id": "HUNTER-001", "status": "auto_driving", "system": {}, "timestamp": NOW},
+        now=NOW,
+    )
+    assert "vehicle_name" not in redis.hashes[status_key("HUNTER-001")]
+
+
 async def test_status_writer_survives_ledger_database_failure() -> None:
     """台账 DB 故障不影响读模型写入，也不向上抛（否则消费重试/DLQ）。"""
     redis = FakeRedisHash()

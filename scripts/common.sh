@@ -54,13 +54,14 @@ GEN_KAFKA_CERTS_SH="${SCRIPT_DIR}/gen-kafka-certs.sh"
 INIT_DB_SH="${SCRIPT_DIR}/init-db.sh"
 INIT_KAFKA_SH="${SCRIPT_DIR}/init-kafka.sh"
 INIT_MINIO_SH="${SCRIPT_DIR}/init-minio.sh"
+SUBMIT_FLINK_JOBS_SH="${SCRIPT_DIR}/submit-flink-jobs.sh"
 HEALTH_CHECK_SH="${SCRIPT_DIR}/health-check.sh"
 BACKUP_SH="${SCRIPT_DIR}/backup.sh"
 UNINSTALL_SH="${SCRIPT_DIR}/uninstall.sh"
 DAILY_CHECK_SH="${SCRIPT_DIR}/daily-check.sh"
 COLLECT_LOGS_SH="${SCRIPT_DIR}/collect-logs.sh"
 export GEN_PASSWORDS_SH GEN_KAFKA_CERTS_SH INIT_DB_SH INIT_KAFKA_SH INIT_MINIO_SH \
-  HEALTH_CHECK_SH BACKUP_SH UNINSTALL_SH DAILY_CHECK_SH COLLECT_LOGS_SH
+  SUBMIT_FLINK_JOBS_SH HEALTH_CHECK_SH BACKUP_SH UNINSTALL_SH DAILY_CHECK_SH COLLECT_LOGS_SH
 
 # ---------------------------------------------------------------------
 # 2. 彩色输出（非交互终端/NO_COLOR 自动降级为无色）
