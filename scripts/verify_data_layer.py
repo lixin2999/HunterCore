@@ -114,6 +114,11 @@ EXPECTED_TABLES: dict[str, str] = {
     "data_analytics.algorithm_metrics": "05_timeseries.sql",
 }
 
+#: 服务私有 schema（独立限界上下文：自带 DDL 文件 + 服务内 ORM 模型 + 自带 Repository，
+#:   不进入共享 hunter_common 元数据）——其表由服务自身契约管理，豁免于共享 13 表 L2 契约的
+#:   DDL↔ORM 逐列对账。新增服务私有 schema 必须在此登记并在 orm-mapping.md §3.5 声明边界。
+SERVICE_PRIVATE_SCHEMAS: frozenset[str] = frozenset({"ingest_platform"})
+
 #: 契约 schema（ddl/00_schemas.sql 中必须全部创建）
 EXPECTED_SCHEMAS = (
     "vehicle_svc",
@@ -136,6 +141,37 @@ EXPECTED_PLATFORM_TOPICS: dict[str, tuple[int, int]] = {
     "alert_event": (3, 2_592_000_000),
     "algorithm_metrics": (6, 604_800_000),
 }
+
+#: ingest-platform 数据消费/解析 Topic 契约（V1.20.4，topics.yaml#ingest_platform_topics）。
+#: 与 platform_topics 分开维护：仅 `EXPECTED_INGEST_CONSUMED` 中的订阅 Topic 派生 {topic}.dlq
+#: （基础设施类失败经 hunter_common 消费者转投）；数据/字段级失败走自建 DLT ingest.dlt。
+#: 同步四处：topics.yaml#ingest_platform_topics ↔ create-topics.sh ↔ kafka-init-job ↔ init-kafka.sh#INGEST_TOPIC_SPECS
+EXPECTED_INGEST_TOPICS: dict[str, tuple[int, int]] = {
+    "vehicle.bag.manifest": (3, 604_800_000),
+    "vehicle.bag.task.status": (3, 604_800_000),
+    "vehicle.bag.parse.progress": (3, 604_800_000),
+    "vehicle.bag.artifact.uploaded": (6, 604_800_000),
+    "vehicle.agent.heartbeat": (6, 604_800_000),
+    "vehicle.agent.alert": (3, 2_592_000_000),
+    "vehicle.agent.cmd.ack": (3, 604_800_000),
+    "vehicle.agent.cmd": (3, 604_800_000),
+    "platform.derived.ready.v1": (3, 2_592_000_000),
+    "platform.bag.qc_failed.v1": (3, 2_592_000_000),
+    "platform.clip.created.v1": (3, 2_592_000_000),
+    "platform.dataset.ready.v1": (3, 2_592_000_000),
+    "ingest.dlt": (3, 2_592_000_000),
+}
+
+#: 被 ingest 消费的订阅 Topic（派生 {topic}.dlq；分区继承源 Topic、保留取 naming.dlq_retention_ms）
+EXPECTED_INGEST_CONSUMED: tuple[str, ...] = (
+    "vehicle.bag.manifest",
+    "vehicle.bag.task.status",
+    "vehicle.bag.parse.progress",
+    "vehicle.bag.artifact.uploaded",
+    "vehicle.agent.heartbeat",
+    "vehicle.agent.alert",
+    "vehicle.agent.cmd.ack",
+)
 
 #: 车端 Topic 契约（名称模式 → 分区数、acks、频率）
 EXPECTED_VEHICLE_TOPICS: dict[str, tuple[int, str, str]] = {
@@ -173,6 +209,9 @@ EXPECTED_BUCKETS: dict[str, int | None] = {
     "hunter-reports": None,
     "hunter-logs": 30,
     "hunter-scene-assets": None,
+    # V1.20.4 ingest-platform 数据湖层（永久；契约名称不可更改）
+    "hunter-derived": None,
+    "hunter-datasets": None,
 }
 
 #: hunter-rosbag Tag 级生命周期（G-12：对象 Tag 选择器 → 过期天数；None = 无过期规则 = 永久）
@@ -396,8 +435,12 @@ def check_ddl_orm_parity() -> tuple[dict[str, Any], dict[str, Any]]:
     orm = orm_tables()
     before = len(failures)
 
-    missing_tables = sorted(set(EXPECTED_TABLES) - set(ddl))
-    extra_tables = sorted(set(ddl) - set(EXPECTED_TABLES))
+    # 服务私有 schema 的表豁免共享 13 表对账（由服务自身契约管理，不入共享 ORM 元数据）
+    shared_ddl = {t for t in ddl if t.split(".", 1)[0] not in SERVICE_PRIVATE_SCHEMAS}
+    shared_orm = {t for t in orm if t.split(".", 1)[0] not in SERVICE_PRIVATE_SCHEMAS}
+
+    missing_tables = sorted(set(EXPECTED_TABLES) - set(shared_ddl))
+    extra_tables = sorted(set(shared_ddl) - set(EXPECTED_TABLES))
     if missing_tables:
         fail(f"DDL 缺失契约表: {missing_tables}")
     if extra_tables:
@@ -405,8 +448,8 @@ def check_ddl_orm_parity() -> tuple[dict[str, Any], dict[str, Any]]:
     if not missing_tables and not extra_tables:
         ok(f"DDL 表清单与契约一致（{len(EXPECTED_TABLES)} 张）")
 
-    orm_missing = sorted(set(EXPECTED_TABLES) - set(orm))
-    orm_extra = sorted(set(orm) - set(EXPECTED_TABLES))
+    orm_missing = sorted(set(EXPECTED_TABLES) - set(shared_orm))
+    orm_extra = sorted(set(shared_orm) - set(EXPECTED_TABLES))
     if orm_missing:
         fail(f"ORM 缺失契约表映射: {orm_missing}")
     if orm_extra:
@@ -841,6 +884,19 @@ def parse_init_kafka_specs(text: str, dlq_pattern: str) -> dict[str, tuple[int, 
         return specs
     for name, (partitions, _retention) in list(specs.items()):
         specs[dlq_pattern.format(original_topic=name)] = (partitions, int(dlq_retention.group(1)))
+
+    # ingest Topic：在平台 dlq 派生之后追加，避免被 blanket 派生 {topic}.dlq
+    ingest_block = re.search(r"INGEST_TOPIC_SPECS=\((.*?)\n\)", text, re.DOTALL)
+    if ingest_block is not None:
+        for name, partitions, retention in re.findall(r'"([\w.]+):(\d+):(\d+)"', ingest_block.group(1)):
+            specs[name] = (int(partitions), int(retention))
+    # 仅对显式列出的订阅 Topic 派生 {topic}.dlq（分区继承源 Topic）
+    consumed_block = re.search(r"INGEST_CONSUMED_TOPICS=\((.*?)\n\)", text, re.DOTALL)
+    if consumed_block is not None:
+        dlq_ms = int(dlq_retention.group(1))
+        for name in re.findall(r'"([\w.]+)"', consumed_block.group(1)):
+            base = specs.get(name)
+            specs[dlq_pattern.format(original_topic=name)] = ((base[0] if base else 0), dlq_ms)
     return specs
 
 
@@ -903,6 +959,29 @@ def check_kafka_topics() -> dict[str, Any]:
         if name != "hunter.broadcast.command" and entry.get("key") != "vehicle_id":
             fail(f"Topic {name}: 消息 key 必须为 vehicle_id（保证单车辆有序）")
 
+    # ingest-platform Topic（topics.yaml#ingest_platform_topics ↔ EXPECTED_INGEST_TOPICS）
+    ingest_topics = {entry["name"]: entry for entry in topics.get("ingest_platform_topics", [])}
+    if set(ingest_topics) != set(EXPECTED_INGEST_TOPICS):
+        fail(
+            f"ingest Topic 清单不一致: 契约={sorted(ingest_topics)} "
+            f"期望={sorted(EXPECTED_INGEST_TOPICS)}"
+        )
+    for name, (partitions, retention) in EXPECTED_INGEST_TOPICS.items():
+        entry = ingest_topics.get(name)
+        if entry is None:
+            continue
+        if entry.get("partitions") != partitions:
+            fail(f"ingest Topic {name}: 分区数 {entry.get('partitions')} != {partitions}")
+        if entry.get("retention_ms") != retention:
+            fail(f"ingest Topic {name}: 保留时间 {entry.get('retention_ms')} != {retention}")
+    # consumed 标记必须与 EXPECTED_INGEST_CONSUMED 一致（驱动 {topic}.dlq 派生）
+    flagged_consumed = {n for n, e in ingest_topics.items() if e.get("consumed") is True}
+    if flagged_consumed != set(EXPECTED_INGEST_CONSUMED):
+        fail(
+            f"ingest consumed 标记与死信派生集不一致: 契约={sorted(flagged_consumed)} "
+            f"期望={sorted(EXPECTED_INGEST_CONSUMED)}"
+        )
+
     naming = topics.get("naming", {})
     if naming.get("dlq_pattern") != "{original_topic}.dlq":
         fail(f"DLQ 命名必须为 {{original_topic}}.dlq，当前={naming.get('dlq_pattern')}")
@@ -945,20 +1024,27 @@ def check_kafka_topics() -> dict[str, Any]:
 
     # ---- 死信 Topic 创建责任（broker 不自动建 Topic：缺 .dlq 时非法消息被静默丢弃） ----
     expected_platform_dlq = expected_dlq_set(naming, EXPECTED_PLATFORM_TOPICS)
-    expected_platform_all = {**EXPECTED_PLATFORM_TOPICS, **expected_platform_dlq}
+    # ingest：基础 13 + 仅被消费的 7 个派生 {topic}.dlq（分区继承源 Topic、保留取 naming.dlq_retention_ms）
+    ingest_dlq_sources = {name: EXPECTED_INGEST_TOPICS[name] for name in EXPECTED_INGEST_CONSUMED}
+    expected_ingest_dlq = expected_dlq_set(naming, ingest_dlq_sources)
+    expected_all = {**EXPECTED_PLATFORM_TOPICS, **expected_platform_dlq,
+                    **EXPECTED_INGEST_TOPICS, **expected_ingest_dlq}
     missing_dlq = sorted(set(expected_platform_dlq) - set(compose_calls))
     if missing_dlq:
         fail(f"create-topics.sh 未创建平台死信 Topic: {missing_dlq}")
-    if compose_calls != expected_platform_all:
-        fail(f"infra/docker/kafka/create-topics.sh 与契约不一致: {compose_calls}")
-    if k8s_calls != expected_platform_all:
-        fail(f"infra/k8s/jobs/kafka-init-job.yaml 与契约不一致: {k8s_calls}")
+    missing_ingest_dlq = sorted(set(expected_ingest_dlq) - set(compose_calls))
+    if missing_ingest_dlq:
+        fail(f"create-topics.sh 未创建 ingest 订阅死信 Topic: {missing_ingest_dlq}")
+    if compose_calls != expected_all:
+        fail(f"infra/docker/kafka/create-topics.sh 与契约不一致: {sorted(set(compose_calls) ^ set(expected_all))}")
+    if k8s_calls != expected_all:
+        fail(f"infra/k8s/jobs/kafka-init-job.yaml 与契约不一致: {sorted(set(k8s_calls) ^ set(expected_all))}")
 
     init_kafka_specs = parse_init_kafka_specs(
         INIT_KAFKA_SCRIPT.read_text(encoding="utf-8"), str(naming.get("dlq_pattern") or "")
     )
-    if init_kafka_specs != expected_platform_all:
-        fail(f"scripts/init-kafka.sh 与契约不一致: {init_kafka_specs}")
+    if init_kafka_specs != expected_all:
+        fail(f"scripts/init-kafka.sh 与契约不一致: {sorted(set(init_kafka_specs) ^ set(expected_all))}")
 
     # 车端死信 Topic 由 provisioning 派生：kafka_admin 必须读契约 naming 段（不得写死后缀/保留期）
     admin_src = VEHICLE_KAFKA_ADMIN.read_text(encoding="utf-8")
@@ -968,8 +1054,8 @@ def check_kafka_topics() -> dict[str, Any]:
 
     if len(failures) == before:
         ok(
-            f"Kafka Topic 契约一致（车端 {len(vehicle_topics)} + 平台 {len(platform_topics)}，"
-            f"含死信 {len(expected_platform_dlq)} 项：topics.yaml ↔ create-topics.sh ↔ kafka-init Job "
+            f"Kafka Topic 契约一致（车端 {len(vehicle_topics)} + 平台 {len(platform_topics)} + ingest {len(EXPECTED_INGEST_TOPICS)}，"
+            f"含死信 {len(expected_platform_dlq) + len(expected_ingest_dlq)} 项：topics.yaml ↔ create-topics.sh ↔ kafka-init Job "
             "↔ init-kafka.sh ↔ provisioning 派生）"
         )
     return topics
@@ -1045,10 +1131,11 @@ def check_consumer_groups() -> None:
     groups = load_yaml(KAFKA_CONTRACT_DIR / "consumer-groups.yaml").get("groups", [])
     before = len(failures)
 
-    known_topics = set(EXPECTED_PLATFORM_TOPICS) | set(EXPECTED_VEHICLE_TOPICS)
+    known_topics = set(EXPECTED_PLATFORM_TOPICS) | set(EXPECTED_VEHICLE_TOPICS) | set(EXPECTED_INGEST_TOPICS)
     # 车端 Topic 支持 regex 订阅（新车动态接入无需改配置）：hunter.{vehicle_id}.telemetry → hunter.*.telemetry
     known_topics |= {name.replace("{vehicle_id}", "*") for name in EXPECTED_VEHICLE_TOPICS}
     known_topics |= {f"{name}.dlq" for name in known_topics}
+    known_topics |= {f"{name}.dlq" for name in EXPECTED_INGEST_CONSUMED}
 
     ids = [group.get("group_id") for group in groups]
     duplicates = sorted({gid for gid in ids if ids.count(gid) > 1})
@@ -1057,8 +1144,10 @@ def check_consumer_groups() -> None:
 
     for group in groups:
         gid = str(group.get("group_id"))
-        if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", gid):
-            fail(f"消费者组 ID 不符命名规范 <service>-<domain>[-<purpose>]: {gid}")
+        if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", gid) and not re.fullmatch(
+            r"g\.ingest\.[a-z0-9]+(-[a-z0-9]+)*", gid
+        ):
+            fail(f"消费者组 ID 不符命名规范 <service>-<domain>[-<purpose>]（或 ingest 点分 g.ingest.<purpose>）: {gid}")
         if not group.get("service"):
             fail(f"{gid}: 缺少 service（归属服务）")
         subscribes = group.get("subscribes") or []

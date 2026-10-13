@@ -1,4 +1,4 @@
-"""Bag 查询路由（§8.1 GET /api/v1/bags）。"""
+"""Bag 查询路由（§8.1 GET /api/v1/ingest/bags）。"""
 from __future__ import annotations
 
 from typing import Annotated
@@ -12,7 +12,7 @@ from app.models.ingest import BagState
 from app.repositories.artifacts import ArtifactRepository
 from app.repositories.bags import BagRepository, BagTopicRepository
 
-router = APIRouter(prefix="/api/v1/bags", tags=["bags"])
+router = APIRouter(prefix="/api/v1/ingest/bags", tags=["bags"])
 
 
 @router.get("")

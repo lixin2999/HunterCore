@@ -1,6 +1,6 @@
 """反向代理服务（契约 x-hunter-gateway-routes / route_headers / circuit_breaker）。
 
-- 路由：7 个前缀（最长前缀匹配）；``strip_prefix=false`` → 转发完整路径
+- 路由：8 个前缀（最长前缀匹配）；``strip_prefix=false`` → 转发完整路径
   （后端按 ``/api/v1/<domain>/...`` 全路径注册路由，与各服务契约一致）
 - 身份注入（契约 route_headers）：``X-User-Id`` / ``X-Roles`` / ``X-Trace-Id``，
   客户端同名头一律覆盖（防身份伪造）；同时剥离客户端 ``Authorization``
@@ -117,6 +117,7 @@ def build_route_table(settings: Settings) -> list[GatewayRoute]:
         GatewayRoute(prefix="/api/v1/ota", service_name="ota-service", base_url=settings.ota_service_url),
         GatewayRoute(prefix="/api/v1/remote", service_name="remote-control", base_url=settings.remote_control_service_url),
         GatewayRoute(prefix="/api/v1/vehicle", service_name="vehicle-service", base_url=settings.vehicle_service_url),
+        GatewayRoute(prefix="/api/v1/ingest", service_name="ingest-platform", base_url=settings.ingest_platform_service_url),
         GatewayRoute(prefix="/api/v1/user", service_name="user-service", base_url=settings.user_service_url),
     ]
 

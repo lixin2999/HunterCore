@@ -75,6 +75,29 @@ data:
     create_topic "alert_event.dlq"         3 "$DLQ_RETENTION_MS"
     create_topic "algorithm_metrics.dlq"    6 "$DLQ_RETENTION_MS"
 
+    # ---- ingest-platform Topic（V1.20.4，契约 topics.yaml#ingest_platform_topics）----
+    create_topic "vehicle.bag.manifest"        3 604800000
+    create_topic "vehicle.bag.task.status"     3 604800000
+    create_topic "vehicle.bag.parse.progress"  3 604800000
+    create_topic "vehicle.bag.artifact.uploaded" 6 604800000
+    create_topic "vehicle.agent.heartbeat"     6 604800000
+    create_topic "vehicle.agent.alert"         3 2592000000
+    create_topic "vehicle.agent.cmd.ack"       3 604800000
+    create_topic "vehicle.agent.cmd"           3 604800000
+    create_topic "platform.derived.ready.v1"   3 2592000000
+    create_topic "platform.bag.qc_failed.v1"   3 2592000000
+    create_topic "platform.clip.created.v1"    3 2592000000
+    create_topic "platform.dataset.ready.v1"   3 2592000000
+    create_topic "ingest.dlt"                  3 2592000000
+    # ---- ingest 订阅 Topic 死信（仅被消费的 7 个，分区继承源 Topic）----
+    create_topic "vehicle.bag.manifest.dlq"        3 "$DLQ_RETENTION_MS"
+    create_topic "vehicle.bag.task.status.dlq"     3 "$DLQ_RETENTION_MS"
+    create_topic "vehicle.bag.parse.progress.dlq"  3 "$DLQ_RETENTION_MS"
+    create_topic "vehicle.bag.artifact.uploaded.dlq" 6 "$DLQ_RETENTION_MS"
+    create_topic "vehicle.agent.heartbeat.dlq"     6 "$DLQ_RETENTION_MS"
+    create_topic "vehicle.agent.alert.dlq"         3 "$DLQ_RETENTION_MS"
+    create_topic "vehicle.agent.cmd.ack.dlq"       3 "$DLQ_RETENTION_MS"
+
     echo "[kafka-init] platform topics ready:"
     kafka_topics --list
 ---

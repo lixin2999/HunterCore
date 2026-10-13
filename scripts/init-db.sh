@@ -220,6 +220,17 @@ main() {
     log_info "无独立 timescale 容器：采用契约单实例形态（时序表与业务表同库 hunter_core）"
   fi
 
+  # ---------- 3b) ingest_platform（V1.20.4，ingest-platform 服务私有 schema） ----------
+  #   单一事实来源：contracts/database/ddl/06_ingest_platform.sql（自包含 CREATE SCHEMA + 枚举 + 15 表，全幂等）。
+  #   ⚠ 不计入上方 8 schema / 13 表校验（校验按业务 schema 名单作用域，ingest_platform 独立于服务侧）。
+  ingest_ddl="${APP_DIR}/contracts/database/ddl/06_ingest_platform.sql"
+  if [ -f "$ingest_ddl" ]; then
+    log_info "应用 ingest_platform 结构：06_ingest_platform.sql（服务私有 schema，幂等）"
+    apply_sql "$C_POSTGRES" "$POSTGRES_USER" "$POSTGRES_DB" "$ingest_ddl" || return 1
+  else
+    log_warn "未找到 ${ingest_ddl}：跳过 ingest_platform DDL（部署需含 contracts/，否则 ingest-platform 服务缺表将无法启动）"
+  fi
+
   # ---------- 4) 初始数据（admin/角色/权限/验证车辆；幂等） ----------
   if [ -n "$ADMIN_PASSWORD_HASH" ]; then
     hash="$ADMIN_PASSWORD_HASH"

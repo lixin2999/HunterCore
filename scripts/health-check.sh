@@ -13,7 +13,7 @@
 #      MinIO(/minio/health/live)、SRS(/api/v1/versions)、Flink UI(/overview)
 #   ③ PostgreSQL：pg_isready       ④ TimescaleDB：pg_isready（存在独立实例时）
 #   ⑤ Redis：redis-cli PING（区分 WRONGPASS / NOAUTH / 空口令）  ⑥ Kafka：Topic 数 ≥6
-#   ⑦ MinIO：Bucket 数 ≥7          ⑧ 磁盘：/data 使用率（>85% WARN，>95% FAIL）
+#   ⑦ MinIO：Bucket 数 ≥9          ⑧ 磁盘：/data 使用率（>85% WARN，>95% FAIL）
 #   ⑨ 内存使用率（>90% WARN）      ⑩ Kafka 消费积压：data-collector-telemetry LAG（>10000 WARN）
 #      ⚠ 三分语义：没查到（-1）/ 积压为 0 / 超阈值，“没查到”不再说成“车辆未上报”（V1.19.13）
 #   ⑪ 配置漂移硬闸（G-03）：docker-compose.override.yml 存在即 FAIL（HUNTER_ALLOW_OVERRIDE=1 降为 WARN）；
@@ -85,6 +85,7 @@ EXPECTED_CONTAINERS=(
   "hunter-postgres" "hunter-redis" "hunter-zookeeper" "hunter-kafka" "hunter-minio" "hunter-srs"
   "hunter-flink-jm" "hunter-flink-tm" "hunter-api-gateway" "hunter-scene" "hunter-collector"
   "hunter-analytics" "hunter-ota" "hunter-remote" "hunter-vehicle-service" "hunter-web"
+  "hunter-ingest-platform"
 )
 OPTIONAL_CONTAINERS=("hunter-timescale")
 
@@ -293,6 +294,7 @@ check_http_endpoints() {
     "ota-service:${OTA_SERVICE_PORT:-8084}:${HEALTH_PATH}"
     "remote-control:${REMOTE_CONTROL_PORT:-8085}:${HEALTH_PATH}"
     "vehicle-service:${VEHICLE_SERVICE_PORT:-8086}:${HEALTH_PATH}"
+    "ingest-platform:${INGEST_PLATFORM_PORT:-8089}:${HEALTH_PATH}"
     "web-portal:${WEB_PORT:-80}:/"
   )
   for item in "${services[@]}"; do
@@ -428,7 +430,7 @@ check_kafka_topics() {
 
 # ⑦ MinIO Bucket 数
 check_minio_buckets() {
-  local raw count minimum=7
+  local raw count minimum=9
   if ! docker inspect "hunter-minio" >/dev/null 2>&1; then
     record_result "FAIL" "MinIO" "容器 hunter-minio 不存在"
     return 0
@@ -797,7 +799,7 @@ check_kafka_broker_cert() {
 #     字段级明细见日志 schema_errors，非法消息已转投 DLQ／落盘（不丢），但不会入库（车辆页面会离线）
 check_service_error_logs() {
   local containers=(hunter-api-gateway hunter-scene hunter-collector hunter-analytics \
-    hunter-ota hunter-remote hunter-vehicle-service)
+    hunter-ota hunter-remote hunter-vehicle-service hunter-ingest-platform)
   local window="${ERROR_LOG_WINDOW:-15m}"
   local err_re='\[(error|critical)[[:space:]]*\]|Traceback \(most recent call last\)'
   local sub_re='Subscribed topic not available'

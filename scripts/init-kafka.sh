@@ -2,8 +2,9 @@
 # =====================================================================
 # HunterCore 单机部署 —— Kafka 平台内部 Topic 初始化（init-kafka.sh）
 #
-#   用途：等待 broker 就绪后，按 contracts/kafka/topics.yaml 创建 7 个平台内部 Topic
-#       与对应的 7 个死信 Topic（{topic}.dlq）（分区数/保留时间严格对齐契约，禁止新增未定义 Topic），并校验创建结果。
+#   用途：等待 broker 就绪后，按 contracts/kafka/topics.yaml 创建平台内部 Topic
+#       （含 ingest-platform 的 vehicle.bag.* / vehicle.agent.* / platform.* / ingest.dlt，V1.20.4）
+#       与对应的死信 Topic（{topic}.dlq）（分区数/保留时间严格对齐契约，禁止新增未定义 Topic），并校验创建结果。
 #
 #   ⚠ 死信 Topic 必须显式创建：broker 关 auto.create.topics.enable，而消费侧转投
 #     {topic}.dlq 属于投递行为——Topic 不存在时报 _UNKNOWN_TOPIC（不可重试），
@@ -64,10 +65,46 @@ TOPIC_SPECS=(
   "sensor_file:3:604800000"         # 7 天
   "analytics_result:6:2592000000"   # 30 天
   "alert_event:3:2592000000"        # 30 天
-  "algorithm_metrics:6:604800000"   # 7 天（Flink 产出→data-analytics 落库）
+  "algorithm_metrics:6:604800000"    # 7 天（Flink 产出→data-analytics 落库）
 )
 # 死信 Topic（topics.yaml#naming：dlq_pattern / dlq_retention_ms / 分区继承源 Topic）
 DLQ_RETENTION_MS=2592000000
+
+# ---- ingest-platform 数据消费/解析 Topic（V1.20.4 纳入编排；契约 topics.yaml#ingest_platform_topics）----
+#   ⚠ 与上方平台内部 Topic 不同，本清单**不纳入** verify_data_layer.py 校验 6 的「平台 Topic 四方同步」：
+#     ① ingest 走自建死信 ingest.dlt，不按 {topic}.dlq 逐条派生；
+#     ② 不写 docker/kafka/create-topics.sh 与 k8s kafka-init-job（compose 优先，仅由本脚本预建）；
+#     ③ broker auto.create.topics.enable=false，生产/订阅目标均需在此显式创建。
+INGEST_TOPIC_SPECS=(
+  #   订阅（车端/agent 产出、ingest 消费）：
+  "vehicle.bag.manifest:3:604800000"
+  "vehicle.bag.task.status:3:604800000"
+  "vehicle.bag.parse.progress:3:604800000"
+  "vehicle.bag.artifact.uploaded:6:604800000"
+  "vehicle.agent.heartbeat:6:604800000"
+  "vehicle.agent.alert:3:2592000000"
+  "vehicle.agent.cmd.ack:3:604800000"
+  #   生产（平台侧；auto.create.topics.enable=false 时生产目标 Topic 必须预建）：
+  "vehicle.agent.cmd:3:604800000"          # 下行命令
+  "platform.derived.ready.v1:3:2592000000" # 派生产物就绪
+  "platform.bag.qc_failed.v1:3:2592000000"
+  "platform.clip.created.v1:3:2592000000"
+  "platform.dataset.ready.v1:3:2592000000"
+  #   DLT 解析/字段级无效消息专用死信（replay 工具取回源）：
+  "ingest.dlt:3:2592000000"
+)
+# 被 ingest 消费者订阅的 Topic：基础设施类失败（连接/超时）经 hunter_common 消费者转投 {topic}.dlq
+# （数据/字段级失败才走 ingest.dlt）；⚠ auto.create.topics.enable=false，这些 {topic}.dlq 必须显式创建，
+#   否则 infra 失败消息转投报 UNKNOWN_TOPIC（不可重试）被静默丢弃。分区继承源 Topic、保留取 DLQ_RETENTION_MS。
+INGEST_CONSUMED_TOPICS=(
+  "vehicle.bag.manifest"
+  "vehicle.bag.task.status"
+  "vehicle.bag.parse.progress"
+  "vehicle.bag.artifact.uploaded"
+  "vehicle.agent.heartbeat"
+  "vehicle.agent.alert"
+  "vehicle.agent.cmd.ack"
+)
 
 usage() {
   cat <<'EOF'
@@ -78,6 +115,8 @@ HunterCore Kafka 内部 Topic 初始化脚本
     telemetry_raw(12,7d) telemetry_clean(12,7d) event_raw(6,30d)
     sensor_file(3,7d) analytics_result(6,30d) alert_event(3,30d) algorithm_metrics(6,7d)
     {以上每个}.dlq（分区继承源 Topic，保留 30 天）——缺死信 Topic 时非法消息会被静默丢弃
+  另创建 13 个 ingest-platform Topic（V1.20.4：vehicle.bag.*/vehicle.agent.*/platform.*/ingest.dlt）；
+    ingest 走自建 DLT（ingest.dlt），**不**逐条派生 {topic}.dlq，也不纳入平台 Topic 四方同步门禁
 
 用法：
   sudo bash scripts/init-kafka.sh [选项]
@@ -194,6 +233,17 @@ check_only_alignment() {
     expected+=("$spec")
     expected+=("${spec%%:*}.dlq:$(printf '%s' "$spec" | cut -d: -f2):${DLQ_RETENTION_MS}")
   done
+  for spec in "${INGEST_TOPIC_SPECS[@]}"; do
+    expected+=("$spec")
+  done
+  for consumed in "${INGEST_CONSUMED_TOPICS[@]}"; do
+    for spec in "${INGEST_TOPIC_SPECS[@]}"; do
+      if [ "${spec%%:*}" = "$consumed" ]; then
+        expected+=("${consumed}.dlq:$(printf '%s' "$spec" | cut -d: -f2):${DLQ_RETENTION_MS}")
+        break
+      fi
+    done
+  done
 
   log_info "===== 只读对账（契约：contracts/kafka/topics.yaml；不创建、不修改）====="
   for spec in "${expected[@]}"; do
@@ -208,7 +258,7 @@ check_only_alignment() {
     verify_topic "$name" "$partitions" "$retention" || drifted=$((drifted + 1))
   done
 
-  # 契约外：既不是 14 个契约 Topic，也不是车端 hunter.*（车辆注册时创建）与 __*（系统 Topic）
+  # 契约外：既不是契约 Topic（平台内部+死信+ingest），也不是车端 hunter.*（车辆注册时创建）与 __*（系统 Topic）
   while IFS= read -r listed; do
     [ -n "$listed" ] || continue
     case "$listed" in
@@ -287,12 +337,21 @@ main() {
   fi
 
   # ---------- 2) 创建平台 Topic 与死信 Topic（幂等） ----------
-  log_info "===== 创建平台内部 Topic + 死信 Topic（契约：contracts/kafka/topics.yaml）====="
-  local -a all_specs=("${TOPIC_SPECS[@]}")
+  log_info "===== 创建平台内部 Topic + 死信 Topic + ingest Topic（契约：contracts/kafka/topics.yaml）====="
+  local -a all_specs=("${TOPIC_SPECS[@]}" "${INGEST_TOPIC_SPECS[@]}")
   local spec dlq_partitions
   for spec in "${TOPIC_SPECS[@]}"; do
     dlq_partitions="$(printf '%s' "$spec" | cut -d: -f2)"
     all_specs+=("${spec%%:*}.dlq:${dlq_partitions}:${DLQ_RETENTION_MS}")
+  done
+  # ingest 订阅 Topic 的死信（分区继承源 Topic）：与平台内部 Topic 同策略，但仅限被消费的 7 个
+  for consumed in "${INGEST_CONSUMED_TOPICS[@]}"; do
+    for spec in "${INGEST_TOPIC_SPECS[@]}"; do
+      if [ "${spec%%:*}" = "$consumed" ]; then
+        all_specs+=("${consumed}.dlq:$(printf '%s' "$spec" | cut -d: -f2):${DLQ_RETENTION_MS}")
+        break
+      fi
+    done
   done
   for spec in "${all_specs[@]}"; do
     name="${spec%%:*}"
@@ -332,7 +391,7 @@ main() {
   kafka_topics_cli --list 2>/dev/null | sed 's/^/  /' || true
   local total
   total="$(kafka_topic_count)"
-  log_info "Topic 总数：${total}（含契约 7 个内部 Topic + 7 个死信 Topic 与系统 Topic __consumer_offsets）"
+  log_info "Topic 总数：${total}（含契约 7 个内部 Topic + 7 个死信 Topic + 13 个 ingest Topic 与系统 Topic __consumer_offsets）"
 
   if [ "$failed" -ne 0 ]; then
     log_error "Kafka 初始化存在 ${failed} 项失败（成功处理 ${created} 项 / 校验通过 ${verified} 项）"

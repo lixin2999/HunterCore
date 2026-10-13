@@ -453,6 +453,7 @@ services:
       OTA_SERVICE_URL: ${OTA_SERVICE_URL:-http://ota-service:8084}
       REMOTE_CONTROL_SERVICE_URL: ${REMOTE_CONTROL_SERVICE_URL:-http://remote-control:8085}
       VEHICLE_SERVICE_URL: ${VEHICLE_SERVICE_URL:-http://vehicle-service:8086}
+      INGEST_PLATFORM_SERVICE_URL: ${INGEST_PLATFORM_SERVICE_URL:-http://ingest-platform:8089}
       RATE_LIMIT_GLOBAL_QPS: ${RATE_LIMIT_GLOBAL_QPS:-10000}
       RATE_LIMIT_PER_USER_QPS: ${RATE_LIMIT_PER_USER_QPS:-100}
       RATE_LIMIT_PER_IP_QPS: ${RATE_LIMIT_PER_IP_QPS:-200}
@@ -741,7 +742,60 @@ services:
       resources:
         limits: { cpus: "1", memory: 1G }
 
-  # ---------- 15. web-portal（Nginx + Vue3 dist；对外 80，同源反代 /api 与 /ws） ----------
+  # ---------- 15. ingest-platform（8089；数据消费解析与处理：7 Kafka 消费者 + orchestrator 加工 worker + 查询/导出 REST） ----------
+  # V1.20.4 纳入部署编排（此前仅代码交付、未进 compose，实机验证卡在 `no such service: ingest-platform`）。
+  # ⚠ 运行镜像 python:3.12-slim 非 distroless（rosbags/pyarrow/numpy 需原生库），容器 HEALTHCHECK 用 python3 urllib 探 /healthz。
+  # ⚠ 端口与同级后端一致只绑 127.0.0.1；对外经 api-gateway 统一前缀 /api/v1/ingest 路由（V1.20.4 已接入网关，见 deployment.md §14）。
+  ingest-platform:
+    image: ${IMAGE_PREFIX:-hunter}/ingest-platform:${VERSION}
+    build:
+      context: .
+      dockerfile: services/ingest-platform/Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-ingest-platform
+    environment:
+      <<: *business-env
+      SERVICE_NAME: ingest-platform
+      API_PORT: "8089"
+      # 数据湖 Bucket（§6.1；parsed 与原始 bag 同桶，derived/dataset 平台专属，由 init-minio.sh 创建）
+      MINIO_BUCKET_ROSBAG: ${MINIO_BUCKET_ROSBAG:-hunter-rosbag}
+      MINIO_BUCKET_PARSED: ${MINIO_BUCKET_PARSED:-hunter-rosbag}
+      MINIO_BUCKET_DERIVED: ${MINIO_BUCKET_DERIVED:-hunter-derived}
+      MINIO_BUCKET_DATASET: ${MINIO_BUCKET_DATASET:-hunter-datasets}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      # §13.2 parsed 只读隔离凭据（可选，缺省回退主凭据；生产应配仅 GetObject/ListBucket 专用 key + bucket policy）
+      MINIO_PARSED_ACCESS_KEY: ${MINIO_PARSED_ACCESS_KEY:-}
+      MINIO_PARSED_SECRET_KEY: ${MINIO_PARSED_SECRET_KEY:-}
+      # DLT 死信（§12.3；Topic 由 init-kafka.sh 创建，缺失则落不了料、replay 无从取数）
+      DLT_ENABLED: ${DLT_ENABLED:-true}
+      DLT_TOPIC: ${DLT_TOPIC:-ingest.dlt}
+      # Alertmanager webhook（可选，留空仅落库+日志）
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    ports:
+      - "127.0.0.1:${INGEST_PLATFORM_PORT:-8089}:8089"
+    volumes:
+      - *contracts-vol
+      - ${DATA_DIR:-/data}/kafka-buffer/ingest-platform:/app/data/kafka-buffer
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8089/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 4G }     # 多 worker 加工 + 7 消费者，参照 data-collector 档
+
+  # ---------- 16. web-portal（Nginx + Vue3 dist；对外 80，同源反代 /api 与 /ws） ----------
   web-portal:
     image: ${IMAGE_PREFIX:-hunter}/web-portal:${VERSION}
     build:

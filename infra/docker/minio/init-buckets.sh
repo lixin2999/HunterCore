@@ -33,7 +33,7 @@ add_expiry() {
   echo "[minio-init] lifecycle: $bucket expire ${days}d${tags:+ (tags=$tags)}"
 }
 
-# ---- 7 个 Bucket（名称与生命周期不可更改） ----
+# ---- 9 个 Bucket（名称与生命周期不可更改） ----
 create_bucket "hunter-raw-data"       # 传感器原始数据（点云/图像）   30 天
 create_bucket "hunter-rosbag"         # ROS Bag 文件                 按 Tag：event 永久/regular 30 天
 create_bucket "hunter-video"          # 远程操控录像                  90 天
@@ -41,6 +41,8 @@ create_bucket "hunter-ota-packages"   # OTA 升级包                    永久
 create_bucket "hunter-reports"        # 分析报告                      永久
 create_bucket "hunter-logs"           # 系统日志                      30 天
 create_bucket "hunter-scene-assets"   # 场景资源（地图/模型）          永久
+create_bucket "hunter-derived"        # 数据湖 derived 层（平台加层产物）永久
+create_bucket "hunter-datasets"       # 数据湖 dataset 层（训练数据集）  永久
 
 # ---- 生命周期规则 ----
 add_expiry "hunter-raw-data" 30
@@ -50,7 +52,7 @@ add_expiry "hunter-raw-data" 30
 add_expiry "hunter-rosbag" 30 "hunter-retention=regular"
 add_expiry "hunter-video" 90
 add_expiry "hunter-logs" 30
-# hunter-ota-packages / hunter-reports / hunter-scene-assets：永久，不设置过期规则
+# hunter-ota-packages / hunter-reports / hunter-scene-assets / hunter-derived / hunter-datasets：永久，不设置过期规则
 
 echo "[minio-init] buckets:"
 mc ls "$ALIAS"

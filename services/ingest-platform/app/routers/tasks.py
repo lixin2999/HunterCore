@@ -1,4 +1,4 @@
-"""任务查询与重算路由（§8.1 GET /api/v1/tasks、§9 replay）。"""
+"""任务查询与重算路由（§8.1 GET /api/v1/ingest/tasks、§9 replay）。"""
 from __future__ import annotations
 
 from typing import Annotated
@@ -11,7 +11,7 @@ from app.core.dependencies import ExecuteUser, ReadUser, SessionDep
 from app.models.ingest import TaskType
 from app.schemas.schemas import ReplayTaskReq
 
-router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
+router = APIRouter(prefix="/api/v1/ingest/tasks", tags=["tasks"])
 
 
 @router.get("")
@@ -23,7 +23,7 @@ async def list_tasks(
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = DEFAULT_PAGE_SIZE,
 ) -> dict:
-    """列举加工任务（§8.1 GET /api/v1/tasks）。"""
+    """列举加工任务（§8.1 GET /api/v1/ingest/tasks）。"""
     from sqlalchemy import func, select
     from app.models.ingest import Task
 
@@ -79,7 +79,7 @@ async def replay_tasks(
     session: SessionDep,
     _user: ExecuteUser,
 ) -> dict:
-    """重算任务（§8.1 POST /api/v1/tasks/replay）。
+    """重算任务（§8.1 POST /api/v1/ingest/tasks/replay）。
 
     为指定 bags 重新创建任务（force_rerun=True 时先重置 DONE→PENDING）。
     """

@@ -1,4 +1,4 @@
-"""Agent 状态路由（§8.1 GET /api/v1/agents）。"""
+"""Agent 状态路由（§8.1 GET /api/v1/ingest/agents）。"""
 from __future__ import annotations
 
 from typing import Annotated
@@ -9,7 +9,7 @@ from hunter_common.responses import success_response
 from app.core.dependencies import ReadUser, SessionDep
 from app.repositories.agents import AgentRepository
 
-router = APIRouter(prefix="/api/v1/agents", tags=["agents"])
+router = APIRouter(prefix="/api/v1/ingest/agents", tags=["agents"])
 
 
 @router.get("")
@@ -19,7 +19,7 @@ async def list_agents(
     online: Annotated[bool | None, Query(description="true=仅在线，false=仅掉线，null=全部")] = None,
     timeout_s: Annotated[int, Query(ge=10, le=3600, description="心跳超时阈值（秒）")] = 120,
 ) -> dict:
-    """列举 Agent 状态（§8.1 GET /api/v1/agents）。"""
+    """列举 Agent 状态（§8.1 GET /api/v1/ingest/agents）。"""
     repo = AgentRepository(session)
     if online is True:
         agents = await repo.list_online(timeout_s=timeout_s)

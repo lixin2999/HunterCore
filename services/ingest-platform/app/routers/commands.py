@@ -1,4 +1,4 @@
-"""命令下发路由（§9.4 POST /api/v1/commands）。"""
+"""命令下发路由（§9.4 POST /api/v1/ingest/commands）。"""
 from __future__ import annotations
 
 from typing import Annotated
@@ -10,7 +10,7 @@ from app.core.dependencies import ExecuteUser, get_cmd_service
 from app.schemas.schemas import IssueCmdReq, IssueCmdResp
 from app.services.cmd_service import CmdService
 
-router = APIRouter(prefix="/api/v1/commands", tags=["commands"])
+router = APIRouter(prefix="/api/v1/ingest/commands", tags=["commands"])
 
 
 @router.post("", response_model=None)

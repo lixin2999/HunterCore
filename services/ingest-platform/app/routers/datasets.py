@@ -1,4 +1,4 @@
-"""数据集路由（§8.2 POST/GET /api/v1/datasets）。"""
+"""数据集路由（§8.2 POST/GET /api/v1/ingest/datasets）。"""
 from __future__ import annotations
 
 from typing import Annotated
@@ -10,7 +10,7 @@ from app.core.dependencies import ExecuteUser, ReadUser, SessionDep, get_dataset
 from app.schemas.schemas import DatasetCreateReq
 from app.services.dataset_service import DatasetService
 
-router = APIRouter(prefix="/api/v1/datasets", tags=["datasets"])
+router = APIRouter(prefix="/api/v1/ingest/datasets", tags=["datasets"])
 
 
 @router.post("")
@@ -35,7 +35,7 @@ async def list_datasets(
     _user: ReadUser,
     svc: Annotated[DatasetService, Depends(get_dataset_service)],
 ) -> dict:
-    """列举数据集（§8.1 GET /api/v1/datasets）。"""
+    """列举数据集（§8.1 GET /api/v1/ingest/datasets）。"""
     items = await svc.list_datasets()
     return success_response(data={"items": items}).model_dump()
 

@@ -1,4 +1,4 @@
-"""产物预签名路由（§8.1 GET /api/v1/artifacts）。"""
+"""产物预签名路由（§8.1 GET /api/v1/ingest/artifacts）。"""
 from __future__ import annotations
 
 from typing import Annotated
@@ -10,7 +10,7 @@ from app.core.dependencies import ReadUser, SessionDep, get_storage
 from app.repositories.artifacts import ArtifactRepository
 from app.storage.minio_client import LakeStorage
 
-router = APIRouter(prefix="/api/v1/artifacts", tags=["artifacts"])
+router = APIRouter(prefix="/api/v1/ingest/artifacts", tags=["artifacts"])
 
 
 @router.get("/{bag_id}")

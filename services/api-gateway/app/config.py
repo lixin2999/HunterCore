@@ -24,6 +24,8 @@ class Settings(HunterBaseConfig):
     remote_control_service_url: str = "http://localhost:8085"
     # vehicle-service 已交付（contracts/openapi/vehicle-service.yaml，端口 8086）
     vehicle_service_url: str = "http://localhost:8086"
+    # ingest-platform 已交付（V1.20.4，统一前缀 /api/v1/ingest，端口 8089）
+    ingest_platform_service_url: str = "http://localhost:8089"
     # user-service 归属待确认（契约 status=pending_confirmation，端口未登记）：
     # 未配置 URL 时对应前缀返回 503 + code=5001（服务不可用），禁止伪造转发
     user_service_url: str | None = None

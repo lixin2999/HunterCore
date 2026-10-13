@@ -42,7 +42,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ENV_FILE_ARG=""
 SKIP_LIFECYCLE=0
-EXPECTED_BUCKETS=7
+EXPECTED_BUCKETS=9
 # Bucket 定义（名称:过期天数:选择器）—— 天数 0 表示永久（不设生命周期规则）；
 # 选择器为对象 Tag 表达式（hunter-retention=...），不带选择器的为整桶规则
 BUCKET_SPECS=(
@@ -53,6 +53,9 @@ BUCKET_SPECS=(
   "hunter-reports:0:"
   "hunter-logs:30:"
   "hunter-scene-assets:0:"
+  # ingest-platform（V1.20.4）平台专属数据湖层（§6.1）：derived 加层产物 / dataset 训练导出，均永久
+  "hunter-derived:0:"
+  "hunter-datasets:0:"
 )
 
 usage() {
@@ -60,9 +63,10 @@ usage() {
 HunterCore MinIO Bucket 初始化脚本
 
 用途：
-  创建 7 个契约 Bucket 并设置生命周期规则（名称与生命周期不可更改）：
+  创建 9 个契约 Bucket 并设置生命周期规则（名称与生命周期不可更改）：
     hunter-raw-data(30d) hunter-rosbag(Tag hunter-retention=regular 30d) hunter-video(90d)
     hunter-logs(30d) hunter-ota-packages(永久) hunter-reports(永久) hunter-scene-assets(永久)
+    hunter-derived(永久) hunter-datasets(永久)   # V1.20.4 ingest-platform 数据湖层
 
 用法：
   sudo bash scripts/init-minio.sh [选项]

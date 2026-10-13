@@ -182,6 +182,7 @@ tasks = await OtaTaskRepository(session).find_all(
 | `api-gateway` | `UserRepository`、`RoleRepository`、`PermissionRepository`、`UserRoleRepository`、`RolePermissionRepository`、`VehicleRepository` | 鉴权链路（`user_svc` RBAC 五表）+ 车辆台账只读 |
 | `remote-control` | `VehicleRepository` | 车辆状态读取（状态写入走 REST 调 vehicle-service） |
 | `vehicle-service` | 无（`VehicleRepository` 等共享层未引用） | `vehicle_svc` owner：本服务 `app/repositories/vehicle.py` 直接基于 `AsyncSession` + `hunter_common.database.models.Vehicle` 实现（历史形态，第 4 节收敛路径待迁移）；登记本行仅为消除「未登记白名单」，**不得**据此新增共享 Repository 引用 |
+| `ingest-platform` | 无（自带 `app/repositories/*`，不引用共享 Repository） | `ingest_platform` schema owner（服务私有 schema，V1.20.4 纳入编排）：自带 DDL `06_ingest_platform.sql` + 服务内 ORM 模型（`app/models/ingest.py`，不入共享 `hunter_common` 元数据）+ 自带 Repository；经 `verify_data_layer.py` 的 `SERVICE_PRIVATE_SCHEMAS` 豁免共享 13 表 L2 逐列对账；登记本行仅为消除「未登记白名单」，**不得**据此新增共享 Repository 引用 |
 | `flink-jobs`（非服务，书面豁免） | 无（禁止使用任何 Repository） | G-13 写侧豁免：实时作业（`hunter_flink`）经 Kafka 写 `alert_event`/`algorithm_metrics`，不直连数据库、不经 hunter_common 数据层；不在 services/ 目录（校验 14 不扫描），本行为书面登记 |
 <!-- service-repository-table:end -->
 

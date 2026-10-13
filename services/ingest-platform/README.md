@@ -43,10 +43,10 @@
   ⚠ **生产必须落实两步**：① 在 MinIO/IAM 建仅具 `s3:GetObject`/`s3:ListBucket` 于 `hunter-rosbag` 的专用 key 并注入本服务；
   ② 对 parsed bucket 挂只读 bucket policy（拒绝写/删），代码仅提供凭据通道，权限收敛在存储侧完成。
 
-## REST 端点（服务内部直连，未入网关路由表）
+## REST 端点（经 api-gateway 统一前缀 `/api/v1/ingest` 接入，V1.20.4）
 
-`/healthz`、`/readyz`、`/metrics`（共享库基线）＋ `/api/v1/bags`、`/api/v1/clips`、`/api/v1/tasks`、
-`/api/v1/artifacts`、`/api/v1/datasets`、`/api/v1/agents`、`/api/v1/commands`。
+`/healthz`、`/readyz`、`/metrics`（共享库基线，直连）＋ `/api/v1/ingest/bags`、`/api/v1/ingest/clips`、`/api/v1/ingest/tasks`、
+`/api/v1/ingest/artifacts`、`/api/v1/ingest/datasets`、`/api/v1/ingest/agents`、`/api/v1/ingest/commands`（均由网关 JWT 鉴权后转发）。
 
 ## 本地运行
 

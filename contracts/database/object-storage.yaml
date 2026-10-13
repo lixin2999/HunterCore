@@ -19,7 +19,7 @@
 version: 1
 source: "系统关键约束第 7 条（Bucket 规划）、第 9 条（SSE-S3）；设计文档 9.4.1 / 9.4.2 节"
 engine: "MinIO（纠删码模式，S3 兼容 API）"
-sse: "SSE-S3（服务端加密，7 个 Bucket 全部启用；密钥由 MINIO_KMS_SECRET_KEY 提供）"
+sse: "SSE-S3（服务端加密，9 个 Bucket 全部启用；密钥由 MINIO_KMS_SECRET_KEY 提供）"
 public_access: "全部 Bucket 私有（匿名访问禁止）；仅通过预签名 URL 或服务端代理访问"
 
 presign_policy:
@@ -210,6 +210,36 @@ buckets:
     access:
       upload: "服务端生成导出产物直传；预签名上传仅异常补录（3600s）"
       download: "预签名 900s + Range（scene-service 契约 presign_expires_in_seconds=900）"
+
+  # ---------------------------------------------------------------- 8
+  - name: hunter-derived
+    purpose: "数据湖 derived 层：平台加层产物（对齐 / 切片 / QC / 富化），平台所有权（V1.20.4 ingest-platform）"
+    lifecycle:
+      mode: permanent
+      expire_days: null
+    sse: sse-s3
+    writers: [ingest-platform]
+    readers: [ingest-platform]
+    object_key_conventions:
+      - pattern: "derived/v1/{bag_id}/{input_rev}/{...}"
+        style: bucket_excluded
+        declared_in: "服务端数据消费解析与处理详细设计文档 §6.1（lake_derived_prefix=derived/v1）"
+    notes: "永久保留；input_rev 为解析模板版本因子（§5.2）；与车端所有权的 parsed 层（hunter-rosbag）分离，平台只写本桶"
+
+  # ---------------------------------------------------------------- 9
+  - name: hunter-datasets
+    purpose: "数据湖 dataset 层：训练数据集导出（webdataset tar 分片）（V1.20.4 ingest-platform）"
+    lifecycle:
+      mode: permanent
+      expire_days: null
+    sse: sse-s3
+    writers: [ingest-platform]
+    readers: [ingest-platform]
+    object_key_conventions:
+      - pattern: "datasets/{dataset_id}/{version}/{...}"
+        style: bucket_excluded
+        declared_in: "服务端数据消费解析与处理详细设计文档 §6.1/§8.2（lake_dataset_prefix=datasets）"
+    notes: "永久保留；每分片最大 clip 数由 dataset_shard_max_clips 控制（§8.2）；就绪事件 platform.dataset.ready.v1"
 
 # =====================================================================
 # 交叉校验（scripts/verify_data_layer.py / common/python/tests/test_storage_contracts.py）

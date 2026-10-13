@@ -20,13 +20,15 @@ data:
   RATE_LIMIT_USER_QPS: "100"
   RATE_LIMIT_IP_QPS: "200"
   # 网关路由表前缀（与设计文档一致，禁止自行更改）
-  GATEWAY_ROUTE_PREFIXES: "/api/v1/scene,/api/v1/data,/api/v1/analytics,/api/v1/ota,/api/v1/remote,/api/v1/vehicle,/api/v1/user"
+  GATEWAY_ROUTE_PREFIXES: "/api/v1/scene,/api/v1/data,/api/v1/analytics,/api/v1/ota,/api/v1/remote,/api/v1/vehicle,/api/v1/ingest,/api/v1/user"
   # ---------- 转发目标（x-hunter-gateway-routes；集群内经 Service DNS） ----------
   SCENE_SERVICE_URL: "http://scene-service:8081"
   DATA_COLLECTOR_SERVICE_URL: "http://data-collector:8082"
   DATA_ANALYTICS_SERVICE_URL: "http://data-analytics:8083"
   OTA_SERVICE_URL: "http://ota-service:8084"
   REMOTE_CONTROL_SERVICE_URL: "http://remote-control:8085"
+  # ingest-platform 已接入（V1.20.4，统一前缀 /api/v1/ingest）
+  INGEST_PLATFORM_SERVICE_URL: "http://ingest-platform:8089"
   # vehicle-service / user-service 归属待确认（契约 pending_confirmation）：
   # 不配置 URL → 对应前缀返回 503 + code=5001，禁止伪造转发
   # ---------- 转发超时与熔断（契约 circuit_breaker 默认策略；阈值待人工确认） ----------

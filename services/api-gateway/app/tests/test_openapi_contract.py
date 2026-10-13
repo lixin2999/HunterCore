@@ -37,6 +37,7 @@ EXPECTED_ROUTE_PREFIXES: tuple[str, ...] = (
     "/api/v1/ota",
     "/api/v1/remote",
     "/api/v1/vehicle",
+    "/api/v1/ingest",
     "/api/v1/user",
 )
 
@@ -284,6 +285,7 @@ def test_proxy_routes_target_correct_service_ports(contract: dict[str, Any]) -> 
         "/api/v1/ota": ("ota-service", 8084),
         "/api/v1/remote": ("remote-control", 8085),
         "/api/v1/vehicle": ("vehicle-service", 8086),
+        "/api/v1/ingest": ("ingest-platform", 8089),
     }
     for prefix, (service, port) in expected.items():
         assert routes[prefix]["target_service"] == service

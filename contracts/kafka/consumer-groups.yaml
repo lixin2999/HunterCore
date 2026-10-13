@@ -176,3 +176,59 @@ groups:
     produces: []
     idempotency_key: "(vehicle_id, alert_id)"
     notes: "告警聚合、WebSocket 推送前端、对接 Alertmanager"
+
+  # =====================================================================
+  # ingest-platform 消费组（V1.20.4，设计文档 §5.1 消费拓扑）
+  #   ⚠ 命名偏离本文件顶部「<service>-<domain>-<purpose>」中划线约定：ingest 采用点分 g.ingest.<purpose>，
+  #     与车端/平台 Topic 的点分命名一致（config.kafka_consumer_groups 为单一事实来源）；
+  #     verify_data_layer 校验 8 对 g.ingest.* 前缀显式放行。
+  #   幂等：事件仓 append-only ON CONFLICT DO NOTHING（§5.2 层1，idempotency_key= event_id）。
+  # =====================================================================
+  - group_id: g.ingest.manifest
+    service: ingest-platform
+    subscribes: [vehicle.bag.manifest]
+    produces: []
+    idempotency_key: event_id
+    notes: "manifest 上传登记 → 投影与就绪判定（§5.1）"
+  - group_id: g.ingest.projection
+    service: ingest-platform
+    subscribes: [vehicle.bag.task.status]
+    produces: []
+    idempotency_key: event_id
+    notes: "车端任务状态回报（纯投影更新，不触发加工）"
+  - group_id: g.ingest.progress
+    service: ingest-platform
+    subscribes: [vehicle.bag.parse.progress]
+    produces: []
+    idempotency_key: event_id
+    notes: "解析进度落库 bags.progress（最新态写入，历史入 events 仓）"
+  - group_id: g.ingest.artifact
+    service: ingest-platform
+    subscribes: [vehicle.bag.artifact.uploaded]
+    produces: [platform.derived.ready.v1, platform.bag.qc_failed.v1, platform.clip.created.v1, platform.dataset.ready.v1]
+    idempotency_key: event_id
+    notes: "产物上传完成 → 就绪判定；每分区令牌桶限速（§5.4 artifact_ingest_rate_limit）"
+  - group_id: g.ingest.heartbeat
+    service: ingest-platform
+    subscribes: [vehicle.agent.heartbeat]
+    produces: []
+    idempotency_key: event_id
+    notes: "agent 心跳（AgentRepository.upsert_heartbeat）"
+  - group_id: g.ingest.alert
+    service: ingest-platform
+    subscribes: [vehicle.agent.alert]
+    produces: []
+    idempotency_key: event_id
+    notes: "agent 告警；critical/error 级经 Webhook/Alertmanager 外发（§10）"
+  - group_id: g.ingest.cmdack
+    service: ingest-platform
+    subscribes: [vehicle.agent.cmd.ack]
+    produces: [vehicle.agent.cmd]
+    idempotency_key: event_id
+    notes: "下行命令回执（命令闭环 §9.4）；30min 未 ack 自动重发一次"
+  - group_id: g.ingest.dlt-replay
+    service: ingest-platform
+    subscribes: [ingest.dlt]
+    produces: []
+    idempotency_key: "(original_topic, original_partition, original_offset)"
+    notes: "DLT 人工重放工具组（§12.3 dlt_replay.py）；非常驻消费者，按需启动"

@@ -285,6 +285,136 @@ platform_topics:
     idempotency_key: "(vehicle_id, time, module, metric_name)"
 
 # =====================================================================
+# 二b、ingest-platform 数据消费/解析 Topic（服务端数据消费解析与处理详细设计文档 §5.1/§7.5/§9.4/§12.3）
+#   独立限界上下文（V1.20.4 纳入编排）。与 platform_topics 不同：
+#     - 死信仅对**被消费**的订阅 Topic 派生 {topic}.dlq（基础设施类失败经 hunter_common 转投），
+#       数据/字段级失败走自建 DLT `ingest.dlt`；生产 Topic 不派生 .dlq。
+#     - auto.create.topics.enable=false，本清单由 init-kafka.sh / create-topics.sh / kafka-init Job 三处显式创建。
+#   消费组见 contracts/kafka/consumer-groups.yaml（g.ingest.*）。组 ID 采用点分命名（与车端/平台 Topic 点分一致）。
+# =====================================================================
+ingest_platform_topics:
+  # ---- 订阅（车端/agent 产出、ingest 消费；均派生 {topic}.dlq）----
+  - name: vehicle.bag.manifest
+    direction: vehicle_to_platform
+    partitions: 3
+    retention_ms: 604800000
+    retention_human: "7 天"
+    consumed: true
+    producer: vehicle-agent
+    consumers: [ingest-platform (g.ingest.manifest)]
+    description: "bag manifest 上传登记（§5.1 消费拓扑；触发投影与就绪判定）"
+  - name: vehicle.bag.task.status
+    direction: vehicle_to_platform
+    partitions: 3
+    retention_ms: 604800000
+    retention_human: "7 天"
+    consumed: true
+    producer: vehicle-agent
+    consumers: [ingest-platform (g.ingest.projection)]
+    description: "车端任务状态回报（纯投影更新，不触发加工）"
+  - name: vehicle.bag.parse.progress
+    direction: vehicle_to_platform
+    partitions: 3
+    retention_ms: 604800000
+    retention_human: "7 天"
+    consumed: true
+    producer: vehicle-agent
+    consumers: [ingest-platform (g.ingest.progress)]
+    description: "解析进度（最新态写入 bags.progress，历史入 events 仓）"
+  - name: vehicle.bag.artifact.uploaded
+    direction: vehicle_to_platform
+    partitions: 6
+    retention_ms: 604800000
+    retention_human: "7 天"
+    consumed: true
+    producer: vehicle-agent
+    consumers: [ingest-platform (g.ingest.artifact)]
+    description: "产物上传完成通知（触发就绪判定；每分区令牌桶限速 §5.4）"
+  - name: vehicle.agent.heartbeat
+    direction: vehicle_to_platform
+    partitions: 6
+    retention_ms: 604800000
+    retention_human: "7 天"
+    consumed: true
+    producer: vehicle-agent
+    consumers: [ingest-platform (g.ingest.heartbeat)]
+    description: "agent 心跳（AgentRepository.upsert_heartbeat）"
+  - name: vehicle.agent.alert
+    direction: vehicle_to_platform
+    partitions: 3
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    consumed: true
+    producer: vehicle-agent
+    consumers: [ingest-platform (g.ingest.alert)]
+    description: "agent 告警（critical/error 级经 Webhook/Alertmanager 外发 §10）"
+  - name: vehicle.agent.cmd.ack
+    direction: vehicle_to_platform
+    partitions: 3
+    retention_ms: 604800000
+    retention_human: "7 天"
+    consumed: true
+    producer: vehicle-agent
+    consumers: [ingest-platform (g.ingest.cmdack)]
+    description: "下行命令回执（命令闭环 §9.4；30min 未 ack 自动重发一次）"
+  # ---- 生产（平台侧；不派生 .dlq）----
+  - name: vehicle.agent.cmd
+    direction: platform_to_vehicle
+    partitions: 3
+    retention_ms: 604800000
+    retention_human: "7 天"
+    consumed: false
+    producer: ingest-platform
+    consumers: [vehicle-agent]
+    description: "下行命令（§9.4；ack 经 vehicle.agent.cmd.ack 回报）"
+  - name: platform.derived.ready.v1
+    direction: platform_internal
+    partitions: 3
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    consumed: false
+    producer: ingest-platform
+    consumers: [下游业务]
+    description: "派生产物就绪（§7.5 对齐/切片/QC/富化完成）"
+  - name: platform.bag.qc_failed.v1
+    direction: platform_internal
+    partitions: 3
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    consumed: false
+    producer: ingest-platform
+    consumers: [下游业务]
+    description: "QC 加权分低于阈值告警（§7.4）"
+  - name: platform.clip.created.v1
+    direction: platform_internal
+    partitions: 3
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    consumed: false
+    producer: ingest-platform
+    consumers: [下游业务]
+    description: "切片生成（§7.3 事件驱动/固定窗口/挖掘/手工）"
+  - name: platform.dataset.ready.v1
+    direction: platform_internal
+    partitions: 3
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    consumed: false
+    producer: ingest-platform
+    consumers: [下游业务]
+    description: "训练数据集导出就绪（§8.2 webdataset 分片）"
+  # ---- DLT（解析/字段级无效消息专用死信；replay 工具 g.ingest.dlt-replay 取回源，§12.3）----
+  - name: ingest.dlt
+    direction: platform_internal
+    partitions: 3
+    retention_ms: 2592000000
+    retention_human: "30 天"
+    consumed: false
+    producer: ingest-platform
+    consumers: [ingest-platform (g.ingest.dlt-replay, 人工重放)]
+    description: "ingest 自建死信（数据/字段级无效消息；区别于 hunter_common 的 {topic}.dlq 基础设施死信）"
+
+# =====================================================================
 # 三、Topic 级限流（设计文档附录 D，不可放宽）
 # =====================================================================
 throttles:

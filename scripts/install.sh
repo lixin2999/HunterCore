@@ -913,7 +913,7 @@ step_3_prepare_dirs() {
   log_info "创建业务服务 Kafka 缓冲目录（属主 10001:10001，供非 root 容器写入）"
   # 以下每一项都是“设不上就必然留下隐性坏环境”的前提，所以逐个 `|| return 1`：
   #   `run_step` 用 `"$@" || rc=$?` 调步函数，那个上下文会**关掉 set -e**——不显式接返值就一路跑到底。
-  for d in api-gateway data-collector data-analytics ota-service remote-control scene-service vehicle-service; do
+  for d in api-gateway data-collector data-analytics ota-service remote-control scene-service vehicle-service ingest-platform; do
     ensure_dir "${DATA_DIR}/kafka-buffer/${d}" "10001:10001" "0755" || return 1
   done
   # vehicle-service 专有：每车客户端证书输出目录（gid 10001 可写；契约 x-hunter-cert-policy.storage_layout）
@@ -1542,6 +1542,12 @@ step_11_start_services() {
   wait_for "service_health_ok ${remote_port}" "remote-control（${remote_port}）" 120 || return 1
   local vehicle_port="${VEHICLE_SERVICE_PORT:-8086}"
   wait_for "service_health_ok ${vehicle_port}" "vehicle-service（${vehicle_port}）" 120 || return 1
+
+  # 11.3b 数据消费解析平台（ingest-platform，8089；仅内部 127.0.0.1，不经网关；7 消费者 + orchestrator worker）
+  #   V1.20.4 纳入编排。依赖 pg/redis/kafka/minio（Step 7~10 已就绪）；DLT/派生桶由 Step 9/10 初始化。
+  hc_run_logged "启动 ingest-platform" compose up -d ingest-platform || return 1
+  local ingest_port="${INGEST_PLATFORM_PORT:-8089}"
+  wait_for "service_health_ok ${ingest_port}" "ingest-platform（${ingest_port}）" 120 || return 1
 
   # 11.4 API 网关（对外 8080；依赖全部上游服务）
   hc_run_logged "启动 api-gateway" compose up -d api-gateway || return 1

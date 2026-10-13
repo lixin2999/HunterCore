@@ -781,6 +781,11 @@ x-hunter-gateway-routes:
       target_port: 8086
       auth: jwt
       note: "车辆台账与车端接入 provisioning（详见 contracts/openapi/vehicle-service.yaml）"
+    - prefix: /api/v1/ingest
+      target_service: ingest-platform
+      target_port: 8089
+      auth: jwt
+      note: "数据消费解析与处理（V1.20.4 ingest-platform）：统一前缀下挂 bag/clip/agent/artifact/dataset/task/command 查询与导出"
     - prefix: /api/v1/user
       target_service: user-service
       target_port: null

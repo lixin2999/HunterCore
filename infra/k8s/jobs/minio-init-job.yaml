@@ -1,5 +1,5 @@
 # =====================================================================
-# MinIO Bucket 初始化 Job（7 个 Bucket + 生命周期 + SSE-S3 默认加密）
+# MinIO Bucket 初始化 Job（9 个 Bucket + 生命周期 + SSE-S3 默认加密）
 # - Bucket 名称与生命周期严格对齐设计文档（不可更改）
 # - 与 infra/docker/minio/init-buckets.sh 保持同步（差异：HTTPS 端点、SSE-S3 加密）
 # - 应用顺序：statefulsets/minio.yaml 就绪（≥3/4 节点）后执行
@@ -62,7 +62,7 @@ data:
       fi
     }
 
-    # ---- 7 个 Bucket（名称与生命周期不可更改） ----
+    # ---- 9 个 Bucket（名称与生命周期不可更改） ----
     create_bucket "hunter-raw-data"
     create_bucket "hunter-rosbag"
     create_bucket "hunter-video"
@@ -70,6 +70,8 @@ data:
     create_bucket "hunter-reports"
     create_bucket "hunter-logs"
     create_bucket "hunter-scene-assets"
+    create_bucket "hunter-derived"
+    create_bucket "hunter-datasets"
 
     # ---- 生命周期规则 ----
     add_expiry "hunter-raw-data" 30
@@ -78,7 +80,7 @@ data:
     add_expiry "hunter-rosbag" 30 "hunter-retention=regular"
     add_expiry "hunter-video" 90
     add_expiry "hunter-logs" 30
-    # hunter-ota-packages / hunter-reports / hunter-scene-assets：永久，不设过期规则
+    # hunter-ota-packages / hunter-reports / hunter-scene-assets / hunter-derived / hunter-datasets：永久，不设过期规则
 
     # ---- 服务端加密 ----
     encrypt_bucket "hunter-raw-data"
@@ -88,6 +90,8 @@ data:
     encrypt_bucket "hunter-reports"
     encrypt_bucket "hunter-logs"
     encrypt_bucket "hunter-scene-assets"
+    encrypt_bucket "hunter-derived"
+    encrypt_bucket "hunter-datasets"
 
     echo "[minio-init] buckets:"
     # shellcheck disable=SC2086

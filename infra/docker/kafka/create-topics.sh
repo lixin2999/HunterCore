@@ -55,5 +55,31 @@ create_topic "analytics_result.dlq"    6 "$DLQ_RETENTION_MS"
 create_topic "alert_event.dlq"         3 "$DLQ_RETENTION_MS"
 create_topic "algorithm_metrics.dlq"    6 "$DLQ_RETENTION_MS"
 
+# ---- ingest-platform Topic（V1.20.4，契约 topics.yaml#ingest_platform_topics）----
+#   订阅（车端/agent 产出、ingest 消费）：
+create_topic "vehicle.bag.manifest"        3 604800000
+create_topic "vehicle.bag.task.status"     3 604800000
+create_topic "vehicle.bag.parse.progress"  3 604800000
+create_topic "vehicle.bag.artifact.uploaded" 6 604800000
+create_topic "vehicle.agent.heartbeat"     6 604800000
+create_topic "vehicle.agent.alert"         3 2592000000
+create_topic "vehicle.agent.cmd.ack"       3 604800000
+#   生产（平台侧）：
+create_topic "vehicle.agent.cmd"           3 604800000
+create_topic "platform.derived.ready.v1"   3 2592000000
+create_topic "platform.bag.qc_failed.v1"   3 2592000000
+create_topic "platform.clip.created.v1"    3 2592000000
+create_topic "platform.dataset.ready.v1"   3 2592000000
+#   DLT（解析/字段级无效消息专用死信，自建）：
+create_topic "ingest.dlt"                  3 2592000000
+# ---- ingest 订阅 Topic 的死信（基础设施类失败经 hunter_common 转投 {topic}.dlq；仅被消费的 7 个）----
+create_topic "vehicle.bag.manifest.dlq"        3 "$DLQ_RETENTION_MS"
+create_topic "vehicle.bag.task.status.dlq"     3 "$DLQ_RETENTION_MS"
+create_topic "vehicle.bag.parse.progress.dlq"  3 "$DLQ_RETENTION_MS"
+create_topic "vehicle.bag.artifact.uploaded.dlq" 6 "$DLQ_RETENTION_MS"
+create_topic "vehicle.agent.heartbeat.dlq"     6 "$DLQ_RETENTION_MS"
+create_topic "vehicle.agent.alert.dlq"         3 "$DLQ_RETENTION_MS"
+create_topic "vehicle.agent.cmd.ack.dlq"       3 "$DLQ_RETENTION_MS"
+
 echo "[kafka-init] platform topics ready:"
 "$KAFKA_TOPICS" --bootstrap-server "$BOOTSTRAP" --list

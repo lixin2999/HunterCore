@@ -79,6 +79,13 @@ spec:
                 name: api-gateway
                 port:
                   number: 8080
+          - path: /api/v1/ingest            # → ingest-platform（V1.20.4）
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
           - path: /api/v1/user
             pathType: Prefix
             backend:

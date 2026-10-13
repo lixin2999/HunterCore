@@ -28,6 +28,24 @@ EXPECTED_PLATFORM_TOPICS: dict[str, tuple[int, int]] = {
     "algorithm_metrics": (6, 604_800_000),
 }
 
+#: ingest-platform 数据消费/解析 Topic（分区数, 保留毫秒）—— topics.yaml#ingest_platform_topics（V1.20.4）
+#: 与 platform_topics 分开维护：仅被消费 Topic 的 {topic}.dlq 由脚本以 $DLQ_RETENTION_MS 变量创建（不匹配字面数字正则）
+EXPECTED_INGEST_TOPICS: dict[str, tuple[int, int]] = {
+    "vehicle.bag.manifest": (3, 604_800_000),
+    "vehicle.bag.task.status": (3, 604_800_000),
+    "vehicle.bag.parse.progress": (3, 604_800_000),
+    "vehicle.bag.artifact.uploaded": (6, 604_800_000),
+    "vehicle.agent.heartbeat": (6, 604_800_000),
+    "vehicle.agent.alert": (3, 2_592_000_000),
+    "vehicle.agent.cmd.ack": (3, 604_800_000),
+    "vehicle.agent.cmd": (3, 604_800_000),
+    "platform.derived.ready.v1": (3, 2_592_000_000),
+    "platform.bag.qc_failed.v1": (3, 2_592_000_000),
+    "platform.clip.created.v1": (3, 2_592_000_000),
+    "platform.dataset.ready.v1": (3, 2_592_000_000),
+    "ingest.dlt": (3, 2_592_000_000),
+}
+
 #: 车端 Topic（分区数, acks, 频率）
 EXPECTED_VEHICLE_TOPICS: dict[str, tuple[int, str, str]] = {
     "hunter.{vehicle_id}.telemetry": (6, "1", "10-50Hz"),
@@ -110,15 +128,18 @@ def test_topic_defaults_follow_security_and_producer_baseline() -> None:
 
 
 def test_topics_yaml_synced_with_compose_and_k8s_scripts() -> None:
+    # 脚本中平台/ingest 死信以 "$DLQ_RETENTION_MS" 变量创建（不匹配字面数字正则），
+    # 故解析结果恰为 platform_topics + ingest_platform_topics 的字面数字实参集合。
+    expected_synced = {**EXPECTED_PLATFORM_TOPICS, **EXPECTED_INGEST_TOPICS}
     compose_calls = parse_create_topic_calls(COMPOSE_SCRIPT.read_text(encoding="utf-8"))
-    assert compose_calls == EXPECTED_PLATFORM_TOPICS
+    assert compose_calls == expected_synced
 
     k8s_script = ""
     for doc in yaml.safe_load_all(K8S_JOB.read_text(encoding="utf-8")):
         if doc and doc.get("kind") == "ConfigMap":
             k8s_script = (doc.get("data") or {}).get("create-topics.sh", "")
     assert k8s_script, "kafka-init Job 缺少 create-topics.sh"
-    assert parse_create_topic_calls(k8s_script) == EXPECTED_PLATFORM_TOPICS
+    assert parse_create_topic_calls(k8s_script) == expected_synced
 
 
 def test_all_schemas_are_valid_draft7_with_examples() -> None:
@@ -236,17 +257,21 @@ def test_command_schema_requires_vehicle_or_broadcast_target() -> None:
 
 def test_consumer_groups_only_reference_registered_topics() -> None:
     groups = load_yaml(KAFKA_DIR / "consumer-groups.yaml")["groups"]
-    known = set(EXPECTED_PLATFORM_TOPICS) | set(EXPECTED_VEHICLE_TOPICS)
+    known = set(EXPECTED_PLATFORM_TOPICS) | set(EXPECTED_VEHICLE_TOPICS) | set(EXPECTED_INGEST_TOPICS)
     known |= {name.replace("{vehicle_id}", "*") for name in EXPECTED_VEHICLE_TOPICS}
     known |= {f"{name}.dlq" for name in known}
 
     group_ids = [group["group_id"] for group in groups]
     assert len(group_ids) == len(set(group_ids)), "消费者组 ID 必须唯一"
     for group in groups:
-        assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", group["group_id"])
-        assert group["idempotency_key"], f"{group['group_id']} 缺少幂等键说明"
+        gid = group["group_id"]
+        # 中划线命名为主；ingest-platform 运行时组为点分 g.ingest.*（契约放行，与 verify_data_layer 一致）
+        assert re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", gid) or re.fullmatch(
+            r"g\.ingest\.[a-z0-9]+(-[a-z0-9]+)*", gid
+        ), gid
+        assert group["idempotency_key"], f"{gid} 缺少幂等键说明"
         for topic in group["subscribes"]:
-            assert topic in known, f"{group['group_id']} 订阅未登记 Topic: {topic}"
+            assert topic in known, f"{gid} 订阅未登记 Topic: {topic}"
 
 
 

@@ -45,6 +45,8 @@ EXPECTED_BUCKETS: dict[str, int | None] = {
     "hunter-reports": None,
     "hunter-logs": 30,
     "hunter-scene-assets": None,
+    "hunter-derived": None,  # 数据湖 derived 层（V1.20.4 ingest-platform）
+    "hunter-datasets": None,  # 数据湖 dataset 层（V1.20.4 ingest-platform）
 }
 
 #: hunter-rosbag Tag 级生命周期（G-12：对象 Tag 选择器 → 过期天数；None = 无过期规则）
@@ -247,7 +249,7 @@ def test_redis_key_builder_module_mirrors_contract() -> None:
 
 
 def test_object_storage_bucket_contract_values() -> None:
-    """7 个 Bucket：名称 / 生命周期 / SSE-S3 / 读写方与系统关键约束第 7 条一致。"""
+    """9 个 Bucket：名称 / 生命周期 / SSE-S3 / 读写方与系统关键约束第 7 条一致。"""
     buckets = contract_buckets()
     assert set(buckets) == set(EXPECTED_BUCKETS)
     for name, expected_days in EXPECTED_BUCKETS.items():
@@ -286,7 +288,7 @@ def test_object_storage_presign_policy_matches_constraints() -> None:
 
 
 def test_minio_init_scripts_match_contract() -> None:
-    """docker 脚本与 K8s Job：create_bucket 集合 / 生命周期天数 / SSE-S3 覆盖 7 个 Bucket。"""
+    """docker 脚本与 K8s Job：create_bucket 集合 / 生命周期天数 / SSE-S3 覆盖 9 个 Bucket。"""
     expected_rules = expected_expiry_rules()
     for script in (MINIO_DOCKER_INIT, MINIO_K8S_INIT):
         assert script.is_file(), f"缺少初始化脚本: {script}"

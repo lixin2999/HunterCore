@@ -1,4 +1,4 @@
-"""Clip 检索路由（§8.1 GET /api/v1/clips）。"""
+"""Clip 检索路由（§8.1 GET /api/v1/ingest/clips）。"""
 from __future__ import annotations
 
 from typing import Annotated
@@ -9,7 +9,7 @@ from hunter_common.responses import success_response
 from app.core.dependencies import ReadUser, SessionDep
 from app.repositories.clips import ClipRepository
 
-router = APIRouter(prefix="/api/v1/clips", tags=["clips"])
+router = APIRouter(prefix="/api/v1/ingest/clips", tags=["clips"])
 
 
 @router.get("")
