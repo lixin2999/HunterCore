@@ -8,6 +8,9 @@
   ⚠ 本读方曾按 ``last_online_time`` 取数——Hash 里从未有写方写该字段，
   致看板/操控台「最近在线」恒兜底为 0 → 展示 1970-01-01 08:00:00（响应字段名不变，
   只改 Hash 取数源）；
+  ⚠ 本读方还曾把缺失的 ``battery_soc``/``velocity`` 兜成 0/0.0（V1.19.21 去掉）：
+  「车没上报」被说成「电量 0%」是同一类谎报，与写侧「未上报即不写字段」的纪律冲突，
+  故这两个字段现在缺失即 null（契约标 nullable，量纲值不得伪造）；
 - 活跃会话：``rc:session:{vehicle_id}``（Hash，本服务写）交叉判定互斥。
 
 BlockReason → 错误码映射（契约 x-hunter-remote-session-lifecycle.responses）：
@@ -28,7 +31,7 @@ KEY_ONLINE_SET = "vehicle:online:set"
 KEY_VEHICLE_STATUS = "vehicle:status:{vehicle_id}"
 KEY_RC_SESSION = "rc:session:{vehicle_id}"
 
-#: Hash 字段名（data-collector 写入侧实际字段；缺失字段容错，契约必填字段以 0 兜底）
+#: Hash 字段名（data-collector 写入侧实际字段；**缺失即 null，不得兜 0**——见下方说明）
 _FIELD_STATUS = "status"
 _FIELD_SOC = "battery_soc"
 _FIELD_VELOCITY = "velocity"
@@ -122,9 +125,15 @@ class VehicleViewReader:
             status=status_enum,
             controllable=controllable,
             block_reason=block_reason,
-            # 契约必填：读模型缺失以 0 兜底（响应字段必在，禁止 null）
-            battery_soc=_parse_int(mapping.get(_FIELD_SOC)) or 0,
-            velocity=_parse_float(mapping.get(_FIELD_VELOCITY)) or 0.0,
+            # ℞ V1.19.21：旧写法 `... or 0` 把「读模型根本没有这个字段」渲染成「电量 0%」，
+            #   而 0% 在业务上是「车快没电了」的强语义（<10% 还对应 battery_critical 事件）——
+            #   与本仓「禁止伪造默认值」纪律（G-08 gear/free_storage_mb、G-11 lat/lng）自相矛盾，
+            #   且现场无法三分「车端没报」「遥测链路断」「真的是 0」。现按 null 如实透出，
+            #   0 仍然是 0（写方报什么就是什么），只有「无数据」才是 null。
+            battery_soc=_parse_int(mapping.get(_FIELD_SOC)),
+            velocity=_parse_float(mapping.get(_FIELD_VELOCITY)),
+            # 最近在线：无心跳时刻时仍给 0.0（前端按 `>0` 判「尚未上线」，1970 已由 V1.19.20 修掉；
+            #   本字段是时间戳而非量纲值，兜 0 不会被误读成某种业务量）
             last_online_time=_parse_float(mapping.get(_FIELD_LAST_ONLINE)) or 0.0,
             active_session=active_session,
         )

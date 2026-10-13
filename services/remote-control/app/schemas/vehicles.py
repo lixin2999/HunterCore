@@ -32,7 +32,9 @@ class ControllableVehicle(BaseModel):
 
     不可操控时 controllable=False 且 block_reason 指明原因：
     offline → 4001；upgrading/charging/fault/emergency → 4002；already_controlled → 7001。
-    battery_soc/last_online_time 为契约必填：读模型缺失时以 0 兜底（响应字段必在）。
+    last_online_time 为契约必填：读模型缺失时以 0 兜底（时间戳量，前端按 `>0` 判「尚未上线」）。
+    battery_soc / velocity **缺失即 null**（V1.19.21）：旧写法兜 0/0.0 把「车端没上报」
+    说成「电量 0%」（与写侧 G-08/G-11「未上报不写字段」纪律冲突）；0 仍如实是 0。
     """
 
     vehicle_id: str = Field(pattern=VEHICLE_ID_PATTERN, description="车辆 ID（= 证书 CN = Kafka key）")
@@ -41,8 +43,12 @@ class ControllableVehicle(BaseModel):
     status: VehicleStatus = Field(description="当前状态（Redis vehicle:status 读模型）")
     controllable: bool = Field(description="当前是否允许创建操控会话（false 时看 block_reason）")
     block_reason: BlockReason | None = Field(default=None, description="不可操控原因（可操控时为 null）")
-    battery_soc: int = Field(default=0, ge=0, le=100, description="电量百分比（接管前提示）")
-    velocity: float = Field(default=0.0, ge=0, description="当前速度 m/s（远程操控上限 2.0 m/s）")
+    battery_soc: int | None = Field(
+        default=None, ge=0, le=100, description="电量百分比（接管前提示）；null = 读模型无该字段（车端未上报/遥测未到达），不等于 0"
+    )
+    velocity: float | None = Field(
+        default=None, ge=0, description="当前速度 m/s（远程操控上限 2.0 m/s）；null = 无该字段，不等于静止"
+    )
     last_online_time: float = Field(default=0.0, description="最近在线时间（Unix epoch 秒）")
     active_session: ActiveSessionBrief | None = Field(
         default=None, description="当前占用的操控会话摘要（未被占用为 null）"

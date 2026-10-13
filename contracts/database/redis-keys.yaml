@@ -76,6 +76,7 @@ keys:
       - {name: free_storage_mb, type: integer, source: "health.free_storage_mb（G-08 决策①；OTA 存储门禁 ≥2048MB；车端排期上报）", status: pending}
       - {name: updated_at, type: "epoch seconds", source: "health.timestamp（陈旧判定依据）", status: required}
       - {name: last_seen_at, type: "epoch seconds", source: "data-collector 写入时刻（health/telemetry 每次 HSET 刷新；remote-control 读模型「最近在线」取数字段，V1.19.20——此前读方误取从未写入的 last_online_time 导致恒显 1970-01-01）", status: required}
+      - {name: telemetry_seen_at, type: "epoch seconds", source: "data-collector **仅 telemetry 消费路径**写入时刻（V1.19.21：last_seen_at 被 health/telemetry 共同刷新，“最近在线新鲜”不能证明遥测在流——电量/速度恰好无数据时无法三分「没上报」与「只有 health 在活」）；health 不写此字段", status: pending}
       - {name: last_seen_seconds, type: "number >=0", source: "data-collector VehicleStatusSweeper 周期推导（current - last_seen_at），OTA 网络稳定性门禁判定依据", status: pending}
       - {name: vehicle_ts, type: "epoch seconds", source: "health.timestamp >0 时写入（车端时间戳，与 last_seen_at 区分 ingestion 与源头时刻）", status: pending}
       - {name: vehicle_name, type: string, source: "data-collector 经台账查询回写（vehicle_svc.vehicles.vehicle_name，TTL 缓存 600s；V1.19.20——此前无任何写方，看板/remote-control 名称恒空；查无此车不写字段）", status: pending}
@@ -206,14 +207,14 @@ keys:
   # ---------------------------------------------------------------- 9
   - pattern: "analytics:ingest_latency"
     type: "String(JSON)"
-    value: "遥测入库延迟车队级 P95 指标（{\"metric\",\"p95_ms\",\"count\",\"window\",\"window_end\"} JSON）"
+    value: "遥测入库延迟车队级 P95 指标（{\"metric\",\"p95_ms\",\"count\",\"window\",\"window_end\"} JSON）；无有效样本时为诊断载荷（p95_ms=null + reason + seen + dropped{unparsable_message,no_vehicle_timestamp,no_kafka_record_timestamp,negative_latency,non_finite_latency}，V1.19.21）"
     ttl_seconds: 300
     ttl_source: "契约推导（pending #10 结案路线：Flink 流式统计→Redis 指标键）：写入窗口 60s，TTL 300s 兜底——作业停摆时键自然过期，看板 pipeline 块降级为 null，绝不展示陈旧值；INGEST_LATENCY_TTL_SECONDS 可调"
     owner_service: data-analytics
     writers: [data-analytics]
     writers_note: "由本服务 Flink 实时作业 data_quality_monitor（消费组 data-analytics-telemetry-raw，输入 telemetry_raw）写入；G-13「Flink 不直连业务库」——本键为指标缓存非系统事实库，属契约批准例外（pending #10 结案）"
     readers: [data-analytics]
-    lifecycle: "每窗口冲刷（跨窗口边界）SET analytics:ingest_latency EX 300 覆盖；无主动删除，依赖 TTL 过期（缺失即降级 null）"
+    lifecycle: "每窗口冲刷（跨窗口边界）SET analytics:ingest_latency EX 300 覆盖；有输入但本诊断节拍（60s，按 Kafka 记录时间戳对齐）无有效样本时写诊断载荷（同样 EX 300，**绝不用 null 载荷覆盖已有 P95**）；无主动删除，依赖 TTL 过期（缺失即降级 null，看板 reason 转成「作业未产出」口径）"
     sensitive: false
     ops: ["SET key json EX 300", "GET", "TTL"]
     refs:
@@ -249,7 +250,7 @@ x-hunter-pending-confirmation:
   # 结构对齐各服务 OpenAPI 既有约定：{id, question, impact, contract_decision}（禁止自行发明键名）
   items:
     - id: 1
-      question: "vehicle:status:{vehicle_id} Hash 字段清单未定稿（当前 fields_draft 25 个字段，已按 data-collector 实际写入行为回填全量字段名；仅 status/battery_soc/vehicle_state/updated_at/last_seen_at 标记 required，其余 pending）"
+      question: "vehicle:status:{vehicle_id} Hash 字段清单未定稿（当前 fields_draft 26 个字段，已按 data-collector 实际写入行为回填全量字段名；仅 status/battery_soc/vehicle_state/updated_at/last_seen_at 标记 required，其余 pending）"
       impact: "阻塞（blocking）：写入方 data-collector health 消费与读取方 data-analytics 看板 / ota-service 门禁 / remote-control 接管判定均依赖字段名，字段改名会造成跨服务静默破读；remote-control 契约 pending #2 同步等待"
       contract_decision: "与写入方及三个读取方确认最终字段集与字段名，定稿后回填本文件 fields（去掉 draft 标记）与各服务契约；一经定稿不得再改"
     - id: 2

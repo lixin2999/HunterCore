@@ -274,6 +274,9 @@ async def test_status_writer_updates_hash_and_online_set_from_health() -> None:
     assert stored["cpu_usage"] == "45.2"
     assert stored["last_seen_at"] == f"{NOW:.3f}"
     assert stored["last_seen_seconds"] == "0"
+    # health 不写 telemetry_seen_at（V1.19.21）：last_seen_at 被 health/telemetry 共同刷新，
+    # “最近在线很新鲜”根本不能证明遥测在流（看板电量空的现场就卡在这一区分上）
+    assert "telemetry_seen_at" not in stored
 
 
 async def test_status_writer_removes_vehicle_when_offline_status_reported() -> None:
@@ -295,7 +298,7 @@ async def test_status_writer_removes_vehicle_when_offline_status_reported() -> N
 
 
 async def test_status_writer_updates_realtime_fields_from_telemetry() -> None:
-    """遥测消息刷新电量/速度/底盘状态字与心跳，但不改写业务状态。"""
+    """遥测消息刷新电量/速度/底盘状态字与心跳（含 telemetry_seen_at），但不改写业务状态。"""
     redis = FakeRedisHash()
     writer = VehicleStatusWriter(redis)
     await writer.update_from_health(
@@ -309,6 +312,21 @@ async def test_status_writer_updates_realtime_fields_from_telemetry() -> None:
     assert stored["status"] == "auto_driving"      # 业务状态不被遥测覆盖
     assert stored["battery_soc"] == "78"
     assert stored["last_seen_at"] == f"{NOW + 1:.3f}"
+    assert stored["telemetry_seen_at"] == f"{NOW + 1:.3f}"  # 遥测侧专属心跳戳（读方/巡检区分用）
+
+
+async def test_status_writer_omits_unreported_realtime_fields() -> None:
+    """未上报即不写字段（G-08/G-11 纪律）：读方不得把“没字段”读成“值为 0”。"""
+    redis = FakeRedisHash()
+    writer = VehicleStatusWriter(redis)
+    payload = telemetry_payload()
+    payload.pop("chassis", None)  # 车端这一帧没带底盘段
+
+    await writer.update_from_telemetry(payload, now=NOW)
+
+    stored = redis.hashes[status_key("HUNTER-001")]
+    assert "battery_soc" not in stored and "velocity" not in stored
+    assert stored["telemetry_seen_at"] == f"{NOW:.3f}"  # 字段缺但遥测确实到了
 
 
 async def test_sweeper_marks_stale_vehicle_offline_and_refreshes_live_one() -> None:

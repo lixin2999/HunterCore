@@ -71,7 +71,8 @@ paths:
         车辆可用性来自 Redis 读模型（**权威值属 vehicle-service**，本服务只读不写）：
         - `vehicle:online:set`：在线车辆集合（在线判定）
         - `vehicle:status:{vehicle_id}`：车辆最新状态 Hash（`status` / `battery_soc` /
-          `velocity` / `last_online_time` 等）
+          `velocity` / `last_seen_at` 等；⚠ 无 `last_online_time` 字段——响应里的
+          `last_online_time` 取数源是写方实际维护的 `last_seen_at`，V1.19.20）
 
         `controllable=false` 时返回 `block_reason`（不可操控原因），前端据此禁用「接管操控」按钮：
         `offline`（离线，错误码 4001）/ `upgrading`（OTA 中，4002）/ `fault`、`emergency`（车辆故障，
@@ -859,6 +860,11 @@ components:
         可操控车辆视图。数据源为 Redis 读模型（**权威值属 vehicle-service，本服务只读**）：
         `vehicle:online:set`（在线集合）+ `vehicle:status:{vehicle_id}`（最新状态 Hash）。
         ⚠ Redis Hash 字段清单未在设计文档给出 → 字段名以本契约为准（pending #2）
+        ⚠ V1.19.21：**必现字段 ≠ 必有值**。battery_soc / velocity 仍属 required（键必在），
+        但**可为 null**——null 意为「读模型没有这个字段」（车端未上报或遥测未到达），
+        **不是 0**。旧写法由读方兜 0，把「无数据」谎报成「电量 0% / 静止」，与写方
+        data-collector「未上报即不写字段」的纪律（redis-keys.yaml G-08 gear / G-11 lat-lng）冲突。
+        量纲值不得伪造；前端对 null 必须展示 `-` 而非 0。
       required: [vehicle_id, status, controllable, battery_soc, last_online_time]
       properties:
         vehicle_id: { $ref: "#/components/schemas/VehicleId" }
@@ -867,9 +873,21 @@ components:
         status: { $ref: "#/components/schemas/VehicleStatus" }
         controllable: { type: boolean, description: 当前是否允许创建操控会话（false 时看 block_reason） }
         block_reason: { $ref: "#/components/schemas/BlockReason" }
-        battery_soc: { type: integer, minimum: 0, maximum: 100, description: 电量百分比（接管前提示） }
-        velocity: { type: number, description: 当前速度 m/s（接管前提示；远程操控上限 2.0 m/s） }
-        last_online_time: { type: number, description: 最近在线时间（Unix epoch 秒） }
+        battery_soc:
+          type: integer
+          minimum: 0
+          maximum: 100
+          nullable: true
+          description: |
+            电量百分比（接管前提示）。null = 读模型无 battery_soc 字段（车端未上报/遥测未到达），
+            **不等于 0%**；真实上报 0 时仍为 0（V1.19.21）
+        velocity:
+          type: number
+          nullable: true
+          description: |
+            当前速度 m/s（接管前提示；远程操控上限 2.0 m/s）。null = 读模型无 velocity 字段，
+            **不等于静止**（静止是 0.0）
+        last_online_time: { type: number, description: "最近在线时间（Unix epoch 秒；取 data-collector 实际写入的 last_seen_at，无心跳时 0——前端按 >0 判定，禁止把 0 当合法时间展示）" }
         active_session: { $ref: "#/components/schemas/ActiveSessionBrief" }
       example:
         vehicle_id: HUNTER-001
@@ -1796,7 +1814,7 @@ x-hunter-pending-confirmation:
     - id: 2
       title: "Redis vehicle:status:{vehicle_id} 的 Hash 字段清单（本服务只读依赖）"
       status: open
-      current: "本契约按 status / battery_soc / velocity / last_online_time / (fault_code / control_mode 可能) 消费；字段名与实际写入方（vehicle-service）必须一致"
+      current: "本契约按 status / battery_soc / velocity / last_seen_at（响应里叫 last_online_time，V1.19.20）/ (fault_code / control_mode 可能) 消费；字段名与实际写入方（data-collector）必须一致；battery_soc/velocity 缺失即 null（V1.19.21，不得兜 0）"
       blocking: true
       files: [contracts/openapi/remote-control.yaml, services/vehicle-service, contracts/database]
       decision_needed: "由 vehicle-service 契约（或共同约定的 Redis 读模型契约）定稿字段名与语义；本服务不写该键"

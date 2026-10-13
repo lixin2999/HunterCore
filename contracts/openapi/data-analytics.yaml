@@ -983,6 +983,18 @@ components:
           type: number
           nullable: true
           description: 遥测入库延迟 P95（ms），目标 ≤ 1000ms（性能指标）
+        ingest_latency_reason:
+          type: string
+          nullable: true
+          description: |
+            入库延迟「为什么没数」的一句话诊断（V1.19.21）。**仅当 ingest_latency_ms_p95 为 null 时非空**，出数时为 null。
+            三档必可区分（不得在展示层混为同一个 `-`）：
+            ① Flink 写端报回的诊断载荷 reason 译文 + 计数（no_input / unparsable_message /
+              no_vehicle_timestamp / no_kafka_record_timestamp / negative_latency / non_finite_latency /
+              mixed_discards / window_not_closed）；
+            ② 指标键不存在或已过期（作业未产出，作业侧问题）；
+            ③ 无诊断可给（Redis 不可用 / 载荷不可解析，本服务日志留痕）。
+            本字段**不计入** pipeline 块的 available（一个估算指标不得把整块标为不可用）。
         kafka_consumer_lag:
           type: object
           additionalProperties: { type: integer }
@@ -1688,8 +1700,8 @@ x-hunter-realtime-jobs:
       outputs: [analytics_result, algorithm_metrics]
       side_output:
         target: "Redis 指标键 analytics:ingest_latency（契约 redis-keys.yaml 登记，TTL 300s）"
-        value: "{metric:ingest_latency_ms_p95, p95_ms, count, window:60s, window_end} JSON"
-        note: "入库延迟 P95 子项面向看板 pipeline 块的落位（pending #10 结案：Kafka 时间戳差估算）；G-13 Flink 不直连业务库，写 Redis 指标缓存属契约批准例外；时钟超前负延迟样本丢弃（不伪造）"
+        value: "{metric:ingest_latency_ms_p95, p95_ms, count, window:60s, window_end} JSON；无有效样本时为诊断载荷 {p95_ms:null, count:0, reason, seen, dropped:{unparsable_message,no_vehicle_timestamp,no_kafka_record_timestamp,negative_latency,non_finite_latency}}（V1.19.21）"
+        note: "入库延迟 P95 子项面向看板 pipeline 块的落位（pending #10 结案：Kafka 时间戳差估算）；G-13 Flink 不直连业务库，写 Redis 指标缓存属契约批准例外；时钟超前负延迟样本丢弃（不伪造）；V1.19.21 起丢弃仍不放宽，但必须写诊断载荷说清「丢了多少、为什么」——无有效样本时不得静默不写键"
       note: "⚠ 数据质量阈值与结果落位（是否单独报告/表）设计文档未定义：契约按 analytics_result(result_type=metric) 输出，见 pending #5；入库延迟 P95 另写 Redis 指标键供看板读取，见 pending #10 结案"
 
   thresholds:
@@ -2000,7 +2012,7 @@ x-hunter-dashboard-contract:
         - "Redis analytics:ingest_latency（只读：入库延迟 P95，由本服务 Flink data_quality_monitor 写入）"
       limits: "单块聚合时间窗上限 ANALYTICS_QUERY_MAX_RANGE_DAYS(7d)；禁止全表精确 COUNT（hypertable 开销）"
       lag_semantics: "【已结案 V1.19.14】消费组滞后只返「已确证」的组：Kafka 对不存在的组 / 从未提交位点的组都返回空分区列表而不报错，因此这类组**不写 lag=0**，而是列入 `unknown_groups`（两者互斥）；`available=false` 仅用于 Kafka 整体不可达，与「读不到位点」分属两条降级路径（旧行为：看板永远显示各组零积压）"
-      ingest_latency: "遥测入库延迟 P95【已结案 pending #10】：采用 Kafka 时间戳差估算——Flink data_quality_monitor 统计（车端 timestamp ↔ Kafka 到达时间差，60s 事件时间滚动窗口车队级 P95）写 Redis 指标键 analytics:ingest_latency，本服务只读展示；键缺失/过期（作业停摆 TTL 兜底）→ ingest_latency_ms_p95=null（不伪造、不取 Prometheus）"
+      ingest_latency: "遥测入库延迟 P95【已结案 pending #10】：采用 Kafka 时间戳差估算——Flink data_quality_monitor 统计（车端 timestamp ↔ Kafka 到达时间差，60s 事件时间滚动窗口车队级 P95）写 Redis 指标键 analytics:ingest_latency，本服务只读展示；键缺失/过期（作业停摆 TTL 兜底）→ ingest_latency_ms_p95=null（不伪造、不取 Prometheus）。【V1.19.21 可观测性】null 不再无信息：写端逐条计数丢弃路径，有输入但无有效样本时按 60s 诊断节拍写一份 p95_ms=null + reason + dropped 的诊断载荷（**绝不用 null 载荷覆盖已有 P95**），本服务将其与「键不存在=作业未产出」两档一并透出到 `ingest_latency_reason`"
     algorithm:
       sources:
         - "data_analytics.algorithm_metrics（module ∈ perception/planning/control，按 ALGORITHM_METRICS_WINDOW_SECONDS 聚合）"

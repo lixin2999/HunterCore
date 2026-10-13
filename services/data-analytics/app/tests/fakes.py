@@ -10,6 +10,8 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from app.repositories.pipeline import IngestLatencyReading
+
 
 class InMemoryObjectStorage:
     """内存对象存储（遵循 app.repositories.storage.ObjectStorage Protocol）。"""
@@ -64,6 +66,8 @@ class FakePipelineRepository:
         dlq: dict[str, int] | None = None,
         averages: dict[str, float] | None = None,
         ingest_latency: float | None = None,
+        ingest_reason: str | None = None,
+        ingest_key_present: bool | None = None,
     ) -> None:
         # 字段按传入值原样保存：None 表示该数据源不可用（触发服务层降级），
         # 需要默认可用数据时由调用方显式传入。
@@ -72,7 +76,10 @@ class FakePipelineRepository:
         self.unknown_groups = unknown_groups or []
         self.dlq = dlq
         self.averages = averages
-        self.ingest_latency = ingest_latency
+        self.ingest_latency_p95 = ingest_latency
+        #: 写端诊断主因（V1.19.21）：与 p95 同时为空即“键不存在”分支
+        self.ingest_reason = ingest_reason
+        self.ingest_key_present = ingest_key_present
 
     async def telemetry_points(self, start_ts: float, end_ts: float) -> int | None:
         return self.points
@@ -89,8 +96,16 @@ class FakePipelineRepository:
     async def dlq_depth(self) -> dict[str, int] | None:
         return self.dlq
 
-    async def ingest_latency_p95(self) -> float | None:
-        return self.ingest_latency
+    async def ingest_latency(self) -> IngestLatencyReading:
+        # key_present 缺省推断：有值或有 reason 就算“键在”，两者都无 = 键不存在（V1.19.21 三档分支）
+        key_present = self.ingest_key_present
+        if key_present is None:
+            key_present = self.ingest_latency_p95 is not None or self.ingest_reason is not None
+        return IngestLatencyReading(
+            p95_ms=self.ingest_latency_p95,
+            reason=self.ingest_reason,
+            key_present=key_present,
+        )
 
     async def close(self) -> None:
         return None

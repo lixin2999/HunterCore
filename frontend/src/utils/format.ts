@@ -81,6 +81,21 @@ export function formatNumber(value?: number | null, fractionDigits = 2): string 
   return value.toFixed(fractionDigits)
 }
 
+/**
+ * 电量百分比文案（V1.19.21）
+ *
+ * null/undefined = 读模型根本没有 battery_soc 字段（车端未上报或遥测未到达），
+ * 必须显示 `-` 而不是 `0%` 或 `-%`——契约 remote-control.yaml 已把该字段标 nullable
+ * 并写明「null ≠ 0%」（旧写法 `formatNumber(soc, 0)}%` 会拼出无语义的 `-%`，
+ * 而后端曾把缺失谎报成 0）。
+ */
+export function formatSoc(value?: number | null): string {
+  if (value === undefined || value === null || Number.isNaN(value)) {
+    return '-'
+  }
+  return `${value.toFixed(0)}%`
+}
+
 /** 比例（0–1）→ 百分比文案 */
 export function formatPercent(value?: number | null, fractionDigits = 1): string {
   if (value === undefined || value === null || Number.isNaN(value)) {

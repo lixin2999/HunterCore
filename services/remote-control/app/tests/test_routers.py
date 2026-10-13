@@ -173,6 +173,40 @@ async def test_vehicles_list_filters(client: AsyncClient) -> None:
     assert items[0]["model"] == "HUNTER_SE"
 
 
+async def test_vehicles_list_missing_telemetry_fields_are_null_not_zero(
+    client: AsyncClient, rc_env: Any
+) -> None:
+    """读模型无 battery_soc/velocity → null（V1.19.21 去谎报）。
+
+    旧写法 `... or 0` 把「车端未上报/遥测未到达」说成「电量 0%」（0% 在业务上是
+    “快没电”的强语义，还对应 battery_critical 事件），与写侧 data-collector
+    「未上报即不写字段」的纪律冲突。同时钉住“0 仍是 0”——只有无数据才是 null。
+    """
+    status_map = rc_env.redis.store[f"vehicle:status:{VEHICLE_ONLINE}"]
+    status_map.pop("battery_soc")
+    status_map.pop("velocity")
+
+    absent = await client.get(
+        "/api/v1/remote/vehicles",
+        headers=OPERATOR_HEADERS,
+        params={"vehicle_id": VEHICLE_ONLINE},
+    )
+    item = absent.json()["data"]["items"][0]
+    assert item["battery_soc"] is None, "缺失不得被兜成 0%"
+    assert item["velocity"] is None, "缺失不得被兜成“静止”"
+    assert "last_online_time" in item  # 时间戳量仍必现（前端按 >0 判定）
+
+    status_map["battery_soc"] = "0"
+    status_map["velocity"] = "0.0"
+    reported = await client.get(
+        "/api/v1/remote/vehicles",
+        headers=OPERATOR_HEADERS,
+        params={"vehicle_id": VEHICLE_ONLINE},
+    )
+    item = reported.json()["data"]["items"][0]
+    assert item["battery_soc"] == 0 and item["velocity"] == pytest.approx(0.0)
+
+
 async def test_history_data_permission_forced_own(client: AsyncClient) -> None:
     """普通用户 history 查询强制 operator_id=自身（他人 sidecar 不可见；契约 324 行）。"""
     response = await client.get("/api/v1/remote/history", headers=OPERATOR_HEADERS)

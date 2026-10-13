@@ -19,7 +19,9 @@
   （:meth:`VehicleLedgerWriter.vehicle_name`，TTL 缓存）补写；台账不可用/查无此车时
   不写字段（禁止伪造默认值）；
 - ``last_seen_seconds`` 由 ``last_seen_at`` 与当前时间推导（:class:`VehicleStatusSweeper`
-  周期刷新并在超阈值时移出在线集合，实现「遥测中断 > 10s → 离线」约束）。
+  周期刷新并在超阈值时移出在线集合，实现「遥测中断 > 10s → 离线」约束）；
+- **``telemetry_seen_at``（V1.19.21）**：**仅** telemetry 路径写入的心跳时刻（health 不写）——
+  ``last_seen_at`` 无法回答“遥测到底在不在流”，而这个区分是判读“电量/速度为空”的前提。
 
 台账回写（V1.18.11）：本模块的三个写入点同时把结果回写 ``vehicle_svc.vehicles.status /
 last_online_time``（“车辆管理”页的唯一数据源，Redis 读模型不被 vehicle-service 读取），
@@ -158,6 +160,10 @@ class VehicleStatusWriter:
             "updated_at": f"{current:.3f}",
             "last_seen_at": f"{current:.3f}",
             "last_seen_seconds": "0",
+            # V1.19.21：遥测专属心跳。last_seen_at 被 health/telemetry 共同刷新，读方（看板
+            # “最近在线”）无法区分“只有 health 在活”与“遥测在流”——电量/速度恰好无数据时
+            # 就分不出“车端没上报”还是“遥测链路断”。health 不写本字段（契约 fields_draft）。
+            "telemetry_seen_at": f"{current:.3f}",
         }
         for field in (
             "battery_soc",

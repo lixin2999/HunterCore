@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -28,6 +29,30 @@ from hunter_common.config import HunterBaseConfig
 from hunter_common.logging import get_logger
 
 logger = get_logger("app.repositories.pipeline")
+
+#: 入库延迟诊断主因 → 可读文案（受控词表与写端
+#: ``flink-jobs/hunter_flink/ingest_latency_job.COUNTER_KEYS`` / ``diagnostic_reason`` 同源，
+#: 新增枚举值必须两边同步；本表只负责“把码翻成人话”，不得在此重新判定主因）
+LATENCY_REASON_LABELS: dict[str, str] = {
+    "no_input": "作业未从 telemetry_raw 读到任何消息",
+    "unparsable_message": "telemetry_raw 载荷不可解析为 JSON",
+    "no_vehicle_timestamp": "消息缺车端 timestamp（无法计算延迟）",
+    "no_kafka_record_timestamp": "Kafka 记录无时间戳（无法取到达时间）",
+    "negative_latency": "车端时钟超前于 broker（负延迟一律丢弃，不伪造）",
+    "non_finite_latency": "延迟样本非有限值（丢弃）",
+    "mixed_discards": "延迟样本因多种原因丢弃",
+    "window_not_closed": "窗口尚未闭合（首个 P95 待冲刷）",
+}
+
+
+@dataclass(frozen=True)
+class IngestLatencyReading:
+    """入库延迟读数（值 + 诊断）；两者可同时为空（键不存在 = 作业从未产出）。"""
+
+    p95_ms: float | None = None
+    reason: str | None = None
+    #: 键是否存在（区分「没这个键」与「有键但 p95 为 null」两种看板同样展示 `-` 的情况）
+    key_present: bool = False
 
 
 class PipelineSource(Protocol):
@@ -53,8 +78,13 @@ class PipelineSource(Protocol):
         """DLQ 消息堆积（失败返回 None）。"""
         ...
 
-    async def ingest_latency_p95(self) -> float | None:
-        """遥测入库延迟 P95（ms）（Flink data_quality_monitor → Redis 指标键；缺失/不可用 → None）。"""
+    async def ingest_latency(self) -> IngestLatencyReading:
+        """遥测入库延迟 P95 与其诊断（Flink data_quality_monitor → Redis 指标键）。
+
+        缺失/不可用时 `p95_ms` 为 None；`reason` 只在**键存在但无有效样本**时非空（说清
+        「为什么没数」）。作业从未产出（键不存在/过期）与「样本全被丢弃」是两回事，不得
+        在展示层混为同一个 `-`（V1.19.21）。
+        """
         ...
 
 
@@ -345,7 +375,7 @@ class IngestLatencyRedisReader:
 
     契约：``contracts/database/redis-keys.yaml`` 键 ``analytics:ingest_latency``（pending #10
     结案：Kafka 时间戳差 → Flink 流式统计 → Redis 指标键）；本服务**只读**（写方 = 本服务
-    的 Flink 实时作业）。键缺失/Redis 不可用/载荷不可解析 → 返回 None（看板降级为 null，
+    的 Flink 实时作业）。Redis 不可用/载荷不可解析 → 降级（看板该字段为 null，
     绝不展示陈旧值：作业停摆时键按 TTL 自然过期）。
     """
 
@@ -356,27 +386,70 @@ class IngestLatencyRedisReader:
     def __init__(self, redis: Redis | None) -> None:
         self._redis = redis
 
-    async def p95_ms(self) -> float | None:
+    async def read(self) -> IngestLatencyReading:
+        """读指标键（V1.19.21）：一次 GET 同时取回 P95 与诊断载荷里的 ``reason``。
+
+        四种读数必可区分（看板/巡检据此分支，不再把四种成因读成同一个 `-`）：
+        ① 键存在且 ``p95_ms`` 为数值 → 真值；② 键存在但 ``p95_ms`` 为 null → 带 ``reason``
+        的丢弃诊断（写端已计数）；③ 键不存在/过期（``key_present=False``）→ 作业从未产出；
+        ④ Redis 不可用/载荷不可解析 → 降级（与③同样不给原因，但日志留痕）。
+        """
         if self._redis is None:
-            return None
+            return IngestLatencyReading()
         try:
             raw = await self._redis.get(self.KEY)
-        except Exception:  # noqa: BLE001 - 观测性读取，失败降级为 None（不向请求路径抛出）
+        except Exception:  # noqa: BLE001 - 观测性读取，失败降级（不向请求路径抛出）
             logger.warning("ingest_latency_read_failed")
-            return None
+            return IngestLatencyReading()
         if raw is None:
-            return None
+            return IngestLatencyReading()
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         try:
             metric = json.loads(raw)
         except (json.JSONDecodeError, TypeError, ValueError):
             logger.warning("ingest_latency_value_unparsable")
-            return None
-        value = metric.get("p95_ms") if isinstance(metric, dict) else None
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        return float(value)
+            return IngestLatencyReading(key_present=True)
+        if not isinstance(metric, dict):
+            return IngestLatencyReading(key_present=True)
+        value = metric.get("p95_ms")
+        p95 = (
+            float(value)
+            if not isinstance(value, bool) and isinstance(value, (int, float))
+            else None
+        )
+        return IngestLatencyReading(
+            p95_ms=p95,
+            reason=None if p95 is not None else _diagnostic_text(metric),
+            key_present=True,
+        )
+
+    async def p95_ms(self) -> float | None:
+        """只要 P95 数值的便捷入口（诊断分支请走 :meth:`read`）。"""
+        return (await self.read()).p95_ms
+
+
+def _diagnostic_text(metric: dict[str, Any]) -> str | None:
+    """把诊断载荷里的 ``reason``/``dropped`` 翻成一句可定位的话（无 reason → 说写端版本旧）。
+
+    主因判定在写端（``diagnostic_reason``）——本函数**不重新推断**，只翻译与附计数。
+    """
+    reason = metric.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return "指标键已写入但无 p95_ms/reason（Flink 写端未升级至 V1.19.21，不展示旧值）"
+    label = LATENCY_REASON_LABELS.get(reason, reason)
+    bits: list[str] = []
+    seen = metric.get("seen")
+    if isinstance(seen, int) and not isinstance(seen, bool):
+        bits.append(f"seen={seen}")
+    dropped = metric.get("dropped")
+    if isinstance(dropped, dict):
+        bits.extend(
+            f"{key}={value}"
+            for key, value in sorted(dropped.items())
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        )
+    return f"{label}（{'; '.join(bits)}）" if bits else label
 
 
 class PipelineRepository:
@@ -399,8 +472,8 @@ class PipelineRepository:
     async def dlq_depth(self) -> dict[str, int] | None:
         return await self._kafka.dlq_depth()
 
-    async def ingest_latency_p95(self) -> float | None:
-        return await self._latency.p95_ms()
+    async def ingest_latency(self) -> IngestLatencyReading:
+        return await self._latency.read()
 
     async def close(self) -> None:
         await self._db.close()

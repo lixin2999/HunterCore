@@ -34,7 +34,7 @@ class FleetOverview(BaseModel):
 
 
 class PipelineStats(BaseModel):
-    """数据管道块（遥测样本 / 消费滞后 / DLQ 水位）。"""
+    """数据管道块（遥测样本 / 入库延迟 / 消费滞后 / DLQ 水位）。"""
 
     available: bool = Field(description="数据源是否可用（false 表示降级展示）")
     reason: str | None = Field(default=None, description="不可用原因")
@@ -42,6 +42,14 @@ class PipelineStats(BaseModel):
     ingest_latency_ms_p95: float | None = Field(
         default=None,
         description="遥测入库延迟 P95（ms）：Flink data_quality_monitor 统计 Kafka 时间戳差→Redis 指标键，未产出/过期为 null",
+    )
+    ingest_latency_reason: str | None = Field(
+        default=None,
+        description=(
+            "**仅当 ``ingest_latency_ms_p95`` 为 null 时非空**：把「为什么没数」说到可定位的一级"
+            "（写端诊断载荷 reason/dropped 的人话版，或「指标键不存在=作业未产出」）；"
+            "出数时为 null（V1.19.21，不得与「没数据」同一展示）"
+        ),
     )
     kafka_consumer_lag: dict[str, int] = Field(
         default_factory=dict,

@@ -43,7 +43,7 @@ import type {
   WsStatusFrame,
 } from '@/types/remote'
 import { HunterApiError } from '@/utils/error-code'
-import { formatNumber, formatTime } from '@/utils/format'
+import { formatNumber, formatSoc, formatTime } from '@/utils/format'
 import { WebRtcClient } from '@/utils/webrtc'
 import { ReconnectingSocket, buildWsUrl, hunterJwtProtocols } from '@/utils/websocket'
 
@@ -446,7 +446,7 @@ onBeforeUnmount(() => {
           <el-option
             v-for="vehicle in vehicles"
             :key="vehicle.vehicle_id"
-            :label="`${vehicle.vehicle_name || vehicle.vehicle_id}（SOC ${formatNumber(vehicle.battery_soc, 0)}%）`"
+            :label="`${vehicle.vehicle_name || vehicle.vehicle_id}（SOC ${formatSoc(vehicle.battery_soc)}）`"
             :value="vehicle.vehicle_id"
             :disabled="!vehicle.controllable"
           />
@@ -625,7 +625,7 @@ onBeforeUnmount(() => {
               {{ formatNumber(telemetry?.chassis?.steering_angle ?? null, 3) }} rad
             </el-descriptions-item>
             <el-descriptions-item label="电量">
-              {{ formatNumber(telemetry?.chassis?.battery_soc ?? null, 0) }}% ·
+              {{ formatSoc(telemetry?.chassis?.battery_soc) }} ·
               {{ formatNumber(telemetry?.chassis?.battery_voltage ?? null, 1) }} V
             </el-descriptions-item>
             <el-descriptions-item label="定位">

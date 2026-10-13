@@ -28,7 +28,7 @@ import { useUserStore } from '@/stores/user'
 import { useVehicleStore } from '@/stores/vehicle'
 import type { DashboardData } from '@/types/analytics'
 import { HunterApiError } from '@/utils/error-code'
-import { formatNumber, formatPercent, formatTime } from '@/utils/format'
+import { formatNumber, formatPercent, formatSoc, formatTime } from '@/utils/format'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -51,6 +51,22 @@ const onlineRatio = computed<number | null>(() => {
 /** 事件维度 */
 const events = computed(() => dashboard.value?.events)
 const isDegraded = computed<boolean>(() => (dashboard.value?.degraded ?? []).length > 0)
+
+/**
+ * 入库延迟（V1.19.21）：无数据时不只显示一个孤零零的 `-`。
+ * 后端 `ingest_latency_reason` 已分三档给出口径（写端丢弃诊断 / 指标键不存在=作业未产出 /
+ * 无可诊断），卡片副文案直接用它，定不到人时退回 SLO 口径。
+ */
+const INGEST_LATENCY_SLO_HINT = 'SLO ≤ 1000 ms（系统约束第 10 条）'
+const ingestLatencyMs = computed<number | null | undefined>(
+  () => dashboard.value?.pipeline.ingest_latency_ms_p95,
+)
+const ingestLatencyHint = computed<string>(() => {
+  if (ingestLatencyMs.value != null) {
+    return INGEST_LATENCY_SLO_HINT
+  }
+  return dashboard.value?.pipeline.ingest_latency_reason || '暂无数据（Flink 未产出诊断，看健康检查 ⑯）'
+})
 
 async function loadDashboard(): Promise<void> {
   loading.value = true
@@ -179,12 +195,12 @@ onMounted(() => {
       <el-col :span="6">
         <StatCard
           title="入库延迟"
-          :value="formatNumber(dashboard?.pipeline.ingest_latency_ms_p95 ?? null, 0)"
-          :unit="dashboard?.pipeline.ingest_latency_ms_p95 != null ? 'ms' : ''"
-          :tone="dashboard?.pipeline.ingest_latency_ms_p95 == null ? 'info' : dashboard.pipeline.ingest_latency_ms_p95 > 1000 ? 'danger' : 'success'"
+          :value="formatNumber(ingestLatencyMs ?? null, 0)"
+          :unit="ingestLatencyMs != null ? 'ms' : ''"
+          :tone="ingestLatencyMs == null ? 'info' : ingestLatencyMs > 1000 ? 'danger' : 'success'"
           :available="dashboard?.pipeline.available ?? true"
           :reason="dashboard?.pipeline.reason"
-          hint="SLO ≤ 1000 ms（系统约束第 10 条）"
+          :hint="ingestLatencyHint"
         />
       </el-col>
     </el-row>
@@ -260,7 +276,7 @@ onMounted(() => {
           </template>
         </el-table-column>
         <el-table-column label="电量" width="100">
-          <template #default="{ row }">{{ formatNumber(row.battery_soc, 0) }}%</template>
+          <template #default="{ row }">{{ formatSoc(row.battery_soc) }}</template>
         </el-table-column>
         <el-table-column label="速度" width="120">
           <template #default="{ row }">{{ formatNumber(row.velocity ?? null, 2) }} m/s</template>

@@ -11,7 +11,7 @@ from hunter_common.logging import get_logger
 from app.config import Settings
 from app.repositories.events import EventSource
 from app.repositories.fleet import VEHICLE_STATES, FleetSource
-from app.repositories.pipeline import PipelineSource
+from app.repositories.pipeline import IngestLatencyReading, PipelineSource
 from app.repositories.vehicles import VehicleSource
 from app.schemas.dashboard import (
     TIME_RANGE_SECONDS,
@@ -33,6 +33,28 @@ _CORE_ALGORITHM_METRIC_KEYS = (
     "planning.planning_latency_ms",
     "control.control_latency_ms",
 )
+
+#: 指标键不存在/已过期时的口径（V1.19.21）：这是**作业侧**问题（没跑 / 没消费到），
+#: 与写端报回来的**数据侧**丢弃诊断（reason/dropped）不是一回事，必须分开说。
+LATENCY_KEY_ABSENT_REASON = (
+    "入库延迟指标键不存在或已过期（analytics:ingest_latency）：Flink data_quality_monitor 未产出"
+    "——先核对作业是否 RUNNING（flink list -a）与消费组 data-analytics-telemetry-raw 是否消费到"
+    " telemetry_raw（巡检 ⑯ 可三分：未产出 / 正在回放 / 样本全丢弃）"
+)
+
+
+def ingest_latency_diagnostic(reading: IngestLatencyReading) -> str | None:
+    """入库延迟的诊断文案（出数时 None）；三档必可区分（V1.19.21）。
+
+    ①有 P95 → None；②键在但无有效样本 → 写端 reason 译文（哪条丢弃路径、多少条）；
+    ③键不在 → 作业侧口径。**不给降级块拼 reason**（本指标仍不计入 ``available``，避免一个
+    估算指标把整个 pipeline 块标成不可用）。
+    """
+    if reading.p95_ms is not None:
+        return None
+    if reading.reason is not None:
+        return reading.reason
+    return LATENCY_KEY_ABSENT_REASON
 
 
 class DashboardService:
@@ -105,7 +127,7 @@ class DashboardService:
             self._pipeline.telemetry_points(start, end),
             self._pipeline.consumer_lag(),
             self._pipeline.dlq_depth(),
-            self._pipeline.ingest_latency_p95(),
+            self._pipeline.ingest_latency(),
         )
         # ℞ V1.19.14：探测侧已把「组不存在 / 无提交位点」从 lag 映射里剔出，此处只负责原样透出；
         #   lag_probe is None 才是「Kafka 整体不可达」（走降级），与「读不到位点」不是同一回事。
@@ -115,12 +137,14 @@ class DashboardService:
             reasons.append("database unavailable")
         if lag_probe is None or dlq is None:
             reasons.append("kafka unavailable")
-        # latency 为可选指标（Flink 入库延迟作业未产出/键过期时为 None）：不计入降级理由
+        # latency 为可选指标（不计入降级理由），但 **null 必须带原因**（V1.19.21）：过去只渲染成
+        #   一个 `-`，运维无法区分「作业没跑」「没数据」「样本全被丢弃」三种完全不同的故障。
         return PipelineStats(
             available=not reasons,
             reason="; ".join(dict.fromkeys(reasons)) if reasons else None,
             telemetry_points=points,
-            ingest_latency_ms_p95=latency,
+            ingest_latency_ms_p95=latency.p95_ms,
+            ingest_latency_reason=ingest_latency_diagnostic(latency),
             kafka_consumer_lag=lag_map,
             unknown_groups=unknown_groups,
             dlq_messages=dlq or {},

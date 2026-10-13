@@ -5,7 +5,7 @@
 # 用途：一次性核对容器 / HTTP 探针 / 数据库 / Redis / Kafka / MinIO / 磁盘与内存 / 消费积压，
 #       输出 [PASS] [WARN] [FAIL] 明细与汇总，并给出退出码（供 install.sh、巡检脚本、CI 调用）。
 #
-# 检查项（共 16 类，⓪ 必须排第一）：
+# 检查项（共 17 类，⓪ 必须排第一）：
 #   ⓪ 环境凭据（.env）：口令类变量为空即 FAIL（典型成因：没加 sudo，.env 权限 600）；
 #      ⚠ 本项 FAIL 时，Redis / Kafka / MinIO 的相关结论一律降为「未判定」，不得当服务异常（V1.19.13）
 #   ① 容器运行状态与 Docker healthcheck（缺失/非 healthy/未运行 → FAIL）
@@ -32,6 +32,10 @@
 #   ⑮ Flink 检查点目录（V1.19.16）：在**容器内**比对运行用户 uid 与检查点目录（及其最近存在
 #      祖先）的属主/权限，只读不写探针——compose 把 ${DATA_DIR}/flink 绑成 /opt/flink/data，而 JM/TM
 #      以非 root 的 flink 用户运行，目录归 root 时作业会死在 `Failed to create directory for shared state`
+#   ⑯ 入库延迟指标键（V1.19.21）：GET/TTL analytics:ingest_latency + 消费组 data-analytics-telemetry-raw
+#      把「作业 RUNNING 但看板入库延迟恒 `-`」变成可判读结论。三分必需：作业未产出（键不存在）/
+#      正在追赶（键不存在但组有积压）/ 样本全被丢弃（键存在、p95_ms=null 带 reason）。
+#      ⚠ ⑭ 只能说“作业活着”，不能说“作业出了数”——前者对后者既非充分也非必要
 #
 # ⚠ 必须用 sudo 跑：.env 权限 600（install.sh / gen-passwords.sh 设定）仅 root 可读；
 #   非 root 时 [ -f .env ] 仍为真但 source 失败 ⇒ 口令全空 ⇒ 本脚本会给出一串
@@ -50,6 +54,7 @@
 #   FLINK_JM_CONTAINER（默认 hunter-flink-jm）/ FLINK_EXPECTED_RUNNING（默认 3）
 #   FLINK_CHECKPOINT_DIR（默认 /opt/flink/data/checkpoints，**容器内路径**；K8s 形态为
 #     /opt/flink/checkpoints，不自动探测——集群由运维显式设置，两处不一致已登记为待办）
+#   REDIS_CONTAINER（默认 hunter-redis）/ INGEST_LATENCY_GROUP（默认 data-analytics-telemetry-raw）
 #
 # 退出码：0 = 全部通过；1 = 存在告警（WARN）；2 = 存在失败（FAIL）
 #
@@ -88,7 +93,7 @@ usage() {
 HunterCore 全栈健康检查脚本
 
 用途：
-  检查 16 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
+  检查 17 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
   退出码：0=全部通过，1=有告警，2=有失败。
 
 ⚠ 请用 sudo 执行：.env 权限 600 仅 root 可读，非 root 时口令类探针会给出错的 FAIL
@@ -111,7 +116,8 @@ HunterCore 全栈健康检查脚本
   环境凭据（.env）、容器状态/Docker healthcheck、服务 HTTP 探针、PostgreSQL、TimescaleDB、Redis、
   Kafka Topic 数、MinIO Bucket 数、/data 磁盘使用率、内存使用率、Kafka 消费积压、
   配置漂移硬闸、车端接入证书（broker 证书 SAN 与有效期）、服务运行期错误日志、
-  Flink 作业健康（flink list -a：FAILED 不会被默认列表列出）。
+  Flink 作业健康（flink list -a：FAILED 不会被默认列表列出）、Flink 检查点目录可写、
+  入库延迟指标键（analytics:ingest_latency 存否/ TTL/诊断载荷，V1.19.21）。
 EOF
 }
 
@@ -606,6 +612,64 @@ check_flink_checkpoint_dir() {
   return 0
 }
 
+# ⑯ 入库延迟指标键（V1.19.21）：作业 RUNNING 不等于“作业出了数”
+# 现场：三作业全部 RUNNING、看板“入库延迟”仍是一个 `-`，而 `-` 背后至少有四种完全不同的故障
+#   （没提交 / 提交了但没消费到 / 消费到了但样本全被丢弃 / 正在回放 7 天历史）。巡检 ⑭ 分不出
+#   它们，作业侧的丢弃计数只能写进这个键——故本项直接读键，并在键不存在时用消费组位点分流。
+redis_cmd() {
+  # 带口令执行 redis-cli（只回回复，供命令替换捕获：不得往 stdout 打日志）
+  local container="${REDIS_CONTAINER:-hunter-redis}"
+  if [ -z "${REDIS_PASSWORD:-}" ]; then
+    docker exec "$container" redis-cli --no-auth-warning "$@" 2>&1
+  else
+    docker exec "$container" redis-cli --no-auth-warning -a "$REDIS_PASSWORD" "$@" 2>&1
+  fi
+}
+
+check_ingest_latency_metric() {
+  local key="analytics:ingest_latency" group="${INGEST_LATENCY_GROUP:-data-analytics-telemetry-raw}"
+  local value ttl p95 reason lag
+  if ! command_exists docker || ! docker inspect "${REDIS_CONTAINER:-hunter-redis}" >/dev/null 2>&1; then
+    record_result "WARN" "入库延迟指标键" "Redis 容器不可达（未部署或无 docker 权限）：本项未判定"
+    return 0
+  fi
+  hc_skip_without_creds "入库延迟指标键" && return 0
+  value="$(redis_cmd GET "$key")"
+  if printf '%s' "$value" | grep -qiE 'NOAUTH|WRONGPASS|Could not connect'; then
+    record_result "FAIL" "入库延迟指标键" "redis-cli 读取失败（凭据/连通问题，**不是“没数据”**）：$(printf '%.160s' "$value")"
+    return 0
+  fi
+  ttl="$(redis_cmd TTL "$key")"
+  p95="$(printf '%s' "$value" | sed -n 's/.*"p95_ms": *\([0-9][0-9.]*\).*/\1/p')"
+  reason="$(printf '%s' "$value" | sed -n 's/.*"reason": *"\([a-z_]*\)".*/\1/p')"
+  if [ -z "$value" ] || printf '%s' "$value" | grep -qE '^\(nil\)$'; then
+    # 键不存在：用消费组分流“没消费”与“正在追赶”（同一句“看板没数”背后的两个世界）
+    lag="$(kafka_consumer_lag "$group" 2>/dev/null)"; [ -z "$lag" ] && lag="-1"
+    if [ "${lag:-1}" -gt 0 ] 2>/dev/null; then
+      record_result "WARN" "入库延迟指标键" "$key 尚未写入，但消费组 ${group} 还有 LAG=${lag}：作业**正在回放历史**（本组首次运行无提交位点 ⇒ 从 earliest 回放，telemetry_raw 保留 7 天）。追平后自动出数（看板可先参照 ⑩ 积压趋势），无需人工介入"
+    elif [ "${lag:-1}" -eq 0 ] 2>/dev/null; then
+      record_result "FAIL" "入库延迟指标键" "$key 不存在而消费组 ${group} **LAG=0**（已追平）：作业读到了数据但**从未写出指标**。两种成因：① 样本全被丢弃且 flink-tm 镜像仍是 V1.19.21 之前的旧版（无诊断载荷）→ docker compose build flink-jm flink-tm 后重跑 submit-flink-jobs.sh；② telemetry_raw 确实无新数据→查 data-collector 是否在看板上“遥测入库点”同时为 0"
+    else
+      record_result "FAIL" "入库延迟指标键" "$key 不存在，且**读不到消费组 ${group}**（不是“滞后为 0”）：作业从未完成一次消费/提交（未提交、提交期失败、或仍在重启环）。查：sudo docker exec hunter-flink-jm flink list -a（⑭；RESTARTING 也是异常）、然后 sudo docker logs hunter-flink-jm --since 2h 取最后一条 Caused by"
+    fi
+    return 0
+  fi
+  if [ -n "$p95" ]; then
+    if [ "${ttl:-0}" = "-1" ] 2>/dev/null; then
+      record_result "WARN" "入库延迟指标键" "P95=${p95} ms 但 **TTL=-1（未过期）**：写端没带 EX 300，作业停摆后看板会一直展示陈旧值（契约 redis-keys.yaml 键 #9 要求 TTL 300）"
+    else
+      record_result "PASS" "入库延迟指标键" "P95=${p95} ms（TTL=${ttl}s，窗口 $(printf '%s' "$value" | sed -n 's/.*"window": *"\([^"]*\)".*/\1/p')）"
+    fi
+    return 0
+  fi
+  if [ -n "$reason" ]; then
+    record_result "WARN" "入库延迟指标键" "键存在但 p95_ms=null（写端诊断载荷）：reason=${reason}；$(printf '%.220s' "$value") → 口径已固化（负延迟不伪造），本项只把成因说出来；处置见《故障排查指南》场景 13"
+    return 0
+  fi
+  record_result "WARN" "入库延迟指标键" "键存在但既无 p95_ms 也无 reason（载荷形状不符合契约键 #9）：$(printf '%.200s' "$value")"
+  return 0
+}
+
 # ⑪ 配置漂移硬闸（G-03）：override 会被 compose 静默合并（TLS/端口/资源降级），生产禁止
 check_compose_override() {
   local override="${APP_DIR}/docker-compose.override.yml"
@@ -781,7 +845,7 @@ check_service_error_logs() {
   return 0
 }
 
-# run_all_health_checks：执行全部 16 类检查（供 daily-check 与 main 复用）
+# run_all_health_checks：执行全部 17 类检查（供 daily-check 与 main 复用）
 # ⚠ 顺序有语义：「环境凭据（.env）」必须排第一——后面的 Redis / Kafka / MinIO 靠它判断
 #   “服务异常”还是“根本没带凭据”（V1.19.13）。
 # 各项均以“失败被测试”的上下文调用（if ! f）：bash 在该上下文中会关闭 errexit，
@@ -793,7 +857,7 @@ run_all_health_checks() {
   for check in check_env_credentials check_compose_override check_containers check_http_endpoints \
     check_databases check_redis check_kafka_topics check_minio_buckets check_disk_usage \
     check_memory_usage check_kafka_lag check_kafka_broker_cert check_service_error_logs \
-    check_flink_jobs check_flink_checkpoint_dir; do
+    check_flink_jobs check_flink_checkpoint_dir check_ingest_latency_metric; do
     if ! "$check"; then
       record_result "WARN" "检查项未完成（${check}）" "该项内部命令返回非 0（已继续执行余下检查，stderr 有具体报错行）"
     fi

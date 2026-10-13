@@ -102,6 +102,11 @@ export interface PipelineStats {
   telemetry_points?: number
   /** 入库延迟 P95（SLO ≤ 1s） */
   ingest_latency_ms_p95?: number | null
+  /**
+   * 入库延迟「为什么没数」的诊断（V1.19.21）：仅当 p95 为 null 时非空，
+   * 内容要么是 Flink 写端的丢弃诊断（哪条路径、多少条），要么是「指标键不存在=作业未产出」。
+   */
+  ingest_latency_reason?: string | null
   /** Kafka consumer lag（仅包含确有提交位点的组，V1.19.14） */
   kafka_consumer_lag?: Record<string, number>
   /** 无法确定滞后的消费组（不存在 / 无位点 / 水位不可取）——不在 lag 映射里，不得当零积压 */

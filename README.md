@@ -84,7 +84,7 @@ HunterCore/
 | `init-db.sh` | 应用 `schema.sql`/`timescaledb.sql`/`init-data.sql` 并校验（8 schema / 11 表 / 2 hypertable），可选注入 admin 口令 |
 | `init-kafka.sh` | 按契约创建 7 个平台内部 Topic + 7 个死信（分区/保留时间校验），可选 `--scram-users`；`--check-only` **只读对账**（不创建，缺失/偏差逐项点名；读不到清单时照贴原始输出、不给出“Topic 缺失”结论，V1.19.15） |
 | `init-minio.sh` | 创建 7 个 Bucket 与生命周期规则（30/90 天与永久） |
-| `health-check.sh` | 全栈健康检查（**16 类**，`[PASS]/[WARN]/[FAIL]`，退出码 0/1/2；**必须 `sudo`——`.env` 是 600/root，非 root 下凭据全空会被误读成基础设施故障**；含车端接入证书 SAN 全集比对（`SERVER_IP` + `KAFKA_CERT_SAN_IPS/DNS`）与有效期、服务运行期错误日志巡检（订阅未命中这类“探针全绿但从未消费”的故障只有日志有痕迹）、环境凭据前置校验、Flink 作业健康（`flink list -a`，V1.19.13）与 Flink 检查点目录可写（V1.19.16），单项内部报错不中断整轮），可被其他脚本 source 复用 |
+| `health-check.sh` | 全栈健康检查（**17 类**，`[PASS]/[WARN]/[FAIL]`，退出码 0/1/2；**必须 `sudo`——`.env` 是 600/root，非 root 下凭据全空会被误读成基础设施故障**；含车端接入证书 SAN 全集比对（`SERVER_IP` + `KAFKA_CERT_SAN_IPS/DNS`）与有效期、服务运行期错误日志巡检（订阅未命中这类“探针全绿但从未消费”的故障只有日志有痕迹）、环境凭据前置校验、Flink 作业健康（`flink list -a`，V1.19.13）、Flink 检查点目录可写（V1.19.16）与入库延迟指标键判读（GET/TTL `analytics:ingest_latency` + 消费组积压，把“作业活着但看板恒 `-`”三分成未产出/在追赶/样本全丢弃，V1.19.21），单项内部报错不中断整轮），可被其他脚本 source 复用 |
 | `daily-check.sh` | 日常巡检（复用健康检查 + critical 事件/DB 连接数/容器重启次数/容量），报告写入 `/var/log/hunter-core/check/` |
 | `backup.sh` | 备份 PostgreSQL 全量 + 时序热数据 + 配置 + Redis RDB，按保留天数清理，输出 MinIO `mc mirror` 指引 |
 | `uninstall.sh` | 卸载（默认保留数据；`--all` 需输入 `DELETE-ALL`，含受保护路径护栏） |

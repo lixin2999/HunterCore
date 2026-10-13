@@ -118,8 +118,13 @@ export interface ControllableVehicle {
   status: VehicleStatus
   controllable: boolean
   block_reason?: BlockReason
-  battery_soc: number
-  velocity?: number
+  /**
+   * 电量百分比。**null = 读模型无 battery_soc 字段**（车端未上报/遥测未到达），不等于 0%（V1.19.21）；
+   * 展示一律走 `formatSoc`，禁止 `formatNumber(v, 0)}%` 这种把 null 拼成 `-%` 的写法。
+   */
+  battery_soc: number | null
+  /** 当前速度 m/s；null = 无该字段，不等于静止（静止是 0.0） */
+  velocity?: number | null
   last_online_time: number
   active_session?: ActiveSessionBrief
 }

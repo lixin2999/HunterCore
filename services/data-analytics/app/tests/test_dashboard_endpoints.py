@@ -83,6 +83,9 @@ async def test_dashboard_all_blocks_available(clean_state: None) -> None:
     assert pipeline["unknown_groups"] == []  # 齐位点时不应凭空多出未判定组
     # 入库延迟 P95 由 Flink data_quality_monitor→Redis 指标键透出（看板 pipeline 块只读）
     assert pipeline["ingest_latency_ms_p95"] == pytest.approx(812.5)
+    # 有真值时不得附带诊断文案（避免看板把正常指标写成故障）
+    # ⚠ 路由 `response_model_exclude_none=True`：null 字段不序列化，断言必须用 .get()
+    assert pipeline.get("ingest_latency_reason") is None
     algorithm = data["algorithm"]
     assert algorithm["perception_fps_avg"] == pytest.approx(10.2)
     assert algorithm["planning_latency_ms_avg"] == pytest.approx(40.0)
@@ -154,6 +157,49 @@ async def test_dashboard_pipeline_unknown_groups_are_not_reported_as_zero(clean_
     assert "data-analytics-telemetry-algo" in pipeline["unknown_groups"]
     assert not set(pipeline["kafka_consumer_lag"]) & set(pipeline["unknown_groups"]), "映射与清单必须互斥"
     assert 0 not in pipeline["kafka_consumer_lag"].values(), "未判定的组不得以 lag=0 混进映射"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_ingest_latency_absent_key_says_job_never_emitted(clean_state: None) -> None:
+    """指标键不存在（作业未产出）：看板必须拿到服务层口径，而不是一个无信息的 `-`（V1.19.21）。
+
+    ⚠ 一个用例只 seed 一次：`_cached(request, KEY_DASHBOARD_SERVICE, ...)` 会把首次 seed 的
+    服务缓存到本用例结束（再 seed 不会生效）。
+    """
+    _seed_dashboard(
+        pipeline=FakePipelineRepository(
+            points=1000, lag={}, dlq={}, averages={}, ingest_latency=None, ingest_key_present=False
+        )
+    )
+    async with api() as client:
+        resp = await client.get("/api/v1/analytics/dashboard", headers=ANALYST_HEADERS)
+    pipeline = resp.json()["data"]["pipeline"]
+    assert pipeline["available"] is True, "入库延迟缺值不属于整块降级"
+    assert pipeline.get("ingest_latency_ms_p95") is None, "exclude_none 下 null 不序列化"
+    assert pipeline.get("ingest_latency_reason"), "无值必须带原因"
+    assert "analytics:ingest_latency" in pipeline["ingest_latency_reason"]
+    assert "data-analytics-telemetry-raw" in pipeline["ingest_latency_reason"], "必须给出可执行的下一步（查作业/巡检 ⑯）"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_ingest_latency_writer_reason_is_passed_through_verbatim(clean_state: None) -> None:
+    """写端已给丢弃诊断时逐字透传，不得叠用「键不存在」口径（两档不互混，V1.19.21）。"""
+    _seed_dashboard(
+        pipeline=FakePipelineRepository(
+            points=1000,
+            lag={},
+            dlq={},
+            averages={},
+            ingest_latency=None,
+            ingest_reason="车端时钟超前于 broker（负延迟一律丢弃，不伪造）（seen=12; negative_latency=12）",
+        )
+    )
+    async with api() as client:
+        resp = await client.get("/api/v1/analytics/dashboard", headers=ANALYST_HEADERS)
+    pipeline = resp.json()["data"]["pipeline"]
+    assert "负延迟" in pipeline["ingest_latency_reason"]
+    assert "seen=12" in pipeline["ingest_latency_reason"]
+    assert "analytics:ingest_latency" not in pipeline["ingest_latency_reason"]
 
 
 @pytest.mark.asyncio

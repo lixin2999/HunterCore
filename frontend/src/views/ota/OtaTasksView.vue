@@ -44,7 +44,7 @@ import type {
   OtaVersionItem,
 } from '@/types/ota'
 import { HunterApiError } from '@/utils/error-code'
-import { formatNumber, formatPercent, formatTime } from '@/utils/format'
+import { formatNumber, formatPercent, formatSoc, formatTime } from '@/utils/format'
 
 const router = useRouter()
 const vehicleStore = useVehicleStore()
@@ -469,7 +469,7 @@ onMounted(async () => {
             <el-option
               v-for="vehicle in vehicleStore.vehicles"
               :key="vehicle.vehicle_id"
-              :label="`${vehicle.vehicle_name || vehicle.vehicle_id}（SOC ${formatNumber(vehicle.battery_soc, 0)}%）`"
+              :label="`${vehicle.vehicle_name || vehicle.vehicle_id}（SOC ${formatSoc(vehicle.battery_soc)}）`"
               :value="vehicle.vehicle_id"
             />
           </el-select>

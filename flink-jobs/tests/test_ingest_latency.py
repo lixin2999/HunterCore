@@ -5,6 +5,11 @@
 - 时钟超前的负延迟丢弃（禁止伪造/取绝对值），非有限值丢弃；
 - 车队级 P95（percentile_cont 线性插值，与看板只读聚合口径一致）；
 - 窗口按车端事件时间滚动，跨窗口边界才冲刷（tumbling 语义）。
+
+V1.19.21 可观测性单测（丢弃口径一条不放宽，只验「计数与诊断载荷」）：
+- 每条丢弃必须落到对应 counter（seen/valid 与各丢弃路径），缓冲区不得被脏样本污染；
+- 诊断载荷的 p95_ms 恒为 None（无有效样本就不出数，禁止伪造）；
+- reason 为受控词表单一主因；节拍以 Kafka 记录时间戳对齐（不用事件时间、不用处理时间）。
 """
 from __future__ import annotations
 
@@ -13,10 +18,16 @@ from typing import Any
 
 import pytest
 from hunter_flink.ingest_latency_job import (
+    COUNTER_KEYS,
     aggregate_latency,
+    diagnostic_payload,
+    diagnostic_reason,
     encode_redis_value,
     expand_latency,
     latency_ms,
+    new_counters,
+    reset_counters,
+    should_emit_diagnostic,
     window_seconds_from_env,
 )
 
@@ -112,7 +123,80 @@ def test_encode_redis_value_roundtrip() -> None:
     decoded = json.loads(encode_redis_value(metric))
     assert decoded["metric"] == "ingest_latency_ms_p95"
     assert decoded["window"] == "60s"
+    # 真值载荷形状不变（未加 reason 等诊断字段）：读端据此区分「P95 真值」与「诊断载荷」
     assert set(decoded) == {"metric", "p95_ms", "count", "window", "window_end"}
+
+
+# =====================================================================
+# 丢弃计数与诊断载荷（V1.19.21：看板 `-` 必须能说清「为什么没数」）
+# =====================================================================
+
+
+def test_expand_latency_counts_each_discard_path_without_buffering() -> None:
+    counters = new_counters()
+    buffers: dict[int, list[float]] = {}
+    kwargs = {"window_seconds": WINDOW, "buffers": buffers, "counters": counters}
+    # 时钟超前 → negative_latency；缺车端 timestamp → no_vehicle_timestamp；缺记录时间戳 → no_kafka_record_timestamp
+    assert expand_latency(raw(1030.0), arrival_time=1029.0, **kwargs) == []
+    assert expand_latency({"vehicle_id": "HUNTER-001"}, arrival_time=1030.0, **kwargs) == []
+    assert expand_latency(raw(1040.0), arrival_time=None, **kwargs) == []
+    assert counters["seen"] == 3
+    assert counters["valid"] == 0
+    assert counters["negative_latency"] == 1
+    assert counters["no_vehicle_timestamp"] == 1
+    assert counters["no_kafka_record_timestamp"] == 1
+    assert buffers == {}  # 计数不得顺带把脏样本放进缓冲
+
+
+def test_expand_latency_counts_valid_samples() -> None:
+    counters = new_counters()
+    buffers: dict[int, list[float]] = {}
+    expand_latency(raw(1030.0), arrival_time=1031.0, window_seconds=WINDOW, buffers=buffers, counters=counters)
+    assert counters["seen"] == 1 and counters["valid"] == 1
+    assert diagnostic_reason(counters) == "window_not_closed"  # 有有效样本，只是窗口未闭合
+
+
+def test_reset_counters_leaves_only_zeroed_fields() -> None:
+    counters = new_counters()
+    counters["seen"] = 9
+    counters["non_finite_latency"] = 9
+    reset_counters(counters)
+    assert set(counters) == {"seen", "valid", *COUNTER_KEYS}
+    assert all(value == 0 for value in counters.values())
+
+
+def test_diagnostic_reason_picks_single_main_cause() -> None:
+    counters = new_counters()
+    assert diagnostic_reason(counters) == "no_input"  # 一条都没读到（与「读到了但全丢」不同源）
+    counters["seen"] = 4
+    counters["non_finite_latency"] = 4
+    assert diagnostic_reason(counters) == "non_finite_latency"
+    counters["seen"] = 6
+    counters["negative_latency"] = 2
+    assert diagnostic_reason(counters) == "mixed_discards"
+
+
+def test_diagnostic_payload_keeps_p95_null_and_describes_drops() -> None:
+    counters = new_counters()
+    counters["seen"] = 12
+    counters["negative_latency"] = 12
+    payload = diagnostic_payload(counters, window_seconds=WINDOW, window_end=1090.456)
+    assert payload["p95_ms"] is None  # 无有效样本绝不出数
+    assert payload["count"] == 0
+    assert payload["reason"] == "negative_latency"
+    assert payload["seen"] == 12
+    assert payload["window_end"] == pytest.approx(1090.456)
+    assert payload["dropped"] == {key: (12 if key == "negative_latency" else 0) for key in COUNTER_KEYS}
+    decoded = json.loads(encode_redis_value(payload))
+    assert set(decoded) == {
+        "metric", "p95_ms", "count", "window", "window_end", "reason", "seen", "dropped",
+    }
+
+
+def test_should_emit_diagnostic_uses_arrival_time_cadence() -> None:
+    assert should_emit_diagnostic(1000.0, None, 60.0) is True  # 本 subtask 首次必发
+    assert should_emit_diagnostic(1059.9, 1000.0, 60.0) is False
+    assert should_emit_diagnostic(1060.0, 1000.0, 60.0) is True
 
 
 # =====================================================================
