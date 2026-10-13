@@ -10,17 +10,40 @@
 """
 from __future__ import annotations
 
+import asyncio
+import json
+import urllib.request
 from typing import Any, ClassVar
 
+from confluent_kafka import Message
 from hunter_common.database import DatabaseSessionManager
 from hunter_common.logging import get_logger
 
+from app.consumers.backpressure import BackpressureGuard
 from app.consumers.base import BaseIngestConsumer
 from app.repositories.agents import AgentRepository
+from app.repositories.alerts import AlertRepository
+from app.repositories.bags import BagRepository
 from app.services.cmd_service import CmdService
 from app.services.projection import ProjectionService
 
 logger = get_logger("app.consumers")
+
+
+def _post_webhook(url: str, body: dict[str, Any], timeout_s: float = 5.0) -> None:
+    """同步 POST JSON（stdlib，经 executor 调用）；非 2xx 抛错。"""
+    data = json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        if resp.status >= 400:
+            raise RuntimeError(f"webhook 返回 {resp.status}")
+
+
+async def _notify_alert(url: str, payload: dict[str, Any]) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: _post_webhook(url, payload))
 
 
 class ManifestConsumer(BaseIngestConsumer):
@@ -52,7 +75,10 @@ class TaskStatusConsumer(BaseIngestConsumer):
 
 
 class ParseProgressConsumer(BaseIngestConsumer):
-    """vehicle.bag.parse.progress 消费者（§5.1：更新进度，写 ClickHouse 时序）。"""
+    """vehicle.bag.parse.progress 消费者（§5.1：解析进度落库 bags.progress）。
+
+    审查 #10：无 ClickHouse 时降级为最新态写入 bags.progress（历史已在 events 表）。
+    """
 
     group_id: ClassVar[str] = "g.ingest.progress"
     subscribe_topic: ClassVar[str] = "vehicle.bag.parse.progress"
@@ -62,13 +88,25 @@ class ParseProgressConsumer(BaseIngestConsumer):
 
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
         bag_id = payload.get("bag_id", "")
-        progress = payload.get("progress", 0)
+        if not bag_id:
+            return
+        progress: dict[str, Any] = {
+            "percent": payload.get("progress", payload.get("percent")),
+            "stage": payload.get("stage"),
+            "updated_at": payload.get("occurred_at"),
+        }
+        async with self._db_mgr.session() as session:
+            updated = await BagRepository(session).update_progress(bag_id, progress)
+        if not updated:
+            logger.debug("parse_progress_bag_missing", bag_id=bag_id)
         logger.debug("parse_progress", bag_id=bag_id, progress=progress)
-        # ClickHouse 写入留接（当前简化为日志）
 
 
 class ArtifactConsumer(BaseIngestConsumer):
-    """vehicle.bag.artifact.uploaded 消费者（§5.1：写 artifacts，触发就绪判定）。"""
+    """vehicle.bag.artifact.uploaded 消费者（§5.1：写 artifacts，触发就绪判定）。
+
+    审查 #21：接入 §5.4 背压守卫（队列积压/速率超限时对消费入口施加延迟）。
+    """
 
     group_id: ClassVar[str] = "g.ingest.artifact"
     subscribe_topic: ClassVar[str] = "vehicle.bag.artifact.uploaded"
@@ -76,6 +114,14 @@ class ArtifactConsumer(BaseIngestConsumer):
     def __init__(self, settings: Any, db_mgr: DatabaseSessionManager, projection: ProjectionService) -> None:
         super().__init__(settings, db_mgr)
         self._projection = projection
+        self._guard = BackpressureGuard(settings, db_mgr)
+
+    async def _before_process(self, message: Message, value: dict[str, Any]) -> None:
+        await self._guard.acquire()
+
+    @property
+    def backpressure_guard(self) -> BackpressureGuard:
+        return self._guard
 
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
         await self._projection.handle_artifact_uploaded(payload)
@@ -106,7 +152,10 @@ class HeartbeatConsumer(BaseIngestConsumer):
 
 
 class AlertConsumer(BaseIngestConsumer):
-    """vehicle.agent.alert 消费者（§5.1：转告警引擎）。"""
+    """vehicle.agent.alert 消费者（§5.1/§10：告警落库 + 分级路由）。
+
+    审查 #11：所有级别告警落 agent_alerts；critical/error 级另走日志 + Alertmanager/Webhook。
+    """
 
     group_id: ClassVar[str] = "g.ingest.alert"
     subscribe_topic: ClassVar[str] = "vehicle.agent.alert"
@@ -117,12 +166,50 @@ class AlertConsumer(BaseIngestConsumer):
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
         vehicle_id = payload.get("vehicle_id", "")
         alert_type = payload.get("alert_type", "")
-        level = payload.get("level", "info")
-        logger.warning(
-            "agent_alert", vehicle_id=vehicle_id, alert_type=alert_type, level=level,
-            detail=payload.get("detail", {}),
-        )
-        # 告警路由留接（PagerDuty / 钉钉 / Alertmanager）
+        level = str(payload.get("level", "info"))
+        detail = payload.get("detail", {})
+
+        async with self._db_mgr.session() as session:
+            alert = await AlertRepository(session).record(
+                vehicle_id, alert_type, level=level, detail=detail, origin="vehicle"
+            )
+            alert_id = getattr(alert, "id", None)
+
+        if level in self._settings.alert_critical_level_set:
+            logger.error(
+                "agent_alert_critical", vehicle_id=vehicle_id,
+                alert_type=alert_type, level=level, detail=detail,
+            )
+            await self._dispatch(alert_id, vehicle_id, alert_type, level, detail)
+        else:
+            logger.warning("agent_alert", vehicle_id=vehicle_id, alert_type=alert_type, level=level)
+
+    async def _dispatch(
+        self, alert_id: Any, vehicle_id: str, alert_type: str, level: str, detail: dict[str, Any]
+    ) -> None:
+        """外发 Alertmanager/Webhook（§10）；未配置 URL 仅落库+日志，失败回写 notify_error。"""
+        url = self._settings.alert_webhook_url
+        if not url:
+            return
+        body = {
+            "alerts": [{
+                "labels": {"alertname": alert_type, "severity": level, "vehicle_id": vehicle_id},
+                "annotations": {"detail": json.dumps(detail, ensure_ascii=False, default=str)},
+            }]
+        }
+        try:
+            await _notify_alert(url, body)
+            if alert_id is not None:
+                async with self._db_mgr.session() as session:
+                    await AlertRepository(session).mark_notified(int(alert_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("alert_notify_failed", error=str(exc))
+            if alert_id is not None:
+                try:
+                    async with self._db_mgr.session() as session:
+                        await AlertRepository(session).mark_notify_error(int(alert_id), str(exc))
+                except Exception as inner_exc:  # noqa: BLE001
+                    logger.debug("alert_notify_error_persist_failed", error=str(inner_exc))
 
 
 class CmdAckConsumer(BaseIngestConsumer):

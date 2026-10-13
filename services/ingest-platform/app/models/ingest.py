@@ -174,6 +174,7 @@ class Bag(Base):
     )
     seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     parse_status: Mapped[str | None] = mapped_column(Text)
+    progress: Mapped[dict[str, object] | None] = mapped_column(JSONB)
     qc_score: Mapped[float | None] = mapped_column(Numeric(4, 3))
     manifest: Mapped[dict[str, object] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
@@ -287,6 +288,9 @@ class Task(Base):
     lease_owner: Mapped[str | None] = mapped_column(Text)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    payload: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
     error_code: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -397,6 +401,10 @@ class Command(Base):
     issued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    last_issued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    resend_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     ack_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ack_status: Mapped[CmdAckStatus] = mapped_column(
         StrEnumType(CmdAckStatus), nullable=False, server_default=text("'pending'")
@@ -428,7 +436,37 @@ class ProjectionAnomaly(Base):
     )
 
 
-# ========== 12. Dataset（数据集快照） ==========
+# ========== 12. AgentAlert（告警持久化与分级路由，§5.1/§10） ==========
+
+class AgentAlert(Base):
+    """告警记录（ingest_platform.agent_alerts，§5.1 Alert 消费落库 + §10 分级路由）。
+
+    origin：vehicle = 车端 agent.alert 事件；platform = 服务端自检告警（如 cmd 超时）。
+    """
+
+    __tablename__ = "agent_alerts"
+    __table_args__ = (
+        Index("idx_alerts_vehicle", "vehicle_id", text("created_at DESC")),
+        Index("idx_alerts_level", "level", text("created_at DESC")),
+        {"schema": INGEST_PLATFORM_SCHEMA},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    vehicle_id: Mapped[str] = mapped_column(Text, nullable=False)
+    alert_type: Mapped[str] = mapped_column(Text, nullable=False)
+    level: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'info'"))
+    detail: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    origin: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'vehicle'"))
+    notified: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+    notify_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ========== 13. Dataset（数据集快照） ==========
 
 class Dataset(Base):
     """训练数据集定义（ingest_platform.datasets，§8.2）。"""
@@ -462,6 +500,7 @@ __all__ = [
     "ArtifactClass",
     "Artifact",
     "Agent",
+    "AgentAlert",
     "Bag",
     "BagState",
     "BagTopic",

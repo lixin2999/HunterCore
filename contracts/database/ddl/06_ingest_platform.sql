@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS ingest_platform.bags (
     state         ingest_platform.bag_state NOT NULL DEFAULT 'discovered',
     seq           BIGINT      NOT NULL DEFAULT 0,
     parse_status  TEXT,
+    progress      JSONB,                             -- 解析进度投影（§5.1 parse.progress 最新态；历史见 events 表）
     qc_score      NUMERIC(4, 3),                     -- 0.000 ~ 1.000
     manifest      JSONB,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -175,6 +176,7 @@ CREATE TABLE IF NOT EXISTS ingest_platform.tasks (
     lease_owner     TEXT,
     lease_expires_at TIMESTAMPTZ,
     result          JSONB,
+    payload         JSONB       NOT NULL DEFAULT '{}'::jsonb,  -- 任务入参（如 export 任务的 dataset_id/version，§8.2/§9）
     error_code      TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -243,6 +245,8 @@ CREATE TABLE IF NOT EXISTS ingest_platform.commands (
     type        TEXT        NOT NULL,        -- cleanup | reupload | reparse | seal | set_config
     payload     JSONB       NOT NULL DEFAULT '{}'::jsonb,
     issued_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 最近一次下发时刻（超时重发扫描基准，§9.4）
+    resend_count INT        NOT NULL DEFAULT 0,          -- 自动重发次数（超 30min 未 ack 重发一次再失败告警，§9.4）
     ack_at      TIMESTAMPTZ,
     ack_status  ingest_platform.cmd_ack_status NOT NULL DEFAULT 'pending',
     ack_detail  JSONB,
@@ -286,7 +290,25 @@ CREATE TABLE IF NOT EXISTS ingest_platform.datasets (
 );
 
 
--- ========== 13. update_time 触发器 ==========
+-- ========== 13. 告警持久化与分级路由（§5.1 Alert 消费 / §10） ==========
+CREATE TABLE IF NOT EXISTS ingest_platform.agent_alerts (
+    id            BIGSERIAL   NOT NULL,
+    vehicle_id    TEXT        NOT NULL,
+    alert_type    TEXT        NOT NULL,
+    level         TEXT        NOT NULL DEFAULT 'info',   -- info | warning | error | critical（受控词表见 enums.md）
+    detail        JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    origin        TEXT        NOT NULL DEFAULT 'vehicle', -- vehicle = 车端上报；platform = 服务端自检（如 cmd 超时）
+    notified      BOOLEAN     NOT NULL DEFAULT false,     -- critical 级外发通知是否成功
+    notify_error  TEXT,                                   -- 外发失败原因（留痕供重试/排查）
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pk_agent_alerts PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_vehicle ON ingest_platform.agent_alerts (vehicle_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_level   ON ingest_platform.agent_alerts (level, created_at DESC);
+
+
+-- ========== 14. update_time 触发器 ==========
 CREATE OR REPLACE TRIGGER trg_bags_updated_at
     BEFORE UPDATE ON ingest_platform.bags
     FOR EACH ROW EXECUTE FUNCTION public.common_set_update_time();
@@ -302,3 +324,9 @@ CREATE OR REPLACE TRIGGER trg_agents_updated_at
 CREATE OR REPLACE TRIGGER trg_datasets_updated_at
     BEFORE UPDATE ON ingest_platform.datasets
     FOR EACH ROW EXECUTE FUNCTION public.common_set_update_time();
+
+-- ========== 15. 列补齐（V1.20.2 新增列；对已建库幂等 ALTER，新库由上方 CREATE TABLE 直接带出） ==========
+ALTER TABLE ingest_platform.bags     ADD COLUMN IF NOT EXISTS progress JSONB;
+ALTER TABLE ingest_platform.tasks    ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE ingest_platform.commands ADD COLUMN IF NOT EXISTS last_issued_at TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE ingest_platform.commands ADD COLUMN IF NOT EXISTS resend_count  INT NOT NULL DEFAULT 0;

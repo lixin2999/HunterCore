@@ -47,6 +47,7 @@ from app.producers.platform_events import PlatformEventProducer
 from app.services.align_worker import AlignWorker
 from app.services.cmd_service import CmdService
 from app.services.dataset_service import DatasetService
+from app.services.export_worker import ExportWorker
 from app.services.orchestrator import Orchestrator
 from app.services.projection import ProjectionService
 from app.services.qc_worker import QcWorker
@@ -80,7 +81,7 @@ class _SupervisedConsumer:
                 return
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(
                     "consumer_crashed_restarting",
                     group_id=self.group_id,
@@ -186,6 +187,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     align_worker = AlignWorker(settings, storage, app.state.db, producer)
     slice_worker = SliceWorker(settings, storage, app.state.db, producer)
     qc_worker = QcWorker(settings, storage, app.state.db, producer)
+    # EXPORT worker（§8.2/§9 任务化，审查 #9）：委托 dataset_service
+    export_worker = ExportWorker(dataset_service)
 
     # ---------- Orchestrator（§9.1 事务锁仲裁 + lease 队列 + §7.1 依赖序） ----------
     orchestrator = Orchestrator(
@@ -195,6 +198,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         align_worker=align_worker,
         slice_worker=slice_worker,
         qc_worker=qc_worker,
+        export_worker=export_worker,
     )
     app.state.orchestrator = orchestrator
 
@@ -209,6 +213,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ---------- 启动 orchestrator ----------
     await orchestrator.start()
 
+    # ---------- 启动 cmd 超时扫描循环（§9.4 审查 #13） ----------
+    timeout_task = asyncio.create_task(
+        cmd_service.run_timeout_loop(), name="cmd-timeout-scan"
+    )
+    app.state.cmd_timeout_task = timeout_task
+
     logger.info(
         "service_started",
         service=settings.service_name,
@@ -220,6 +230,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ---------- 优雅停机 ----------
     await orchestrator.stop()
+    timeout_task.cancel()
+    try:
+        await timeout_task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("cmd_timeout_stop_failed")
     for consumer in consumers:
         consumer.stop()
     for task in consumer_tasks:
@@ -228,7 +245,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await task
         except asyncio.CancelledError:
             pass
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("consumer_stop_failed")
 
     await app.state.redis.close()
@@ -282,7 +299,7 @@ async def trace_id_middleware(request: Request, call_next) -> Response:
 
 
 # ---------- 注册路由 ----------
-from app.routers import (  # noqa: E402
+from app.routers import (
     agents,
     artifacts,
     bags,
@@ -291,7 +308,7 @@ from app.routers import (  # noqa: E402
     datasets,
     tasks,
 )
-from app.routers.health import router as health_router  # noqa: E402
+from app.routers.health import router as health_router
 
 app.include_router(health_router)
 app.include_router(bags.router)

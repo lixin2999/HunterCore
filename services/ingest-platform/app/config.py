@@ -39,6 +39,11 @@ class Settings(HunterBaseConfig):
     # 消费侧 Schema 校验（契约先行）
     ingest_schema_validation_enabled: bool = True
 
+    # ---------- DLT 死信（§5.3） ----------
+    # 解析/字段级无效消息专用死信主题（基础设施类失败仍走 hunter_common 的 {topic}.dlq）
+    dlt_enabled: bool = True
+    dlt_topic: str = "ingest.dlt"
+
     # ---------- 数据湖：对象存储前缀（§6.1） ----------
     # parsed 层（车端所有权，平台只读）：bags/v1/{vehicle_id}/{date}/{bag_id}/
     lake_parsed_prefix: str = "bags/v1"
@@ -52,6 +57,11 @@ class Settings(HunterBaseConfig):
     minio_bucket_derived: str = "hunter-derived"     # derived 层（平台专属）
     minio_bucket_dataset: str = "hunter-datasets"    # dataset 层
     minio_region: str = "us-east-1"
+    # §13.2 数据湖最小权限：parsed 层（车端所有权，平台只读）独立只读凭据；
+    # 未配置回退主凭据（dev 兼容），生产必须配置仅具 s3:GetObject/ListBucket 权限的专用 key，
+    # 并在 MinIO 侧对 parsed bucket 挂只读 bucket policy（见 services/ingest-platform/README.md）
+    minio_parsed_access_key: str = ""
+    minio_parsed_secret_key: str = ""
     # 预签名 URL 有效期
     presigned_download_expire_seconds: int = 600     # 10 min（§8.1）
 
@@ -64,6 +74,12 @@ class Settings(HunterBaseConfig):
     interpolate_imu: bool = False
     # 点云匹配最大允许偏差（ms），超出则记 null
     max_lidar_dt_ms: int = 100
+
+    # ---------- 事件挖掘规则引擎（§7.3 来源1，服务端侧） ----------
+    # 从 IMU 加速度序列挖掘急刹/碰撞事件（去重力后的合加速度阈值 m/s²）
+    rule_mining_enabled: bool = True
+    rule_hard_brake_mps2: float = 4.0
+    rule_collision_mps2: float = 8.0
 
     # ---------- 切片参数（§7.3） ----------
     # 固定窗口切片：窗口时长（s）、步长重叠（s）
@@ -82,6 +98,8 @@ class Settings(HunterBaseConfig):
     qc_black_frame_threshold: float = 10.0
     # 连续相同 hash 帧数超过此值判为冻结帧
     qc_frozen_frame_min_count: int = 3
+    # 黑帧/冻结帧/解码抽检的连续采样帧数（§7.4 检查项 5）
+    qc_image_sample_count: int = 10
 
     # ---------- 就绪判定模板（§7.1） ----------
     # 必需产物类型（至少要有 manifest + 一张表才触发加工）
@@ -98,6 +116,13 @@ class Settings(HunterBaseConfig):
     task_backoff_base_s: int = 30             # 退避基数：30s × 2^n
     # 加工队列深度超过此值时触发背压（§5.4）
     task_queue_backpressure_threshold: int = 2000
+    # 背压深度重查间隔（秒）与命中后单条消息最大延迟（秒）
+    backpressure_check_interval_s: float = 10.0
+    backpressure_throttle_s: float = 2.0
+
+    # ---------- 数据集导出（§8.2） ----------
+    # webdataset tar 分片每片最大 clip 数
+    dataset_shard_max_clips: int = 1000
 
     # ---------- 解析模板版本（input_rev 计算因子，§5.2） ----------
     parse_template_version: str = "v1.0"
@@ -124,12 +149,26 @@ class Settings(HunterBaseConfig):
 
     # ---------- orchestrator 主循环 ----------
     orchestrator_poll_interval_s: float = 2.0
+    # 单轮并发派发任务上限（§9 并发 worker 池；单主锁内并行 claim/执行）
+    orchestrator_max_parallel_tasks: int = 4
     # 单主选举：PG advisory lock key（固定数字，同一集群内唯一）
     orchestrator_advisory_lock_key: int = 918273645
+
+    # ---------- 命令闭环（§9.4） ----------
+    cmd_ack_timeout_s: int = 1800             # 30min 未 ack 自动重发一次
+    cmd_timeout_scan_interval_s: float = 60.0  # 超时扫描周期
+
+    # ---------- 告警路由（§5.1/§10） ----------
+    # 命中这些 level 的 agent.alert 视为需要外发通知（Alertmanager/Webhook）
+    alert_critical_levels: str = "critical,error"
+    # Alertmanager-compatible webhook（JSON POST）；留空仅落库+日志
+    alert_webhook_url: str = ""
 
     # ---------- 数据脱敏（§13.4） ----------
     # GNSS 坐标保留小数位（看板读路径）
     gnss_descimal_places: int = 4
+    # 服务端加工链路（frame_index GNSS 列）坐标截断开关
+    gnss_mask_enabled: bool = True
 
     # ---------- RBAC ----------
     data_read_roles: str = "admin,analyst,operator"
@@ -154,6 +193,10 @@ class Settings(HunterBaseConfig):
     @property
     def ready_optional_class_list(self) -> list[str]:
         return [c.strip() for c in self.ready_optional_classes.split(",") if c.strip()]
+
+    @property
+    def alert_critical_level_set(self) -> frozenset[str]:
+        return frozenset(l.strip().lower() for l in self.alert_critical_levels.split(",") if l.strip())
 
 
 settings = Settings()

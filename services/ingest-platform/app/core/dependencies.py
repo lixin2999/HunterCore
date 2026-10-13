@@ -18,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 
-
 # ---------- Session 依赖 ----------
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
@@ -44,13 +43,20 @@ def _require_forwarded_auth(
         Header(alias="X-Roles", description="api-gateway 注入的角色列表（逗号分隔）"),
     ],
 ) -> tuple[str, set[str]]:
-    """校验网关转发认证头（缺失 → 1001）。"""
+    """校验网关转发认证头（缺失 → 1001）。
+
+    fail-closed（§13.1 审查 #14）：HMAC 密钥未配置时不得跳过签名校验，
+    否则任何能直达端口的请求伪造 X-User-Id/X-Roles 即绕过认证。
+    """
     if not x_user_id or not x_roles:
         raise AuthenticationError(
             message="未认证：缺少网关注入的 X-User-Id / X-Roles 请求头"
         )
-    if settings.gateway_hmac_secret and not verify_identity_headers(
-        settings.gateway_hmac_secret,
+    secret = settings.gateway_hmac_secret
+    if not secret:
+        raise AuthenticationError(message="未认证：服务端未配置身份签名密钥（fail-closed）")
+    if not verify_identity_headers(
+        secret,
         request.headers,
         max_age_seconds=settings.gateway_identity_max_age_s,
     ):

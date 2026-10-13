@@ -13,6 +13,7 @@ import pytest
 
 from app.models.ingest import (
     Agent,
+    AgentAlert,
     Artifact,
     ArtifactClass,
     Bag,
@@ -49,7 +50,7 @@ QUOTED_RE = re.compile(r"'([^']*)'")
 
 ORM_MODELS = [
     IngestEvent, Bag, BagTopic, Artifact, DerivedAsset, Task,
-    Clip, Label, Agent, Command, ProjectionAnomaly, Dataset,
+    Clip, Label, Agent, AgentAlert, Command, ProjectionAnomaly, Dataset,
 ]
 
 ENUM_MODEL_MAP: dict[str, type] = {

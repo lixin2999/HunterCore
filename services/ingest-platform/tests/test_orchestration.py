@@ -195,7 +195,7 @@ class TestOrchestrator:
         m_create.assert_not_called()
 
     async def test_no_worker_fails_task(self, test_settings, mock_session) -> None:
-        """未注册 worker 的任务类型（EXPORT）→ fail(NO_WORKER)，不执行不推进。"""
+        """未注册 worker 的任务类型（COMPACT）→ fail(NO_WORKER)，不执行不推进。"""
         from contextlib import asynccontextmanager
 
         mgr = MagicMock()
@@ -206,12 +206,62 @@ class TestOrchestrator:
 
         mgr.session_factory = MagicMock(side_effect=lambda: _cm())
         mock_session.execute.return_value = _lock_result(True)
-        task = _claimed_task(TaskType.EXPORT)
+        task = _claimed_task(TaskType.COMPACT)
         orch, _ = _make_orchestrator(test_settings, mgr)
         with patch.object(TaskRepository, "claim_next", new=AsyncMock(return_value=task)), \
              patch.object(TaskRepository, "fail", new=AsyncMock()) as m_fail:
             await orch._process_one_task()
         assert m_fail.await_args.kwargs.get("error_code") == "NO_WORKER"
+
+    def test_export_worker_registered_when_provided(self, test_settings, mock_db_mgr) -> None:
+        """注入 export_worker → TaskType.EXPORT 进入 _workers（审查 #9）。"""
+        from contextlib import asynccontextmanager
+
+        workers = {}
+        for ttype in (TaskType.VERIFY, TaskType.ALIGN, TaskType.SLICE, TaskType.QC):
+            w = MagicMock()
+            w.execute = AsyncMock(return_value={"ok": 1})
+            workers[ttype] = w
+        export_w = MagicMock()
+        export_w.execute = AsyncMock(return_value={"ok": 1})
+
+        @asynccontextmanager
+        async def _cm():
+            yield mock_db_mgr.session_factory()
+
+        orch = Orchestrator(
+            settings=test_settings,
+            db_session=mock_db_mgr.session_factory,
+            verify_worker=workers[TaskType.VERIFY],
+            align_worker=workers[TaskType.ALIGN],
+            slice_worker=workers[TaskType.SLICE],
+            qc_worker=workers[TaskType.QC],
+            export_worker=export_w,
+        )
+        assert TaskType.EXPORT in orch._workers
+        assert TaskType.COMPACT not in orch._workers
+
+    async def test_process_round_claims_batch_and_runs_concurrently(self, test_settings, mock_session) -> None:
+        """#20 并发轮：锁事务内批量领取→锁外 gather 并发执行。"""
+        from contextlib import asynccontextmanager
+
+        mgr = MagicMock()
+
+        @asynccontextmanager
+        async def _cm():
+            yield mock_session
+
+        mgr.session_factory = MagicMock(side_effect=lambda: _cm())
+        mock_session.execute.return_value = _lock_result(True)
+        orch, workers = _make_orchestrator(test_settings, mgr)
+        batch = [_claimed_task(TaskType.ALIGN), _claimed_task(TaskType.QC)]
+        with patch.object(TaskRepository, "claim_next_batch", new=AsyncMock(return_value=batch)) as m_batch, \
+             patch.object(TaskRepository, "complete", new=AsyncMock()), \
+             patch.object(TaskRepository, "create", new=AsyncMock(return_value=True)):
+            await orch._process_round()
+        m_batch.assert_awaited()
+        workers[TaskType.ALIGN].execute.assert_awaited()
+        workers[TaskType.QC].execute.assert_awaited()
 
 
 # ========== 层1 events 去重（BaseIngestConsumer._handle） ==========

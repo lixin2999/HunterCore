@@ -54,23 +54,12 @@ async def readyz(request: Request) -> JSONResponse:
     else:
         checks["redis"] = "unknown"
 
-    # MinIO（HEAD bucket 探测）
+    # MinIO（HEAD bucket 探测，经存储层公开异步入口）
     storage = getattr(request.app.state, "storage", None)
     if storage is not None:
-        try:
-            loop = asyncio.get_event_loop()
-            await asyncio.wait_for(
-                loop.run_in_executor(
-                    storage._executor,  # noqa: SLF001
-                    lambda: storage._client.head_bucket(  # noqa: SLF001
-                        Bucket=storage._settings.minio_bucket_derived  # noqa: SLF001
-                    ),
-                ),
-                timeout=_PROBE_TIMEOUT_S,
-            )
-            checks["minio"] = "ok"
-        except BaseException:  # noqa: BLE001
-            checks["minio"] = "error"
+        from app.config import settings
+        ok = await _bounded_probe(storage.check_bucket(settings.minio_bucket_derived))
+        checks["minio"] = "ok" if ok else "error"
     else:
         checks["minio"] = "unknown"
 

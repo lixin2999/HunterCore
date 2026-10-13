@@ -1,6 +1,7 @@
 """app.models 包：ORM 模型集合。"""
 from app.models.ingest import (
     Agent,
+    AgentAlert,
     Artifact,
     ArtifactClass,
     Bag,
@@ -24,6 +25,7 @@ from app.models.ingest import (
 
 __all__ = [
     "Agent",
+    "AgentAlert",
     "Artifact",
     "ArtifactClass",
     "Bag",

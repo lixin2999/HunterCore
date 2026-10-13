@@ -85,12 +85,18 @@ class ObjectMeta:
 # ========== 主客户端 ==========
 
 class LakeStorage:
-    """数据湖 MinIO 存储封装（boto3 同步客户端，经 asyncio.to_thread 调用）。
+    """数据湖 MinIO 存储封装。
 
     Bucket 归属：
     - hunter-rosbag: parsed 层（车端上传，平台只读）
     - hunter-derived: derived 层（平台专属）
     - hunter-datasets: dataset 层（平台专属）
+
+    最小权限（§13.2）：parsed 层读路径优先使用独立只读凭据
+    minio_parsed_access_key/secret_key，未配置时回退主凭据。
+
+    事件循环保护（§性能）：对外公开方法均为 async，同步 boto3 IO
+    统一投递到线程池执行，避免 worker 执行期间 FastAPI 事件循环停摆。
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -103,30 +109,58 @@ class LakeStorage:
             region_name=settings.minio_region,
             config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
         )
+        # parsed 只读客户端（§13.2）：配置了独立凭据则使用，否则复用主客户端
+        if settings.minio_parsed_access_key and settings.minio_parsed_secret_key:
+            self._parsed_client = boto3.client(
+                "s3",
+                endpoint_url=settings.minio_endpoint_url,
+                aws_access_key_id=settings.minio_parsed_access_key,
+                aws_secret_access_key=settings.minio_parsed_secret_key,
+                region_name=settings.minio_region,
+                config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+            )
+        else:
+            self._parsed_client = self._client
         self._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="s3")
 
-    # ---------- 读：parsed 层 ----------
+    async def _run(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        loop = asyncio.get_running_loop()
+        if kwargs:
+            return await loop.run_in_executor(
+                self._executor, lambda: fn(*args, **kwargs)
+            )
+        return await loop.run_in_executor(self._executor, fn, *args)
 
-    def get_manifest(self, vehicle_id: str, dt: date_type, bag_id: str) -> dict[str, Any]:
+    # ---------- 读：parsed 层（只读凭据） ----------
+
+    async def get_manifest(self, vehicle_id: str, dt: date_type, bag_id: str) -> dict[str, Any]:
         """读取 manifest.json（parsed 层），返回解析后的 dict。"""
         key = parsed_key(vehicle_id, dt, bag_id, "manifest.json")
-        data = self._get_object_bytes(self._settings.minio_bucket_parsed, key)
+        data = await self._run(self._get_object_bytes, self._parsed_client, self._settings.minio_bucket_parsed, key)
         return json.loads(data.decode("utf-8"))
 
-    def get_parsed_object(self, key: str) -> bytes:
+    async def get_parsed_object(self, key: str) -> bytes:
         """读取 parsed 层任意对象（图片、点云等）。"""
-        return self._get_object_bytes(self._settings.minio_bucket_parsed, key)
+        return await self._run(self._get_object_bytes, self._parsed_client, self._settings.minio_bucket_parsed, key)
 
-    def list_parsed_prefix(self, vehicle_id: str, dt: date_type, bag_id: str, suffix: str = "") -> list[str]:
+    async def list_parsed_prefix(self, vehicle_id: str, dt: date_type, bag_id: str, suffix: str = "") -> list[str]:
         """列举 parsed 层某 bag 某子目录下的对象 key。"""
         prefix = parsed_key(vehicle_id, dt, bag_id, suffix)
         if suffix and not prefix.endswith("/"):
             prefix += "/"
-        return self._list_keys(self._settings.minio_bucket_parsed, prefix)
+        return await self._run(self._list_keys, self._parsed_client, self._settings.minio_bucket_parsed, prefix)
 
-    # ---------- 写：derived 层 ----------
+    async def head_parsed(self, key: str) -> ObjectMeta | None:
+        """HEAD parsed 层对象；不存在返回 None。"""
+        return await self._run(self._head, self._parsed_client, self._settings.minio_bucket_parsed, key)
 
-    def put_derived_json(
+    async def ahead_parsed(self, key: str) -> ObjectMeta | None:
+        """HEAD parsed 层对象（兼容旧名，等同 head_parsed）。"""
+        return await self.head_parsed(key)
+
+    # ---------- 写：derived 层（平台主凭据） ----------
+
+    async def put_derived_json(
         self,
         bag_id: str,
         input_rev: str,
@@ -136,7 +170,8 @@ class LakeStorage:
         """写 JSON 到 derived 层，返回完整 object key。"""
         key = derived_key(bag_id, input_rev, suffix)
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-        self._put_object(
+        await self._run(
+            self._put_object,
             self._settings.minio_bucket_derived,
             key,
             body,
@@ -145,7 +180,7 @@ class LakeStorage:
         )
         return key
 
-    def put_derived_bytes(
+    async def put_derived_bytes(
         self,
         bag_id: str,
         input_rev: str,
@@ -157,7 +192,8 @@ class LakeStorage:
         """写二进制到 derived 层（Parquet 文件等），返回完整 object key。"""
         key = derived_key(bag_id, input_rev, suffix)
         sha = hashlib.sha256(data).hexdigest()
-        self._put_object(
+        await self._run(
+            self._put_object,
             self._settings.minio_bucket_derived,
             key,
             data,
@@ -166,17 +202,37 @@ class LakeStorage:
         )
         return key
 
+    async def get_derived_object(self, key: str) -> bytes:
+        """读取 derived 层对象（key 为 derived_key() 生成的完整路径）。"""
+        return await self._run(self._get_object_bytes, self._client, self._settings.minio_bucket_derived, key)
+
+    async def head_derived(self, key: str) -> ObjectMeta | None:
+        """HEAD derived 层对象。"""
+        return await self._run(self._head, self._client, self._settings.minio_bucket_derived, key)
+
     # ---------- 写：dataset 层 ----------
 
-    def put_dataset_manifest_line(self, dataset_id: str, version: str, line: str) -> str:
+    async def put_dataset_manifest_line(self, dataset_id: str, version: str, line: str) -> str:
         """向 snapshot.manifest.jsonl 追加一行（单条 clip 记录）。"""
         key = dataset_key(dataset_id, version, "snapshot.manifest.jsonl")
         body = (line + "\n").encode("utf-8")
-        self._put_object(
+        await self._run(
+            self._put_object,
             self._settings.minio_bucket_dataset,
             key,
             body,
             content_type="application/x-ndjson",
+        )
+        return key
+
+    async def put_dataset_object(self, key: str, body: bytes, *, content_type: str = "application/octet-stream") -> str:
+        """写任意对象到 dataset 层（公开入口，替代直接调用私有 _put_object）。"""
+        await self._run(
+            self._put_object,
+            self._settings.minio_bucket_dataset,
+            key,
+            body,
+            content_type=content_type,
         )
         return key
 
@@ -202,20 +258,7 @@ class LakeStorage:
 
     # ---------- HEAD 核验（QC 用，§7.4） ----------
 
-    def head_parsed(self, key: str) -> ObjectMeta | None:
-        """HEAD parsed 层对象；不存在返回 None。"""
-        return self._head(self._settings.minio_bucket_parsed, key)
-
-    async def ahead_parsed(self, key: str) -> ObjectMeta | None:
-        """HEAD parsed 层对象（异步：boto3 同步调用投递到线程池，避免阻塞事件循环）。"""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self.head_parsed, key)
-
-    def head_derived(self, key: str) -> ObjectMeta | None:
-        """HEAD derived 层对象。"""
-        return self._head(self._settings.minio_bucket_derived, key)
-
-    def sample_hash_check(
+    async def sample_hash_check(
         self,
         bucket: str,
         keys: list[str],
@@ -223,36 +266,68 @@ class LakeStorage:
         *,
         sample_ratio: float = 0.05,
     ) -> list[str]:
-        """抽样校验 hash（§7.4）；返回校验失败的 key 列表。
+        """抽样校验 hash（§7.4 检查项 1）；返回校验失败的 key 列表。
+
+        校验源优先对象元数据 x-amz-meta-sha256（平台写入对象）；
+        车端上传对象不携带该头时，GET 全量内容计算 sha256 比对
+        （expected 来自 manifest 声明值），避免哈希检查空转。
 
         Args:
             keys: 待校验对象 key 列表。
             expected_hashes: key → sha256 hex 映射（来自 manifest 声明）。
             sample_ratio: 抽样比例（0~1）。
         """
+        if not keys:
+            return []
         import random
         n = max(1, int(len(keys) * sample_ratio))
         sampled = random.sample(keys, min(n, len(keys)))
+        return await self._run(self._sample_hash_check_sync, bucket, sampled, expected_hashes)
+
+    def _sample_hash_check_sync(
+        self,
+        bucket: str,
+        sampled: list[str],
+        expected_hashes: dict[str, str],
+    ) -> list[str]:
         corrupt: list[str] = []
+        client = self._parsed_client if bucket == self._settings.minio_bucket_parsed else self._client
         for key in sampled:
             expected = expected_hashes.get(key)
             if not expected:
                 continue
-            meta = self._head(bucket, key)
+            meta = self._head(client, bucket, key)
             if meta is None:
                 corrupt.append(key)
                 continue
-            # MinIO etag 对非分块上传 = MD5；sha256 需从元数据取
             stored_sha = meta.sha256
-            if stored_sha and stored_sha != expected:
+            if stored_sha is not None:
+                if stored_sha != expected:
+                    corrupt.append(key)
+                continue
+            # 无元数据头（车端对象）：下载内容实算比对
+            try:
+                body = self._get_object_bytes(client, bucket, key)
+            except FileNotFoundError:
+                corrupt.append(key)
+                continue
+            if hashlib.sha256(body).hexdigest() != expected:
                 corrupt.append(key)
         return corrupt
 
+    async def check_bucket(self, bucket: str) -> bool:
+        """探测 bucket 可达（健康检查公开入口，避免外部访问私有属性）。"""
+        try:
+            await self._run(self._client.head_bucket, Bucket=bucket)
+            return True
+        except ClientError:
+            return False
+
     # ---------- 内部方法 ----------
 
-    def _get_object_bytes(self, bucket: str, key: str) -> bytes:
+    def _get_object_bytes(self, client: Any, bucket: str, key: str) -> bytes:
         try:
-            resp = self._client.get_object(Bucket=bucket, Key=key)
+            resp = client.get_object(Bucket=bucket, Key=key)
             data: bytes = resp["Body"].read()
             return data
         except ClientError as exc:
@@ -282,9 +357,9 @@ class LakeStorage:
         )
         logger.debug("put_object", bucket=bucket, key=key, size=len(body))
 
-    def _head(self, bucket: str, key: str) -> ObjectMeta | None:
+    def _head(self, client: Any, bucket: str, key: str) -> ObjectMeta | None:
         try:
-            resp = self._client.head_object(Bucket=bucket, Key=key)
+            resp = client.head_object(Bucket=bucket, Key=key)
             return ObjectMeta(
                 key=key,
                 size=int(resp["ContentLength"]),
@@ -297,17 +372,17 @@ class LakeStorage:
                 return None
             raise
 
-    def _list_keys(self, bucket: str, prefix: str) -> list[str]:
+    def _list_keys(self, client: Any, bucket: str, prefix: str) -> list[str]:
         keys: list[str] = []
-        paginator = self._client.get_paginator("list_objects_v2")
+        paginator = client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 keys.append(str(obj["Key"]))
         return keys
 
     def iter_parsed_objects(self, bucket: str, prefix: str) -> Iterator[str]:
-        """迭代器模式列举（适合大量对象，避免一次加载到内存）。"""
-        paginator = self._client.get_paginator("list_objects_v2")
+        """迭代器模式列举（适合大量对象，避免一次加载到内存；同步 IO，仅限非事件循环线程使用）。"""
+        paginator = self._parsed_client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 yield str(obj["Key"])

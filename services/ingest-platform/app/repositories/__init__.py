@@ -1,5 +1,6 @@
 """仓储层包（所有 Repository 统一导出）。"""
 from app.repositories.agents import AgentRepository
+from app.repositories.alerts import AlertRepository
 from app.repositories.artifacts import ArtifactRepository
 from app.repositories.bags import BagRepository, BagTopicRepository
 from app.repositories.clips import ClipRepository, LabelRepository
@@ -11,6 +12,7 @@ from app.repositories.tasks import TaskRepository
 
 __all__ = [
     "AgentRepository",
+    "AlertRepository",
     "ArtifactRepository",
     "BagRepository",
     "BagTopicRepository",

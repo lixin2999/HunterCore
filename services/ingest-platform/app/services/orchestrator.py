@@ -44,6 +44,7 @@ class Orchestrator:
         align_worker: AlignWorker,
         slice_worker: SliceWorker,
         qc_worker: QcWorker,
+        export_worker: Any | None = None,
     ) -> None:
         self._settings = settings
         self._db = db_session
@@ -53,6 +54,9 @@ class Orchestrator:
             TaskType.SLICE: slice_worker,
             TaskType.QC: qc_worker,
         }
+        # EXPORT worker 可选注入（§8.2/§9 任务化，审查 #9）；未注入则不注册
+        if export_worker is not None:
+            self._workers[TaskType.EXPORT] = export_worker
         self._running = False
         #: 上一轮争锁结果（仅用于观测/日志，不作为跳过检查的依据）
         self._is_leader = False
@@ -80,24 +84,34 @@ class Orchestrator:
     async def _main_loop(self) -> None:
         while self._running:
             try:
-                await self._process_one_task()
+                await self._process_round()
             except Exception:
                 logger.exception("orchestrator_loop_error")
             await asyncio.sleep(self._settings.orchestrator_poll_interval_s)
 
-    async def _process_one_task(self) -> None:
-        """事务内争锁 → 领取一个任务；提交释放锁后再执行 worker（§9.1）。"""
-        task: Task | None = None
+    async def _process_round(self) -> None:
+        """单轮并发派发（审查 #20）：锁事务内批量领取至多 N 个任务→提交释锁→并发执行。
+
+        N = orchestrator_max_parallel_tasks。领取阶段短暂持锁保证多实例不重复领取，
+        重执行（align/slice/qc 长 IO）在锁外 asyncio.gather 并发，不再串行阻塞。
+        """
+        limit = max(1, self._settings.orchestrator_max_parallel_tasks)
+        tasks: list[Task] = []
         async with self._db() as session:
             if not await self._try_xact_lock(session):
                 return
             repo = TaskRepository(session)
-            task = await repo.claim_next(_WORKER_ID, lease_s=self._settings.task_lease_timeout_s)
+            tasks = await repo.claim_next_batch(
+                _WORKER_ID, limit, lease_s=self._settings.task_lease_timeout_s
+            )
             await session.commit()  # xact 锁随提交释放
 
-        if task is None:
+        if not tasks:
             return
+        await asyncio.gather(*(self._run_one(task) for task in tasks))
 
+    async def _run_one(self, task: Task) -> None:
+        """执行单个已领取任务：worker.execute → complete+推进 / fail。"""
         worker = self._workers.get(task.task_type)
         if worker is None:
             logger.warning("no_worker_for_task", task_type=task.task_type.value)
@@ -106,7 +120,6 @@ class Orchestrator:
                 await repo.fail(task.task_id, _WORKER_ID, error_code="NO_WORKER")
                 await session.commit()
             return
-
         try:
             result = await worker.execute(task)
             async with self._db() as session:
@@ -126,6 +139,19 @@ class Orchestrator:
                     backoff_base_s=self._settings.task_backoff_base_s,
                 )
                 await session.commit()
+
+    async def _process_one_task(self) -> None:
+        """单任务版领取+执行（保留供测试与低并发场景；等价于 _process_round 的 limit=1）。"""
+        task: Task | None = None
+        async with self._db() as session:
+            if not await self._try_xact_lock(session):
+                return
+            repo = TaskRepository(session)
+            task = await repo.claim_next(_WORKER_ID, lease_s=self._settings.task_lease_timeout_s)
+            await session.commit()
+        if task is None:
+            return
+        await self._run_one(task)
 
     async def _advance_task_graph(self, repo: TaskRepository, task: Task) -> None:
         """前置任务 done → 创建后继任务（§7.1 依赖序 + §5.2 层3 唯一键幂等）。

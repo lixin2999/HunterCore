@@ -16,6 +16,7 @@ from confluent_kafka import Message
 from hunter_common.database import DatabaseSessionManager
 from hunter_common.kafka.consumer import SCHEMA_AUTO, BatchEndHook, KafkaConsumerManager
 from hunter_common.kafka.idempotency import IdempotencyGuard
+from hunter_common.kafka.producer import KafkaProducerManager
 from hunter_common.logging import get_logger, reset_vehicle_id, set_vehicle_id
 
 from app.config import Settings
@@ -101,6 +102,9 @@ class BaseIngestConsumer:
     async def process(self, payload: dict[str, Any], *, topic: str) -> None:
         raise NotImplementedError
 
+    async def _before_process(self, message: Message, value: dict[str, Any]) -> None:
+        """处理前置钩子（§5.4 背压）：默认无操作，子类可插入限速/延迟。"""
+
     def _event_row(self, message: Message, value: dict[str, Any]) -> dict[str, Any]:
         """由 envelope 构造 events 行（§6.2 事件仓，payload 存完整 envelope 供重放）。"""
         topic = str(message.topic())
@@ -121,25 +125,61 @@ class BaseIngestConsumer:
         }
 
     async def _handle(self, message: Message, value: Any) -> None:
-        if not isinstance(value, dict):
-            raise TypeError(f"消息必须为 JSON 对象，实际 {type(value).__name__}")
-        vehicle_id = value.get("vehicle_id", "")
-        token = set_vehicle_id(str(vehicle_id))
         try:
-            async with self._db_mgr.session() as session:
-                row = self._event_row(message, value)
-                is_new = await IngestEventRepository(session).insert_dedup(row)
-                if not is_new:
-                    logger.debug(
-                        "duplicate_event_skipped",
-                        event_id=str(row["event_id"]), topic=row["event_type"],
-                    )
-                    return
-                # 业务处理与事件行同事务：process 内部自开的 session 先行提交，
-                # 若 process 抛错则事件行回滚，Kafka 重投时可重新执行（层2/层3 幂等兜底）。
-                await self.process(value, topic=str(message.topic()))
-        finally:
-            reset_vehicle_id(token)
+            if not isinstance(value, dict):
+                raise TypeError(f"消息必须为 JSON 对象，实际 {type(value).__name__}")
+            vehicle_id = value.get("vehicle_id", "")
+            token = set_vehicle_id(str(vehicle_id))
+            try:
+                await self._before_process(message, value)
+                async with self._db_mgr.session() as session:
+                    row = self._event_row(message, value)
+                    is_new = await IngestEventRepository(session).insert_dedup(row)
+                    if not is_new:
+                        logger.debug(
+                            "duplicate_event_skipped",
+                            event_id=str(row["event_id"]), topic=row["event_type"],
+                        )
+                        return
+                    # 业务处理与事件行同事务：process 内部自开的 session 先行提交，
+                    # 若 process 抛错则事件行回滚，Kafka 重投时可重新执行（层2/层3 幂等兜底）。
+                    await self.process(value, topic=str(message.topic()))
+            finally:
+                reset_vehicle_id(token)
+        except (TypeError, ValueError, KeyError, IndexError) as exc:
+            # §5.3 死信主题：解析/schema/字段校验类数据错误路由 ingest.dlt（原始消息+错误上下文），
+            # 吞不上抛避免无效重试；基础设施错误（连接/超时）仍上抛走 {topic}.dlq 重试。
+            await self._route_dlt(message, value, exc)
+
+    async def _route_dlt(self, message: Message, value: Any, exc: BaseException) -> None:
+        """将数据性错误消息路由到 DLT 主题（§5.3）；未启用或 Kafka 不可用时降级为日志。"""
+        topic = str(message.topic())
+        partition = int(message.partition())
+        offset = int(message.offset())
+        logger.error(
+            "dlt_route", topic=topic, partition=partition, offset=offset,
+            error_type=type(exc).__name__, error=str(exc),
+        )
+        if not self._settings.dlt_enabled:
+            return
+        record: dict[str, Any] = {
+            "original_topic": topic,
+            "original_partition": partition,
+            "original_offset": offset,
+            "consumer_group": self.group_id,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc)[:1000],
+            "message": value if isinstance(value, dict) else {"_raw_repr": repr(value)[:2000]},
+            "failed_at": datetime.now(UTC).isoformat(),
+        }
+        try:
+            producer = KafkaProducerManager.instance()
+            await producer.produce(self._settings.dlt_topic, key=str(offset), value=record)
+        except Exception as dlt_exc:  # noqa: BLE001
+            # Kafka 未初始化（本地/单测）或不可用：记录后不阻断（数据错误已吞断，不会无限重试）
+            logger.warning(
+                "dlt_produce_failed", topic=self._settings.dlt_topic, error=str(dlt_exc)
+            )
 
 
 __all__ = ["BaseIngestConsumer"]

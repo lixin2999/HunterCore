@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Query
 from hunter_common.database.repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from hunter_common.responses import success_response
 
@@ -53,6 +53,7 @@ async def list_bags(
             "message_count": b.message_count,
             "qc_score": float(b.qc_score) if b.qc_score else None,
             "parse_status": b.parse_status,
+            "progress": b.progress,
             "updated_at": b.updated_at.isoformat() if b.updated_at else None,
         }
         for b in items
@@ -94,14 +95,15 @@ async def get_bag(
         "message_count": bag.message_count,
         "qc_score": float(bag.qc_score) if bag.qc_score else None,
         "parse_status": bag.parse_status,
+        "progress": bag.progress,
         "updated_at": bag.updated_at.isoformat() if bag.updated_at else None,
         "manifest": bag.manifest,
         "topics": [
             {
                 "topic": t.topic,
-                "type": t.type,
-                "count": t.count,
-                "serialization_format": t.serialization_format,
+                "msg_type": t.msg_type,
+                "message_count": t.message_count,
+                "hz": float(t.hz) if t.hz is not None else None,
             }
             for t in topics
         ],
@@ -131,10 +133,11 @@ async def get_bag_timeline(
         "topics": [
             {
                 "topic": t.topic,
-                "type": t.type,
-                "count": t.count,
-                "first_ts_ns": t.first_ts_ns,
-                "last_ts_ns": t.last_ts_ns,
+                "msg_type": t.msg_type,
+                "message_count": t.message_count,
+                "start_ns": t.start_ns,
+                "end_ns": t.end_ns,
+                "hz": float(t.hz) if t.hz is not None else None,
             }
             for t in topics
         ],

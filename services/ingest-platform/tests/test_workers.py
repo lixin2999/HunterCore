@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-
 # ========== AlignWorker._extract_ts_from_keys ==========
 
 class TestExtractTsFromKeys:
@@ -182,31 +181,37 @@ class TestQcScoreCalculation:
         assert total == pytest.approx(1.0, abs=1e-6)
 
     def test_perfect_score(self) -> None:
-        from app.services.qc_worker import QcCheckItem, _WEIGHTS
+        from app.services.qc_worker import _WEIGHTS, QcCheckItem
 
         checks = [QcCheckItem(name, 1.0, {}) for name in _WEIGHTS]
         score = sum(c.score * _WEIGHTS[c.name] for c in checks)
         assert score == pytest.approx(1.0)
 
     def test_zero_score(self) -> None:
-        from app.services.qc_worker import QcCheckItem, _WEIGHTS
+        from app.services.qc_worker import _WEIGHTS, QcCheckItem
 
         checks = [QcCheckItem(name, 0.0, {}) for name in _WEIGHTS]
         score = sum(c.score * _WEIGHTS[c.name] for c in checks)
         assert score == pytest.approx(0.0)
 
     def test_partial_score(self) -> None:
-        from app.services.qc_worker import QcCheckItem, _WEIGHTS
+        from app.services.qc_worker import _WEIGHTS, QcCheckItem
 
+        # 9 项检查（§7.4 审查 #4）：权重和为 1.0
         checks = [
-            QcCheckItem("hash_integrity", 1.0, {}),       # 0.25
-            QcCheckItem("frame_gaps", 0.5, {}),           # 0.10
-            QcCheckItem("monotonicity", 1.0, {}),         # 0.15
-            QcCheckItem("message_count", 0.0, {}),        # 0.00
-            QcCheckItem("image_decode", 0.8, {}),         # 0.08
-            QcCheckItem("pcd_valid", 1.0, {}),            # 0.10
-            QcCheckItem("tf_available", 1.0, {}),         # 0.05
+            QcCheckItem("hash_integrity", 1.0, {}),          # 0.22
+            QcCheckItem("frame_gaps", 0.5, {}),              # 0.18 * 0.5
+            QcCheckItem("monotonicity", 1.0, {}),            # 0.13
+            QcCheckItem("message_count", 0.0, {}),           # 0.12 * 0
+            QcCheckItem("image_decode", 0.8, {}),            # 0.08 * 0.8
+            QcCheckItem("black_frozen_frames", 1.0, {}),     # 0.10
+            QcCheckItem("pcd_valid", 1.0, {}),               # 0.09
+            QcCheckItem("tf_available", 1.0, {}),            # 0.04
+            QcCheckItem("calibration_conflict", 0.5, {}),    # 0.04 * 0.5
         ]
-        expected = 0.25 + 0.10 + 0.15 + 0.0 + 0.08 + 0.10 + 0.05
+        expected = (
+            0.22 + 0.18 * 0.5 + 0.13 + 0.0 + 0.08 * 0.8
+            + 0.10 + 0.09 + 0.04 + 0.04 * 0.5
+        )
         score = sum(c.score * _WEIGHTS[c.name] for c in checks)
         assert score == pytest.approx(expected)

@@ -127,6 +127,20 @@ class BagRepository:
         )
         await self._session.execute(stmt)
 
+    async def update_progress(self, bag_id: str, progress: dict[str, Any]) -> bool:
+        """更新解析进度快照（§5.1 ParseProgress 事件落库，无 ClickHouse 时的降级方案）。
+
+        Returns:
+            True = 更新成功；False = bag 不存在。
+        """
+        stmt = (
+            update(Bag)
+            .where(Bag.bag_id == bag_id)
+            .values(progress=progress, updated_at=text("now()"))
+        )
+        result = await self._session.execute(stmt)
+        return bool(result.rowcount == 1)
+
 
 class BagTopicRepository:
     """bag_topics 仓储（§6.2）。"""

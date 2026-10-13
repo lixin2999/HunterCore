@@ -1,11 +1,10 @@
 """任务编排 Repository（§9.1 lease 队列 + SKIP LOCKED）。"""
 from __future__ import annotations
 
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.models.ingest import Task, TaskState, TaskType
@@ -17,11 +16,12 @@ class TaskRepository:
 
     async def create(
         self,
-        bag_id: str,
-        input_rev: str,
+        bag_id: str | None,
+        input_rev: str | None,
         task_type: TaskType,
         *,
         priority: int = 5,
+        payload: dict[str, Any] | None = None,
     ) -> bool:
         """幂等创建任务（§5.2 层3 副作用幂等键）。
 
@@ -30,7 +30,13 @@ class TaskRepository:
         """
         stmt = (
             pg_insert(Task)
-            .values(bag_id=bag_id, input_rev=input_rev, task_type=task_type, priority=priority)
+            .values(
+                bag_id=bag_id,
+                input_rev=input_rev,
+                task_type=task_type,
+                priority=priority,
+                payload=payload or {},
+            )
             .on_conflict_do_nothing(constraint="uq_tasks_bag_type_rev")
         )
         result = await self._session.execute(stmt)
@@ -65,6 +71,41 @@ class TaskRepository:
         result = await self._session.execute(stmt)
         task: Task | None = result.scalars().first()
         return task
+
+    async def claim_next_batch(self, worker_id: str, limit: int, *, lease_s: int = 300) -> list[Task]:
+        """一次领取至多 limit 个待执行任务（§9 并发 worker 池，单事务 + SKIP LOCKED）。
+
+        与 :meth:`claim_next` 同源，仅将 limit 由 1 扩到 N：同一事务/同一锁下批量
+        置 RUNNING 并写 lease，锁外由调用方 asyncio.gather 并发执行 worker。
+        """
+        if limit <= 0:
+            return []
+        now = datetime.now(timezone.utc)
+        subq = (
+            select(Task.task_id)
+            .where(
+                Task.state == TaskState.PENDING,
+                Task.next_retry_at <= now,
+            )
+            .order_by(Task.priority.asc(), Task.task_id.asc())
+            .limit(limit)
+            .with_only_columns(Task.task_id)
+            .execution_options(skip_locked=True)
+        )
+        lease_expires = now + timedelta(seconds=lease_s)
+        stmt = (
+            update(Task)
+            .where(Task.task_id.in_(subq))
+            .values(
+                state=TaskState.RUNNING,
+                lease_owner=worker_id,
+                lease_expires_at=lease_expires,
+                attempts=Task.attempts + 1,
+            )
+            .returning(Task)
+        )
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
 
     async def complete(self, task_id: int, worker_id: str, result_data: dict[str, Any]) -> None:
         """标记任务成功（fencing：lease_owner 必须匹配）。"""
@@ -131,7 +172,7 @@ class TaskRepository:
 
     async def queue_depth(self, task_type: TaskType | None = None) -> int:
         """当前 pending 队列深度（§5.4 背压监控）。"""
-        stmt = select(text("COUNT(*)")).select_from(Task).where(Task.state == TaskState.PENDING)
+        stmt = select(func.count()).select_from(Task).where(Task.state == TaskState.PENDING)
         if task_type:
             stmt = stmt.where(Task.task_type == task_type)
         result = await self._session.execute(stmt)
