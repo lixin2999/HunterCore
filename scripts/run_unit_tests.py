@@ -34,6 +34,7 @@ UNIT_TARGETS: tuple[str, ...] = (
     "services/data-analytics",
     "services/ota-service",
     "services/remote-control",
+    "services/ingest-platform",
 )
 #: 单元阶段排除的标记（容器集成 / e2e / 性能用例由各自 CI 阶段运行）
 DEFAULT_MARK_EXPR = "not integration and not e2e and not performance"

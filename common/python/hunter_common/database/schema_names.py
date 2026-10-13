@@ -18,6 +18,8 @@ OTA_SCHEMA = "ota_svc"
 REMOTE_CONTROL_SCHEMA = "remote_control"
 #: 预留：网关审计
 GATEWAY_SCHEMA = "gateway"
+#: 数据消费解析与处理（ingest-platform，设计文档 06_ingest_platform.sql）
+INGEST_PLATFORM_SCHEMA = "ingest_platform"
 
 #: 全部 schema（供 Alembic 建/删 schema 使用）
 ALL_SCHEMAS: tuple[str, ...] = (
@@ -29,6 +31,7 @@ ALL_SCHEMAS: tuple[str, ...] = (
     OTA_SCHEMA,
     REMOTE_CONTROL_SCHEMA,
     GATEWAY_SCHEMA,
+    INGEST_PLATFORM_SCHEMA,
 )
 
 #: 需要 TimescaleDB hypertable 化的表（schema 限定名）
@@ -48,6 +51,7 @@ __all__ = [
     "COLLECTOR_SCHEMA",
     "GATEWAY_SCHEMA",
     "HYPERTABLES",
+    "INGEST_PLATFORM_SCHEMA",
     "OTA_SCHEMA",
     "REMOTE_CONTROL_SCHEMA",
     "RETENTION_INTERVAL",
