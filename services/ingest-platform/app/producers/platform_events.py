@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -107,7 +108,8 @@ class PlatformEventProducer:
     async def _produce(self, topic: str, key: str, value: dict[str, Any]) -> None:
         try:
             producer = KafkaProducerManager.instance()
-            await producer.produce(topic, key=key, value=value)
+            # 低层 produce 只接受 bytes/str：直传 dict 会被 confluent_kafka 拒绝（except 吞掉）。
+            await producer.produce(topic, key=key, value=json.dumps(value, ensure_ascii=False))
             logger.debug("platform_event_published", topic=topic, key=key)
         except RuntimeError:
             # Kafka 未初始化（测试场景），静默跳过

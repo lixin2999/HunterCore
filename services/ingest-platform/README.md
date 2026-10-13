@@ -2,7 +2,7 @@
 
 车端 rosbag 数据的消费接入、解析、对齐、切片、质检与任务编排平台（《服务端数据消费解析与处理详细设计文档》
 6 项核心需求的实现服务，V1.20.0 交付；审查 P0 三项修复见 V1.20.1；审查 P1 剩余 #4–#21（数据处理/安全/性能）
-全部落地见 V1.20.2）。端口 **8089**，schema `ingest_platform`（13 表）。
+全部落地见 V1.20.2；审查「功能遗漏汇总」剩余 §12.3 DLT replay 工具 + `produce(dict)` 序列化缺陷修复见 V1.20.3）。端口 **8089**，schema `ingest_platform`（13 表）。
 
 > ⚠ **部署状态**：本服务尚未纳入 `infra/deploy/docker-compose.yml` 与 `infra/k8s/` 编排，当前仅在
 > 联调/手动接入环境运行；接入步骤与容量核算见 `docs/deployment.md` §14，运维口径见《运维操作手册》§3.7、
@@ -25,6 +25,9 @@
 
 消费韧性：**#12 DLT 死信主题**（`app/consumers/base.py`）——解析/字段级无效消息（`TypeError/ValueError/KeyError/IndexError`）路由
 `ingest.dlt`（保留原始消息 + 错误上下文），基础设施类失败仍走 `hunter_common` 的 `{topic}.dlq`；`DLT_ENABLED=False` 退回旧行为。
+**§12.3 DLT replay 工具**（`app/tools/dlt_replay.py`，V1.20.3）——从 `ingest.dlt` 读回原始 envelope 并按 `original_topic` 重投，
+让消息重走正常消费链路（原事务已回滚 ⇒ 事件仓层1去重重新放行）。CLI：`python -m app.tools.dlt_replay [--dry-run] [--topic T] [--error-type E] [--since/--until ISO] [--max N] [--group-id G] [--json]`，
+默认独立消费组 `g.ingest.dlt-replay`；**先 `--dry-run` 评估、再收窄范围分批回填**。
 **#21 背压**（`app/consumers/backpressure.py.BackpressureGuard`）——加工队列深度（`tasks.state=pending`）≥ `TASK_QUEUE_BACKPRESSURE_THRESHOLD`
 时注入单消息节流延迟 + 令牌桶限速，`_before_process` 钩子接入 ArtifactConsumer。
 

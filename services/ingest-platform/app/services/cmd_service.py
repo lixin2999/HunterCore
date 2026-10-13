@@ -118,7 +118,9 @@ class CmdService:
         }
         try:
             producer = KafkaProducerManager.instance()
-            await producer.produce(_CMD_TOPIC, key=vehicle_id, value=message)
+            # 低层 produce 只接受 bytes/str（与仓内 data-collector/remote-control 同款约定）：
+            # 直传 dict 会被 confluent_kafka 拒绝并被下方 except 静默吞掉，命令实际未下发。
+            await producer.produce(_CMD_TOPIC, key=vehicle_id, value=json.dumps(message, ensure_ascii=False))
             logger.info("cmd_published", cmd_id=str(cmd_id), vehicle_id=vehicle_id, type=cmd_type)
         except Exception as exc:
             logger.error("cmd_publish_failed", cmd_id=str(cmd_id), error=str(exc))

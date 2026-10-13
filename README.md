@@ -56,7 +56,7 @@ HunterCore/
 │   ├── data-analytics/        # 8083 数据分析
 │   ├── ota-service/           # 8084 OTA 管理
 │   ├── remote-control/        # 8085 远程操控
-│   └── ingest-platform/       # 8089 数据消费解析与处理（V1.20.0 交付、V1.20.1 P0/V1.20.2 P1 审查整改，尚未纳入部署编排，见 docs/deployment.md §14）
+│   └── ingest-platform/       # 8089 数据消费解析与处理（V1.20.0 交付、V1.20.1 P0/V1.20.2 P1/V1.20.3 功能遗漏汇总（DLT replay）审查整改，尚未纳入部署编排，见 docs/deployment.md §14）
 ├── common/
 │   ├── python/hunter_common/  # Python 共享库（配置/日志/异常/响应/Kafka/DB/Redis）
 │   └── typescript/            # TypeScript 共享类型（后续层级初始化）
@@ -134,7 +134,7 @@ services/{service-name}/
 | 数据分析 | data-analytics | 8083 | `/api/v1/analytics/**` |
 | OTA 管理 | ota-service | 8084 | `/api/v1/ota/**` |
 | 远程操控 | remote-control | 8085 | `/api/v1/remote/**`、`/ws/remote/**`（WebSocket） |
-| 数据消费解析与处理 | ingest-platform | 8089 | 未入网关路由表（服务未纳入部署编排；REST 供内部查询/导出：`/api/v1/bags|clips|tasks|artifacts|datasets|agents|commands`，V1.20.0；审查 P0/P1 整改见 V1.20.1/V1.20.2） |
+| 数据消费解析与处理 | ingest-platform | 8089 | 未入网关路由表（服务未纳入部署编排；REST 供内部查询/导出：`/api/v1/bags|clips|tasks|artifacts|datasets|agents|commands`，V1.20.0；审查 P0/P1 整改见 V1.20.1/V1.20.2，功能遗漏汇总剩余（§12.3 DLT replay）见 V1.20.3） |
 
 ## 快速开始
 

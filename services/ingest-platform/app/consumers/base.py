@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 from uuid import UUID, uuid5
@@ -174,7 +175,13 @@ class BaseIngestConsumer:
         }
         try:
             producer = KafkaProducerManager.instance()
-            await producer.produce(self._settings.dlt_topic, key=str(offset), value=record)
+            # 低层 produce 只接受 bytes/str：直传 dict 会被 confluent_kafka 拒绝并被 except 吞掉，
+            # 导致 DLT 永远不落料、replay 工具无从取回（§5.3/§12.3）。
+            await producer.produce(
+                self._settings.dlt_topic,
+                key=str(offset),
+                value=json.dumps(record, ensure_ascii=False),
+            )
         except Exception as dlt_exc:  # noqa: BLE001
             # Kafka 未初始化（本地/单测）或不可用：记录后不阻断（数据错误已吞断，不会无限重试）
             logger.warning(
