@@ -118,6 +118,7 @@ HunterCore 全栈健康检查脚本
   Kafka Topic 数、MinIO Bucket 数、/data 磁盘使用率、内存使用率、Kafka 消费积压、
   配置漂移硬闸、车端接入证书（broker 证书 SAN 与有效期）、服务运行期错误日志、
   Flink 作业健康（flink list -a：FAILED 不会被默认列表列出）、Flink 检查点目录可写、
+  业务服务 Kafka 本地磁盘缓冲目录可写（宿主 kafka-buffer 属主 10001 预检，V1.20.4）、
   入库延迟指标键（analytics:ingest_latency 存否/ TTL/诊断载荷，V1.19.21）。
 EOF
 }
@@ -672,6 +673,34 @@ check_ingest_latency_metric() {
   return 0
 }
 
+# 业务服务 Kafka 本地磁盘缓冲目录可写性（V1.20.4）：bind 源被 Docker 以 root 预建 → 非 root 容器建不了子目录
+#   现场：ingest-platform 纳入编排后首启即崩溃重启环（/healthz 不可达），traceback 末端
+#     `LocalDiskBuffer ... PermissionError: 'data/kafka-buffer/ingest-platform'`。根因：业务容器以
+#     非 root uid 10001 运行，compose 将宿主 ${DATA_DIR}/kafka-buffer/<svc> 绑成容器 /app/data/kafka-buffer，
+#     lifespan 内在其下 mkdir <service>；若 install.sh Step 3 未先跑（或早于本版、清单里没有该 svc），
+#     宿主目录缺失时会被 Docker 自动以 root:root 预建 → uid 10001 无权 mkdir → 启动失败。
+#   本项走纯宿主侧 stat（不依赖容器存活，崩溃重启中亦可判定），与 ⑮ flink 检查点目录同规格。
+check_business_kafka_buffer() {
+  local uid="${HC_BUFFER_UID:-10001}" data_dir="${DATA_DIR:-/data}"
+  local -a svcs=(api-gateway data-collector data-analytics ota-service remote-control scene-service vehicle-service ingest-platform)
+  local bad="" missing="" d host own
+  for d in "${svcs[@]}"; do
+    host="${data_dir}/kafka-buffer/${d}"
+    if [ ! -d "$host" ]; then
+      missing+=" ${d}"
+      continue
+    fi
+    own="$(stat -c '%u' "$host" 2>/dev/null || echo unknown)"
+    [ "$own" = "$uid" ] || bad+=" ${d}(属主 ${own})"
+  done
+  if [ -z "$bad" ] && [ -z "$missing" ]; then
+    record_result "PASS" "业务 Kafka 缓冲目录" "${#svcs[@]} 个业务服务 ${data_dir}/kafka-buffer/* 均属 uid=${uid}，非 root 容器可写"
+  else
+    record_result "FAIL" "业务 Kafka 缓冲目录" "以下宿主缓冲目录缺失或属主非 ${uid}:${missing}${bad}；非 root 容器会在 lifespan LocalDiskBuffer.mkdir 报 PermissionError → 崩溃重启环（/healthz 不可达，服务日志见 data/kafka-buffer）。修复：sudo bash scripts/install.sh --only-step 3 -y（预建并 chown ${uid}），或逐个 sudo chown -R ${uid}:${uid} ${data_dir}/kafka-buffer/<svc> \&\& sudo chmod 755 ${data_dir}/kafka-buffer/<svc>（bind 源改属主即时生效，**无需重建镜像**），再 cd ${APP_DIR} \&\& sudo docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --force-recreate <svc>"
+  fi
+  return 0
+}
+
 # ⑪ 配置漂移硬闸（G-03）：override 会被 compose 静默合并（TLS/端口/资源降级），生产禁止
 check_compose_override() {
   local override="${APP_DIR}/docker-compose.override.yml"
@@ -859,7 +888,7 @@ run_all_health_checks() {
   for check in check_env_credentials check_compose_override check_containers check_http_endpoints \
     check_databases check_redis check_kafka_topics check_minio_buckets check_disk_usage \
     check_memory_usage check_kafka_lag check_kafka_broker_cert check_service_error_logs \
-    check_flink_jobs check_flink_checkpoint_dir check_ingest_latency_metric; do
+    check_flink_jobs check_flink_checkpoint_dir check_business_kafka_buffer check_ingest_latency_metric; do
     if ! "$check"; then
       record_result "WARN" "检查项未完成（${check}）" "该项内部命令返回非 0（已继续执行余下检查，stderr 有具体报错行）"
     fi
