@@ -298,7 +298,7 @@ services:
     ports:
       - "${SRS_RTMP_PORT:-1935}:1935"           # 车端 RTMP 推流
       - "${SRS_RTC_UDP_PORT:-8000}:8000/udp"    # WebRTC 媒体
-      - "${SERVER_IP}:${SRS_HTTP_API_HOST_PORT:-9090}:9090"   # HTTP API（V1.21.1：浏览器信令已改同源 /rtc/ 反代，此端口仅留作健康检查/直接调试，确认同源链路后可改回 127.0.0.1 收紧）
+      - "127.0.0.1:${SRS_HTTP_API_HOST_PORT:-9090}:9090"   # HTTP API（V1.21.3 收回 127.0.0.1：浏览器信令已经同源 /rtc/ 反代（实机验证通过），此端口仅供宿主机健康检查/诊断（health-check ② 探的就是 127.0.0.1:9090）；web-portal nginx 经 hunter-net 直达 srs:9090，不受宿主绑定影响）
     volumes:
       - ./config/srs.conf:/usr/local/srs/conf/srs.conf:ro
       # ⚠ 禁止挂载到 /usr/local/srs/objs：该目录含镜像自带的 srs 二进制（command ./objs/srs），
