@@ -401,10 +401,15 @@ services:
       flink-jm:
         condition: service_healthy
     environment:
+      # V1.21.2：TM 默认槽位 2→4。契约「一组一作业」三常驻作业（detection/
+      # algorithm_performance/ingest_latency，并行度默认 1、各占 1 槽），旧值 2 使第三个
+      # 作业永远申请不到槽位 → NoResourceAvailableException 反复 RESTARTING
+      # → 看板 analytics:ingest_latency 键不出数（V1.20.4 遗留确诊）。
+      # ⚠ 说明只能放 YAML 注释位（不能写进 FLINK_PROPERTIES 块——会原样写入容器内 Flink 配置）。
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: flink-jm
         taskmanager.memory.process.size: ${FLINK_TM_PROCESS_MEM:-4096m}
-        taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-2}
+        taskmanager.numberOfTaskSlots: ${FLINK_TASK_SLOTS:-4}
         classloader.check-leaked-classloader: false
         execution.checkpointing.dir: file:///opt/flink/data/checkpoints
       TZ: ${TZ:-Asia/Shanghai}

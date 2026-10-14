@@ -3,7 +3,7 @@
 # HunterCore 单机部署 —— MinIO Bucket 初始化（init-minio.sh）
 #
 # 用途：等待 MinIO 就绪后，按契约（contracts/database/object-storage.yaml）创建
-#       7 个 Bucket 并设置生命周期规则：
+#       9 个 Bucket、设置生命周期规则，并确保业务服务账号（MINIO_ACCESS_KEY）存在：
 #
 #   Bucket                生命周期
 #   hunter-raw-data       30 天自动删除（传感器原始数据：点云/图像）
@@ -29,7 +29,9 @@
 #   sudo bash /opt/hunter-core/scripts/init-minio.sh
 #   sudo bash /opt/hunter-core/scripts/init-minio.sh --skip-lifecycle
 #
-# 幂等：mb --ignore-existing；生命周期规则已存在则跳过（不重复添加）。
+# 幂等：mb --ignore-existing；生命周期规则已存在则跳过（不重复添加）；
+#       服务账号已存在则跳过（V1.21.2：修复 gen-passwords 随机化 MINIO_ACCESS_KEY 后
+#       MinIO 侧无此用户 → 业务容器 S3 请求全 403，操控记录页「对象存储列举失败」实录）。
 # 依赖：common.sh（同目录）、容器 hunter-minio、镜像 minio/mc（可用 MINIO_MC_IMAGE 覆盖）
 # 日期：2026-09-19  |  目标系统：Ubuntu 22.04 LTS
 # =====================================================================
@@ -63,7 +65,8 @@ usage() {
 HunterCore MinIO Bucket 初始化脚本
 
 用途：
-  创建 9 个契约 Bucket 并设置生命周期规则（名称与生命周期不可更改）：
+  创建 9 个契约 Bucket、设置生命周期规则（名称与生命周期不可更改），并确保
+  MINIO_ACCESS_KEY 服务账号存在且具 readwrite 策略（V1.21.2）：
     hunter-raw-data(30d) hunter-rosbag(Tag hunter-retention=regular 30d) hunter-video(90d)
     hunter-logs(30d) hunter-ota-packages(永久) hunter-reports(永久) hunter-scene-assets(永久)
     hunter-derived(永久) hunter-datasets(永久)   # V1.20.4 ingest-platform 数据湖层
@@ -81,8 +84,9 @@ HunterCore MinIO Bucket 初始化脚本
   MINIO_MC_IMAGE=minio/mc:RELEASE.2024-06-13T16-39-23Z sudo bash scripts/init-minio.sh
 
 校验：
-  mc ls local/                 # 7 个 Bucket
+  mc ls local/                 # 9 个 Bucket
   mc ilm rule ls local/<bucket>  # 生命周期规则
+  mc admin user list local     # 含 MINIO_ACCESS_KEY 服务账号（readwrite）
 
 备份（大文件不打包，用 mc mirror 增量同步）：
   docker run --rm --network container:hunter-minio -e MC_HOST_local=http://<user>:<pass>@127.0.0.1:9000 \
@@ -161,6 +165,39 @@ add_expiry() {
   return 1
 }
 
+# ensure_service_account：确保业务服务账号（MINIO_ACCESS_KEY/MINIO_SECRET_KEY）在 MinIO 侧存在。
+# 背景（V1.21.2 修复）：.env 的 MINIO_ACCESS_KEY/SECRET 由 gen-passwords 随机化（非 root 最小权限账号），
+# 但此前全流程无任何脚本在 MinIO 侧创建该用户 → 业务容器（remote-control 录像归档/历史列举、
+# data-analytics、ota、scene、ingest 等共用 business-env 凭据）所有 S3 请求 403 InvalidAccessKeyId，
+# 表现为操控记录页「对象存储列举失败」、录像 sidecar 写入失败（sidecar_written=false）等。
+# 策略用 MinIO 内置 readwrite（跨桶读写；单桶精细化策略待生产评估，见 release.md 待办）。
+ensure_service_account() {
+  local ak="${MINIO_ACCESS_KEY:-}" sk="${MINIO_SECRET_KEY:-}"
+  if [ -z "$ak" ] || [ -z "$sk" ]; then
+    log_warn "MINIO_ACCESS_KEY / MINIO_SECRET_KEY 未配置，跳过服务账号创建（业务容器将无法访问对象存储）"
+    return 0
+  fi
+  if [ "$ak" = "${MINIO_ROOT_USER:-}" ]; then
+    log_info "MINIO_ACCESS_KEY 与 ROOT 用户同名，跳过服务账号创建（使用 root 凭据）"
+    return 0
+  fi
+  if minio_mc admin user list local 2>/dev/null | grep -qE "(^|[[:space:]])${ak}([[:space:]]|$)"; then
+    log_success "服务账号已存在（幂等跳过）：${ak}"
+    return 0
+  fi
+  if ! minio_mc admin user add local "$ak" "$sk" >/dev/null 2>&1; then
+    log_error "创建服务账号失败：${ak}"
+    log_error "可手工重试：mc admin user add local ${ak} '<MINIO_SECRET_KEY>'"
+    return 1
+  fi
+  if ! minio_mc admin policy attach local readwrite --user "$ak" >/dev/null 2>&1; then
+    log_error "服务账号 ${ak} 附加 readwrite 策略失败（账号已建，策略需手工补）"
+    log_error "可手工重试：mc admin policy attach local readwrite --user ${ak}"
+    return 1
+  fi
+  log_success "服务账号已就绪：${ak}（策略 readwrite，覆盖全契约桶读写）"
+}
+
 # =====================================================================
 # 主流程
 # =====================================================================
@@ -225,7 +262,13 @@ main() {
     done
   fi
 
-  # ---------- 5) 校验与汇总 ----------
+  # ---------- 5) 业务服务账号（V1.21.2：MINIO_ACCESS_KEY 必须在 MinIO 侧真实存在） ----------
+  log_info "===== 确保业务服务账号 ====="
+  if ! ensure_service_account; then
+    failed=$((failed + 1))
+  fi
+
+  # ---------- 6) 校验与汇总 ----------
   log_info "===== Bucket 列表 ====="
   minio_mc ls local 2>/dev/null | sed 's/^/  /' || true
   bucket_count="$(minio_bucket_count)"
