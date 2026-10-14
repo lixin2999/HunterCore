@@ -38,11 +38,13 @@ data:
   MINIO_BUCKET_VIDEO: "hunter-video"
   # SRS 媒体面基址（V1.21.0：车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流）
   # 不含 app/stream，后端按会话拼装下发；⚠ 生产按对外地址（浏览器/车端可达）覆盖 CHANGE_ME
+  # V1.21.1：WHEP/WHIP 同源口径——浏览器经门户同域 Ingress 路径 /rtc/ 反代到 srs Service:9090
+  # （需在 Ingress 补 /rtc/ → srs:9090 路由，避免跨源 CSP/CORS 拦截）；直连 :9090 仅作过渡/调试。
   RC_SRS_APP: "remote_control"
   RC_SRS_STREAM_PREFIX: "hunter"
   RC_SRS_RTMP_URL: "rtmp://CHANGE_ME_SERVER_IP:1935/remote_control"
-  RC_SRS_WHEP_URL: "http://CHANGE_ME_SERVER_IP:9090/rtc/v1/whep/"
-  RC_SRS_WHIP_URL: "http://CHANGE_ME_SERVER_IP:9090/rtc/v1/whip/"
+  RC_SRS_WHEP_URL: "http://CHANGE_ME_SERVER_IP/rtc/v1/whep/"
+  RC_SRS_WHIP_URL: "http://CHANGE_ME_SERVER_IP/rtc/v1/whip/"
 ---
 apiVersion: apps/v1
 kind: Deployment

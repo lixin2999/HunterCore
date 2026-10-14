@@ -298,7 +298,7 @@ services:
     ports:
       - "${SRS_RTMP_PORT:-1935}:1935"           # 车端 RTMP 推流
       - "${SRS_RTC_UDP_PORT:-8000}:8000/udp"    # WebRTC 媒体
-      - "${SERVER_IP}:${SRS_HTTP_API_HOST_PORT:-9090}:9090"   # HTTP API / WHEP 信令（V1.21.0：浏览器拉流需可达）
+      - "${SERVER_IP}:${SRS_HTTP_API_HOST_PORT:-9090}:9090"   # HTTP API（V1.21.1：浏览器信令已改同源 /rtc/ 反代，此端口仅留作健康检查/直接调试，确认同源链路后可改回 127.0.0.1 收紧）
     volumes:
       - ./config/srs.conf:/usr/local/srs/conf/srs.conf:ro
       # ⚠ 禁止挂载到 /usr/local/srs/objs：该目录含镜像自带的 srs 二进制（command ./objs/srs），
@@ -662,11 +662,13 @@ services:
       # 私有：SRS 地址与操控参数（详见 .env.example §remote-control）
       # V1.21.0：媒体架构 = 车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流；下列为基址，
       # 后端按会话 stream（hunter_{vehicle_id}_{session_id}）拼装 app/stream 查询下发。
+      # V1.21.1：WHEP/WHIP 信令默认改同源 http://${SERVER_IP}/rtc/…（web-portal nginx 反代 → srs:9090），
+      # 规避浏览器跨源 CSP connect-src/CORS 拦截；直连 :9090 仅留作调试。
       RC_SRS_APP: ${RC_SRS_APP:-remote_control}
       RC_SRS_STREAM_PREFIX: ${RC_SRS_STREAM_PREFIX:-hunter}
       RC_SRS_RTMP_URL: ${RC_SRS_RTMP_URL:-rtmp://${SERVER_IP}:1935/remote_control}
-      RC_SRS_WHEP_URL: ${RC_SRS_WHEP_URL:-http://${SERVER_IP}:${SRS_HTTP_API_HOST_PORT:-9090}/rtc/v1/whep/}
-      RC_SRS_WHIP_URL: ${RC_SRS_WHIP_URL:-http://${SERVER_IP}:${SRS_HTTP_API_HOST_PORT:-9090}/rtc/v1/whip/}
+      RC_SRS_WHEP_URL: ${RC_SRS_WHEP_URL:-http://${SERVER_IP}/rtc/v1/whep/}
+      RC_SRS_WHIP_URL: ${RC_SRS_WHIP_URL:-http://${SERVER_IP}/rtc/v1/whip/}
       RC_PUBLIC_WS_BASE_URL: ${RC_PUBLIC_WS_BASE_URL:-ws://${SERVER_IP}/ws/remote}
       RC_STUN_URLS: ${RC_STUN_URLS:-stun:${SERVER_IP}:8000}
       RC_COMMAND_HZ: ${RC_COMMAND_HZ:-20}
@@ -800,7 +802,7 @@ services:
       resources:
         limits: { cpus: "2", memory: 4G }     # 多 worker 加工 + 7 消费者，参照 data-collector 档
 
-  # ---------- 16. web-portal（Nginx + Vue3 dist；对外 80，同源反代 /api 与 /ws） ----------
+  # ---------- 16. web-portal（Nginx + Vue3 dist；对外 80，同源反代 /api、/ws 与 /rtc（V1.21.1 WHEP 信令→srs:9090）） ----------
   web-portal:
     image: ${IMAGE_PREFIX:-hunter}/web-portal:${VERSION}
     build:
@@ -815,6 +817,9 @@ services:
       - ./config/nginx.conf:/etc/nginx/nginx.conf:ro     # 用法 A：整份 nginx.conf 覆盖
     depends_on:
       api-gateway: { condition: service_healthy }
+      # V1.21.1：nginx 启动时需解析 /rtc/ 反代上游 srs（静态 upstream 在加载期解析，非运行期）；
+      # 仅要求已启动（service_healthy 会因 srs 健康探针滞后而拖长门户上线）
+      srs: { condition: service_started }
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
       interval: 10s

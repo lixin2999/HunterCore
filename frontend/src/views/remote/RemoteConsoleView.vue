@@ -278,6 +278,8 @@ const ackStale = computed<boolean>(
 
 /* --------------------- 会话状态轮询 + 实时遥测（限流区） --------------------- */
 const telemetry = ref<TelemetrySample | null>(null)
+/** 遥测查询回溯窗口（秒）：契约要求 start_time/end_time 必选，取此刻起往前该窗口的最新 1 点 */
+const TELEMETRY_LOOKBACK_S = 120
 let sessionTimer: number | null = null
 let telemetryTimer: number | null = null
 
@@ -306,11 +308,14 @@ function startSessionPolling(): void {
       return
     }
     try {
+      // 契约要求 start_time/end_time 必选（缺失 → 422）：取最近窗口的最新 1 点（time DESC）
+      const nowSec = Date.now() / 1000
       const data = await queryTelemetry({
         vehicle_id: vehicleId,
+        start_time: nowSec - TELEMETRY_LOOKBACK_S,
+        end_time: nowSec,
         page: 1,
         page_size: 1,
-        order: 'desc',
       })
       telemetry.value = data.items[0] ?? null
     } catch {

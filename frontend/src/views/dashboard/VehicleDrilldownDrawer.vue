@@ -47,9 +47,17 @@ async function load(): Promise<void> {
   }
   loading.value = true
   try {
+    // 契约要求 telemetry 的 start_time/end_time 必选（缺失 → 422）：取最近 1h 窗口内最新 60 点
+    const nowSec = Date.now() / 1000
     const [dash, tele, evt] = await Promise.all([
       fetchDashboard({ time_range: props.timeRange, vehicle_id: props.vehicleId }),
-      queryTelemetry({ vehicle_id: props.vehicleId, page: 1, page_size: 60, order: 'desc' }),
+      queryTelemetry({
+        vehicle_id: props.vehicleId,
+        start_time: nowSec - 3600,
+        end_time: nowSec,
+        page: 1,
+        page_size: 60,
+      }),
       listEvents({ vehicle_id: props.vehicleId, page: 1, page_size: 10, order: 'desc', sort: 'event_time' }),
     ])
     dashboard.value = dash
