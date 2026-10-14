@@ -8,54 +8,14 @@
 -- ---------- Schema ----------
 CREATE SCHEMA IF NOT EXISTS ingest_platform;
 
--- ---------- 枚举类型（受控词表，对应 contracts/database/enums.md） ----------
--- bag 状态机 rank：discovered < verified < parsed < uploaded < done
-DO $$ BEGIN
-    CREATE TYPE ingest_platform.bag_state AS ENUM
-        ('discovered', 'verified', 'parsed', 'uploaded', 'done', 'parse_failed');
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-
--- 任务状态机：pending -> running -> done | failed | dead
-DO $$ BEGIN
-    CREATE TYPE ingest_platform.task_state AS ENUM
-        ('pending', 'running', 'done', 'failed', 'dead');
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-
--- 任务类型
-DO $$ BEGIN
-    CREATE TYPE ingest_platform.task_type AS ENUM
-        ('verify', 'align', 'slice', 'qc', 'export', 'compact', 'enrich');
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-
--- 产物类型
-DO $$ BEGIN
-    CREATE TYPE ingest_platform.artifact_class AS ENUM
-        ('manifest', 'image', 'pcd', 'table', 'raw', 'meta', 'derived');
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-
--- 产物上传状态
-DO $$ BEGIN
-    CREATE TYPE ingest_platform.upload_state AS ENUM
-        ('uploaded', 'verified', 'missing', 'corrupt');
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-
--- 派生资产类型
-DO $$ BEGIN
-    CREATE TYPE ingest_platform.derived_kind AS ENUM
-        ('aligned', 'clip', 'qc', 'enrich');
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-
--- 命令状态
-DO $$ BEGIN
-    CREATE TYPE ingest_platform.cmd_ack_status AS ENUM
-        ('pending', 'ack', 'timeout', 'failed');
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-
--- 切片来源
-DO $$ BEGIN
-    CREATE TYPE ingest_platform.clip_source AS ENUM
-        ('event', 'window', 'mined', 'manual');
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+-- ---------- 枚举列表示约定（V1.20.5）----------
+-- 受控枚举列一律用 TEXT + CHECK (col IN (...)) 表示，与共享库
+-- hunter_common.database.base.StrEnumType(impl=Text) 及 01~05 schema 保持一致；
+-- 不使用 PG 原生 CREATE TYPE ... AS ENUM——原生枚举会使物理列类型为 ingest_platform.<type>，
+-- 而 ORM 侧以 Text 绑定比较参数，asyncpg 下触发：
+--   UndefinedFunctionError: operator does not exist: ingest_platform.<type> = character varying
+-- （SQLite 单测无法暴露，仅真实 PostgreSQL 复现）。取值词表见 contracts/database/enums.md，
+-- ORM StrEnum 定义见 services/ingest-platform/app/models/ingest.py。
 
 -- ========== 1. 事件仓（append-only，按月分区，§6.2）==========
 CREATE TABLE IF NOT EXISTS ingest_platform.events (
@@ -99,7 +59,7 @@ CREATE TABLE IF NOT EXISTS ingest_platform.bags (
     sha256        TEXT,
     message_count BIGINT,
     manifest_rev  TEXT,                              -- input_rev 计算基础
-    state         ingest_platform.bag_state NOT NULL DEFAULT 'discovered',
+    state         TEXT        NOT NULL DEFAULT 'discovered',
     seq           BIGINT      NOT NULL DEFAULT 0,
     parse_status  TEXT,
     progress      JSONB,                             -- 解析进度投影（§5.1 parse.progress 最新态；历史见 events 表）
@@ -107,7 +67,8 @@ CREATE TABLE IF NOT EXISTS ingest_platform.bags (
     manifest      JSONB,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT pk_bags PRIMARY KEY (bag_id)
+    CONSTRAINT pk_bags PRIMARY KEY (bag_id),
+    CONSTRAINT ck_bags_state CHECK (state IN ('discovered', 'verified', 'parsed', 'uploaded', 'done', 'parse_failed'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_bags_vehicle   ON ingest_platform.bags (vehicle_id, updated_at DESC);
@@ -133,15 +94,17 @@ CREATE TABLE IF NOT EXISTS ingest_platform.bag_topics (
 CREATE TABLE IF NOT EXISTS ingest_platform.artifacts (
     object_key    TEXT        NOT NULL,
     bag_id        TEXT,
-    artifact_class ingest_platform.artifact_class NOT NULL,
+    artifact_class TEXT        NOT NULL,
     size_bytes    BIGINT,
     sha256        TEXT,
     etag          TEXT,
     rows          INT,
     count         INT,
-    upload_state  ingest_platform.upload_state NOT NULL DEFAULT 'uploaded',
+    upload_state  TEXT        NOT NULL DEFAULT 'uploaded',
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT pk_artifacts PRIMARY KEY (object_key)
+    CONSTRAINT pk_artifacts PRIMARY KEY (object_key),
+    CONSTRAINT ck_artifacts_artifact_class CHECK (artifact_class IN ('manifest', 'image', 'pcd', 'table', 'raw', 'meta', 'derived')),
+    CONSTRAINT ck_artifacts_upload_state CHECK (upload_state IN ('uploaded', 'verified', 'missing', 'corrupt'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_bag_class
@@ -152,11 +115,12 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_bag_class
 CREATE TABLE IF NOT EXISTS ingest_platform.derived_assets (
     bag_id     TEXT   NOT NULL,
     input_rev  TEXT   NOT NULL,
-    kind       ingest_platform.derived_kind NOT NULL,
+    kind       TEXT        NOT NULL,
     object_key TEXT   NOT NULL,
     meta       JSONB  NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT pk_derived_assets PRIMARY KEY (bag_id, input_rev, kind, object_key)
+    CONSTRAINT pk_derived_assets PRIMARY KEY (bag_id, input_rev, kind, object_key),
+    CONSTRAINT ck_derived_assets_kind CHECK (kind IN ('aligned', 'clip', 'qc', 'enrich'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_derived_bag ON ingest_platform.derived_assets (bag_id, input_rev);
@@ -167,8 +131,8 @@ CREATE TABLE IF NOT EXISTS ingest_platform.tasks (
     task_id         BIGSERIAL   NOT NULL,
     bag_id          TEXT,
     input_rev       TEXT,
-    task_type       ingest_platform.task_type NOT NULL,
-    state           ingest_platform.task_state NOT NULL DEFAULT 'pending',
+    task_type       TEXT        NOT NULL,
+    state           TEXT        NOT NULL DEFAULT 'pending',
     priority        INT         NOT NULL DEFAULT 5,
     attempts        INT         NOT NULL DEFAULT 0,
     max_attempts    INT         NOT NULL DEFAULT 3,
@@ -182,7 +146,9 @@ CREATE TABLE IF NOT EXISTS ingest_platform.tasks (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT pk_tasks PRIMARY KEY (task_id),
     -- §5.2 副作用幂等键：同 (bag_id, task_type, input_rev) 只有一条记录
-    CONSTRAINT uq_tasks_bag_type_rev UNIQUE (bag_id, task_type, input_rev)
+    CONSTRAINT uq_tasks_bag_type_rev UNIQUE (bag_id, task_type, input_rev),
+    CONSTRAINT ck_tasks_task_type CHECK (task_type IN ('verify', 'align', 'slice', 'qc', 'export', 'compact', 'enrich')),
+    CONSTRAINT ck_tasks_state CHECK (state IN ('pending', 'running', 'done', 'failed', 'dead'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_queue
@@ -197,14 +163,15 @@ CREATE TABLE IF NOT EXISTS ingest_platform.clips (
     input_rev   TEXT        NOT NULL,
     start_ns    BIGINT      NOT NULL,
     end_ns      BIGINT      NOT NULL,
-    source      ingest_platform.clip_source NOT NULL DEFAULT 'window',
+    source      TEXT        NOT NULL DEFAULT 'window',
     tags        TEXT[]      NOT NULL DEFAULT '{}',
     scene_label TEXT,
     quality     NUMERIC(4, 3),
     manifest_key TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT pk_clips PRIMARY KEY (clip_id),
-    CONSTRAINT uq_clips_bag_rev_span UNIQUE (bag_id, input_rev, start_ns, end_ns, source)
+    CONSTRAINT uq_clips_bag_rev_span UNIQUE (bag_id, input_rev, start_ns, end_ns, source),
+    CONSTRAINT ck_clips_source CHECK (source IN ('event', 'window', 'mined', 'manual'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_clips_bag   ON ingest_platform.clips (bag_id);
@@ -248,9 +215,10 @@ CREATE TABLE IF NOT EXISTS ingest_platform.commands (
     last_issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 最近一次下发时刻（超时重发扫描基准，§9.4）
     resend_count INT        NOT NULL DEFAULT 0,          -- 自动重发次数（超 30min 未 ack 重发一次再失败告警，§9.4）
     ack_at      TIMESTAMPTZ,
-    ack_status  ingest_platform.cmd_ack_status NOT NULL DEFAULT 'pending',
+    ack_status  TEXT        NOT NULL DEFAULT 'pending',
     ack_detail  JSONB,
-    CONSTRAINT pk_commands PRIMARY KEY (cmd_id)
+    CONSTRAINT pk_commands PRIMARY KEY (cmd_id),
+    CONSTRAINT ck_commands_ack_status CHECK (ack_status IN ('pending', 'ack', 'timeout', 'failed'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_commands_vehicle ON ingest_platform.commands (vehicle_id, issued_at DESC);

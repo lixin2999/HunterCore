@@ -44,8 +44,9 @@ CREATE_TABLE_RE = re.compile(
     re.DOTALL,
 )
 CREATE_TYPE_RE = re.compile(
-    r"CREATE TYPE ingest_platform\.(\w+) AS ENUM\s*\((.*?)\)\s*;", re.DOTALL
+    r"CREATE\s+TYPE\s+ingest_platform\.(\w+)\s+AS\s+ENUM", re.IGNORECASE
 )
+CHECK_ENUM_RE = re.compile(r"CHECK\s*\(\s*(\w+)\s+IN\s*\((.*?)\)", re.DOTALL)
 QUOTED_RE = re.compile(r"'([^']*)'")
 
 ORM_MODELS = [
@@ -53,15 +54,16 @@ ORM_MODELS = [
     Clip, Label, Agent, AgentAlert, Command, ProjectionAnomaly, Dataset,
 ]
 
-ENUM_MODEL_MAP: dict[str, type] = {
-    "bag_state": BagState,
-    "task_state": TaskState,
-    "task_type": TaskType,
-    "artifact_class": ArtifactClass,
-    "upload_state": UploadState,
-    "derived_kind": DerivedKind,
-    "cmd_ack_status": CmdAckStatus,
-    "clip_source": ClipSource,
+# 枚举列的 TEXT+CHECK 表示：(表名, 列名) → StrEnum（V1.20.5，与 StrEnumType(impl=Text) 对齐）
+ENUM_CHECK_MAP: dict[tuple[str, str], type] = {
+    ("bags", "state"): BagState,
+    ("tasks", "state"): TaskState,
+    ("tasks", "task_type"): TaskType,
+    ("artifacts", "artifact_class"): ArtifactClass,
+    ("artifacts", "upload_state"): UploadState,
+    ("derived_assets", "kind"): DerivedKind,
+    ("commands", "ack_status"): CmdAckStatus,
+    ("clips", "source"): ClipSource,
 }
 
 
@@ -111,16 +113,39 @@ def test_ingest_ddl_columns_match_orm(model) -> None:
     )
 
 
+def _ddl_enum_checks() -> dict[tuple[str, str], set[str]]:
+    """从各 CREATE TABLE 主体解析 CHECK (col IN (...)) → {(table, column): 取值集合}。"""
+    result: dict[tuple[str, str], set[str]] = {}
+    for match in CREATE_TABLE_RE.finditer(_ddl_text()):
+        table = match.group(1).lower().split(".")[-1]
+        for column, values in CHECK_ENUM_RE.findall(match.group(2)):
+            result[(table, column.lower())] = set(QUOTED_RE.findall(values))
+    return result
+
+
+def test_ingest_ddl_no_native_enum_types() -> None:
+    """回归护栏：ingest DDL 禁止使用 PG 原生 CREATE TYPE ... AS ENUM。
+
+    原生枚举会使物理列类型为 ingest_platform.<type>，而 ORM 以 StrEnumType(impl=Text)
+    绑定比较参数，asyncpg 下报 UndefinedFunctionError: operator does not exist:
+    ingest_platform.<type> = character varying（仅真实 PostgreSQL 复现，SQLite 单测不暴露）。
+    受控枚举必须用 TEXT + CHECK (col IN (...)) 表示（与 01~05 schema 一致）。
+    """
+    assert not CREATE_TYPE_RE.search(_ddl_text()), (
+        "06_ingest_platform.sql 不得声明原生枚举类型，应改用 TEXT + CHECK"
+    )
+
+
 def test_ingest_ddl_enum_values_match_orm() -> None:
-    """DDL 枚举类型取值与 ORM StrEnum 完全一致（受控词表，contracts/database/enums.md）。"""
-    ddl_types = {
-        name.lower(): set(QUOTED_RE.findall(body))
-        for name, body in CREATE_TYPE_RE.findall(_ddl_text())
-    }
-    for type_name, enum_cls in ENUM_MODEL_MAP.items():
-        assert type_name in ddl_types, f"DDL 缺失枚举类型: ingest_platform.{type_name}"
+    """DDL 枚举列 CHECK (col IN (...)) 取值与 ORM StrEnum 完全一致（受控词表，contracts/database/enums.md）。"""
+    ddl_checks = _ddl_enum_checks()
+    for (table, column), enum_cls in ENUM_CHECK_MAP.items():
+        key = (table, column)
+        assert key in ddl_checks, (
+            f"DDL 缺失枚举 CHECK：ingest_platform.{table}.{column}（对应 {enum_cls.__name__}）"
+        )
         orm_values = {e.value for e in enum_cls}
-        assert ddl_types[type_name] == orm_values, (
-            f"{type_name} 取值不一致：DDL 多出 {sorted(ddl_types[type_name] - orm_values)} / "
-            f"ORM 多出 {sorted(orm_values - ddl_types[type_name])}"
+        assert ddl_checks[key] == orm_values, (
+            f"{table}.{column} 取值不一致：DDL 多出 {sorted(ddl_checks[key] - orm_values)} / "
+            f"ORM 多出 {sorted(orm_values - ddl_checks[key])}"
         )
