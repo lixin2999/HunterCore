@@ -788,8 +788,10 @@ class SessionService:
     def _build_webrtc(self, vehicle_id: str, session_id: str) -> WebRtcConnectionInfo:
         """WebRTC 接入上下文（WSS 信令/控制通道 + SRS 媒体信息；契约 WebRtcConnectionInfo）。
 
-        通道路径对齐网关路由 /ws/remote/**；SRS 集成参数（WHIP/WHEP/RTMP）来自配置，
-        pending #10 定稿前可为空（契约 optional 字段）。
+        V1.21.0：视频链路改为 SRS 媒体架构——车端 RTMP 推流、浏览器 WHEP 拉流；
+        signal 通道保留但不作为视频必经路径。媒体地址由配置基址按会话 stream 拼装
+        （见 Settings.srs_*_url_for），基址未配置时对应字段为 None（契约 optional）。
+        通道路径对齐网关路由 /ws/remote/**。
         """
         settings = self._settings
         return WebRtcConnectionInfo(
@@ -800,10 +802,10 @@ class SessionService:
             ice_servers=self._build_ice_servers(),
             media_server=SrsMediaInfo(
                 app=settings.rc_srs_app,
-                stream=f"{settings.rc_srs_stream_prefix}/{vehicle_id}_{session_id}",
-                whip_url=settings.rc_srs_whip_url or None,
-                whep_url=settings.rc_srs_whep_url or None,
-                rtmp_url=settings.rc_srs_rtmp_url or None,
+                stream=settings.srs_stream_name(vehicle_id, session_id),
+                whip_url=settings.srs_whip_url_for(vehicle_id, session_id),
+                whep_url=settings.srs_whep_url_for(vehicle_id, session_id),
+                rtmp_url=settings.srs_rtmp_url_for(vehicle_id, session_id),
             ),
         )
 

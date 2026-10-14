@@ -328,17 +328,32 @@ const fenceText = computed(() => {
             <code>{{ detail.scram_username }}</code>
             <span class="hint">（= vehicle_id；口令一次性下发不缓存）</span>
           </el-descriptions-item>
-          <el-descriptions-item label="Topic 清单">
+          <el-descriptions-item label="实时控制/遥测 Topic">
             <el-tag
               v-for="topic in detail.topics_preview"
               :key="topic"
               size="small"
               effect="plain"
+              type="success"
               class="topic-tag"
             >
               {{ topic }}
             </el-tag>
-            <div class="hint">共 {{ detail.topics_preview.length }} 个（telemetry/event/health/command/command_result/ota_notify/ota_status/remote_control）</div>
+            <div class="hint">共 {{ detail.topics_preview.length }} 个 `hunter.{vehicle_id}.*`（telemetry/event/health/command/command_result/ota_notify/ota_status/remote_control）</div>
+          </el-descriptions-item>
+          <el-descriptions-item label="数据采集 Agent Topic">
+            <el-tag
+              v-for="topic in detail.agent_topics_preview || []"
+              :key="topic"
+              size="small"
+              effect="plain"
+              type="warning"
+              class="topic-tag"
+            >
+              {{ topic }}
+            </el-tag>
+            <span v-if="!(detail.agent_topics_preview && detail.agent_topics_preview.length)" class="hint">（无）</span>
+            <div class="hint">共 {{ detail.agent_topics_preview?.length ?? 0 }} 个（V1.20.0 新增，全局命名 vehicle.bag.* / vehicle.agent.*；由 ingest-platform 消费，本服务仅预览）</div>
           </el-descriptions-item>
         </el-descriptions>
       </el-card>

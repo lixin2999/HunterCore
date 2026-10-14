@@ -72,7 +72,11 @@ export interface IceServer {
   credential_ttl_s?: number
 }
 
-/** SRS 媒体信息（WHIP 推流 / WHEP 拉流） */
+/**
+ * SRS 媒体信息（V1.21.0：车端 RTMP/WHIP 推流 → SRS → 浏览器 WHEP 拉流）。
+ * whep_url 为浏览器视频拉流入口（由后端按会话 stream 拼装下发）；
+ * 未配置时缺省，前端据此提示「媒体服务未就绪」（不再依赖 signal WS 中继）。
+ */
 export interface SrsMediaInfo {
   app: string
   stream: string
@@ -81,7 +85,7 @@ export interface SrsMediaInfo {
   rtmp_url?: string
 }
 
-/** WebRTC 连接信息（信令 WS + 控制 WS + SRTP） */
+/** WebRTC 连接信息（控制 WS + SRTP 媒体；signal_ws_url 保留但视频不再经其中继） */
 export interface WebRtcConnectionInfo {
   signal_ws_url: string
   control_ws_url: string

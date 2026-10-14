@@ -1,9 +1,10 @@
 // HunterCore 前端构建配置
 // 说明：
-// 1. 开发环境通过 Vite dev server 反向代理到 api-gateway(8080)，避免本地 CORS；
-//    生产环境由 Ingress 按网关路由表前缀（/api/v1/**、/ws/remote/**）同源转发，
+// 1. 开发环境通过 Vite dev server 反向代理：/api → api-gateway(8080)，/ws → remote-control(8085)；
+//    （V1.21.0：api-gateway 不代理 WebSocket，控制/信令 WS 必须直连 remote-control，与生产 nginx /ws/ 路由一致）；
+//    生产环境由 Ingress/nginx 按路由表前缀（/api/v1/**、/ws/remote/**）同源转发，
 //    因此前端只使用相对基础路径，禁止在代码中硬编码后端主机地址（系统约束第 16 条）。
-// 2. WebSocket 走同一代理（ws: true），网关契约要求 WSS + JWT 握手。
+// 2. WebSocket 走独立代理（ws: true），网关契约要求 WSS + JWT 握手。
 import { fileURLToPath, URL } from 'node:url'
 
 import vue from '@vitejs/plugin-vue'
@@ -13,6 +14,8 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), 'VITE_')
   const devPort = Number(env.VITE_DEV_PORT ?? 5173)
   const proxyTarget = env.VITE_PROXY_TARGET ?? 'http://localhost:8080'
+  // /ws/remote/** 走 remote-control（8085），与生产 nginx 同源路由对齐（api-gateway 不代理 WS）
+  const wsProxyTarget = env.VITE_PROXY_WS_TARGET ?? 'http://localhost:8085'
 
   return {
     plugins: [vue()],
@@ -27,8 +30,8 @@ export default defineConfig(({ mode }) => {
       proxy: {
         // 网关路由表：/api/v1/** → 各微服务（api-gateway 统一鉴权/限流）
         '/api': { target: proxyTarget, changeOrigin: true },
-        // /ws/remote/** → remote-control（网关 x-hunter-websocket-routes）
-        '/ws': { target: proxyTarget, changeOrigin: true, ws: true },
+        // /ws/remote/** → remote-control:8085（网关不代理 WS，V1.21.0 dev 代理直连操控服务）
+        '/ws': { target: wsProxyTarget, changeOrigin: true, ws: true },
       },
     },
     build: {

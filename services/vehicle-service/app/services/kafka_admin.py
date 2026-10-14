@@ -51,7 +51,9 @@ except ImportError:  # pragma: no cover - kafka-python-ng 回退路径
 # 由 hunter_common 引入）；Topic 管理仍用 kafka-python-ng AdminClient。
 from confluent_kafka import KafkaError as ConfluentKafkaError  # type: ignore[import-untyped]
 from confluent_kafka import KafkaException  # type: ignore[import-untyped]
-from confluent_kafka.admin import AdminClient as ConfluentAdminClient  # type: ignore[import-untyped]
+from confluent_kafka.admin import (
+    AdminClient as ConfluentAdminClient,  # type: ignore[import-untyped]
+)
 from confluent_kafka.admin import (  # type: ignore[import-untyped]
     ScramCredentialInfo,
     ScramMechanism,
@@ -66,6 +68,9 @@ logger = get_logger("app.services.kafka_admin")
 #: Topic 命名模式：`hunter.{vehicle_id}.<type>`（契约 vehicle_topics，8 项/车；
 #: 广播 `hunter.broadcast.command` 无 vehicle_id 段，创建每车 Topic 时跳过）
 VEHICLE_TOPIC_PATTERN = "hunter.{vehicle_id}."
+
+#: 车端 agent Topic 前缀（V1.20.0：ingest_platform_topics 中 `vehicle.` 开头的 bag/agent 条目）
+INGEST_AGENT_TOPIC_PREFIX = "vehicle."
 
 #: DLQ 派生缺省值（仅契约 naming 段缺字段时兜底，正常路径一律读契约：dlq_pattern /
 #: dlq_retention_ms / dlq_partitions_inherit_source）
@@ -105,6 +110,7 @@ def _is_scram_principal_missing(exc: BaseException) -> bool:
 # =====================================================================
 _VEHICLE_TOPICS_CACHE: list[dict[str, Any]] | None = None
 _DLQ_NAMING_CACHE: dict[str, Any] | None = None
+_INGEST_AGENT_TOPICS_CACHE: list[dict[str, Any]] | None = None
 _CACHE_LOCK = threading.Lock()
 
 
@@ -132,7 +138,7 @@ def load_vehicle_topics() -> list[dict[str, Any]]:
     `name` 保留 `{vehicle_id}` 占位符，由调用方 `.format(vehicle_id=...)` 展开。
     同时缓存 naming 段的 DLQ 派生规则（供 :func:`render_vehicle_topics` 使用）。
     """
-    global _VEHICLE_TOPICS_CACHE, _DLQ_NAMING_CACHE  # noqa: PLW0603 - 单例缓存，进程内允许
+    global _VEHICLE_TOPICS_CACHE, _DLQ_NAMING_CACHE
     with _CACHE_LOCK:
         if _VEHICLE_TOPICS_CACHE is not None:
             return _VEHICLE_TOPICS_CACHE
@@ -175,6 +181,39 @@ def load_vehicle_topics() -> list[dict[str, Any]]:
             dlq_pattern=_DLQ_NAMING_CACHE["pattern"],
             file=str(topics_file),
         )
+        return entries
+
+
+def load_agent_topics() -> list[dict[str, Any]]:
+    """从 topics.yaml#ingest_platform_topics 加载车端 agent 相关 Topic（V1.20.0）。
+
+    车端 agent Topic 均为全局命名（不含 `{vehicle_id}` 占位符），以 `vehicle.` 前缀筛选：
+    ``vehicle.bag.*``（4：manifest/task.status/parse.progress/artifact.uploaded，车端生产）与
+    ``vehicle.agent.*``（4：heartbeat/alert/cmd.ack 车端生产 + cmd 车端消费）。排除平台内部
+    ``platform.*`` 与 ``ingest.dlt``。返回元素：``{"name", "direction", "consumed"}``。
+    """
+    global _INGEST_AGENT_TOPICS_CACHE
+    with _CACHE_LOCK:
+        if _INGEST_AGENT_TOPICS_CACHE is not None:
+            return _INGEST_AGENT_TOPICS_CACHE
+        topics_file = _find_contracts_dir() / "topics.yaml"
+        if not topics_file.is_file():
+            raise ServiceUnavailableError(f"Kafka Topic 契约文件缺失: {topics_file}")
+        raw = yaml.safe_load(topics_file.read_text(encoding="utf-8")) or {}
+        entries: list[dict[str, Any]] = []
+        for item in raw.get("ingest_platform_topics") or []:
+            name = str(item.get("name", ""))
+            if not name.startswith(INGEST_AGENT_TOPIC_PREFIX):
+                continue
+            entries.append(
+                {
+                    "name": name,
+                    "direction": str(item.get("direction", "")),
+                    "consumed": bool(item.get("consumed", False)),
+                }
+            )
+        _INGEST_AGENT_TOPICS_CACHE = entries
+        logger.info("ingest_agent_topics_loaded", count=len(entries), file=str(topics_file))
         return entries
 
 
@@ -378,7 +417,7 @@ class KafkaAdminOps:
     def close(self) -> None:
         try:
             self._admin.close()
-        except Exception:  # noqa: BLE001 - 关闭尽力而为
+        except Exception:
             logger.exception("kafka_admin_close_failed")
         # confluent AdminClient 无显式 close（进程退出时由 librdkafka 回收），无需额外处理
 
@@ -492,7 +531,7 @@ def build_admin_client() -> KafkaAdminOps:
     # SCRAM 控制面（confluent-kafka）：构造失败不阻断 Topic 控制面，SCRAM 调用时再抛 5001
     try:
         scram_admin: ConfluentAdminClient | None = _build_scram_admin()
-    except Exception:  # noqa: BLE001 - confluent 配置错误不应连带 Topic 能力不可用
+    except Exception:
         logger.exception("kafka_scram_admin_init_failed")
         scram_admin = None
     return KafkaAdminOps(admin, scram_admin=scram_admin)
@@ -510,16 +549,17 @@ async def build_admin_client_safe() -> KafkaAdminOps | None:
     except ServiceUnavailableError as exc:
         logger.warning("kafka_admin_bootstrap_deferred", error=str(exc))
         return None
-    except Exception:  # noqa: BLE001 - 任何建连异常都不阻断启动
+    except Exception:
         logger.exception("kafka_admin_bootstrap_failed")
         return None
 
 
 __all__ = [
-    "KafkaAdminOps",
     "VEHICLE_TOPIC_PATTERN",
+    "KafkaAdminOps",
     "build_admin_client",
     "build_admin_client_safe",
+    "load_agent_topics",
     "load_vehicle_topics",
     "render_vehicle_topics",
 ]

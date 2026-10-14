@@ -298,7 +298,7 @@ services:
     ports:
       - "${SRS_RTMP_PORT:-1935}:1935"           # 车端 RTMP 推流
       - "${SRS_RTC_UDP_PORT:-8000}:8000/udp"    # WebRTC 媒体
-      - "127.0.0.1:${SRS_HTTP_API_HOST_PORT:-9090}:9090"   # HTTP API / WHEP 信令（仅回环）
+      - "${SERVER_IP}:${SRS_HTTP_API_HOST_PORT:-9090}:9090"   # HTTP API / WHEP 信令（V1.21.0：浏览器拉流需可达）
     volumes:
       - ./config/srs.conf:/usr/local/srs/conf/srs.conf:ro
       # ⚠ 禁止挂载到 /usr/local/srs/objs：该目录含镜像自带的 srs 二进制（command ./objs/srs），
@@ -660,8 +660,13 @@ services:
       SERVICE_NAME: remote-control
       API_PORT: "8085"
       # 私有：SRS 地址与操控参数（详见 .env.example §remote-control）
-      RC_SRS_RTMP_URL: ${RC_SRS_RTMP_URL:-rtmp://srs:1935/remote_control}
-      RC_SRS_WHEP_URL: ${RC_SRS_WHEP_URL:-http://srs:9090/rtc/v1/whep/}
+      # V1.21.0：媒体架构 = 车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流；下列为基址，
+      # 后端按会话 stream（hunter_{vehicle_id}_{session_id}）拼装 app/stream 查询下发。
+      RC_SRS_APP: ${RC_SRS_APP:-remote_control}
+      RC_SRS_STREAM_PREFIX: ${RC_SRS_STREAM_PREFIX:-hunter}
+      RC_SRS_RTMP_URL: ${RC_SRS_RTMP_URL:-rtmp://${SERVER_IP}:1935/remote_control}
+      RC_SRS_WHEP_URL: ${RC_SRS_WHEP_URL:-http://${SERVER_IP}:${SRS_HTTP_API_HOST_PORT:-9090}/rtc/v1/whep/}
+      RC_SRS_WHIP_URL: ${RC_SRS_WHIP_URL:-http://${SERVER_IP}:${SRS_HTTP_API_HOST_PORT:-9090}/rtc/v1/whip/}
       RC_PUBLIC_WS_BASE_URL: ${RC_PUBLIC_WS_BASE_URL:-ws://${SERVER_IP}/ws/remote}
       RC_STUN_URLS: ${RC_STUN_URLS:-stun:${SERVER_IP}:8000}
       RC_COMMAND_HZ: ${RC_COMMAND_HZ:-20}

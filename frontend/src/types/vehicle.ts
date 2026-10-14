@@ -64,6 +64,8 @@ export interface VehicleDetail extends VehicleRow {
   scram_username: string
   /** 8 个 Topic 名称预览（不查 Kafka，纯字符串拼接） */
   topics_preview: string[]
+  /** 车端数据采集 Agent Topic 预览（V1.20.0 新增：vehicle.bag.* / vehicle.agent.*，全局命名） */
+  agent_topics_preview?: string[]
 }
 
 /** 分页响应（VehiclePage） */

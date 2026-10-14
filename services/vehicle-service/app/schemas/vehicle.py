@@ -93,6 +93,10 @@ class VehicleDetail(VehicleRow):
     )
     scram_username: str = Field(..., description="车端 SCRAM 用户名（= vehicle_id）")
     topics_preview: list[str] = Field(default_factory=list)
+    agent_topics_preview: list[str] = Field(
+        default_factory=list,
+        description="车端数据采集 Agent Topic（V1.20.0 新增：vehicle.bag.* / vehicle.agent.*，全局命名）",
+    )
 
 
 class ProvisionResult(BaseModel):

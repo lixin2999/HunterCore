@@ -1,0 +1,45 @@
+[project]
+name = "vehicle-simulator"
+version = "0.1.0"
+description = "内置车辆模拟器：消费 remote_control 驱动车端运动学，生产 telemetry/health/command_result，并经 SRS RTMP 推合成视频（端到端演示/自测，不依赖真实车辆）"
+requires-python = ">=3.11"
+dependencies = [
+    "confluent-kafka>=2.3,<3",   # SASL_SSL + SCRAM-SHA-512 车端身份（user=vehicle_id）
+    "pydantic>=2.7,<3",          # 配置与帧模型校验
+    "jsonschema>=4.21,<5",       # 生产消息按 contracts/kafka/schemas/*.schema.json 自校验
+    "Pillow>=10.2",              # 合成视频帧（速度/转角叠加文本）
+]
+
+# 本工具为独立进程（不依赖 hunter_common），以便在开发机/CI 直接运行；
+# 契约目录经 --contract-dir / SIM_CONTRACT_DIR 注入，默认从仓库相对路径探测。
+[project.optional-dependencies]
+whip = [
+    "aiortc>=1.9,<2",            # 无 ffmpeg 时回退 WebRTC WHIP 推流（可选）
+    "aiohttp>=3.9,<4",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+vehicle-simulator = "vehicle_simulator.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["B"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vehicle_simulator"]

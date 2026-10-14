@@ -97,6 +97,17 @@ def _topics_preview(vehicle_id: str) -> list[str]:
         return []
 
 
+def _agent_topics_preview() -> list[str]:
+    """车端数据采集 Agent Topic（V1.20.0 ingest_platform_topics 中 `vehicle.` 前缀）。
+
+    全局命名、与单车无关（不随 vehicle_id 变化），与 `topics_preview`（8 个 `hunter.{vid}.*`）分组展示。
+    """
+    try:
+        return [t["name"] for t in kafka_admin.load_agent_topics()]
+    except Exception:  # noqa: BLE001 - 与 topics_preview 同构降级，不阻断详情
+        return []
+
+
 def _bootstrap_value() -> str:
     host = settings.server_ip or "127.0.0.1"
     return f"{host}:{settings.kafka_external_port}"
@@ -127,6 +138,7 @@ def _to_detail(v: Vehicle) -> VehicleDetail:
         kafka_bootstrap=_bootstrap_value(),
         scram_username=v.vehicle_id,
         topics_preview=_topics_preview(v.vehicle_id),
+        agent_topics_preview=_agent_topics_preview(),
     )
 
 
@@ -232,7 +244,7 @@ async def create_vehicle(
     provisioner: Annotated[Provisioner, Depends(get_provisioner)],
 ) -> ApiResponseProvisionResult:
     outcome = await provisioner.provision(body)
-    row = await provisioner._store.get(body.vehicle_id)  # noqa: SLF001 - 路由与 Provisioner 同层协作
+    row = await provisioner._store.get(body.vehicle_id)
     if row is None:  # 理论上不应发生（刚成功 provision 后行必存在）
         raise ServiceUnavailableError("provisioning 后台账不可读")
     detail = _to_detail(row)

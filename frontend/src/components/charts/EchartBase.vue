@@ -14,8 +14,13 @@ const props = withDefaults(
     option: EChartsOption
     height?: string
     loading?: boolean
+    /**
+     * 更新时是否替换而非合并（默认 true，保持既有页面行为）。
+     * 看板动态图表传 false：增量合并 + 动画，轮询刷新时数据平滑过渡而非闪断重绘。
+     */
+    notMerge?: boolean
   }>(),
-  { height: '320px', loading: false },
+  { height: '320px', loading: false, notMerge: true },
 )
 
 const container = ref<HTMLDivElement | null>(null)
@@ -35,7 +40,7 @@ onMounted(() => {
 watch(
   () => props.option,
   (option) => {
-    chart?.setOption(option, true)
+    chart?.setOption(option, { notMerge: props.notMerge })
   },
   { deep: true },
 )

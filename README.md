@@ -138,6 +138,8 @@ services/{service-name}/
 
 ## 快速开始
 
+> **版本要点（V1.21.0）**：① 运营看板重构为**深色科技风三层信息架构**（KPI 发光带 + 动态图表 + 单车抽屉钻取，仅看板页、不改全局主题）；② 远程操控视频改 **SRS WHEP 拉流**架构（车端 RTMP 推流→ SRS → 浏览器 WHEP，消除“信令连接异常”，环境变量 `RC_SRS_WHEP_URL`/`RC_SRS_WHIP_URL` 等，见 `docs/deployment.md` §15）；③ **新增内置车辆模拟器** `tools/vehicle-simulator/`（端到端可演示/自测）；④ dev `/ws` 代理修正到 remote-control:8085；⑤ 车辆详情新增数据采集 Agent Topic 预览（V1.20.0 `vehicle.bag.*`/`vehicle.agent.*`）。变更详情与验证口径见 `release.md` V1.21.0。
+
 ### 前置要求
 
 - Docker Desktop（含 Docker Compose v2）
@@ -224,7 +226,7 @@ ruff check tests common/python services           # Lint（CI 同款命令）
 2. 安装共享库 `hunter_common`（editable），并执行数据库迁移：`alembic -c common/python/alembic.ini upgrade head`（建 schema/表/hypertable）
 3. 启动业务微服务（依赖基础设施）：scene-service → data-collector → data-analytics → ota-service → remote-control
 4. 启动 api-gateway（依赖上述服务就绪后统一对外路由，8080）
-5. 前端 dev server：`cd frontend && npm install && npm run dev`（Vite 5173，代理 `/api` 与 `/ws` → 网关 8080；详见 `frontend/README.md`）
+5. 前端 dev server：`cd frontend && npm install && npm run dev`（Vite 5173，代理 `/api` → 网关 8080；**`/ws` → remote-control:8085**（V1.21.0：网关不代理 WS，dev 与生产 nginx 路由对齐，`VITE_PROXY_WS_TARGET` 可覆盖）；详见 `frontend/README.md`）
 
 ## Kubernetes 部署与监控（L1）
 
@@ -496,6 +498,8 @@ python scripts/verify_test_layer.py
 | 契约 ConfigMap 一致性 | `python scripts/generate_contracts_configmap.py --check`（运行时 Schema 校验依赖的 `hunter-contracts` 与 `contracts/kafka` 一致） |
 | 数据分析契约校验 | `cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q`（契约 ↔ 设计文档 6 章/12.4 节 ↔ DDL ↔ Kafka ↔ K8s，32 项） |
 | 远程操控契约校验 | `cd services/remote-control && pytest app/tests/test_remote_control_contract.py -q`（契约 ↔ 设计文档 15 条安全约束/12.6 节推导 ↔ Kafka ↔ MinIO 归档 ↔ K8s，契约测试随实现步骤落地） |
+| remote-control SRS/WHEP 配置测试 | `python scripts/run_unit_tests.py services/remote-control`（含 `app/tests/test_config_srs.py`：`srs_stream_name`/`srs_{whep,whip,rtmp}_url_for` 拼装与基址空降级，V1.21.0） |
+| 内置车辆模拟器测试 | `cd tools/vehicle-simulator && pytest -q`（一维运动学/超时停车、telemetry/health/command_result schema 自校验、内存桩 Kafka 编排，18 项，V1.21.0；需 `pip install -e tools/vehicle-simulator`） |
 | 契约文件静态校验 | `python -c "import yaml; yaml.safe_load(open('contracts/openapi/remote-control.yaml', encoding='utf-8'))"`（YAML 语法 + `$ref` 解析，无需服务） |
 | 数据库迁移 | `alembic -c common/python/alembic.ini current` / `... upgrade head` / `... upgrade head --sql`（离线预览） |
 | 表结构核对 | `docker exec hunter-postgres psql -U hunter -d hunter_core -c "\\dt scene_svc.*"` |

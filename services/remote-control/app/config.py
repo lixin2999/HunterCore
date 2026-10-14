@@ -9,7 +9,8 @@
 契约 pending 项对应的配置化处理：
 - pending #17：rc_session_start / rc_session_end 指令类型取值经环境变量注入
   （RC_COMMAND_SESSION_START_TYPE / RC_COMMAND_SESSION_END_TYPE），契约定稿后只改配置不改代码；
-- pending #10/#12：SRS 媒体面参数（WHIP/WHEP/RTMP）默认空串占位，SRS 集成定稿后回填；
+- pending #10/#12：SRS 媒体面参数（WHIP/WHEP/RTMP）基址经环境变量注入，V1.21.0 起
+  由 srs_*_url_for 按会话拼装完整地址下发（架构：车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流）；
 - pending #18：RC_MAX_STEER_RAD 为实现侧保护上限（契约 Kafka schema 未定义 steer 取值域）。
 """
 from __future__ import annotations
@@ -77,7 +78,10 @@ class Settings(HunterBaseConfig):
     rc_video_keyframe_interval_s: int = 1
     rc_video_container: str = "mp4"
 
-    # ---------- SRS 媒体面（pending #10/#12：集成定稿前空串占位） ----------
+    # ---------- SRS 媒体面（V1.21.0：架构切换为「车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流」） ----------
+    # rtmp/whip/whep 为**基址**（不含 app/stream 查询），由 srs_*_url_for 按会话
+    # （vehicle_id + session_id）拼装完整地址下发；基址为空时对应字段返回 None
+    # （契约 optional，前端据此提示「媒体服务未就绪」，不再无限重连）。
     rc_srs_app: str = "remote_control"
     rc_srs_stream_prefix: str = "hunter"
     rc_srs_rtmp_url: str = ""
@@ -152,6 +156,33 @@ class Settings(HunterBaseConfig):
     def rc_turn_url_list(self) -> list[str]:
         """TURN 服务器地址列表（未配置时为空 → 仅下发 STUN）。"""
         return sorted(_split_csv(self.rc_turn_urls))
+
+    # ---------- SRS 媒体地址拼装（V1.21.0：按会话 stream 组装，业务代码不硬编码 URL） ----------
+    def srs_stream_name(self, vehicle_id: str, session_id: str) -> str:
+        """SRS 流名：{prefix}_{vehicle_id}_{session_id}（与 srs.conf 约定一致）。"""
+        return f"{self.rc_srs_stream_prefix}_{vehicle_id}_{session_id}"
+
+    def _with_srs_query(self, base: str, vehicle_id: str, session_id: str) -> str | None:
+        """WHIP/WHEP 基址 + app/stream 查询（基址空 → None；已含 ? 则用 & 续接）。"""
+        if not base:
+            return None
+        stream = self.srs_stream_name(vehicle_id, session_id)
+        separator = "&" if "?" in base else "?"
+        return f"{base}{separator}app={self.rc_srs_app}&stream={stream}"
+
+    def srs_whep_url_for(self, vehicle_id: str, session_id: str) -> str | None:
+        """浏览器 WHEP 拉流完整地址（基址未配置返回 None）。"""
+        return self._with_srs_query(self.rc_srs_whep_url, vehicle_id, session_id)
+
+    def srs_whip_url_for(self, vehicle_id: str, session_id: str) -> str | None:
+        """车端 WHIP 推流完整地址（基址未配置返回 None）。"""
+        return self._with_srs_query(self.rc_srs_whip_url, vehicle_id, session_id)
+
+    def srs_rtmp_url_for(self, vehicle_id: str, session_id: str) -> str | None:
+        """车端 RTMP 推流完整地址（基址 + /stream；基址未配置返回 None）。"""
+        if not self.rc_srs_rtmp_url:
+            return None
+        return f"{self.rc_srs_rtmp_url.rstrip('/')}/{self.srs_stream_name(vehicle_id, session_id)}"
 
     @model_validator(mode="after")
     def _validate_contract_invariants(self) -> Settings:

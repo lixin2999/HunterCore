@@ -50,7 +50,7 @@ def contract_doc() -> dict[str, Any]:
 def _endpoints_from_contract(doc: dict[str, Any]) -> set[tuple[str, str]]:
     out: set[tuple[str, str]] = set()
     for path, ops in (doc.get("paths") or {}).items():
-        for method in ops.keys():
+        for method in ops:
             if method.lower() in ("get", "post", "patch", "delete", "put"):
                 out.add((method.upper(), path))
     return out
@@ -101,7 +101,7 @@ def test_ops_endpoints_in_contract(contract_doc: dict[str, Any]) -> None:
 
 def test_fastapi_routes_registered(contract_doc: dict[str, Any]) -> None:
     """FastAPI 实际路由 == 契约端点集合（业务 + 运维；/metrics 由 register_metrics 注入）。"""
-    from app.main import app  # noqa: PLC0415 - 延迟导入避免 pytest 收集期启动 lifespan
+    from app.main import app
 
     actual: set[tuple[str, str]] = set(iter_registered_routes(app.routes))
     expected = EXPECTED_BUSINESS_ENDPOINTS | EXPECTED_OPS_ENDPOINTS
@@ -111,7 +111,7 @@ def test_fastapi_routes_registered(contract_doc: dict[str, Any]) -> None:
 
 def test_rbac_bindings_match_settings(contract_doc: dict[str, Any]) -> None:
     """x-hunter-service.rbac_role_bindings 与 app.config Settings 词表一致。"""
-    from app.config import settings  # noqa: PLC0415
+    from app.config import settings
 
     bindings = contract_doc["x-hunter-service"]["rbac_role_bindings"]
     # 每个角色 → 动作集
@@ -171,9 +171,36 @@ def test_per_vehicle_topics_count(contract_doc: dict[str, Any]) -> None:
     )
 
 
+def test_data_collection_agent_topics_consistent(contract_doc: dict[str, Any]) -> None:
+    """V1.20.0 车端 Agent Topic 三方一致：OpenAPI 声明 == topics.yaml#ingest_platform_topics == 路由预览。
+
+    口径：topics.yaml 的 ingest_platform_topics 中以 `vehicle.` 前缀筛出的条目（bag 4 + agent 4 = 8），
+    排除平台内部 `platform.*` / `ingest.dlt`；路由 `_agent_topics_preview()` 必须与之一字不差。
+    """
+    declared = contract_doc["x-hunter-kafka"]["data_collection_agent_topics"]
+    assert len(declared) == 8, f"契约声明 Agent Topic 应为 8，实际 {len(declared)}"
+
+    topics = yaml.safe_load(TOPICS_CONTRACT.read_text(encoding="utf-8"))
+    yaml_agent = [
+        str(item.get("name"))
+        for item in (topics.get("ingest_platform_topics") or [])
+        if str(item.get("name", "")).startswith("vehicle.")
+    ]
+    assert sorted(declared) == sorted(yaml_agent), (
+        f"Agent Topic 漂移：{set(declared) ^ set(yaml_agent)}"
+    )
+
+    # 路由预览（读 topics.yaml，与缓存隔离）必须等于上述清单
+    from app.routers.vehicles import _agent_topics_preview
+    from app.services import kafka_admin
+
+    kafka_admin._INGEST_AGENT_TOPICS_CACHE = None  # type: ignore[attr-defined]
+    assert sorted(_agent_topics_preview()) == sorted(yaml_agent)
+
+
 def test_error_codes_in_http_status_map(contract_doc: dict[str, Any]) -> None:
     """契约 ApiResponseError.code 枚举 ⊆ HTTP_STATUS_BY_CODE 覆盖集合（error_handlers）。"""
-    from app.core.error_handlers import HTTP_STATUS_BY_CODE  # noqa: PLC0415
+    from app.core.error_handlers import HTTP_STATUS_BY_CODE
 
     schema = contract_doc["components"]["schemas"]["ApiResponseError"]
     codes: set[int] = set()

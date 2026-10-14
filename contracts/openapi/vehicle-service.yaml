@@ -450,6 +450,10 @@ components:
               type: array
               items: { type: string }
               description: 8 个车端 Topic 名称预览（不查 Kafka，纯字符串拼接）
+            agent_topics_preview:
+              type: array
+              items: { type: string }
+              description: 车端数据采集 Agent Topic 预览（V1.20.0 新增：vehicle.bag.* / vehicle.agent.*，全局命名，读 contracts/kafka/topics.yaml#ingest_platform_topics）
 
     VehicleCreateRequest:
       type: object
@@ -600,6 +604,18 @@ x-hunter-kafka:
   dlq_creation: |
     每车 8 个 .dlq 由本服务创建（平台内部 Topic 的死信由 create-topics.sh / init-kafka.sh 创建）；
     命名与保留期仍不属本服务决策，一律读 contracts/kafka/topics.yaml#naming。
+  data_collection_agent_topics:
+    # V1.20.0 数据采集 Agent Topic（ingest-platform 限界上下文）；本服务仅在详情**预览**这些 Topic，
+    # 不创建也不生产/消费（创建责任属 ingest-platform / 基础设施初始化）。与
+    # contracts/kafka/topics.yaml#ingest_platform_topics 中 `vehicle.` 前缀条目严格一致（8 个）。
+    - vehicle.bag.manifest             # 车端 agent 生产 → ingest 消费
+    - vehicle.bag.task.status
+    - vehicle.bag.parse.progress
+    - vehicle.bag.artifact.uploaded
+    - vehicle.agent.heartbeat
+    - vehicle.agent.alert
+    - vehicle.agent.cmd.ack
+    - vehicle.agent.cmd                # 平台下行命令 → 车端 agent 消费
 
 x-hunter-provisioning:
   description: 一键开通 4 步编排（顺序固定，失败逆序回滚）

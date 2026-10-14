@@ -1,21 +1,27 @@
 /**
- * 原生 WebRTC 客户端（浏览器侧 recvonly 拉流 + 信令中继）
+ * 原生 WebRTC 客户端（浏览器侧 WHEP 拉流 · recvonly）
+ *
+ * 架构（V1.21.0 收口 pending #10/#12）：车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流。
+ * 视频不再经由 signal WS 中继（旧「recvonly offer → 车端 answer」回程在平台侧从未落地，
+ * 导致「信令连接异常，正在重试」死链）。改为标准 WHEP 握手：
+ *   1. 读取会话响应 webrtc.media_server.whep_url（由后端按会话 stream 拼装下发）；
+ *   2. 本地 recvonly offer → 等待 ICE 收集完成（offer 内联 candidate，非 trickle）；
+ *   3. POST(whep_url, Content-Type: application/sdp, body=offer.sdp) → 取回 answer SDP；
+ *   4. setRemoteDescription(answer)，ontrack 绑定到 video；stop 时对 WHEP 资源发 DELETE 释放。
  *
  * 契约依据（remote-control.yaml x-hunter-control-channel）：
  * - 媒体面：WebRTC / SRTP（DTLS-SRTP 加密），不经 api-gateway；
- * - 信令面：WSS `/ws/remote/{session_id}/signal` 中继 SDP/ICE（帧格式见 types/remote.ts WsSignalFrame）；
- * - ICE：ICE 服务器与 TURN 短期凭据由会话响应 webrtc.ice_servers 下发（禁止前端硬编码 STUN/TURN）；
+ * - ICE：服务器与 TURN 短期凭据由会话响应 webrtc.ice_servers 下发（禁止前端硬编码 STUN/TURN）；
  * - 视频：H.264 720p@30fps，2–4 Mbps，关键帧 1s（会话响应 video 字段），浏览器只能请求降档；
  * - 延迟预算：采集编码 50 + 网络 100 + 解码渲染 30 = 200ms，前端以 getStats() 估测并上报。
  * 禁止使用任何第三方云视频服务（契约 ui 约束）。
  */
-import type { IceServer, RemoteSessionInfo, VideoStats, WsIceFrame, WsSignalFrame, WsSdpFrame } from '@/types/remote'
-import { ReconnectingSocket, buildWsUrl } from '@/utils/websocket'
+import type { IceServer, RemoteSessionInfo, VideoStats } from '@/types/remote'
 
 export interface WebRtcClientOptions {
-  /** 会话信息（提供 ice_servers / signal_ws_url / video 配置） */
+  /** 会话信息（提供 ice_servers / media_server.whep_url / video 配置） */
   session: RemoteSessionInfo
-  /** WS 握手子协议（默认 hunter-jwt，见 constants WS_JWT_SUBPROTOCOL） */
+  /** 保留字段（WHEP 走 HTTP，不再需要 WS 子协议；控制通道另有其实例） */
   protocols?: string[]
   onStateChange?: (state: RTCPeerConnectionState) => void
   onIceCandidateStateChange?: (state: RTCIceConnectionState) => void
@@ -44,17 +50,18 @@ function toIceServers(servers: IceServer[]): RTCIceServer[] {
   }))
 }
 
+/** ICE 收集等待上限（超时则以当前 candidate 继续，避免个别环境无 candidate 时永久挂起） */
+const ICE_GATHERING_TIMEOUT_MS = 2000
+
 /**
- * 远程操控视频客户端
+ * 远程操控视频客户端（WHEP 拉流）
  * 用法：new WebRtcClient(options) → await start(videoEl) → stats() → stop()
  */
 export class WebRtcClient {
   private readonly options: WebRtcClientOptions
   private readonly pc: RTCPeerConnection
-  private signal: ReconnectingSocket | null = null
-  /** 远端在收到 offer 前可能先发 ICE，需缓存后统一 addIceCandidate */
-  private pendingCandidates: RTCIceCandidateInit[] = []
-  private remoteDescriptionSet = false
+  /** WHEP 资源 URL（answer 响应 Link 头 rel="resource"）；stop 时 DELETE 释放会话 */
+  private whepResourceUrl: string | null = null
   private lastStatsSnapshot: { bytes: number; at: number } | null = null
 
   constructor(options: WebRtcClientOptions) {
@@ -68,13 +75,20 @@ export class WebRtcClient {
     this.pc.oniceconnectionstatechange = () => {
       this.options.onIceCandidateStateChange?.(this.pc.iceConnectionState)
     }
-    // 仅接收（recvonly）：视频轨道由车端/SRS 推送
+    // 仅接收（recvonly）：媒体由车端经 SRS 推送
     this.pc.addTransceiver('video', { direction: 'recvonly' })
     this.pc.addTransceiver('audio', { direction: 'recvonly' })
   }
 
-  /** 建立信令连接并完成 SDP/ICE 交换，远端轨道绑定到 video 元素 */
+  /** 经 WHEP 完成 SDP 协商，远端轨道绑定到 video 元素 */
   async start(videoElement: HTMLVideoElement): Promise<void> {
+    const whepUrl = this.options.session.webrtc.media_server.whep_url
+    if (!whepUrl) {
+      // 媒体地址缺失（后端未配置 SRS 基址）：显式提示，不再无限重连
+      this.options.onError?.('媒体服务未就绪（缺少 SRS WHEP 拉流地址）')
+      return
+    }
+
     this.pc.ontrack = (event: RTCTrackEvent) => {
       const [stream] = event.streams
       if (stream) {
@@ -86,86 +100,64 @@ export class WebRtcClient {
       }
     }
 
-    this.pc.onicecandidate = (event: RTCPeerConnectionIceEvent) => {
-      if (!event.candidate) {
-        return
-      }
-      const frame: WsIceFrame = {
-        type: 'ice',
-        candidate: event.candidate.candidate,
-        sdpMid: event.candidate.sdpMid,
-        sdpMLineIndex: event.candidate.sdpMLineIndex,
-      }
-      this.signal?.send(frame)
-    }
+    try {
+      const offer = await this.pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true })
+      await this.pc.setLocalDescription(offer)
+      // 非 trickle：等待 ICE 收集完成，把 candidate 内联进 offer 后一次性提交给 SRS
+      await this.waitForIceGathering()
 
-    const signalUrl = this.resolveSignalUrl()
-    this.signal = new ReconnectingSocket({
-      url: signalUrl,
-      protocols: this.options.protocols,
-      onMessage: (payload) => {
-        void this.handleSignalFrame(payload as WsSignalFrame)
-      },
-      onError: () => {
-        this.options.onError?.('信令连接异常，正在重试')
-      },
-    })
-    this.signal.connect()
-
-    const offer = await this.pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true })
-    await this.pc.setLocalDescription(offer)
-    const frame: WsSdpFrame = {
-      type: 'sdp',
-      sdp_type: 'offer',
-      sdp: offer.sdp ?? '',
-    }
-    // 信令通道可能尚未 open：等待 open 后重发一次（20Hz 控制通道不受影响）
-    const resend = window.setInterval(() => {
-      if (this.signal?.send(frame)) {
-        window.clearInterval(resend)
+      const response = await fetch(whepUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/sdp' },
+        body: this.pc.localDescription?.sdp ?? offer.sdp ?? '',
+      })
+      if (!response.ok) {
+        throw new Error(`WHEP ${response.status} ${response.statusText}`)
       }
-    }, 300)
-    window.setTimeout(() => window.clearInterval(resend), 10_000)
+      this.captureResourceUrl(response, whepUrl)
+      const answer = await response.text()
+      await this.pc.setRemoteDescription({ type: 'answer', sdp: answer })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '未知错误'
+      this.options.onError?.(`视频拉流失败：${message}`)
+    }
   }
 
-  /** 处理信令下行帧（SDP answer / 远端 ICE） */
-  private async handleSignalFrame(frame: WsSignalFrame): Promise<void> {
-    try {
-      if (frame.type === 'sdp' && frame.sdp_type === 'answer') {
-        await this.pc.setRemoteDescription({ type: 'answer', sdp: frame.sdp })
-        this.remoteDescriptionSet = true
-        for (const candidate of this.pendingCandidates) {
-          await this.pc.addIceCandidate(candidate)
-        }
-        this.pendingCandidates = []
-        return
-      }
-      if (frame.type === 'ice') {
-        const candidate: RTCIceCandidateInit = {
-          candidate: frame.candidate,
-          sdpMid: frame.sdpMid,
-          sdpMLineIndex: frame.sdpMLineIndex,
-        }
-        if (!this.remoteDescriptionSet) {
-          this.pendingCandidates.push(candidate)
+  /** 等待 ICE gathering 完成（或超时兜底） */
+  private waitForIceGathering(): Promise<void> {
+    if (this.pc.iceGatheringState === 'complete') {
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      const finish = () => {
+        if (this.pc.iceGatheringState !== 'complete') {
           return
         }
-        await this.pc.addIceCandidate(candidate)
+        window.clearTimeout(timer)
+        this.pc.removeEventListener('icegatheringstatechange', finish)
+        resolve()
       }
-    } catch (error) {
-      this.options.onError?.(`信令处理失败：${error instanceof Error ? error.message : '未知错误'}`)
-    }
+      const timer = window.setTimeout(() => {
+        this.pc.removeEventListener('icegatheringstatechange', finish)
+        resolve()
+      }, ICE_GATHERING_TIMEOUT_MS)
+      this.pc.addEventListener('icegatheringstatechange', finish)
+    })
   }
 
-  /** 信令 WS 地址（会话响应 webrtc.signal_ws_url 优先；否则按网关 WS 前缀拼装） */
-  private resolveSignalUrl(): string {
-    const fromSession = this.options.session.webrtc.signal_ws_url
-    if (fromSession.startsWith('ws')) {
-      return fromSession
+  /** 解析 answer 响应 Link 头中的 WHEP 资源地址（用于 stop 时 DELETE 释放） */
+  private captureResourceUrl(response: Response, whepUrl: string): void {
+    const link = response.headers.get('Link') ?? ''
+    const match = link.match(/<([^>]+)>;\s*rel="resource"/)
+    if (!match?.[1]) {
+      this.whepResourceUrl = null
+      return
     }
-    return buildWsUrl(
-      fromSession.startsWith('/') ? fromSession : `/remote/${this.options.session.session_id}/signal`,
-    )
+    try {
+      this.whepResourceUrl = new URL(match[1], whepUrl).toString()
+    } catch {
+      this.whepResourceUrl = match[1]
+    }
   }
 
   /**
@@ -221,14 +213,17 @@ export class WebRtcClient {
     }
   }
 
-  /** 关闭信令与 PeerConnection（会话结束时必须调用以触发车端停止推流） */
+  /** 关闭拉流会话（DELETE WHEP 资源 + 关闭 PeerConnection，触发 SRS 停止向本订阅推送） */
   stop(): void {
-    this.signal?.dispose()
-    this.signal = null
+    if (this.whepResourceUrl) {
+      // fire-and-forget：释放服务端 WHEP 会话，失败不影响本地关闭
+      void fetch(this.whepResourceUrl, { method: 'DELETE' }).catch(() => undefined)
+      this.whepResourceUrl = null
+    }
     try {
       this.pc.getSenders().forEach((sender) => this.pc.removeTrack(sender))
     } catch {
-      // 忽略：无发送轨道时无需移除
+      // 忽略：recvonly 无发送轨道
     }
     this.pc.close()
   }
