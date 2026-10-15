@@ -111,8 +111,9 @@ class Settings(HunterBaseConfig):
     rc_admin_role: str = "admin"
 
     # ---------- 限流（附录 D：POST /remote/session 单用户 1 QPS） ----------
-    rc_session_create_rate_limit_per_min: int = 1
-    rate_limit_window_seconds: int = 60
+    # V1.21.9：窗口从 60s 改为 1s，使阈值真正表示 QPS（原 60s 窗口导致 1 次/分钟）
+    rc_session_create_rate_limit_per_min: int = 1   # 实际语义已变为 QPS，变量名保留以兼容环境变量
+    rate_limit_window_seconds: int = 1
 
     # ---------- WS 控制/信令通道（G-09；契约 x-hunter-websocket-contract） ----------
     # 握手 JWT 校验（网关签发 Access Token 共享 JWT_SECRET_KEY；issuer 与设计文档 3.2.2 一致）

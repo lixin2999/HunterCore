@@ -1189,8 +1189,8 @@ x-hunter-service:
       usage: "上线加入 / 遥测中断 >10s 移出（communication_loss 判定输入）"
     - pattern: "rate_limit:{ip}:{api}"
       type: "String"
-      ttl_seconds: 60
-      usage: "接口限流计数（窗口 1 分钟；与附录 D 阈值配合）"
+      ttl_seconds: 1
+      usage: "接口限流计数（窗口 1 秒；与附录 D QPS 阈值配合）"
   config_source: "pydantic-settings（环境变量 / K8s ConfigMap data-collector-config + Secret hunter-app-secrets）"
   required_env:
     - SERVICE_NAME
@@ -1397,7 +1397,7 @@ x-hunter-event-contract:
 
 x-hunter-rate-limits:
   source: "设计文档 附录 D（API 限流配置）+ contracts/openapi/api-gateway.yaml x-hunter-rate-limits"
-  algorithm: "Redis 滑动窗口计数（键 rate_limit:{ip}:{api}，窗口 1 分钟）"
+  algorithm: "Redis 固定窗口计数（键 rate_limit:{ip}:{api}，窗口 1 秒）"
   inherit_gateway:
     global_qps: 10000
     per_user_qps: 100

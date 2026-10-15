@@ -40,7 +40,7 @@ def too_many_requests_response(exc: RateLimitExceeded) -> JSONResponse:
     logger.warning(
         "rate_limit_triggered", retry_after=exc.retry_after, limit=exc.limit
     )
-    payload = error_response(5001, "服务不可用", request_id=get_trace_id() or None)
+    payload = error_response(5001, "请求过于频繁，请稍后重试", request_id=get_trace_id() or None)
     return JSONResponse(
         status_code=429,
         content=payload.model_dump(),

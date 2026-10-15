@@ -806,7 +806,7 @@ x-hunter-gateway-routes:
 # ---------- 限流配置（设计文档附录 D；阈值不可更改） ----------
 x-hunter-rate-limits:
   source: "设计文档 附录 D（API 限流配置）"
-  algorithm: "Redis 滑动窗口计数（键 rate_limit:{ip}:{api}，窗口 1 分钟）"
+  algorithm: "Redis 固定窗口计数（键 rate_limit:{ip}:{api}，窗口 1 秒）"
   global_qps: 10000
   per_user_qps: 100
   per_ip_qps: 200

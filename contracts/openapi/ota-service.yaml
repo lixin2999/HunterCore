@@ -2015,8 +2015,8 @@ x-hunter-service:
       usage: "只读：目标车辆在线数量统计（start 前可行性预检）"
     - pattern: "rate_limit:{ip}:{api}"
       type: "String"
-      ttl_seconds: 60
-      usage: "接口限流计数（窗口 1 分钟；与附录 D 阈值配合）"
+      ttl_seconds: 1
+      usage: "接口限流计数（窗口 1 秒；与附录 D QPS 阈值配合）"
   dependencies:
     postgresql: "ota_svc 三表（唯一索引 uq_ota_versions_version_code / uq_ota_versions_version_name / uq_ota_records_task_vehicle；部分索引 idx_ota_records_inflight；车辆维度索引 idx_ota_records_vehicle_start_time）"
     redis: "只写 ota:progress:{task_id}、只读 vehicle:status:{vehicle_id} / vehicle:online:set（不新增 Redis 键模式）"

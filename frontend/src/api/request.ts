@@ -97,6 +97,11 @@ async function refreshAccessToken(): Promise<string> {
       return pair.access_token
     })
     .catch((error: unknown) => {
+      // V1.21.9：429 限流不应踢登录，仅抛错让调用方稍后重试
+      const status = (error as { response?: { status?: number } })?.response?.status
+      if (status === 429) {
+        throw new HunterApiError(5001, '请求过于频繁，请稍后重试', undefined, 429)
+      }
       const message = error instanceof HunterApiError ? error.message : '登录状态已过期，请重新登录'
       expireSession(message)
       throw error instanceof HunterApiError ? error : new HunterApiError(TOKEN_EXPIRED_CODE, message)
@@ -117,6 +122,17 @@ http.interceptors.response.use(
 
     // 统一响应体存在时按业务码处理
     if (payload && typeof payload.code === 'number') {
+      // V1.21.9：429 限流特判（不触发 expireSession，不触发 token 刷新）
+      if (status === 429) {
+        return Promise.reject(
+          new HunterApiError(
+            payload.code,
+            payload.message || '请求过于频繁，请稍后重试',
+            payload.request_id,
+            429,
+          ),
+        )
+      }
       if (payload.code === TOKEN_EXPIRED_CODE && config && !config.__retried) {
         const token = await refreshAccessToken()
         config.__retried = true

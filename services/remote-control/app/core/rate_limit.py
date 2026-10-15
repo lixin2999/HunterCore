@@ -22,10 +22,10 @@ async def enforce_user_rate_limit(
     redis_manager: RedisManager,
     *,
     api: str,
-    limit_per_min: int,
+    limit_per_min: int,  # V1.21.9：窗口已改为 1s，实际语义为 QPS（参数名保留以兼容调用方）
     settings: Settings,
 ) -> None:
-    """单用户限流（异步 Redis；附录 D 语义）。
+    """单用户限流（异步 Redis；附录 D 语义；V1.21.9 窗口 1s → 阈值即 QPS）。
 
     - 未超限 → 计数 +1 放行；
     - 超限 → 429（code=5001）+ Retry-After + 指标 hunter_remote_control_rate_limited_total；

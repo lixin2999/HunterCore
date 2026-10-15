@@ -1,6 +1,6 @@
 """网关限流中间件（设计文档附录 D 五级限流的进程内两级 + 接口级）。
 
-- 单 IP 200 QPS（rate_limit:{ip}:global）
+- 单 IP 200 QPS（rate_limit:{ip}:global；窗口 1s，V1.21.9 修正）
 - 单用户 100 QPS（rate_limit:{user_id}:global；签名有效即计数，无效 Token
   交由认证依赖统一拒绝，此处仅识别身份）
 - 接口级（user 维度）：POST /api/v1/ota/versions 5 / POST /api/v1/remote/session 1 /

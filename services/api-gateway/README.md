@@ -51,7 +51,7 @@ API 网关：统一接入、JWT 认证鉴权、五级限流熔断、路由转发
 | POST /api/v1/remote/session | 1 QPS（user） | `rate_limit:{user_id}:remote-session` |
 | GET /api/v1/data/telemetry | 20 QPS（user） | `rate_limit:{user_id}:data-telemetry` |
 
-- 算法：Redis 滑动窗口（INCR + EXPIRE(NX)，窗口 60s）
+- 算法：Redis 固定窗口（INCR + EXPIRE(NX)，窗口 1s，V1.21.9 从 60s 修正为 1s 以匹配 QPS 单位）
 - 超限：HTTP 429 + `Retry-After` / `X-RateLimit-Limit|Remaining|Reset`；响应体 `code` 复用 5001（附录 A 无专用错误码）
 - 可用性：`rate_limit` 非强依赖 → Redis 故障 fail-open 放行并告警（session 校验为强依赖 fail-closed）
 - 探针与 `/metrics`/`/docs` 豁免限流；CORS 预检（OPTIONS）豁免

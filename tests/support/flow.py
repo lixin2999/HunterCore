@@ -444,7 +444,7 @@ def session_key(user_id: str) -> str:
 
 
 def rate_limit_key(ip: str, api: str) -> str:
-    """限流 Redis 键（``rate_limit:{ip}:{api}``，窗口 1 分钟）。"""
+    """限流 Redis 键（``rate_limit:{ip}:{api}``，窗口 1 秒）。"""
     pattern = contracts.redis_key("rate_limit:{ip}:{api}")["pattern"]
     return pattern.replace("{ip}", ip).replace("{api}", api)
 

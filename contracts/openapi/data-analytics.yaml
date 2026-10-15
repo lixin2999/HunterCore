@@ -2067,7 +2067,7 @@ x-hunter-alert-contract:
 
 x-hunter-rate-limits:
   source: "设计文档 附录 D（API 限流配置）+ contracts/openapi/api-gateway.yaml x-hunter-rate-limits"
-  algorithm: "Redis 滑动窗口计数（键 rate_limit:{ip}:{api}，窗口 1 分钟）"
+  algorithm: "Redis 固定窗口计数（键 rate_limit:{ip}:{api}，窗口 1 秒）"
   inherit_gateway:
     global_qps: 10000
     per_user_qps: 100

@@ -54,6 +54,13 @@ function toIceServers(servers: IceServer[]): RTCIceServer[] {
 const ICE_GATHERING_TIMEOUT_MS = 2000
 
 /**
+ * WHEP 重试策略（V1.21.9）：车端 RTMP 推流到 SRS 有启动延迟（pipeline preroll ~1-2s），
+ * 首次 WHEP 可能因流尚无数据而被 SRS 关连（502），需退避重试。
+ */
+const WHEP_MAX_RETRIES = 3
+const WHEP_RETRY_DELAYS_MS = [3000, 5000, 8000] // 第 1/2/3 次重试前等待时间
+
+/**
  * 远程操控视频客户端（WHEP 拉流）
  * 用法：new WebRtcClient(options) → await start(videoEl) → stats() → stop()
  */
@@ -80,7 +87,7 @@ export class WebRtcClient {
     this.pc.addTransceiver('audio', { direction: 'recvonly' })
   }
 
-  /** 经 WHEP 完成 SDP 协商，远端轨道绑定到 video 元素 */
+  /** 经 WHEP 完成 SDP 协商，远端轨道绑定到 video 元素（含退避重试） */
   async start(videoElement: HTMLVideoElement): Promise<void> {
     const whepUrl = this.options.session.webrtc.media_server.whep_url
     if (!whepUrl) {
@@ -100,27 +107,47 @@ export class WebRtcClient {
       }
     }
 
+    // 构建 offer（只做一次，重试复用同一 PC 与 offer）
     try {
       const offer = await this.pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true })
       await this.pc.setLocalDescription(offer)
       // 非 trickle：等待 ICE 收集完成，把 candidate 内联进 offer 后一次性提交给 SRS
       await this.waitForIceGathering()
-
-      const response = await fetch(whepUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/sdp' },
-        body: this.pc.localDescription?.sdp ?? offer.sdp ?? '',
-      })
-      if (!response.ok) {
-        throw new Error(`WHEP ${response.status} ${response.statusText}`)
-      }
-      this.captureResourceUrl(response, whepUrl)
-      const answer = await response.text()
-      await this.pc.setRemoteDescription({ type: 'answer', sdp: answer })
     } catch (error) {
       const message = error instanceof Error ? error.message : '未知错误'
-      this.options.onError?.(`视频拉流失败：${message}`)
+      this.options.onError?.(`视频 offer 构建失败：${message}`)
+      return
     }
+
+    // WHEP POST + 退避重试
+    const sdp = this.pc.localDescription?.sdp ?? ''
+    let lastError = ''
+    for (let attempt = 0; attempt <= WHEP_MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        const delay = WHEP_RETRY_DELAYS_MS[attempt - 1] ?? 8000
+        this.options.onError?.(`视频拉流未就绪，${Math.round(delay / 1000)}s 后重试（第 ${attempt} 次）…`)
+        await new Promise((r) => setTimeout(r, delay))
+      }
+      try {
+        const response = await fetch(whepUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/sdp' },
+          body: sdp,
+        })
+        if (!response.ok) {
+          throw new Error(`WHEP ${response.status} ${response.statusText}`)
+        }
+        this.captureResourceUrl(response, whepUrl)
+        const answer = await response.text()
+        await this.pc.setRemoteDescription({ type: 'answer', sdp: answer })
+        return // 成功
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : '未知错误'
+        // 网络错误（TypeError: Failed to fetch）不重试（可能已离线）
+        if (error instanceof TypeError) break
+      }
+    }
+    this.options.onError?.(`视频拉流失败：${lastError}`)
   }
 
   /** 等待 ICE gathering 完成（或超时兜底） */

@@ -1248,8 +1248,8 @@ x-hunter-service:
       usage: "只读：在线判定（离线 → 4001 车辆不在线）"
     - pattern: "rate_limit:{ip}:{api}"
       type: String
-      ttl_seconds: 60
-      usage: "接口限流计数（窗口 1 分钟；`POST /api/v1/remote/session` 单用户 1 QPS）"
+      ttl_seconds: 1
+      usage: "接口限流计数（窗口 1 秒；`POST /api/v1/remote/session` 单用户 1 QPS）"
   dependencies:
     redis: "会话态/互斥锁/限流计数（强依赖；不可用 → 503 + code 5001，禁止降级为无锁模式）"
     kafka: "指令下发 `hunter.{vehicle_id}.remote_control`（20Hz）+ 回执消费 `hunter.*.command_result`"
@@ -1730,7 +1730,7 @@ x-hunter-rate-limits:
     - "操控指令下行 20Hz/会话（由令牌桶保证，非 Redis 限流）"
     - "车端上行遥测单车 ≤100 msg/s（非本服务职责，仅引用系统约束）"
   implementation: |
-    Redis 计数器 `rate_limit:{ip}:{api}`（INCR + EXPIRE，窗口 60s，见 `hunter_common.redis.incr_with_expire`）；
+    Redis 计数器 `rate_limit:{ip}:{api}`（INCR + EXPIRE，窗口 1s，见 `hunter_common.redis.incr_with_expire`）；
     超限 → **HTTP 429** + `code=5001`（错误码表无专用限流码，**禁止自造**）+ `Retry-After`，
     并计入 `hunter_remote_control_rate_limited_total`。
   no_bypass: "限流在服务侧与网关侧双重生效；禁止仅为压测关闭限流（生产配置 ENVIRONMENT=prod 时强制开启）"

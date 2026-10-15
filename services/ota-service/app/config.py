@@ -71,10 +71,10 @@ class Settings(HunterBaseConfig):
     ota_create_roles: str = "admin,operator"
     ota_execute_roles: str = "admin,operator"
 
-    # ---------- 接口限流（附录 D：POST /versions 单用户 5 QPS；publish 建议值 2 QPS） ----------
-    version_create_rate_limit_per_min: int = 5
+    # ---------- 接口限流（附录 D：POST /versions 单用户 5 QPS；publish 2 QPS；V1.21.9 窗口 1s） ----------
+    version_create_rate_limit_per_min: int = 5   # 实际语义已变为 QPS，变量名保留以兼容环境变量
     publish_rate_limit_per_min: int = 2
-    rate_limit_window_seconds: int = 60
+    rate_limit_window_seconds: int = 1
 
     @field_validator("ota_canary_stages")
     @classmethod

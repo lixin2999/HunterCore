@@ -1,7 +1,9 @@
 """接口限流（设计文档附录 D + 契约 x-hunter-rate-limits）。
 
-- 算法：Redis 滑动窗口计数，键 ``rate_limit:{ip}:{api}``，窗口 1 分钟
-  （redis-keys.yaml 第 4 条；计数必须经 INCR + EXPIRE(NX) 原子组合，见
+- 算法：Redis 固定窗口计数，键 ``rate_limit:{ip}:{api}``，窗口 1 秒
+  （V1.21.9 实机定案：原 60s 窗口导致“QPS”实际为“次/分钟”，前端轮询必顶破；
+  契约 ``x-hunter-rate-limits`` 阈值单位统一为 QPS，窗口必须为 1s）
+  计数必须经 INCR + EXPIRE(NX) 原子组合，见
   ``hunter_common.redis.RedisManager.incr_with_expire``）
 - 维度与阈值（附录 D，不可更改）：单 IP 200 QPS / 单用户 100 QPS；
   接口级（user 维度）：POST /api/v1/ota/versions 5、POST /api/v1/remote/session 1、
@@ -22,7 +24,7 @@ from hunter_common.logging import get_logger
 
 logger = get_logger("app.core.rate_limit")
 
-WINDOW_SECONDS: Final[int] = 60        # 附录 D：窗口 1 分钟（rate_limit ttl_seconds=60）
+WINDOW_SECONDS: Final[int] = 1         # V1.21.9：契约附录 D 单位为 QPS，窗口必须为 1s（原 60s 导致实际 1.67 QPS）
 GLOBAL_SCOPE: Final[str] = "global"    # 全局维度作用域标识
 
 #: 附录 D 接口级限流（user 维度）：(method, 对外路径) -> (作用域 slug, 单用户 QPS)

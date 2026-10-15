@@ -121,8 +121,8 @@ keys:
   - pattern: "rate_limit:{ip}:{api}"
     type: "String"
     value: "窗口计数器（整数字符串）"
-    ttl_seconds: 60
-    ttl_source: "系统约束第 8 条（1 分钟）"
+    ttl_seconds: 1
+    ttl_source: "V1.21.9 实机定案：契约附录 D 单位为 QPS，窗口必须 1s（原 60s 导致实际 1.67 QPS，前端轮询必顶破）"
     owner_service: api-gateway
     writers: [api-gateway, scene-service, data-collector, data-analytics, ota-service, remote-control]
     readers: [api-gateway, scene-service, data-collector, data-analytics, ota-service, remote-control]

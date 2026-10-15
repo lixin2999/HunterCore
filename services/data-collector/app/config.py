@@ -75,9 +75,9 @@ class Settings(HunterBaseConfig):
     vehicle_telemetry_max_msg_per_sec: int = 100
     file_upload_max_bytes_per_second: int = 1310720
 
-    # ---------- 接口限流（附录 D：GET /data/telemetry 单用户 20 QPS；Redis 窗口 60s） ----------
-    telemetry_query_rate_limit_per_min: int = 20
-    rate_limit_window_seconds: int = 60
+    # ---------- 接口限流（附录 D：GET /data/telemetry 单用户 20 QPS；V1.21.9 窗口 1s） ----------
+    telemetry_query_rate_limit_per_min: int = 20   # 实际语义已变为 QPS，变量名保留以兼容环境变量
+    rate_limit_window_seconds: int = 1
 
     # ---------- RBAC（网关注入 X-Roles；角色→动作映射待 RBAC 服务化后收敛为权限查询） ----------
     data_read_roles: str = "admin,analyst,operator"

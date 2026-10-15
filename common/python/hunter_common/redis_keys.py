@@ -26,7 +26,7 @@ SESSION = "session:{user_id}"
 VEHICLE_STATUS = "vehicle:status:{vehicle_id}"
 #: 在线车辆集合 Set（data-collector 写；不过期）
 VEHICLE_ONLINE_SET = "vehicle:online:set"
-#: 接口限流窗口计数器（各服务写读；TTL 60s）
+#: 接口限流窗口计数器（各服务写读；TTL 1s，V1.21.9 从 60s 改为 1s 以匹配契约 QPS 单位）
 RATE_LIMIT = "rate_limit:{ip}:{api}"
 #: OTA 升级进度热点视图 Hash（ota-service 独占；TTL 86400s）
 OTA_PROGRESS = "ota:progress:{task_id}"
