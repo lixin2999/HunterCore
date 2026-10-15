@@ -531,6 +531,18 @@ container_restart_count() {
   printf '%s' "${count:-0}"
 }
 
+# container_env <container> <KEY>：输出容器**生效**的环境变量值（取不到则空串，恒返回 0）
+#   为何需要：compose 里大量变量写成 ${VAR:-默认值}（如 RC_SRS_WHEP_URL、各服务端口），
+#   .env 里根本不出现——只看 .env 会把“默认值已生效”误判成“未配”（V1.21.6 ⑰-e 实机假 FAIL）。
+#   走 docker inspect 读 Config.Env：不依赖容器内有 shell/grep（业务镜像 distroless 无 exec 入口）。
+# ⚠ 输出纪律：stdout 只写值（本函数会被 $(...) 捕获），诊断归调用方走 stderr。
+container_env() {
+  local name="$1" key="$2" line
+  command_exists docker || return 0
+  line="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$name" 2>/dev/null | grep -m1 "^${key}=")" || return 0
+  printf '%s' "${line#${key}=}"
+}
+
 # ---------------------------------------------------------------------
 # 7. Kafka CLI 辅助
 #    ⚠ 部署包内部监听为 SASL_PLAINTEXT（.env: KAFKA_INTERNAL_SECURITY_PROTOCOL，docs/01 §1.4⑤），

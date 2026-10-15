@@ -280,7 +280,9 @@ check_public_ports() {
 # 宿主机第二 SRS 实例硬闸（V1.21.6）：1935 端口预检看不出这类冲突——本项目容器已占着 1935 时，
 # 端口检查直接豁免通过；而“另一个非容器化的 srs 进程”可以与容器并存（它绑不上 1935 就绑别的，
 # 或先于容器绑上），结果是车端推到 A、浏览器从 B 拉 → 视频永远黑屏，而所有探针都是 PASS。
-# 实机就吃了这个亏（V1.21.5 把 502 误判为“车端未推流”，多花一轮）：部署与巡检都必须先证明“全局只有一个 SRS”。
+# ⚠ 本闸仍保留，但判据口径已修正（V1.21.7 实机）：192.168.31.35 上它 PASS，恰好证伪了“双实例”假设——
+#   宿主机 `ps` 里那个 `./objs/srs` 是容器主进程（Docker 共享宿主 PID 视图），不是第二实例。
+#   判据必须按 cgroup 区分（hc_foreign_srs_pids 已如此），不能看 cmdline。
 check_single_srs_instance() {
   local pids pid cmd
   if ! declare -F hc_foreign_srs_pids >/dev/null 2>&1; then
@@ -298,12 +300,12 @@ check_single_srs_instance() {
     log_error "  ${pid}: ${cmd}"
   done
   log_error "危害：车端 RTMP 与浏览器 WHEP 可能落在不同实例上——推流方 TCP ESTAB、容器探针 healthy，拉流方永远 502。"
-  log_error "定案（不要只凭 ss）：curl -s http://127.0.0.1:9090/api/v1/streams —— 看容器身上有没有那条流。"
+  log_error "定案（不要只凭 ss，也不要只凭 ps）：curl -sL http://127.0.0.1:9090/api/v1/streams —— 看容器身上有没有那条流（⚠ 必须带 -L，否则 SRS 302 后只回 Redirect to）"
   log_error "  已用 iptables DNAT 发布时（userland-proxy=false），宿主机那份仍会显示在 LISTEN 却拿不到外部流量；仅凭 ss 结果就 kill 会误判。"
   log_error "修复（确认该进程不是其它业务在用后停掉，再重建容器使其重新绑上 1935）："
   log_error "  sudo kill ${pids}"
   log_error "  cd ${APP_DIR} && sudo docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --force-recreate srs"
-  log_error "  sudo ss -ltnp 'sport = :1935'   # 旁证：监听者应为 docker-proxy，而非 ./objs/srs"
+  log_error "  sudo ss -ltnp 'sport = :1935'   # 旁证：监听者应为 docker-proxy / dockerd（取决于 userland-proxy），而非 ./objs/srs"
   return 1
 }
 
@@ -1110,6 +1112,37 @@ generate_env_inline() {
   log_success "口令已生成并保存到 ${PASSWORDS_FILE}（权限 600）"
 }
 
+# upgrade_nginx_rtc_upstream <file>：把旧渲染副本的「静态 /rtc/ 上游」就地升级为运行期解析
+# 背景（V1.21.7 实机）：nginx 对 proxy_pass http://srs:9090 只在加载配置时解析一次域名；
+#   而改 candidate 的唯一路径是 up -d --force-recreate srs（单文件 bind，restart 不重挂），
+#   重建后 srs 换容器 IP → hunter-web 仍连旧 IP → 浏览器 WHEP 始终 502，只能再 restart hunter-web。
+# 幂等：已是变量写法直接返回 0；文件形态不认识（运维改过）只告警不覆盖；改写后未达预期则回滚。
+upgrade_nginx_rtc_upstream() {
+  local file="$1" backup="$1.bak-v1217"
+  grep -qE '^[[:space:]]*set[[:space:]]+\$srs_upstream' "$file" && return 0
+  if ! grep -qE '^[[:space:]]*proxy_pass[[:space:]]+http://srs:9090;[[:space:]]*$' "$file"; then
+    if grep -q 'location /rtc/' "$file"; then
+      log_warn "${file} 的 /rtc/ 上游形态不认识（可能被手工改写）：不自动升级"
+      log_warn "  若 srs 重建后 WHEP 报 502，请手工改为 set \$srs_upstream + proxy_pass \$srs_upstream\$request_uri（参照仓库 infra/deploy/config/nginx.conf）"
+    fi
+    return 0
+  fi
+  cp -a "$file" "$backup"
+  sed -i -E 's|^([[:space:]]*)proxy_pass[[:space:]]+http://srs:9090;[[:space:]]*$|\1set $srs_upstream http://srs:9090;\n\1proxy_pass         $srs_upstream$request_uri;|' "$file"
+  grep -qE '^[[:space:]]*resolver[[:space:]]' "$file" \
+    || sed -i -E 's|^([[:space:]]*)upstream api_gateway[[:space:]]*\{|\1resolver 127.0.0.11 valid=10s ipv6=off;\n\n\1upstream api_gateway {|' "$file"
+  if grep -qE '^[[:space:]]*set[[:space:]]+\$srs_upstream' "$file" \
+    && ! grep -qE '^[[:space:]]*proxy_pass[[:space:]]+http://srs:9090;[[:space:]]*$' "$file"; then
+    log_success "/rtc/ 上游已改为运行期解析（srs 重建后不再需要手工 restart hunter-web）；原副本备份：${backup}"
+    log_warn "nginx.conf 是单文件 bind mount：需重建才生效——"
+    log_warn "  sudo docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --force-recreate web-portal"
+  else
+    cp -a "$backup" "$file"
+    log_warn "/rtc/ 上游自动升级未达预期，已回滚 ${file}（备份保留：${backup}）；请手工比对仓库版本"
+  fi
+  return 0
+}
+
 # ensure_nginx_conf：确保 ${APP_DIR}/config/nginx.conf 就位（优先部署包，其次仓库 infra/deploy）
 ensure_nginx_conf() {
   local target="${APP_DIR}/config/nginx.conf"
@@ -1117,6 +1150,7 @@ ensure_nginx_conf() {
   if [ -f "$target" ]; then
     chmod 644 "$target"
     log_info "Nginx 配置已就位：${target}（幂等）"
+    upgrade_nginx_rtc_upstream "$target"
     return 0
   fi
   local src

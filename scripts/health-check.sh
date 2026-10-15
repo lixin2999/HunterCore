@@ -36,9 +36,10 @@
 #      把「作业 RUNNING 但看板入库延迟恒 `-`」变成可判读结论。三分必需：作业未产出（键不存在）/
 #      正在追赶（键不存在但组有积压）/ 样本全被丢弃（键存在、p95_ms=null 带 reason）。
 #      ⚠ ⑭ 只能说“作业活着”，不能说“作业出了数”——前者对后者既非充分也非必要
-#   ⑰ 视频链路（V1.21.6）：车端 RTMP → SRS → 浏览器 WHEP 整条链的四个可判据——SRS 实例唯一（宿主机
-#      有无非容器化 srs）/ 容器内生效的 candidate 等于浏览器可达地址 / 同源 /rtc/ 真被反代接管（502
-#      与 nginx 静态 fallback 的 405 分流）/ SRS 当前有无活跃流。
+#   ⑰ 视频链路（V1.21.6，V1.21.7 扩到六个判据）：车端 RTMP → SRS → 浏览器 WHEP 整条链——SRS 实例唯一
+#      （宿主机有无非容器化 srs）/ 容器内生效的 candidate 等于浏览器可达地址 / 同源 /rtc/ 真被反代接管
+#      （502 与 nginx 静态 fallback 的 405 分流）/ SRS 当前有无活跃流 / 下发的 WHEP 基址（取容器生效值，
+#      不是 .env）/ /rtc/ 上游是静态还是运行期解析（静态写法下 srs 一重建就 502）。
 #      ⚠ 容器 healthy 与 HTTP 探针只能证明“我们这个 SRS 实例活着”，证明不了“车端那条流在它身上”
 #      ——V1.21.5 就因此把 502 误归为“车端未推流”（车端其实 TCP ESTAB、GStreamer 在编码），多花一轮
 #
@@ -125,7 +126,7 @@ HunterCore 全栈健康检查脚本
   Flink 作业健康（flink list -a：FAILED 不会被默认列表列出）、Flink 检查点目录可写、
   业务服务 Kafka 本地磁盘缓冲目录可写（宿主 kafka-buffer 属主 10001 预检，V1.20.4）、
   入库延迟指标键（analytics:ingest_latency 存否/ TTL/诊断载荷，V1.19.21）、
-  视频链路（SRS 实例唯一 / WebRTC candidate / 同源 /rtc/ 反代 / SRS 活跃流 / WHEP 基址同源，V1.21.6）。
+  视频链路（SRS 实例唯一 / WebRTC candidate / 同源 /rtc/ 反代 / SRS 活跃流 / WHEP 基址同源 / /rtc/ 上游解析方式，V1.21.6、V1.21.7）。
 EOF
 }
 
@@ -885,11 +886,16 @@ check_service_error_logs() {
 # ⑰ 视频链路（车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流）端到端可判读（V1.21.6）
 # 为什么单独立一项：这一串的每个环节都有人看、就是没人一起看过——① 容器 healthy 只说“我们这个
 #   SRS 实例活着”，② 的 /api/v1/versions 只说“它的 HTTP API 应答”，两者都证明不了“车端那条流在它身上”。
-#   实机代价（V1.21.5）：宿主机多了一个手跑的 ./objs/srs 接走了车端推流，浏览器向容器里的 SRS 拉不到
-#   流 → 502，当时归因为“车端未推流”（车端其实 ESTAB + 在编码），多花一轮。本项把四类成因分开指名：
-#   实例不唯一 / candidate 不可达 / 反代断裂 / 根本没流。
+#   实机代价（V1.21.5）：一条 502 被归因为“车端未推流”（车端其实 ESTAB + 在编码），多花一轮。
+#   ⚠ 当时怀疑的“宿主机第二个 SRS 实例”已被 V1.21.7 实机证据**否掉**：1935 由 dockerd 持有、
+#   本项 a) 按 cgroup 判定无非容器化 srs——宿主机 `ps` 里那个 `./objs/srs` 就是容器主进程本身
+#   （Docker 共享宿主 PID 视图，容器进程在宿主 /proc 里可见）。真实根因是下面两个：
+#   静态 /rtc/ 上游在 srs 重建后陈旧（本项 c/f）+ candidate 残留公网 IP（本项 b）。
+#   本项仍把四类成因分开指名：实例不唯一 / candidate 不可达 / 反代断裂 / 根本没流。
+# V1.21.7 补两个：WHEP 基址改读**容器生效值**（实机假 FAIL：compose 有默认值、.env 里根本没这行），
+#   并新增 f) /rtc/ 上游解析方式——静态 proxy_pass 在 srs 重建后必把拉流打成 502（本次实机即此）。
 check_video_chain() {
-  local pids pid expect_ip current raw code body resp streams names whep
+  local pids pid expect_ip current raw code body resp streams names whep nginx_conf
   # a) 实例唯一性：1935 上只能有一个 SRS（本项目容器那个）
   if declare -F hc_foreign_srs_pids >/dev/null 2>&1; then
     pids="$(hc_foreign_srs_pids 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
@@ -898,7 +904,7 @@ check_video_chain() {
     else
       for pid in $pids; do
         raw="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || printf '<已退出>')"
-        record_result "FAIL" "视频链路（SRS 实例唯一）" "宿主机还有非容器化 srs：PID ${pid}（${raw}）→ 车端推到哪个实例不再确定（典型现象：推流方 ESTAB、拉流方 502、容器探针全绿）。定案看本项 d) 的活跃流列表，不要只凭 ss（iptables DNAT 发布时宿主机那份仍在 LISTEN 却拿不到外部流量）；坐实后：sudo kill ${pids} 再 up -d --force-recreate srs"
+        record_result "FAIL" "视频链路（SRS 实例唯一）" "宿主机还有非容器化 srs：PID ${pid}（${raw}）→ 车端推到哪个实例不再确定（典型现象：推流方 ESTAB、拉流方 502、容器探针全绿）。定案看本项 d) 的活跃流列表，不要只凭 ss（iptables DNAT 发布时宿主机那份仍在 LISTEN 却拿不到外部流量）；坐实后：sudo kill ${pids} 再 up -d --force-recreate srs（已按 cgroup 排除容器内那个，本项报出的就是真在宿主机上跑的）"
       done
     fi
   else
@@ -944,7 +950,7 @@ check_video_chain() {
       201 | 200)
         record_result "WARN" "视频链路（同源 /rtc/）" "http=${code}：探针 offer 故意不可解析，正常应被 SRS 拒（400）；现在反而被接受，说明上游不是 SRS（旧版 srs 无 /rtc/ 路由时会静默回静态站）→ 人工看一眼 curl -s http://127.0.0.1:9090/api/v1/versions" ;;
       502 | 504)
-        record_result "FAIL" "视频链路（同源 /rtc/）" "http=${code}：nginx 连不上上游 srs:9090（srs 重建换 IP 后静态 upstream 陈旧 → sudo docker restart hunter-web；或渲染副本 config/nginx.conf 落后仓库 → cp + --force-recreate web-portal）" ;;
+        record_result "FAIL" "视频链路（同源 /rtc/）" "http=${code}：nginx 连不上上游 srs:9090（最常见：srs 刚重建换 IP、而渲染副本仍是静态上游 → sudo docker restart hunter-web，根治见本项 f)；或渲染副本 config/nginx.conf 落后仓库 → cp + --force-recreate web-portal）" ;;
       4*)
         if printf '%s' "$body" | grep -qi '<html'; then
           record_result "FAIL" "视频链路（同源 /rtc/）" "http=${code} 且响应体为 nginx 错误页 → /rtc/ location 未匹配（回退到静态 fallback，见《故障排查指南》§9.2）；检查挂载源 ${APP_DIR}/config/nginx.conf 而非仓库那份"
@@ -957,26 +963,48 @@ check_video_chain() {
   fi
 
   # d) 当前活跃流：把“黑屏”在平台侧与车端侧之间切一刀
-  streams="$(curl -s -m 5 "$(srs_api_url /api/v1/streams)" 2>/dev/null || true)"
+  #    ⚠ 必须带 -L：SRS 会把 /api/v1/streams 302 到 /api/v1/streams/，不带就只拿到一行 `Redirect to …`，
+  #    既看不到流也看不出服务异常（V1.21.7 实机就因此漏做过定案）。
+  streams="$(curl -sL -m 5 "$(srs_api_url /api/v1/streams)" 2>/dev/null || true)"
   if [ -z "$streams" ]; then
     record_result "WARN" "视频链路（SRS 活跃流）" "$(srs_api_url /api/v1/streams) 无响应（② 已定级），本项未判定"
   else
     names="$(printf '%s' "$streams" | grep -o '"name":"[^"]*"' | sed -E 's/"name":"//; s/"$//' | tr '\n' ' ' | sed -E 's/ $//')"
     if [ -z "$names" ]; then
-      record_result "WARN" "视频链路（SRS 活跃流）" "SRS 当前**无活跃流**（推流已建连也不等于流已发布：RTMP 握手/发布失败时 TCP 仍 ESTAB）→ 先查 docker logs --since 5m hunter-srs；若车端确认在推而这里为空，回到本项 a) 看是否推到了另一个实例"
+      record_result "WARN" "视频链路（SRS 活跃流）" "SRS 当前**无活跃流**（推流已建连也不等于流已发布：RTMP 握手/发布失败时 TCP 仍 ESTAB）→ 先查 docker logs --since 5m hunter-srs；⚠ 刚做过 up -d --force-recreate srs / docker restart srs 的话本项为空是**预期的**：容器一重启会踢掉一切客户端连接，而车端 GStreamer/ffmpeg 不会自动重推，必须重开一次操控会话；若车端确认在推而这里仍为空，回到本项 a) 看是否推到了另一个实例"
     else
       record_result "PASS" "视频链路（SRS 活跃流）" "在流：${names}（浏览器拉不到画时应查 candidate/ICE 与 8000udp，而非“没推流”）"
     fi
   fi
 
   # e) 下发的 WHEP 基址必须是同源（V1.21.1：直连 :9090 会被页 CSP/CORS 拦成 Failed to fetch）
-  whep="${RC_SRS_WHEP_URL:-}"
+  #    ⚠ 先读**容器生效值**：compose 把 RC_SRS_WHEP_URL 写成 ${RC_SRS_WHEP_URL:-http://${SERVER_IP}/rtc/…}，
+  #    .env 里往往没这一行——只看 .env 会把“默认值已生效”误判成“未配”（V1.21.6 在实机假 FAIL 过一次）。
+  whep=""
+  if declare -F container_env >/dev/null 2>&1; then
+    whep="$(container_env "${C_REMOTE:-hunter-remote}" RC_SRS_WHEP_URL)"
+  fi
+  [ -n "$whep" ] || whep="${RC_SRS_WHEP_URL:-}"
   case "$whep" in
-    '') record_result "FAIL" "视频链路（WHEP 基址）" "RC_SRS_WHEP_URL 未配 → 会话响应 whep_url 为空，前端只能提示“媒体服务未就绪”" ;;
+    '') record_result "WARN" "视频链路（WHEP 基址）" "读不到生效值（${C_REMOTE:-hunter-remote} 未运行且 .env 未配）；compose 有同源默认值 http://<SERVER_IP>/rtc/v1/whep/，服起来后复测本项" ;;
     *':9090'*) record_result "FAIL" "视频链路（WHEP 基址）" "RC_SRS_WHEP_URL=${whep} 仍直连 9090（跨源）→ 改同源 http://<浏览器地址>/rtc/v1/whep/ 并 --force-recreate remote-control" ;;
     CHANGE_ME*) record_result "FAIL" "视频链路（WHEP 基址）" "RC_SRS_WHEP_URL 仍为占位值 ${whep}" ;;
     *) record_result "PASS" "视频链路（WHEP 基址）" "${whep}（同源反代口径）" ;;
   esac
+
+  # f) /rtc/ 上游解析方式（V1.21.7）：静态写法在 srs 每次重建后都会把拉流打成 502
+  #    nginx 对 proxy_pass http://srs:9090 只在加载配置时解析一次域名；而改 candidate 必须
+  #    up -d --force-recreate srs（单文件 bind，restart 不重挂）→ 重建后旧 IP 失效。
+  nginx_conf="${APP_DIR:-.}/config/nginx.conf"
+  if [ ! -f "$nginx_conf" ]; then
+    record_result "WARN" "视频链路（/rtc/ 上游解析）" "未找到渲染副本 ${nginx_conf}，本项未判定"
+  elif grep -qE '^[[:space:]]*set[[:space:]]+\$srs_upstream' "$nginx_conf"; then
+    record_result "PASS" "视频链路（/rtc/ 上游解析）" "运行期解析（resolver + 变量）→ srs 重建不需 restart hunter-web"
+  elif grep -q 'location /rtc/' "$nginx_conf"; then
+    record_result "WARN" "视频链路（/rtc/ 上游解析）" "${nginx_conf} 仍是静态 proxy_pass http://srs:9090：每次 up -d --force-recreate srs 后必须 sudo docker restart hunter-web，否则 WHEP 502（本项 c 会报）；升级：sudo bash scripts/install.sh --only-step 4 -y 后 --force-recreate web-portal"
+  else
+    record_result "FAIL" "视频链路（/rtc/ 上游解析）" "${nginx_conf} 没有 location /rtc/（V1.21.1 之前的旧副本）→ 同源反代未就位，浏览器跨源必被 CSP/CORS 拦；从仓库 infra/deploy/config/nginx.conf 覆盖后 --force-recreate web-portal"
+  fi
   return 0
 }
 
