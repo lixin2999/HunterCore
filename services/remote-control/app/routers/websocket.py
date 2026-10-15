@@ -3,7 +3,7 @@
 端点（operationId 对齐契约 x-hunter-endpoints）：
 - ``wsRemoteControl``：control 通道（rbac remote:execute）——control 帧 20Hz 转发 Kafka
   ``hunter.{vehicle_id}.remote_control``（服务端 seq/限幅/超频丢弃）+ heartbeat 帧刷新
-  ``rc:session.last_heartbeat_at`` + estop 帧零速收敛 + 下行 ack/status/error 帧；
+  ``rc:session.last_heartbeat_at`` + estop 帧零速停车（不结束会话）+ 下行 ack/status/error 帧；
 - ``wsRemoteSignal``：signal 通道（rbac remote:create）——sdp/ice 帧经 command topic
   中继车端（command_type 配置注入，pending #17 同模式）。
 
@@ -40,7 +40,7 @@ from app.config import settings
 from app.core.dependencies import OperatorContext
 from app.core.rate_limit import enforce_user_rate_limit
 from app.core.ws_auth import WsIdentity, authenticate_ws_handshake
-from app.schemas.common import DegradedReason, SessionEndReason, SessionStatus
+from app.schemas.common import DegradedReason, SessionStatus
 from app.schemas.sessions import ControlStats
 from app.schemas.websocket import (
     UplinkFrameError,
@@ -71,7 +71,7 @@ logger = get_logger("app.routers.websocket")
 router = APIRouter(tags=["websocket"])
 
 # ---------- WS 关闭码（契约 x-hunter-websocket-contract.frames.close_codes） ----------
-CLOSE_NORMAL = 1000  # 正常结束（estop 收敛完成后）
+CLOSE_NORMAL = 1000  # 正常关闭码（保留：契约 close_codes；V1.21.5 起 estop 不再触发关闭）
 CLOSE_POLICY = 1008  # 认证/权限失效（握手拒绝与连接期 Token 过期）
 CLOSE_SESSION_GONE = 4001  # 会话已结束或不存在（3001 语义）
 CLOSE_REPLACED = 4008  # 同一会话新连接替代旧连接
@@ -298,12 +298,20 @@ async def _handle_estop(
     operator: OperatorContext,
     frame: WsEstopFrameIn,
 ) -> bool:
-    """estop：立即零速帧 → 「先安全后清理」收敛会话（审计日志，契约 x-hunter-audit-log）。"""
+    """estop：下发零速满制动帧使车辆立即安全停车，但**不结束会话**（V1.21.5 契约变更）。
+
+    历史实现把 estop 与「收敛会话」耦合（先安全后清理 → end_session → close 1000），
+    操作员按下紧急停车后操控会话即退出，易与「主动结束会话」混淆。现调整为：
+    estop 仅“安全停车”，控制通道与会话保持存活，操作员松开急停后可继续操控；
+    会话结束仍由「主动结束会话 / 心跳超时 / 管理员操作」触发（end_convergence 顺序不变）。
+    审计：仍记录 rc_estop_received 结构化日志（契约 x-hunter-audit-log）。
+    """
     logger.warning(
         "rc_estop_received",
         vehicle_id=conn.vehicle_id,
         session_id=conn.session_id,
         operator_id=conn.operator_id,
+        operator_user_id=operator.user_id,
         reason=frame.reason,
     )
     seq = await service.next_control_seq(conn.vehicle_id)
@@ -319,19 +327,13 @@ async def _handle_estop(
                 brake=1.0,  # G-10：estop 零速帧固定满制动请求（契约 control.brake 语义）
             )
         except ServiceUnavailableError as exc:
-            # 零速帧失败不阻断收敛（车端 >500ms 无指令自动减速停车兜底）
+            # 零速帧失败不阻断（车端 >500ms 无指令自动减速停车兜底）
             await hub.send_json(conn.websocket, error_frame(5001, exc.message, None))
-    try:
-        await service.end_session(
-            conn.session_id, operator, SessionEndReason.OPERATOR_END
-        )
-    except ResourceNotFoundError:
-        pass  # 幂等：已被其他路径结束
+    # 急停已生效：回推当前状态（会话保持 active），不结束、不关闭 → 松开后可继续操控
     await hub.send_json(
-        conn.websocket, status_frame(SessionStatus.ENDED.value, [], None)
+        conn.websocket, status_frame(SessionStatus.ACTIVE.value, [], None)
     )
-    await conn.websocket.close(code=CLOSE_NORMAL, reason="estop_converged")
-    return True
+    return False
 
 
 async def _status_ticker(

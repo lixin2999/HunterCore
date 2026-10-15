@@ -12,6 +12,7 @@ import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import 'element-plus/dist/index.css'
 
 import App from './App.vue'
+import { SESSION_EXPIRED_EVENT } from './api/request'
 import { permissionDirective } from './directives/permission'
 import router from './router'
 import { useUserStore } from './stores/user'
@@ -24,6 +25,15 @@ app.use(createPinia())
 
 // 注册全局会话失效监听：任一请求返回 1001/1003 且无法刷新时清理本地会话
 useUserStore().bindSessionExpiredListener()
+// 问题4：会话失效后跳转登录页。
+// bindSessionExpiredListener 仅 reset()（profile=null → 菜单清空），不跳路由，
+// 会导致停留在原页：菜单空但页面组件仍在轮询（WS/HTTP），呈现“登录失效但数据在刷新”。
+// 这里在 main.ts（已持有 router）补一个监听做统一跳转，避免 store 直接 import router 造成循环依赖。
+globalThis.addEventListener(SESSION_EXPIRED_EVENT, () => {
+  if (router.currentRoute.value.name !== 'login') {
+    void router.replace({ name: 'login' })
+  }
+})
 
 app.use(router)
 app.use(ElementPlus, { locale: zhCn })

@@ -12,7 +12,7 @@
  * - 速度上限取会话响应 control_channel.max_speed_mps（默认 2.0 m/s，不可越过）；
  * - 会话互斥：同一车辆同时仅允许一名操作员（冲突返回 7001）；
  * - 心跳 10s（缺失 3 次降级、60s 结束会话）；
- * - 紧急停车：立即下发 estop 帧（服务端转 target_velocity=0 并收敛会话）。
+ * - 紧急停车：下发 estop 帧使车辆零速停车（服务端不再结束会话，松开后可继续操控）。
  * - 视频：原生 WebRTC（RTCPeerConnection），禁止第三方云视频服务。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
@@ -241,7 +241,7 @@ function handleDownlink(frame: WsControlDownlinkFrame): void {
   ElMessage.error(`控制通道错误（code=${frame.code}）：${frame.message}`)
 }
 
-/** 紧急停车（estop：立即下发 target_velocity=0 并触发服务端收敛会话） */
+/** 紧急停车（estop：下发零速满制动帧使车辆停车；服务端不再结束会话，松开后可继续操控） */
 async function handleEstop(): Promise<void> {
   const current = session.value
   targetVelocity.value = 0
@@ -256,7 +256,7 @@ async function handleEstop(): Promise<void> {
     reason: 'operator_emergency_stop',
   }
   controlSocket.value?.send(frame)
-  ElMessage.warning('已发送紧急停车指令')
+  ElMessage.warning('已执行紧急停车：车辆零速停车，会话保持存活，可继续操控或手动结束')
 }
 
 /** 降级原因文案（WS status 帧 degraded_reasons[]） */
@@ -396,6 +396,13 @@ async function cleanupSession(callApi = true): Promise<void> {
     } catch (error) {
       ElMessage.error(error instanceof HunterApiError ? error.message : '结束会话失败，请重试')
     }
+  }
+  // 问题3：会话结束后主动重拉车辆列表，避免列表停留在旧的 already_controlled 快照
+  // （非优雅退出由服务端 60s reaper 收敛，此处刷新可让操作员尽快重建连接而非被迫刷新页面）
+  if (current) {
+    await loadVehicles().catch(() => {
+      // 刷新失败不阻断清理（下次轮询/手动刷新会重新拉取）
+    })
   }
 }
 

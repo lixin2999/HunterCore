@@ -1412,7 +1412,7 @@ x-hunter-websocket-contract:
     control_uplink:
       - { type: control,   direction: "browser→platform", frequency: "20Hz（50ms）", fields: "session_id, seq, timestamp, control{target_velocity, target_steer, gear?, brake?}", note: "G-10：gear（P/R/N/D）与 brake（0-1）为可选上行字段，平台限幅/验词后透传 Kafka；control.mode 不接受上行（平台侧预留字段，防注入）" }
       - { type: heartbeat, direction: "browser→platform", interval_s: 10, fields: "session_id, timestamp" }
-      - { type: estop,     direction: "browser→platform", fields: "session_id, reason", note: "紧急停车：立即下发 target_velocity=0 并按 x-hunter-session-lifecycle.end_convergence 收敛会话（先安全后清理；车端 >500ms 无指令自动减速为兜底）" }
+      - { type: estop,     direction: "browser→platform", fields: "session_id, reason", note: "紧急停车（V1.21.5 行为变更）：立即下发 target_velocity=0 + brake=1.0 零速帧使车辆安全停车，但**不结束会话**（控制通道与 rc:session 保持存活，松开急停后可继续操控）；会话结束仍由「主动结束会话 / 心跳超时 / 管理员操作」触发，x-hunter-session-lifecycle.end_convergence 顺序不变（先安全后清理仍适用于真正的会话结束）；车端 >500ms 无指令自动减速为兜底" }
     control_downlink:
       - { type: ack,    direction: "platform→browser", fields: "session_id, seq, ack_latency_ms, vehicle_state", note: "来源 Kafka hunter.{vehicle_id}.command_result；受契约限制按 (session_id, seq) 时序近似关联（remote_control 无 command_id，见 x-hunter-control-channel.ack.correlation）" }
       - { type: status, direction: "platform→browser", fields: "status, degraded_reasons[], control_stats, video_stats", frequency: "1Hz 或状态变更时" }

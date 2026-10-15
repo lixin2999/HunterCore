@@ -347,7 +347,7 @@ export interface WsHeartbeatFrame {
   timestamp: number
 }
 
-/** 紧急停车帧（浏览器 → 平台；立即下发 target_velocity=0 并收敛会话） */
+/** 紧急停车帧（浏览器 → 平台；服务端下发零速满制动帧使车辆停车，但不结束会话，松开后可继续操控） */
 export interface WsEstopFrame {
   type: 'estop'
   session_id: string

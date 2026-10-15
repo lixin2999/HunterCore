@@ -221,8 +221,8 @@ def test_ws_heartbeat_frame_refreshes_session(rc_env: Any) -> None:
     assert float(env.redis.store[key]["last_heartbeat_at"]) > 0.0  # 心跳帧已刷新
 
 
-def test_ws_estop_converges_session(rc_env: Any) -> None:
-    """estop：零速帧尽力投递 → 会话收敛 ended → status(ended) 帧 + 正常关闭。"""
+def test_ws_estop_stops_without_ending_session(rc_env: Any) -> None:
+    """estop（V1.21.5 契约变更）：零速满制动帧使车辆停车，但会话不收敛、控制通道保持存活。"""
     env = rc_env
     session_id = _create_session(env)
     with _client().websocket_connect(
@@ -238,14 +238,15 @@ def test_ws_estop_converges_session(rc_env: Any) -> None:
             )
         )
         frame = _recv_until(ws, "status")
-        assert frame["status"] == "ended"
-        with pytest.raises(WebSocketDisconnect):
-            ws.receive_json()
+        assert frame["status"] != "ended"  # 急停不再收敛会话
+        # 控制通道仍存活：可继续发送心跳并收到下行帧（不抛 WebSocketDisconnect）
+        ws.send_text(json.dumps({"type": "heartbeat", "session_id": session_id}))
+        _recv_until(ws, "status")
     control = [f for f in env.frame.frames if f[0] == "control"]
     assert control[-1][2]["target_velocity"] == 0.0
     assert control[-1][2]["target_steer"] == 0.0
     assert control[-1][2]["brake"] == 1.0  # G-10：estop 零速帧固定满制动请求
-    assert key_gone(env)  # end_session 完整收敛（Hash 删除）
+    assert not key_gone(env)  # 会话未被收敛（rc:session 仍存在）
 
 
 def key_gone(env: Any) -> bool:
