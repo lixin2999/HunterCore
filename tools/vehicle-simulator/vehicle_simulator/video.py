@@ -157,15 +157,36 @@ class VideoStreamer:
             "-f", "flv", rtmp_url,
         ]
         try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            # stderr 必须接回来而不是丢进 DEVNULL：RTMP 握手/发布失败时 ffmpeg 只把原因写在 stderr，
+            #   丢掉就等于“推流方自认为在推、SRS 上根本没流”——排查者只能从浏览器侧猜（V1.21.6 实机）。
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         except OSError as exc:  # pragma: no cover
             self._log("video_ffmpeg_spawn_failed", error=str(exc))
             return
         self._proc = proc
         self._stop.clear()
+        if proc.stderr is not None:
+            threading.Thread(
+                target=self._drain_stderr, args=(proc.stderr,), daemon=True, name="ffmpeg-stderr"
+            ).start()
         self._thread = threading.Thread(target=self._pump, args=(session_id, proc), daemon=True)
         self._thread.start()
         self._log("video_rtmp_started", rtmp_url=rtmp_url)
+
+    def _drain_stderr(self, pipe: Any) -> None:
+        """逐行转发 ffmpeg 告警/报错到日志（不阻断推流；进程退出后自然结束）。"""
+        try:
+            for line in iter(pipe.readline, b""):
+                text = line.decode("utf-8", "replace").strip()
+                if text:
+                    self._log("video_ffmpeg_stderr", line=text[:300])
+        except (ValueError, OSError):  # pragma: no cover
+            pass
+        finally:
+            try:
+                pipe.close()
+            except OSError:  # pragma: no cover
+                pass
 
     def _pump(self, session_id: str, proc: subprocess.Popen) -> None:
         src = FrameSource(self.cfg, self._state_getter)
@@ -190,7 +211,9 @@ class VideoStreamer:
                 else:
                     next_at = time.monotonic()
         finally:
-            self._log("video_pump_exit", session_id=session_id)
+            # returncode 非 0/None 即推流已死（地址不可达、发布被拒等）：不记下来就会被当成“平台没视频”
+            #   往服务器方向查一整轮（V1.21.6 实录）。
+            self._log("video_pump_exit", session_id=session_id, returncode=proc.poll())
 
     def _shutdown_proc(self) -> None:
         self._stop.set()

@@ -5,7 +5,7 @@
 # 用途：一次性核对容器 / HTTP 探针 / 数据库 / Redis / Kafka / MinIO / 磁盘与内存 / 消费积压，
 #       输出 [PASS] [WARN] [FAIL] 明细与汇总，并给出退出码（供 install.sh、巡检脚本、CI 调用）。
 #
-# 检查项（共 17 类，⓪ 必须排第一）：
+# 检查项（共 18 类，⓪ 必须排第一）：
 #   ⓪ 环境凭据（.env）：口令类变量为空即 FAIL（典型成因：没加 sudo，.env 权限 600）；
 #      ⚠ 本项 FAIL 时，Redis / Kafka / MinIO 的相关结论一律降为「未判定」，不得当服务异常（V1.19.13）
 #   ① 容器运行状态与 Docker healthcheck（缺失/非 healthy/未运行 → FAIL）
@@ -36,6 +36,11 @@
 #      把「作业 RUNNING 但看板入库延迟恒 `-`」变成可判读结论。三分必需：作业未产出（键不存在）/
 #      正在追赶（键不存在但组有积压）/ 样本全被丢弃（键存在、p95_ms=null 带 reason）。
 #      ⚠ ⑭ 只能说“作业活着”，不能说“作业出了数”——前者对后者既非充分也非必要
+#   ⑰ 视频链路（V1.21.6）：车端 RTMP → SRS → 浏览器 WHEP 整条链的四个可判据——SRS 实例唯一（宿主机
+#      有无非容器化 srs）/ 容器内生效的 candidate 等于浏览器可达地址 / 同源 /rtc/ 真被反代接管（502
+#      与 nginx 静态 fallback 的 405 分流）/ SRS 当前有无活跃流。
+#      ⚠ 容器 healthy 与 HTTP 探针只能证明“我们这个 SRS 实例活着”，证明不了“车端那条流在它身上”
+#      ——V1.21.5 就因此把 502 误归为“车端未推流”（车端其实 TCP ESTAB、GStreamer 在编码），多花一轮
 #
 # ⚠ 必须用 sudo 跑：.env 权限 600（install.sh / gen-passwords.sh 设定）仅 root 可读；
 #   非 root 时 [ -f .env ] 仍为真但 source 失败 ⇒ 口令全空 ⇒ 本脚本会给出一串
@@ -94,7 +99,7 @@ usage() {
 HunterCore 全栈健康检查脚本
 
 用途：
-  检查 17 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
+  检查 18 类健康项并输出 [PASS]/[WARN]/[FAIL] 明细与汇总。
   退出码：0=全部通过，1=有告警，2=有失败。
 
 ⚠ 请用 sudo 执行：.env 权限 600 仅 root 可读，非 root 时口令类探针会给出错的 FAIL
@@ -119,7 +124,8 @@ HunterCore 全栈健康检查脚本
   配置漂移硬闸、车端接入证书（broker 证书 SAN 与有效期）、服务运行期错误日志、
   Flink 作业健康（flink list -a：FAILED 不会被默认列表列出）、Flink 检查点目录可写、
   业务服务 Kafka 本地磁盘缓冲目录可写（宿主 kafka-buffer 属主 10001 预检，V1.20.4）、
-  入库延迟指标键（analytics:ingest_latency 存否/ TTL/诊断载荷，V1.19.21）。
+  入库延迟指标键（analytics:ingest_latency 存否/ TTL/诊断载荷，V1.19.21）、
+  视频链路（SRS 实例唯一 / WebRTC candidate / 同源 /rtc/ 反代 / SRS 活跃流 / WHEP 基址同源，V1.21.6）。
 EOF
 }
 
@@ -876,7 +882,105 @@ check_service_error_logs() {
   return 0
 }
 
-# run_all_health_checks：执行全部 17 类检查（供 daily-check 与 main 复用）
+# ⑰ 视频链路（车端 RTMP 推流 → SRS → 浏览器 WHEP 拉流）端到端可判读（V1.21.6）
+# 为什么单独立一项：这一串的每个环节都有人看、就是没人一起看过——① 容器 healthy 只说“我们这个
+#   SRS 实例活着”，② 的 /api/v1/versions 只说“它的 HTTP API 应答”，两者都证明不了“车端那条流在它身上”。
+#   实机代价（V1.21.5）：宿主机多了一个手跑的 ./objs/srs 接走了车端推流，浏览器向容器里的 SRS 拉不到
+#   流 → 502，当时归因为“车端未推流”（车端其实 ESTAB + 在编码），多花一轮。本项把四类成因分开指名：
+#   实例不唯一 / candidate 不可达 / 反代断裂 / 根本没流。
+check_video_chain() {
+  local pids pid expect_ip current raw code body resp streams names whep
+  # a) 实例唯一性：1935 上只能有一个 SRS（本项目容器那个）
+  if declare -F hc_foreign_srs_pids >/dev/null 2>&1; then
+    pids="$(hc_foreign_srs_pids 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+    if [ -z "$pids" ]; then
+      record_result "PASS" "视频链路（SRS 实例唯一）" "宿主机无非容器化 srs 进程"
+    else
+      for pid in $pids; do
+        raw="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || printf '<已退出>')"
+        record_result "FAIL" "视频链路（SRS 实例唯一）" "宿主机还有非容器化 srs：PID ${pid}（${raw}）→ 车端推到哪个实例不再确定（典型现象：推流方 ESTAB、拉流方 502、容器探针全绿）。定案看本项 d) 的活跃流列表，不要只凭 ss（iptables DNAT 发布时宿主机那份仍在 LISTEN 却拿不到外部流量）；坐实后：sudo kill ${pids} 再 up -d --force-recreate srs"
+      done
+    fi
+  else
+    record_result "WARN" "视频链路（SRS 实例唯一）" "scripts/common.sh 未同步（缺 hc_foreign_srs_pids），本项未判定"
+  fi
+
+  # b) candidate 生效值：必须是**浏览器可达**的地址（双网卡机器上不等于 SERVER_IP）
+  expect_ip="${SRS_CANDIDATE_IP:-${SERVER_IP:-}}"
+  case "$expect_ip" in
+    '' | CHANGE_ME*)
+      record_result "WARN" "视频链路（WebRTC candidate）" ".env 的 SRS_CANDIDATE_IP/SERVER_IP 未配，无法比对期望值"
+      ;;
+    *)
+      current=""
+      if command_exists docker && docker inspect "${C_SRS:-hunter-srs}" >/dev/null 2>&1; then
+        raw="$(docker exec "${C_SRS:-hunter-srs}" grep -h -m1 -E '^[[:space:]]*candidate' /usr/local/srs/conf/srs.conf 2>/dev/null || true)"
+        current="$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+      fi
+      if [ -z "$current" ]; then
+        record_result "WARN" "视频链路（WebRTC candidate）" "读不到容器内 candidate（镜像无 grep / 配置路径变更？），未判定；手工：docker exec hunter-srs cat /usr/local/srs/conf/srs.conf"
+      elif [ "$current" != "$expect_ip" ]; then
+        record_result "FAIL" "视频链路（WebRTC candidate）" "容器内 candidate=${current}，期望 ${expect_ip}（SRS_CANDIDATE_IP 或 SERVER_IP）→ WHEP answer 里的地址浏览器连不到时，即使有流也永远 0 fps（与“车端未推流”同现象）；修复：改 .env 后 sudo bash scripts/install.sh --only-step 4 -y，再 up -d --force-recreate srs（单文件 bind，restart 不重挂）"
+      else
+        record_result "PASS" "视频链路（WebRTC candidate）" "容器内 candidate=${current}（与期望一致）"
+      fi
+      ;;
+  esac
+
+  # c) 同源反代 /rtc/ 是否真被反代接管（区分 nginx 静态 fallback 的 405 与 SRS 的 405）
+  code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:${WEB_PORT:-80}/healthz" 2>/dev/null || printf '000')"
+  if [ "$code" = "000" ] || [ "$code" = "404" ]; then
+    record_result "WARN" "视频链路（同源 /rtc/）" "web-portal 首页不可达（/healthz=${code}），无法验证反代"
+  else
+    # 一次请求同时拿回响应体与状态码（-w 追加到末尾，避开两次探测看到不同结果）。
+    # ⚠ 必须用 POST（与浏览器同形）：GET 时未匹配的 /rtc/ 会 fallback 到静态站点并返 200+HTML，
+    #   探针会错判“反代完好”；POST 时静态 fallback 返 405，才与 SRS 的 4xx 可区分（见 §9.2）。
+    resp="$(curl -s -m 5 -w '\n%{http_code}' -X POST -H 'Content-Type: application/sdp' \
+      --data 'x' "http://127.0.0.1:${WEB_PORT:-80}/rtc/v1/whep/?app=${RC_SRS_APP:-remote_control}&stream=hc_probe" 2>/dev/null || printf '\n000')"
+    code="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+    case "$code" in
+      000) record_result "FAIL" "视频链路（同源 /rtc/）" "请求 /rtc/v1/whep/ 无响应（web-portal 挂死？）" ;;
+      201 | 200)
+        record_result "WARN" "视频链路（同源 /rtc/）" "http=${code}：探针 offer 故意不可解析，正常应被 SRS 拒（400）；现在反而被接受，说明上游不是 SRS（旧版 srs 无 /rtc/ 路由时会静默回静态站）→ 人工看一眼 curl -s http://127.0.0.1:9090/api/v1/versions" ;;
+      502 | 504)
+        record_result "FAIL" "视频链路（同源 /rtc/）" "http=${code}：nginx 连不上上游 srs:9090（srs 重建换 IP 后静态 upstream 陈旧 → sudo docker restart hunter-web；或渲染副本 config/nginx.conf 落后仓库 → cp + --force-recreate web-portal）" ;;
+      4*)
+        if printf '%s' "$body" | grep -qi '<html'; then
+          record_result "FAIL" "视频链路（同源 /rtc/）" "http=${code} 且响应体为 nginx 错误页 → /rtc/ location 未匹配（回退到静态 fallback，见《故障排查指南》§9.2）；检查挂载源 ${APP_DIR}/config/nginx.conf 而非仓库那份"
+        else
+          record_result "PASS" "视频链路（同源 /rtc/）" "http=${code} 由 SRS 应答（探针 offer 故意不可解析，预期非 2xx）→ 反代链路完好"
+        fi
+        ;;
+      *) record_result "PASS" "视频链路（同源 /rtc/）" "http=${code}（上游已应答，反代链路完好）" ;;
+    esac
+  fi
+
+  # d) 当前活跃流：把“黑屏”在平台侧与车端侧之间切一刀
+  streams="$(curl -s -m 5 "$(srs_api_url /api/v1/streams)" 2>/dev/null || true)"
+  if [ -z "$streams" ]; then
+    record_result "WARN" "视频链路（SRS 活跃流）" "$(srs_api_url /api/v1/streams) 无响应（② 已定级），本项未判定"
+  else
+    names="$(printf '%s' "$streams" | grep -o '"name":"[^"]*"' | sed -E 's/"name":"//; s/"$//' | tr '\n' ' ' | sed -E 's/ $//')"
+    if [ -z "$names" ]; then
+      record_result "WARN" "视频链路（SRS 活跃流）" "SRS 当前**无活跃流**（推流已建连也不等于流已发布：RTMP 握手/发布失败时 TCP 仍 ESTAB）→ 先查 docker logs --since 5m hunter-srs；若车端确认在推而这里为空，回到本项 a) 看是否推到了另一个实例"
+    else
+      record_result "PASS" "视频链路（SRS 活跃流）" "在流：${names}（浏览器拉不到画时应查 candidate/ICE 与 8000udp，而非“没推流”）"
+    fi
+  fi
+
+  # e) 下发的 WHEP 基址必须是同源（V1.21.1：直连 :9090 会被页 CSP/CORS 拦成 Failed to fetch）
+  whep="${RC_SRS_WHEP_URL:-}"
+  case "$whep" in
+    '') record_result "FAIL" "视频链路（WHEP 基址）" "RC_SRS_WHEP_URL 未配 → 会话响应 whep_url 为空，前端只能提示“媒体服务未就绪”" ;;
+    *':9090'*) record_result "FAIL" "视频链路（WHEP 基址）" "RC_SRS_WHEP_URL=${whep} 仍直连 9090（跨源）→ 改同源 http://<浏览器地址>/rtc/v1/whep/ 并 --force-recreate remote-control" ;;
+    CHANGE_ME*) record_result "FAIL" "视频链路（WHEP 基址）" "RC_SRS_WHEP_URL 仍为占位值 ${whep}" ;;
+    *) record_result "PASS" "视频链路（WHEP 基址）" "${whep}（同源反代口径）" ;;
+  esac
+  return 0
+}
+
+# run_all_health_checks：执行全部 18 类检查（供 daily-check 与 main 复用）
 # ⚠ 顺序有语义：「环境凭据（.env）」必须排第一——后面的 Redis / Kafka / MinIO 靠它判断
 #   “服务异常”还是“根本没带凭据”（V1.19.13）。
 # 各项均以“失败被测试”的上下文调用（if ! f）：bash 在该上下文中会关闭 errexit，
@@ -888,7 +992,8 @@ run_all_health_checks() {
   for check in check_env_credentials check_compose_override check_containers check_http_endpoints \
     check_databases check_redis check_kafka_topics check_minio_buckets check_disk_usage \
     check_memory_usage check_kafka_lag check_kafka_broker_cert check_service_error_logs \
-    check_flink_jobs check_flink_checkpoint_dir check_business_kafka_buffer check_ingest_latency_metric; do
+    check_flink_jobs check_flink_checkpoint_dir check_business_kafka_buffer check_ingest_latency_metric \
+    check_video_chain; do
     if ! "$check"; then
       record_result "WARN" "检查项未完成（${check}）" "该项内部命令返回非 0（已继续执行余下检查，stderr 有具体报错行）"
     fi

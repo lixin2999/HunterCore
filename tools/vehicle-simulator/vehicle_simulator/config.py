@@ -35,8 +35,11 @@ class SimConfig:
     duration_s: float = 0.0                    # 0 = 一直运行（Ctrl-C 退出）
     start_soc: int = 80
     # ---------- 视频 ----------
+    # ⚠ 基址里的 host:port 必须指向与浏览器拉流**同一个** SRS 实例（否则推流落在 A、拉流取自 B，
+    #   浏览器永远 502 而车端看着“推流正常”）；HTTP-API 端口本项目统一 9090（不是 SRS 默认的 1985），
+    #   生产上走 web-portal 同源反代 /rtc/（避开浏览器跨源 CSP/CORS）。
     srs_rtmp: str | None = None                # 基址 rtmp://{ip}:1935/remote_control
-    srs_whip: str | None = None                # 基址 http://{ip}:1985/rtc/v1/whip/（无 ffmpeg 回退）
+    srs_whip: str | None = None                # 基址 http://{ip}/rtc/v1/whip/（无 ffmpeg 回退）
     stream_prefix: str = "hunter"              # 与 RC_SRS_STREAM_PREFIX 对齐（流名 {prefix}_{vid}_{sid}）
     video: bool = True
     video_width: int = 1280
@@ -125,7 +128,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--duration", type=float, default=float(_env("SIM_DURATION", "0")), help="运行秒数（0=一直运行）")
     p.add_argument("--start-soc", type=int, default=int(_env("SIM_START_SOC", "80")))
     p.add_argument("--srs-rtmp", default=_env("SIM_SRS_RTMP"), help="SRS RTMP 基址，如 rtmp://IP:1935/remote_control")
-    p.add_argument("--srs-whip", default=_env("SIM_SRS_WHIP"), help="SRS WHIP 基址（无 ffmpeg 回退），如 http://IP:1985/rtc/v1/whip/")
+    p.add_argument("--srs-whip", default=_env("SIM_SRS_WHIP"), help="SRS WHIP 基址（无 ffmpeg 回退），如 http://IP/rtc/v1/whip/（同源反代）或 http://IP:9090/rtc/v1/whip/")
     p.add_argument("--stream-prefix", default=_env("RC_SRS_STREAM_PREFIX", "hunter"))
     p.add_argument("--no-video", action="store_true", help="禁用视频推流（仅数据链路自测）")
     p.add_argument("--no-ack", action="store_true", help="禁用控制帧 command_result 回执")

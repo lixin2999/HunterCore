@@ -54,8 +54,8 @@ vehicle-simulator \
 | `--scram-user` / `--scram-pass` | SCRAM 凭据（user 默认取 vehicle-id） |
 | `--security-protocol` | `SASL_SSL`(默认) / `SSL` / `SASL_PLAINTEXT` / `PLAINTEXT` |
 | `--ssl-cafile/--ssl-certfile/--ssl-keyfile/--ssl-keypassword` | mTLS 客户端证书 |
-| `--srs-rtmp` | SRS RTMP 基址（视频主路径），如 `rtmp://IP:1935/remote_control` |
-| `--srs-whip` | SRS WHIP 基址（无 ffmpeg 回退），如 `http://IP:1985/rtc/v1/whip/` |
+| `--srs-rtmp` | SRS RTMP 基址（视频主路径），如 `rtmp://IP:1935/remote_control`（⚠ 必须指向**与浏览器拉流同一个** SRS 实例；宿主机上另跑了一份 srs 时，推流会落到另一实例，浏览器永远拉不到画且报 502） |
+| `--srs-whip` | SRS WHIP 基址（无 ffmpeg 回退），如 `http://<浏览器同源地址>/rtc/v1/whip/`（经 web-portal nginx 反代）或诊断用 `http://IP:9090/rtc/v1/whip/`；⚠ **不是 1985**（那是 SRS 默认 HTTP-API 端口，本项目统一用 9090） |
 | `--stream-prefix` | 流名前缀，须与 remote-control `RC_SRS_STREAM_PREFIX`（默认 `hunter`）一致 |
 | `--telemetry-hz` / `--health-hz` | 遥测（默认 10Hz）/ 健康（默认 1Hz）频率 |
 | `--duration` | 运行秒数，`0`=一直运行（Ctrl-C 退出） |

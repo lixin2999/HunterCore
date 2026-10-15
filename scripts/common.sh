@@ -639,9 +639,42 @@ minio_health_url() {
 }
 
 # srs_health_url：SRS HTTP API 版本接口（容器内 9090，宿主机映射 127.0.0.1）
+#   基址一律走 srs_api_url，避免与 ⑰ 视频链路探针各自算一次端口而漂移
 srs_health_url() {
+  srs_api_url /api/v1/versions
+}
+
+# srs_api_url <path>：SRS HTTP API 通用寻址（宿主机 127.0.0.1，V1.21.3 起 9090 仅绑回环）
+#   例：srs_api_url /api/v1/streams —— 供健康检查取“当前有哪些流在 SRS 上”
+srs_api_url() {
   local port="${SRS_HTTP_API_HOST_PORT:-${SRS_HTTP_API_PORT:-9090}}"
-  printf 'http://127.0.0.1:%s/api/v1/versions' "$port"
+  printf 'http://127.0.0.1:%s%s' "$port" "${1:-/api/v1/versions}"
+}
+
+# hc_foreign_srs_pids：列出**宿主机上非容器化**的 SRS 进程 PID（每行一个）
+# 背景（V1.21.6 实机）：有人在宿主机手工跑了一份 `./objs/srs -c conf/srs.conf`，与 compose 的
+#   hunter-srs 并存。车端 RTMP 与浏览器 WHEP 于是落在**两个不同实例**上——车端 TCP ESTAB、
+#   GStreamer 在编码、`docker compose ps srs` 一路 healthy，而拉流方永远 502：现有全部探针
+#   （容器 healthcheck + /api/v1/versions）都只看“我们这个实例活没活”，看不见“流在不在它身上”。
+# 判据：cmdline 含 srs 可执行（objs/srs 或 `srs -c`）**且** cgroup 不含容器标识（64 位 hex /
+#   docker / containerd）——容器内那个 ./objs/srs 在宿主机 /proc 里同样可见，必须按 cgroup 排除，
+#   否则每次巡检都自报一个假第二实例。
+# ⚠ 输出纪律：stdout 只写 PID（本函数会被 $(...) 捕获，见 check_port 注释里的同一个坑）。
+hc_foreign_srs_pids() {
+  local pid cmdline cgroup
+  for pid in /proc/[0-9]*; do
+    pid="${pid##*/}"
+    [ -r "/proc/${pid}/cmdline" ] || continue
+    cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)" || continue
+    case "$cmdline" in
+      *objs/srs* | *"srs -c "*) : ;;
+      *) continue ;;
+    esac
+    cgroup="$(cat "/proc/${pid}/cgroup" 2>/dev/null)" || cgroup=""
+    printf '%s\n' "$cgroup" | grep -qE '(docker[/-]|containerd|[0-9a-f]{64})' && continue
+    printf '%s\n' "$pid"
+  done
+  return 0
 }
 
 # flink_ui_url：Flink Web UI 宿主机地址（⚠ 容器 8081 与 scene-service 冲突，宿主机用 FLINK_UI_HOST_PORT=8088）

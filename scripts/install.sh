@@ -277,6 +277,36 @@ check_public_ports() {
   return 0
 }
 
+# 宿主机第二 SRS 实例硬闸（V1.21.6）：1935 端口预检看不出这类冲突——本项目容器已占着 1935 时，
+# 端口检查直接豁免通过；而“另一个非容器化的 srs 进程”可以与容器并存（它绑不上 1935 就绑别的，
+# 或先于容器绑上），结果是车端推到 A、浏览器从 B 拉 → 视频永远黑屏，而所有探针都是 PASS。
+# 实机就吃了这个亏（V1.21.5 把 502 误判为“车端未推流”，多花一轮）：部署与巡检都必须先证明“全局只有一个 SRS”。
+check_single_srs_instance() {
+  local pids pid cmd
+  if ! declare -F hc_foreign_srs_pids >/dev/null 2>&1; then
+    log_warn "scripts/common.sh 未同步（缺 hc_foreign_srs_pids）：跳过宿主机 SRS 第二实例检查"
+    return 0
+  fi
+  pids="$(hc_foreign_srs_pids 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  if [ -z "$pids" ]; then
+    log_success "SRS 实例唯一性：宿主机无非容器化 srs 进程"
+    return 0
+  fi
+  log_error "宿主机存在非容器化的 SRS 进程（与 compose 的 hunter-srs 并存）：PID=${pids}"
+  for pid in $pids; do
+    cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || printf '<已退出>')"
+    log_error "  ${pid}: ${cmd}"
+  done
+  log_error "危害：车端 RTMP 与浏览器 WHEP 可能落在不同实例上——推流方 TCP ESTAB、容器探针 healthy，拉流方永远 502。"
+  log_error "定案（不要只凭 ss）：curl -s http://127.0.0.1:9090/api/v1/streams —— 看容器身上有没有那条流。"
+  log_error "  已用 iptables DNAT 发布时（userland-proxy=false），宿主机那份仍会显示在 LISTEN 却拿不到外部流量；仅凭 ss 结果就 kill 会误判。"
+  log_error "修复（确认该进程不是其它业务在用后停掉，再重建容器使其重新绑上 1935）："
+  log_error "  sudo kill ${pids}"
+  log_error "  cd ${APP_DIR} && sudo docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --force-recreate srs"
+  log_error "  sudo ss -ltnp 'sport = :1935'   # 旁证：监听者应为 docker-proxy，而非 ./objs/srs"
+  return 1
+}
+
 preflight() {
   log_info "===== 预检查（root / 操作系统 / 端口 / 磁盘 / 资源档位）====="
   check_root || exit 1
@@ -291,6 +321,7 @@ preflight() {
   fi
 
   check_public_ports || exit 1
+  check_single_srs_instance || exit 1
   check_disk_space "$DATA_DIR" 50 || exit 1
 
   # /data 独立挂载与资源档位提示（docs/01 §2.1：/data 必须 SSD；低于最低档须降配）
@@ -1101,11 +1132,19 @@ ensure_nginx_conf() {
   return 1
 }
 
-# ensure_srs_conf：确保 ${APP_DIR}/config/srs.conf 就位并替换 candidate 占位符（compose 以文件方式挂载）
-# 背景：bind 源路径不存在时 Docker 会自动创建同名空目录，导致“目录挂载到文件”启动失败（Step 7 srs）
+# ensure_srs_conf：确保 ${APP_DIR}/config/srs.conf 就位并把 rtc_server.candidate 对到可达 IP（compose 以文件方式挂载）
+# 背景一：bind 源路径不存在时 Docker 会自动创建同名空目录，导致“目录挂载到文件”启动失败（Step 7 srs）
+# 背景二（V1.21.6 实机）：旧实现只在文件里还留着 `$SERVER_IP` 占位符时才替换——**替换过一次就永不跟随**。
+#   实机就卡在这：容器内 candidate 仍是部署当天的公网 IP，而浏览器/车端实际走局域网地址，
+#   WHEP answer 里的 host candidate 浏览器根本连不到 → 即使流已推上 SRS、信令也 201，画面仍永远 0 fps。
+#   现改为幂等对齐：占位符、旧 IP、手改过的值一律重写为期望值（$2 缺省回退 $1）。
+# ⚠ 单文件 bind mount 换内容必须 --force-recreate（sed -i 产生新 inode，容器仍看旧 inode，
+#   restart 不重挂）——与 nginx.conf 同一个坑（V1.21.4 实录），故本函数只在真改了时才提示重建。
 ensure_srs_conf() {
   local target="${APP_DIR}/config/srs.conf"
   local server_ip="$1"
+  local candidate_ip="${2:-$1}"
+  local current="" conf_changed=0
   if [ -d "$target" ]; then
     log_error "${target} 是目录（多为 Docker 挂载源缺失时误创建的空目录），应为配置文件"
     if [ -z "$(ls -A "$target" 2>/dev/null)" ]; then
@@ -1127,16 +1166,33 @@ ensure_srs_conf() {
   else
     log_info "SRS 配置已就位：${target}（幂等）"
   fi
-  # 占位符替换：candidate $SERVER_IP → 真实 IP（SRS 不展开环境变量，未替换则 WebRTC candidate 错误）
-  if grep -qF '$SERVER_IP' "$target"; then
-    if [ -z "$server_ip" ]; then
-      log_error "srs.conf 含 \$SERVER_IP 占位符但 SERVER_IP 为空，无法替换"
-      return 1
+  if [ -z "$candidate_ip" ]; then
+    log_error "candidate 目标 IP 为空（SERVER_IP 与 SRS_CANDIDATE_IP 均未设置），无法写入 srs.conf"
+    return 1
+  fi
+  # candidate 强制对齐：SRS 不展开环境变量，占位符/旧值都得改写
+  current="$(grep -E '^[[:space:]]*candidate[[:space:]]' "$target" | head -n1 \
+    | sed -E 's/^[[:space:]]*candidate[[:space:]]+//; s/;[[:space:]]*$//; s/[[:space:]]+$//')"
+  if [ "$current" != "$candidate_ip" ]; then
+    sed -i -E "s|^([[:space:]]*)candidate[[:space:]]+[^;]+;|\1candidate ${candidate_ip};|" "$target"
+    conf_changed=1
+    log_success "srs.conf candidate：${current:-<缺失>} → ${candidate_ip}（浏览器可达地址）"
+    if [ -n "$current" ]; then
+      log_warn "candidate 曾错为 ${current}：该地址浏览器连不到时，WebRTC 永远不出画（与“车端没推流”同现象）"
     fi
-    sed -i "s|\$SERVER_IP|${server_ip}|g" "$target"
-    log_success "srs.conf candidate 已替换为 SERVER_IP=${server_ip}"
+  else
+    log_info "srs.conf candidate 已是 ${candidate_ip}（幂等）"
+  fi
+  # 占位符残留硬闸：$SERVER_IP 未替换会被 SRS 原样当字面量 candidate（不报错，静默错到永远）
+  if grep -qF '$SERVER_IP' "$target"; then
+    log_error "${target} 仍含 \$SERVER_IP 占位符（SRS 不展开环境变量，candidate 会是字面量）"
+    return 1
   fi
   chmod 644 "$target"
+  if [ "$conf_changed" -eq 1 ]; then
+    log_warn "srs.conf 已变更：单文件 bind mount 需重建才生效（restart 不重挂）——"
+    log_warn "  sudo docker compose -f infra/deploy/docker-compose.yml --project-directory . up -d --force-recreate srs"
+  fi
   return 0
 }
 
@@ -1231,7 +1287,16 @@ step_4_gen_config() {
   ensure_nginx_conf || return 1
 
   # 4.6 SRS 配置（compose 挂载 ./config/srs.conf；缺失会被 Docker 误建为空目录导致 Step 7 启动失败）
-  ensure_srs_conf "$server_ip" || return 1
+  # candidate 目标地址：SRS_CANDIDATE_IP 优先（双网卡/NAT 场景下“浏览器可达的地址”不等于 SERVER_IP）
+  local candidate_ip
+  candidate_ip="$(grep -E '^SRS_CANDIDATE_IP=' "$env_file" | head -n1 | cut -d= -f2- | awk '{print $1}')"
+  case "$candidate_ip" in
+    "" | CHANGE_ME_*) candidate_ip="$server_ip" ;;
+  esac
+  if [ "$candidate_ip" != "$server_ip" ]; then
+    log_info "SRS WebRTC candidate 使用 SRS_CANDIDATE_IP=${candidate_ip}（SERVER_IP=${server_ip} 仅用于 Kafka/同源地址）"
+  fi
+  ensure_srs_conf "$server_ip" "$candidate_ip" || return 1
 
   log_success "配置生成完成：${env_file}（权限 600）、${PASSWORDS_FILE}（权限 600）"
 }

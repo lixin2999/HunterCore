@@ -65,7 +65,7 @@ def test_config_derives_topics_and_stream():
     cfg = SimConfig(
         vehicle_id=VID,
         srs_rtmp="rtmp://10.0.0.5:1935/remote_control",
-        srs_whip="http://10.0.0.5:1985/rtc/v1/whip/",
+        srs_whip="http://10.0.0.5:9090/rtc/v1/whip/",
     )
     assert cfg.remote_control_topic() == f"hunter.{VID}.remote_control"
     assert cfg.telemetry_topic() == f"hunter.{VID}.telemetry"
