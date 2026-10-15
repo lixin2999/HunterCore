@@ -889,13 +889,19 @@ check_service_error_logs() {
 #   实机代价（V1.21.5）：一条 502 被归因为“车端未推流”（车端其实 ESTAB + 在编码），多花一轮。
 #   ⚠ 当时怀疑的“宿主机第二个 SRS 实例”已被 V1.21.7 实机证据**否掉**：1935 由 dockerd 持有、
 #   本项 a) 按 cgroup 判定无非容器化 srs——宿主机 `ps` 里那个 `./objs/srs` 就是容器主进程本身
-#   （Docker 共享宿主 PID 视图，容器进程在宿主 /proc 里可见）。真实根因是下面两个：
-#   静态 /rtc/ 上游在 srs 重建后陈旧（本项 c/f）+ candidate 残留公网 IP（本项 b）。
-#   本项仍把四类成因分开指名：实例不唯一 / candidate 不可达 / 反代断裂 / 根本没流。
+#   （Docker 共享宿主 PID 视图，容器进程在宿主 /proc 里可见）。
+#   ⚠ 同样被 V1.21.7 实机**证伪**的还有“502 = 静态上游陈旧”：把 /rtc/ 改成运行期解析
+#   （本项 f) PASS）并 --force-recreate web-portal 后，⑰ c) 仍稳到 502；而车端重推当前会话的流后
+#   浏览器不再报 502。定案：**SRS 对“目标流拿不到”的 WHEP 请求直接关连、不回 HTTP 响应**，
+#   nginx 那一侧就记成 502——静态上游仍是真隐患（重建后必断，已根治），但不是本次 502 的成因。
+#   因此本项 c) 自 V1.21.8 起：① 探针改用⑰ d) 采到的**真实流名**，② 拿到 502 时做“直连 srs 同形对照”。
+#   本项把四类成因分开指名：实例不唯一 / candidate 不可达 / 反代断裂 / 根本没流（或流里没帧）。
 # V1.21.7 补两个：WHEP 基址改读**容器生效值**（实机假 FAIL：compose 有默认值、.env 里根本没这行），
-#   并新增 f) /rtc/ 上游解析方式——静态 proxy_pass 在 srs 重建后必把拉流打成 502（本次实机即此）。
+#   并新增 f) /rtc/ 上游解析方式——静态 proxy_pass 在 srs 每次重建后确实会把拉流打成 502（结构性隐患，
+#   已根治），但 V1.21.7 实机证明它不是当时那条 502 的成因（见上方定案）。
 check_video_chain() {
   local pids pid expect_ip current raw code body resp streams names whep nginx_conf
+  local probe_stream first_stream frames_now kbps_now f2
   # a) 实例唯一性：1935 上只能有一个 SRS（本项目容器那个）
   if declare -F hc_foreign_srs_pids >/dev/null 2>&1; then
     pids="$(hc_foreign_srs_pids 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
@@ -921,7 +927,7 @@ check_video_chain() {
       current=""
       if command_exists docker && docker inspect "${C_SRS:-hunter-srs}" >/dev/null 2>&1; then
         raw="$(docker exec "${C_SRS:-hunter-srs}" grep -h -m1 -E '^[[:space:]]*candidate' /usr/local/srs/conf/srs.conf 2>/dev/null || true)"
-        current="$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+        current="$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
       fi
       if [ -z "$current" ]; then
         record_result "WARN" "视频链路（WebRTC candidate）" "读不到容器内 candidate（镜像无 grep / 配置路径变更？），未判定；手工：docker exec hunter-srs cat /usr/local/srs/conf/srs.conf"
@@ -933,6 +939,21 @@ check_video_chain() {
       ;;
   esac
 
+  # 先取一次活跃流（原本在 d）：⑰-c 的探针要用**真实存在的流名**。
+  #   理由（V1.21.7 实机）：探针固定用 stream=hc_probe，而 SRS 对“目标流不存在”的 WHEP 请求是
+  #   直接关连、不回 HTTP 响应 ⇒ nginx 永远记 502，本项就永远判不出反代到底通不通。
+  # ⚠ 必须带 -L：SRS 会把 /api/v1/streams 302 到 /api/v1/streams/，不带就只拿到一行 `Redirect to …`，
+  #   既看不到流也看不出服务异常（V1.21.7 实机就因此漏做过定案）。
+  streams="$(curl -sL -m 5 "$(srs_api_url /api/v1/streams)" 2>/dev/null || true)"
+  names=""; first_stream=""; frames_now=""; kbps_now=""
+  if [ -n "$streams" ]; then
+    names="$(printf '%s' "$streams" | grep -o '"name":"[^"]*"' | sed -E 's/"name":"//; s/"$//' | tr '\n' ' ' | sed -E 's/ $//' || true)"   # || true：无流时 grep 退 1，本函数也必须能跑完（不依赖调用上下文的 errexit）
+    first_stream="${names%% *}"   # 纯 bash 取首项（不用 awk：开发机/精简镜像上 awk 可能不存在或不可靠）
+    frames_now="$(printf '%s' "$streams" | grep -oE '"frames":[0-9]+' | head -n1 | cut -d: -f2 || true)"
+    kbps_now="$(printf '%s' "$streams" | grep -oE '"recv_30s":[0-9]+' | head -n1 | cut -d: -f2 || true)"   # ⚠ 用 cut 取冒号后段，不要 grep -oE '[0-9]+'（key 里的 recv_30s 自带的 30 会被当成值）
+  fi
+  probe_stream="${first_stream:-hc_probe}"
+
   # c) 同源反代 /rtc/ 是否真被反代接管（区分 nginx 静态 fallback 的 405 与 SRS 的 405）
   code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:${WEB_PORT:-80}/healthz" 2>/dev/null || printf '000')"
   if [ "$code" = "000" ] || [ "$code" = "404" ]; then
@@ -942,7 +963,7 @@ check_video_chain() {
     # ⚠ 必须用 POST（与浏览器同形）：GET 时未匹配的 /rtc/ 会 fallback 到静态站点并返 200+HTML，
     #   探针会错判“反代完好”；POST 时静态 fallback 返 405，才与 SRS 的 4xx 可区分（见 §9.2）。
     resp="$(curl -s -m 5 -w '\n%{http_code}' -X POST -H 'Content-Type: application/sdp' \
-      --data 'x' "http://127.0.0.1:${WEB_PORT:-80}/rtc/v1/whep/?app=${RC_SRS_APP:-remote_control}&stream=hc_probe" 2>/dev/null || printf '\n000')"
+      --data 'x' "http://127.0.0.1:${WEB_PORT:-80}/rtc/v1/whep/?app=${RC_SRS_APP:-remote_control}&stream=${probe_stream}" 2>/dev/null || printf '\n000')"
     code="${resp##*$'\n'}"
     body="${resp%$'\n'*}"
     case "$code" in
@@ -950,30 +971,50 @@ check_video_chain() {
       201 | 200)
         record_result "WARN" "视频链路（同源 /rtc/）" "http=${code}：探针 offer 故意不可解析，正常应被 SRS 拒（400）；现在反而被接受，说明上游不是 SRS（旧版 srs 无 /rtc/ 路由时会静默回静态站）→ 人工看一眼 curl -s http://127.0.0.1:9090/api/v1/versions" ;;
       502 | 504)
-        record_result "FAIL" "视频链路（同源 /rtc/）" "http=${code}：nginx 连不上上游 srs:9090（最常见：srs 刚重建换 IP、而渲染副本仍是静态上游 → sudo docker restart hunter-web，根治见本项 f)；或渲染副本 config/nginx.conf 落后仓库 → cp + --force-recreate web-portal）" ;;
+        # ⚠ 不能直接判“反代断裂”（V1.21.7 实机误判点）：探针用的 stream=hc_probe **本来就不存在**，
+        #   而 SRS 对“目标流不存在”的 WHEP 请求是直接关连、不回 HTTP 响应——nginx 那一侧就记成 502。
+        #   所以必须做同形对照：拿同一个请求直连 srs:9090。
+        #     直连能拿到 4xx（SRS 正常应答）而走代理 502 ⇒ 反代真断裂（FAIL）
+        #     直连也不回 HTTP 响应（000）/同样 5xx ⇒ 502 由“流不存在”造成，反代其实是通的（WARN）
+        direct="$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST -H 'Content-Type: application/sdp' \
+          --data 'x' "$(srs_api_url "/rtc/v1/whep/?app=${RC_SRS_APP:-remote_control}&stream=${probe_stream}")" 2>/dev/null || printf '000')"
+        case "$direct" in
+          4* | 2* | 503)
+            record_result "FAIL" "视频链路（同源 /rtc/）" "http=${code}（探针 stream=${probe_stream}），但同形请求**直连 srs 返回 ${direct}** → 反代真断裂：首查容器内生效配置与渲染副本是否一致（sudo docker exec hunter-web nginx -T \| grep -A3 'location /rtc/'）与 srs 当前 IP；旧静态上游可 sudo docker restart hunter-web 顶一时，根治见本项 f)"
+            ;;
+          *)
+            record_result "WARN" "视频链路（同源 /rtc/）" "http=${code}（探针 stream=${probe_stream}），但**直连 srs 的同形请求也不返回 HTTP 响应（${direct}）**：SRS 对拿不到的流会直接关连，所以 502 不能单独判反代断裂。定案看 nginx 日志：connect() failed / no live upstreams = 真断裂；upstream prematurely closed = 只是流不存在 → sudo docker logs --since 5m hunter-web 2>&1 | grep -E '/rtc/\|connect\(\) failed\|no live upstreams\|prematurely closed'"
+            ;;
+        esac
+        ;;
       4*)
         if printf '%s' "$body" | grep -qi '<html'; then
           record_result "FAIL" "视频链路（同源 /rtc/）" "http=${code} 且响应体为 nginx 错误页 → /rtc/ location 未匹配（回退到静态 fallback，见《故障排查指南》§9.2）；检查挂载源 ${APP_DIR}/config/nginx.conf 而非仓库那份"
         else
-          record_result "PASS" "视频链路（同源 /rtc/）" "http=${code} 由 SRS 应答（探针 offer 故意不可解析，预期非 2xx）→ 反代链路完好"
+          record_result "PASS" "视频链路（同源 /rtc/）" "http=${code} 由 SRS 应答（探针 stream=${probe_stream}，offer 故意不可解析，预期非 2xx）→ 反代链路完好"
         fi
         ;;
       *) record_result "PASS" "视频链路（同源 /rtc/）" "http=${code}（上游已应答，反代链路完好）" ;;
     esac
   fi
 
-  # d) 当前活跃流：把“黑屏”在平台侧与车端侧之间切一刀
-  #    ⚠ 必须带 -L：SRS 会把 /api/v1/streams 302 到 /api/v1/streams/，不带就只拿到一行 `Redirect to …`，
-  #    既看不到流也看不出服务异常（V1.21.7 实机就因此漏做过定案）。
-  streams="$(curl -sL -m 5 "$(srs_api_url /api/v1/streams)" 2>/dev/null || true)"
+  # d) 活跃流 + 帧到达率：把“黑屏”在平台侧与车端侧之间切一刀（数据已在 c 前取好）
   if [ -z "$streams" ]; then
     record_result "WARN" "视频链路（SRS 活跃流）" "$(srs_api_url /api/v1/streams) 无响应（② 已定级），本项未判定"
+  elif [ -z "$names" ]; then
+    record_result "WARN" "视频链路（SRS 活跃流）" "SRS 当前**无活跃流**（推流已建连也不等于流已发布：RTMP 握手/发布失败时 TCP 仍 ESTAB）→ 先查 docker logs --since 5m hunter-srs；⚠ 刚做过 up -d --force-recreate srs / docker restart srs 的话本项为空是**预期的**：容器一重启会踢掉一切客户端连接，而车端 GStreamer/ffmpeg 不会自动重推，必须重开一次操控会话；若车端确认在推而这里仍为空，回到本项 a) 看是否推到了另一个实例"
   else
-    names="$(printf '%s' "$streams" | grep -o '"name":"[^"]*"' | sed -E 's/"name":"//; s/"$//' | tr '\n' ' ' | sed -E 's/ $//')"
-    if [ -z "$names" ]; then
-      record_result "WARN" "视频链路（SRS 活跃流）" "SRS 当前**无活跃流**（推流已建连也不等于流已发布：RTMP 握手/发布失败时 TCP 仍 ESTAB）→ 先查 docker logs --since 5m hunter-srs；⚠ 刚做过 up -d --force-recreate srs / docker restart srs 的话本项为空是**预期的**：容器一重启会踢掉一切客户端连接，而车端 GStreamer/ffmpeg 不会自动重推，必须重开一次操控会话；若车端确认在推而这里仍为空，回到本项 a) 看是否推到了另一个实例"
+    # 有流 ≠ 有数据。V1.21.7 实机见过：publish.active=true、video H264 640x480、recv_bytes 已到 50KB，
+    #   但 frames=0、kbps.recv_30s=0——车端 RTMP 握手与 publish 都成功、SRS 也拿到了序列头，
+    #   之后一帧没送；只报“在流”会把这种情形误判成“平台/ICE 问题”，故这里做 2s 复采算新增帧。
+    sleep 2
+    f2="$(curl -sL -m 5 "$(srs_api_url /api/v1/streams)" 2>/dev/null | grep -oE '"frames":[0-9]+' | head -n1 | cut -d: -f2 || true)"
+    if [ -z "$frames_now" ] || [ -z "$f2" ]; then
+      record_result "PASS" "视频链路（SRS 活跃流）" "在流：${names}（帧数读不到：frames=${frames_now:-?}，未判到达率）"
+    elif [ "$f2" -le "$frames_now" ] 2>/dev/null; then
+      record_result "FAIL" "视频链路（SRS 活跃流）" "流在但**2s 内没有新帧**（frames ${frames_now}→${f2}，recv_30s=${kbps_now:-?}）：车端 RTMP 已 publish、SRS 也收到了序列头，但之后没送视频帧 ⇒ 0 fps 的根在车端“编码→推流”这一段，不在反代与 ICE；查车端 rtmpsink 是否真在写、管道是否卡在下游背压/编码器限流"
     else
-      record_result "PASS" "视频链路（SRS 活跃流）" "在流：${names}（浏览器拉不到画时应查 candidate/ICE 与 8000udp，而非“没推流”）"
+      record_result "PASS" "视频链路（SRS 活跃流）" "在流：${names}，2s 新增 $((f2 - frames_now)) 帧（frames ${frames_now}→${f2}）→ 车端到 SRS 这段有数据；浏览器仍 0 fps 就查 candidate/ICE 与 8000udp（webrtc-internals 看 candidate pair）"
     fi
   fi
 
