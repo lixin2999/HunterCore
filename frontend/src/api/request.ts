@@ -24,6 +24,7 @@ import {
   clearStoredSession,
   getRefreshToken,
   getStoredSession,
+  isAccessTokenExpiring,
   setStoredSession,
   toExpiresAt,
 } from '@/utils/storage'
@@ -33,6 +34,14 @@ export const SESSION_EXPIRED_EVENT = 'hunter:session-expired'
 
 /** 请求默认超时（服务端 P95 ≤ 200ms，前端留足余量） */
 const REQUEST_TIMEOUT_MS = 20_000
+
+/**
+ * 前置刷新窗口（V1.21.11 方案 A）：Access Token 剩余有效期不足 60s 即主动刷新。
+ * 根因：网关 session:{user_id} 键 TTL 与 Access Token exp 同刻写入同刻过期
+ * （auth_service 以 jwt_access_token_expire_minutes*60 落库），等到收到 1003 再刷新时
+ * 会话键已消失 → /user/refresh 恒 401(1003)，Refresh Token 7d 有效期形同虚设。
+ */
+const TOKEN_REFRESH_AHEAD_MS = 60_000
 
 /** 带重试标记的请求配置 */
 type RetryableConfig = AxiosRequestConfig & { __retried?: boolean }
@@ -44,10 +53,20 @@ const http: AxiosInstance = axios.create({
   headers: { Accept: 'application/json' },
 })
 
-http.interceptors.request.use((config: InternalAxiosRequestConfig) => {
+http.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
   const session = getStoredSession()
   if (session?.access_token) {
-    config.headers.Authorization = `Bearer ${session.access_token}`
+    // V1.21.11 方案 A：临期前置刷新（单飞共享一次刷新），保证 /user/refresh 发生在
+    // 网关会话键存活期内；刷新失败则仍以原 Token 放行，由响应拦截器 1003 兜底路径处理。
+    let token = session.access_token
+    if (isAccessTokenExpiring(TOKEN_REFRESH_AHEAD_MS) && getRefreshToken()) {
+      try {
+        token = await refreshAccessToken()
+      } catch {
+        token = session.access_token
+      }
+    }
+    config.headers.Authorization = `Bearer ${token}`
   }
   // trace_id：服务端契约 TraceRequestId 头，便于 Jaeger/日志关联
   if (!config.headers['X-Request-ID']) {

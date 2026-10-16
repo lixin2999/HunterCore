@@ -1147,27 +1147,60 @@ upgrade_nginx_rtc_upstream() {
   return 0
 }
 
+# sync_runtime_config <repo_src> <runtime_target> <desc> [normalize_sed]
+# V1.21.10：把仓库 infra/deploy/config/* 同步到运行时副本 ${APP_DIR}/config/*。
+# 背景（本次 502 真因）：容器挂载的是运行时副本（--project-directory . + 配置优先级 APP_DIR/config/ >
+#   infra/deploy/config/），而旧版 ensure_nginx_conf/ensure_srs_conf 在副本已存在时只打“幂等”日志、
+#   **从不回同步仓库** → git pull 改了 infra/deploy/config/ 对运行容器完全无效（nginx 仍用旧上游 → WHEP 502）。
+# 行为：仓库源缺失→告警跳过；目标缺失→创建；目标存在且一致→幂等无操；目标存在但异→备份后覆盖并提示重启。
+# normalize_sed（可选）：比较前对两侧都应用的 sed（用于忽略 srs.conf 的 candidate 部署期替换，避免每次误判差异）。
+sync_runtime_config() {
+  local src="$1" target="$2" desc="$3" norm_sed="${4:-}"
+  if [ ! -f "$src" ]; then
+    log_warn "仓库源缺失：${src}（跳过 ${desc} 同步；若运行容器报配置相关错误请核对仓库）"
+    return 0
+  fi
+  local same=0
+  if [ -f "$target" ]; then
+    if [ -n "$norm_sed" ]; then
+      cmp -s <(sed -E "$norm_sed" "$src") <(sed -E "$norm_sed" "$target") && same=1
+    else
+      cmp -s "$src" "$target" && same=1
+    fi
+  fi
+  if [ "$same" -eq 1 ]; then
+    log_info "${desc} 运行时副本与仓库一致（幂等，无需同步）"
+    return 0
+  fi
+  if [ -f "$target" ]; then
+    local backup="${target}.bak-$(date +%Y%m%d%H%M%S)"
+    cp -a "$target" "$backup"
+    install -m 0644 "$src" "$target"
+    log_success "${desc} 运行时副本已从仓库更新：${target}（原副本已备份：${backup}）"
+    log_warn "  ⚠ 单文件 bind mount：需重启/重建受影响容器才生效（nginx→docker restart hunter-web；srs→--force-recreate srs）"
+  else
+    install -m 0644 "$src" "$target"
+    log_success "${desc} 运行时副本已从仓库创建：${src} → ${target}"
+  fi
+  return 0
+}
+
 # ensure_nginx_conf：确保 ${APP_DIR}/config/nginx.conf 就位（优先部署包，其次仓库 infra/deploy）
 ensure_nginx_conf() {
   local target="${APP_DIR}/config/nginx.conf"
-  local candidates=("${APP_DIR}/infra/deploy/config/nginx.conf")
-  if [ -f "$target" ]; then
-    chmod 644 "$target"
-    log_info "Nginx 配置已就位：${target}（幂等）"
-    upgrade_nginx_rtc_upstream "$target"
-    return 0
+  local src="${APP_DIR}/infra/deploy/config/nginx.conf"
+  # V1.21.10：无论目标是否存在，都先从仓库同步（修复旧版“已就位就永不更新”导致 nginx.conf 变更不生效）
+  sync_runtime_config "$src" "$target" "Nginx 配置"
+  if [ ! -f "$target" ]; then
+    log_warn "未找到 Nginx 配置（期望 ${target}）：web-portal 容器将启动失败"
+    log_warn "请从仓库 infra/deploy/config/nginx.conf 复制到 ${APP_DIR}/config/ 后重试"
+    return 1
   fi
-  local src
-  for src in "${candidates[@]}"; do
-    if [ -f "$src" ]; then
-      install -m 0644 "$src" "$target"
-      log_success "已复制 Nginx 配置：${src} → ${target}"
-      return 0
-    fi
-  done
-  log_warn "未找到 Nginx 配置（期望 ${target}）：web-portal 容器将启动失败"
-  log_warn "请从仓库 infra/deploy/config/nginx.conf 复制到 ${APP_DIR}/config/ 后重试"
-  return 1
+  chmod 644 "$target"
+  # 兜底：仓库源缺失但运行副本仍是旧静态 /rtc/ 上游时，就地升级为运行期解析（V1.21.7）；
+  #   仓库已为 V1.21.10 变量写法时本函数 grep 命中直接返回 0（空操作）。
+  upgrade_nginx_rtc_upstream "$target"
+  return 0
 }
 
 # ensure_srs_conf：确保 ${APP_DIR}/config/srs.conf 就位并把 rtc_server.candidate 对到可达 IP（compose 以文件方式挂载）
@@ -1192,17 +1225,15 @@ ensure_srs_conf() {
       return 1
     fi
   fi
+  # V1.21.10：无论目标是否存在，都先从仓库同步（修复旧版“已就位就永不更新”导致 srs.conf 变更不生效）。
+  # candidate 行是部署期替换（仓库为 $SERVER_IP 占位符、运行时为真实 IP），比较前用归一化 sed 抹去其值，
+  #   避免每次因 candidate 不同而误判差异；同步后下方 candidate 对齐逻辑会把占位符重写为真实 IP。
+  local src="${APP_DIR}/infra/deploy/config/srs.conf"
+  sync_runtime_config "$src" "$target" "SRS 配置" 's|^([[:space:]]*candidate[[:space:]]+).*|\1|'
   if [ ! -f "$target" ]; then
-    local src="${APP_DIR}/infra/deploy/config/srs.conf"
-    if [ ! -f "$src" ]; then
-      log_error "未找到 srs.conf 模板（期望 ${src}）：srs 容器将启动失败"
-      log_error "请从仓库 infra/deploy/config/srs.conf 复制到 ${target} 后重试"
-      return 1
-    fi
-    install -m 0644 "$src" "$target"
-    log_success "已复制 SRS 配置：${src} → ${target}"
-  else
-    log_info "SRS 配置已就位：${target}（幂等）"
+    log_error "未找到 srs.conf 模板（期望 ${src}）：srs 容器将启动失败"
+    log_error "请从仓库 infra/deploy/config/srs.conf 复制到 ${target} 后重试"
+    return 1
   fi
   if [ -z "$candidate_ip" ]; then
     log_error "candidate 目标 IP 为空（SERVER_IP 与 SRS_CANDIDATE_IP 均未设置），无法写入 srs.conf"
