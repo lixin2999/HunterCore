@@ -676,6 +676,11 @@ services:
       RC_SRS_WHIP_URL: ${RC_SRS_WHIP_URL:-http://${SERVER_IP}/rtc/v1/whip/}
       RC_PUBLIC_WS_BASE_URL: ${RC_PUBLIC_WS_BASE_URL:-ws://${SERVER_IP}/ws/remote}
       RC_STUN_URLS: ${RC_STUN_URLS:-}
+      # V1.21.11：TURN 透传（t5 跨网段落地硬前提；共享密钥短期凭据模式见 config.py rc_turn_*）。
+      # 默认空=不启用；启用需另部署 coturn 并在 .env 填 RC_TURN_URLS/RC_TURN_SHARED_SECRET（后者优先经 Secret 注入）
+      RC_TURN_URLS: ${RC_TURN_URLS:-}
+      RC_TURN_USERNAME: ${RC_TURN_USERNAME:-}
+      RC_TURN_SHARED_SECRET: ${RC_TURN_SHARED_SECRET:-}
       RC_COMMAND_HZ: ${RC_COMMAND_HZ:-20}
       RC_MAX_SPEED_MPS: ${RC_MAX_SPEED_MPS:-2.0}
     ports:
