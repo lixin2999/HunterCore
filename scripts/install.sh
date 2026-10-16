@@ -237,7 +237,28 @@ port_owned_by_project() {
     printf '%s' "$(printf '%s' "$owners" | tr '\n' ',' | sed 's/,$//')"
     return 0
   fi
+  # V1.21.11：SRS host 网络模式下宿主直绑的 1935/8000 等端口不在 docker ps 的 PORTS 列，
+  #   上面识别不到 → 续跑被误报「非本项目进程占用」（V1.21.10 切 host 模式的新缺口）
+  port_owned_by_host_mode_srs "$port" && return 0
   return 1
+}
+
+# host 模式 SRS 端口归属豁免（判据与 common.sh hc_foreign_srs_pids 同源：按 cgroup 区分容器进程）：
+#   hunter-srs 存在且 NetworkMode=host，且该端口监听进程的 /proc/<pid>/cgroup 含其容器 ID → 视为本项目占用。
+port_owned_by_host_mode_srs() {
+  local port="$1" cid nm pid
+  cid="$(docker inspect -f '{{.Id}}' hunter-srs 2>/dev/null)" || return 1
+  [ -n "$cid" ] || return 1
+  nm="$(docker inspect -f '{{.HostConfig.NetworkMode}}' hunter-srs 2>/dev/null)"
+  [ "$nm" = "host" ] || return 1
+  pid="$(ss -Hltnp "sport = :${port}" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+  if [ -z "$pid" ]; then
+    pid="$(ss -Hlunp "sport = :${port}" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+  fi
+  [ -n "$pid" ] || return 1
+  grep -q "$cid" "/proc/${pid}/cgroup" 2>/dev/null || return 1
+  printf 'hunter-srs（host 网络模式）'
+  return 0
 }
 
 check_public_ports() {
