@@ -291,14 +291,14 @@ services:
         limits: { cpus: "2", memory: 4G }     # 生产用分布式多节点纠删码；单节点仅供开发测试
 
   # ---------- 6. SRS 5.0（RTMP 1935 / WebRTC 8000udp / HTTP API 9090；远程操控视频流） ----------
+  # V1.21.10：切换为 host 网络模式。根因：Docker bridge 的 UDP DNAT/MASQUERADE 导致
+  # WebRTC STUN 回包在浏览器侧被丢弃（ICE 永不通过 → DTLS 无法开始 → 视频永远黑屏）。
+  # host 模式下 SRS 直接绑定宿主 1935/8000udp/9090，无 NAT，candidate 即本机 IP。
   srs:
     image: ossrs/srs:5
     container_name: hunter-srs
     command: ["./objs/srs", "-c", "conf/srs.conf"]
-    ports:
-      - "${SRS_RTMP_PORT:-1935}:1935"           # 车端 RTMP 推流
-      - "${SRS_RTC_UDP_PORT:-8000}:8000/udp"    # WebRTC 媒体
-      - "127.0.0.1:${SRS_HTTP_API_HOST_PORT:-9090}:9090"   # HTTP API（V1.21.3 收回 127.0.0.1：浏览器信令已经同源 /rtc/ 反代（实机验证通过），此端口仅供宿主机健康检查/诊断（health-check ② 探的就是 127.0.0.1:9090）；web-portal nginx 经 hunter-net 直达 srs:9090，不受宿主绑定影响）
+    network_mode: host
     volumes:
       - ./config/srs.conf:/usr/local/srs/conf/srs.conf:ro
       # ⚠ 禁止挂载到 /usr/local/srs/objs：该目录含镜像自带的 srs 二进制（command ./objs/srs），
@@ -306,13 +306,13 @@ services:
     healthcheck:
       # 不依赖 curl/wget：ossrs/srs:5 镜像内无 curl（用 curl 探针会永远 unhealthy，
       # 并经 depends_on srs: service_healthy 阻断 remote-control）。改用 bash /dev/tcp 直接探 HTTP API 端口（9090）。
+      # host 模式下容器共享宿主网络栈，127.0.0.1:9090 即 SRS 自身。
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9090' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 15s
     restart: unless-stopped
-    networks: [hunter-net]
     logging: *default-logging
     deploy:
       resources:
@@ -675,7 +675,7 @@ services:
       RC_SRS_WHEP_URL: ${RC_SRS_WHEP_URL:-http://${SERVER_IP}/rtc/v1/whep/}
       RC_SRS_WHIP_URL: ${RC_SRS_WHIP_URL:-http://${SERVER_IP}/rtc/v1/whip/}
       RC_PUBLIC_WS_BASE_URL: ${RC_PUBLIC_WS_BASE_URL:-ws://${SERVER_IP}/ws/remote}
-      RC_STUN_URLS: ${RC_STUN_URLS:-stun:${SERVER_IP}:8000}
+      RC_STUN_URLS: ${RC_STUN_URLS:-}
       RC_COMMAND_HZ: ${RC_COMMAND_HZ:-20}
       RC_MAX_SPEED_MPS: ${RC_MAX_SPEED_MPS:-2.0}
     ports:

@@ -653,7 +653,11 @@ step_1_system_init() {
     }
     log_success "ufw 已启用（默认拒绝入向 / 允许出向）"
   fi
-  log_warn "注意：Docker 发布端口会绕过 ufw；'仅内网' 端口（5432/5433/6379/9092/8081-8085/8088/9090）依赖 compose 绑定 127.0.0.1（docs/01 §3.4）"
+  log_warn "注意：Docker 发布端口会绕过 ufw；'仅内网' 端口（5432/5433/6379/9092/8081-8085/8088）依赖 compose 绑定 127.0.0.1（docs/01 §3.4）"
+  # V1.21.10：SRS host 网络模式下 9090 直接绑定宿主 0.0.0.0，nginx 容器经 bridge 网关(172.28.0.1)访问，
+  # 需放行 Docker 子网到 9090 的 INPUT（否则 /rtc/ 反代超时）。
+  ufw allow from 172.28.0.0/16 to any port 9090 proto tcp comment 'SRS HTTP-API from docker bridge' >/dev/null 2>&1 || \
+    log_warn "ufw 规则添加失败：172.28.0.0/16 → 9090/tcp，请手工执行"
 
   log_success "系统初始化完成（apt/时区/主机名/hunter 用户/内核参数/swap/ufw）"
 }

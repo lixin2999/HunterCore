@@ -769,7 +769,12 @@ class SessionService:
         )
 
     def _build_ice_servers(self) -> list[IceServer]:
-        """ICE 服务器列表（STUN 列表 + TURN 短期凭证；契约 IceServer 描述）。"""
+        """ICE 服务器列表（STUN 列表 + TURN 短期凭证；契约 IceServer 描述）。
+
+        V1.21.10：当 STUN/TURN 均未配置时（局域网部署常见），返回一个无害的本地回环 STUN 条目
+        以满足契约 minItems=1 约束。浏览器尝试连接 127.0.0.1:3478 失败后仅使用 host candidate，
+        不影响 ICE 连通性检查。
+        """
         settings = self._settings
         servers = [IceServer(urls=[url]) for url in settings.rc_stun_url_list]
         turns = settings.rc_turn_url_list
@@ -783,6 +788,9 @@ class SessionService:
                     credential_ttl_s=settings.rc_turn_credential_ttl_s,
                 )
             )
+        if not servers:
+            # 局域网部署无 STUN/TURN：占位条目满足 schema，浏览器自动回退到 host candidate
+            servers.append(IceServer(urls=["stun:127.0.0.1:3478"]))
         return servers
 
     def _build_webrtc(self, vehicle_id: str, session_id: str) -> WebRtcConnectionInfo:
