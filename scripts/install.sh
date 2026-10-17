@@ -69,6 +69,9 @@ UFW_RULES=(
   "9000/tcp:MinIO S3 API"
   # G-07：MinIO Console 不再对外（仅 127.0.0.1:9001，SSH 隧道访问），不检查/不开放 9001
   "9093/tcp:Kafka SASL_SSL (vehicle)"
+  # V1.21.13：车端 REST mTLS 入口（web-portal nginx 8443）；与 9093 同属车端可达端口，不做 IP 过滤，
+  # 设备面由 api-gateway 侧 mTLS 证书重验 + vehicle_id==CN 强校验把关（非白名单/异 CA 一律 1001）。
+  "8443/tcp:vehicle REST mTLS (presign/complete)"
   "1935/tcp:SRS RTMP"
   "8000/udp:SRS WebRTC"
 )
