@@ -134,6 +134,14 @@ class HunterBaseConfig(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_secure: bool = False
 
+    # 车端可达的 MinIO 公网/外网地址（host:port 或含 scheme 的完整 URL）。
+    # 不配置时回落到 minio_endpoint（适用于单机部署车端与平台同网段的情形）。
+    # 生产/K8s 部署中，服务侧走集群内 DNS（minio_endpoint），车端侧走此外部地址，
+    # 二者分离可避免预签名 URL 中嵌入无法路由的集群内地址。
+    # 典型值（单机部署）：SERVER_IP:9000 或 minio.hunter-core.example.com:9000
+    # 典型值（K8s 部署）：minio.hunter-core.example.com（前面挂 Ingress/LB，443 走 TLS）
+    minio_public_endpoint: str | None = None
+
     @property
     def minio_endpoint_url(self) -> str:
         """boto3/aioboto3 的 endpoint_url 必须含 scheme。
@@ -145,6 +153,20 @@ class HunterBaseConfig(BaseSettings):
         if "://" in self.minio_endpoint:
             return self.minio_endpoint
         return f"{'https' if self.minio_secure else 'http'}://{self.minio_endpoint}"
+
+    @property
+    def minio_public_endpoint_url(self) -> str:
+        """生成预签名 URL 时使用的外部 endpoint（车端可达地址）。
+
+        配置了 MINIO_PUBLIC_ENDPOINT 时使用该地址，否则回落到 minio_endpoint_url。
+        scheme 补全规则与 minio_endpoint_url 一致（依据 minio_secure）。
+        """
+        ep = self.minio_public_endpoint
+        if not ep:
+            return self.minio_endpoint_url
+        if "://" in ep:
+            return ep
+        return f"{'https' if self.minio_secure else 'http'}://{ep}"
 
     # ---------- 认证与安全 ----------
     # 生产环境必须通过 K8s Secret 覆盖，禁止使用默认值上线（启动时强校验，见下）

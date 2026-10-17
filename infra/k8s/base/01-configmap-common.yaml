@@ -51,6 +51,12 @@ data:
   # ---------- MinIO（S3 兼容对象存储） ----------
   MINIO_ENDPOINT: "minio.hunter-core.svc.cluster.local:9000"
   MINIO_SECURE: "true"                          # 数据安全：全链路 TLS
+  # 车端可达的 MinIO 外部地址（预签名 URL 中的 host 使用此值）。
+  # 需通过 Ingress / LoadBalancer 将 MinIO 9000 端口暴露到集群外，再填入对应地址。
+  # 例：minio.hunter-core.example.com（TLS，端口 443，Ingress passthrough）
+  #      或 10.0.0.10:9000（LB ExternalIP，无 TLS 时需同步将 MINIO_SECURE 改为 false）
+  # ⚠ 此值会直接出现在下发给车端的预签名 URL 里，必须是车端 4G/5G 或 WiFi 网络可路由地址
+  MINIO_PUBLIC_ENDPOINT: "CHANGE_ME_MINIO_PUBLIC_ENDPOINT"
 
   # ---------- 认证与安全（JWT 密钥本体在 Secret） ----------
   JWT_ALGORITHM: "HS256"

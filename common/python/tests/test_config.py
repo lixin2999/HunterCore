@@ -47,6 +47,50 @@ def test_cors_origins_list() -> None:
     assert settings.cors_origins_list == ["http://a.com", "http://b.com"]
 
 
+# ---------------------------------------------------------------------------
+# MinIO 双 endpoint（服务侧连接 vs 预签名 URL host，车端可达地址分离）
+# ---------------------------------------------------------------------------
+def test_minio_endpoint_url_scheme_completion() -> None:
+    """共享配置下发 host:port，直传 boto3 前需补全 scheme（依 minio_secure）。"""
+    plain = DemoSettings(minio_endpoint="minio:9000", minio_secure=False)
+    assert plain.minio_endpoint_url == "http://minio:9000"
+    tls = DemoSettings(minio_endpoint="minio:9000", minio_secure=True)
+    assert tls.minio_endpoint_url == "https://minio:9000"
+    already = DemoSettings(minio_endpoint="http://minio:9000")
+    assert already.minio_endpoint_url == "http://minio:9000"
+
+
+def test_minio_public_endpoint_falls_back_to_internal() -> None:
+    """未配置/空白 MINIO_PUBLIC_ENDPOINT → 预签名 host 回落内部地址（单机同网段兼容）。"""
+    unset = DemoSettings(minio_endpoint="minio:9000")
+    assert unset.minio_public_endpoint_url == "http://minio:9000"
+    blank = DemoSettings(minio_endpoint="minio:9000", minio_public_endpoint="")
+    assert blank.minio_public_endpoint_url == "http://minio:9000"
+
+
+def test_minio_public_endpoint_used_for_presign_url() -> None:
+    """配置后预签名 host 与内部连接地址分离；scheme 补全规则与内部一致。"""
+    settings = DemoSettings(
+        minio_endpoint="minio:9000",
+        minio_public_endpoint="203.0.113.10:9000",
+        minio_secure=False,
+    )
+    assert settings.minio_endpoint_url == "http://minio:9000"  # 服务侧不变
+    assert settings.minio_public_endpoint_url == "http://203.0.113.10:9000"
+    tls = DemoSettings(
+        minio_endpoint="minio:9000",
+        minio_public_endpoint="minio.example.com",
+        minio_secure=True,
+    )
+    assert tls.minio_public_endpoint_url == "https://minio.example.com"
+    explicit = DemoSettings(
+        minio_endpoint="minio:9000",
+        minio_public_endpoint="https://minio.example.com:443",
+        minio_secure=True,
+    )
+    assert explicit.minio_public_endpoint_url == "https://minio.example.com:443"  # 已含 scheme 原样
+
+
 def test_jwt_token_ttl_matches_spec() -> None:
     """Access Token 30min（G-04 决策①收紧，原设计文档 2h）/ Refresh Token 7d。"""
     settings = DemoSettings()

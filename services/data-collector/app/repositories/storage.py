@@ -31,19 +31,32 @@ ROSBAG_RETENTION_TAG_KEY = "hunter-retention"
 
 
 class MinioStorage:
-    """MinIO 对象存储访问（预签名/元数据/列举/分片合并）。"""
+    """MinIO 对象存储访问（预签名/元数据/列举/分片合并）。
 
-    def __init__(self, client: Any) -> None:
-        self._client = client
+    双 client 设计：
+    - ``_client``：内部连接（MINIO_ENDPOINT，集群内地址），用于 head/get/list/tagging 等服务侧操作。
+    - ``_presign_client``：预签名专用（MINIO_PUBLIC_ENDPOINT，车端可达外部地址），
+      保证生成的上传/下载 URL 中 host 为车端可路由地址。
+      未配置 MINIO_PUBLIC_ENDPOINT 时两者指向相同 endpoint（回落，单机部署同网段情形）。
+    """
+
+    def __init__(self, internal_client: Any, presign_client: Any | None = None) -> None:
+        self._client = internal_client
+        # 预签名 client：未传则回落到内部 client（向后兼容测试注入单 client 的场景）
+        self._presign_client = presign_client if presign_client is not None else internal_client
 
     # ---------- 单次直传（PUT 预签名） ----------
 
     def presign_put(self, bucket: str, key: str, content_type: str | None = None) -> str:
-        """PUT 预签名 URL（上传有效期 1 小时，MinIO 契约）。"""
+        """PUT 预签名 URL（上传有效期 1 小时，MinIO 契约）。
+
+        使用 _presign_client（endpoint = MINIO_PUBLIC_ENDPOINT）确保 URL 中的 host
+        为车端可达的外部地址。
+        """
         params: dict[str, Any] = {"Bucket": bucket, "Key": key}
         if content_type:
             params["ContentType"] = content_type
-        return self._client.generate_presigned_url(
+        return self._presign_client.generate_presigned_url(
             ClientMethod="put_object",
             Params=params,
             ExpiresIn=settings.presigned_upload_expire_seconds,
@@ -56,8 +69,11 @@ class MinioStorage:
         upload_id: str,
         part_number: int,
     ) -> str:
-        """分片上传预签名 URL（有效期与单次直传一致：1 小时）。"""
-        return self._client.generate_presigned_url(
+        """分片上传预签名 URL（有效期与单次直传一致：1 小时）。
+
+        使用 _presign_client 确保分片 URL 中的 host 为车端可达地址。
+        """
+        return self._presign_client.generate_presigned_url(
             ClientMethod="upload_part",
             Params={
                 "Bucket": bucket,
@@ -69,7 +85,11 @@ class MinioStorage:
         )
 
     def create_multipart_upload(self, bucket: str, key: str, content_type: str | None) -> str:
-        """创建分片上传会话，返回 upload_id。"""
+        """创建分片上传会话，返回 upload_id。
+
+        通过内部 client 在 MinIO 服务端创建会话；upload_id 与对象路径绑定，
+        与后续 presign_upload_part 使用哪个 endpoint 无关。
+        """
         args: dict[str, Any] = {"Bucket": bucket, "Key": key}
         if content_type:
             args["ContentType"] = content_type
@@ -82,8 +102,11 @@ class MinioStorage:
     # ---------- 下载（GET 预签名，支持 Range 分片下载） ----------
 
     def presign_get(self, bucket: str, key: str) -> str:
-        """GET 预签名 URL（下载有效期 15 分钟，支持 Range）。"""
-        return self._client.generate_presigned_url(
+        """GET 预签名 URL（下载有效期 15 分钟，支持 Range）。
+
+        使用 _presign_client 确保下载 URL 中的 host 为车端/浏览器可达地址。
+        """
+        return self._presign_client.generate_presigned_url(
             ClientMethod="get_object",
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=settings.presigned_download_expire_seconds,
@@ -233,16 +256,20 @@ class MinioStorage:
 
 async def get_storage() -> MinioStorage:
     """FastAPI 依赖：构建 MinioStorage（同步 boto3 客户端，调用经 to_thread 包装）。"""
-    return MinioStorage(await asyncio.to_thread(_build_sync_client))
+    internal_client = await asyncio.to_thread(_build_sync_client, settings.minio_endpoint_url)
+    # 预签名专用客户端：endpoint 替换为车端可达的公网/外网地址（MINIO_PUBLIC_ENDPOINT）。
+    # 若未配置 MINIO_PUBLIC_ENDPOINT，则与 internal_client 指向同一地址（回落逻辑见 property）。
+    presign_client = await asyncio.to_thread(_build_sync_client, settings.minio_public_endpoint_url)
+    return MinioStorage(internal_client=internal_client, presign_client=presign_client)
 
 
-def _build_sync_client() -> Any:
+def _build_sync_client(endpoint_url: str) -> Any:
     """构建 boto3 S3 客户端（同步；构造为纯 CPU 操作，亦在 to_thread 中执行）。"""
     import boto3  # 局部导入：避免模块导入期建立连接
 
     return boto3.client(
         "s3",
-        endpoint_url=settings.minio_endpoint_url,
+        endpoint_url=endpoint_url,
         aws_access_key_id=settings.minio_access_key,
         aws_secret_access_key=settings.minio_secret_key,
         region_name=settings.minio_region,

@@ -1201,6 +1201,7 @@ x-hunter-service:
     - KAFKA_SECURITY_PROTOCOL
     - KAFKA_SASL_MECHANISM
     - MINIO_ENDPOINT
+    - MINIO_PUBLIC_ENDPOINT
     - MINIO_ACCESS_KEY
     - MINIO_SECRET_KEY
     - MINIO_BUCKET_RAW_DATA
@@ -1306,6 +1307,7 @@ x-hunter-file-upload-flow:
     range_download: true
     max_part_count: 10000
     parts_url_count_limit: "与 part_count 一致（最多 10000）"
+    url_host: "预签名 URL 的 host 取 MINIO_PUBLIC_ENDPOINT（车端可达外部地址，服务侧连接仍走 MINIO_ENDPOINT）；未配置时回落 MINIO_ENDPOINT，适用于单机同网段部署。⚠ K8s/分离网络下必须配置，否则车端 PUT 直传无法路由（预签名 URL 嵌入集群内 DNS 地址）"
   bucket_mapping:
     point_cloud: hunter-raw-data
     camera_image: hunter-raw-data

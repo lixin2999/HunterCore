@@ -64,6 +64,9 @@ x-business-env: &business-env
   MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
   MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
   MINIO_SECURE: ${MINIO_SECURE:-false}
+  # 车端可达的外部地址：仅用于生成预签名 URL 的 host（服务侧连接仍走 MINIO_ENDPOINT）。
+  # 留空回落到 MINIO_ENDPOINT（单机同网段情形）；生产必须填车端可路由地址，否则车端直传超时
+  MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-}
   # JWT / 认证
   JWT_SECRET_KEY: ${JWT_SECRET_KEY}
   # G-02：网关→后端身份头 HMAC 签名密钥（网关与 5 个后端服务共用；≥ 32 字节随机串）
