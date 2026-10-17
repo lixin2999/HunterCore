@@ -33,6 +33,20 @@ class FleetOverview(BaseModel):
     )
 
 
+class UndeterminedGroup(BaseModel):
+    """本轮无法确定滞后的消费组（V1.21.14：把成因一并透出，不再只给一个组名）。"""
+
+    group: str = Field(description="消费组 ID")
+    cause: str = Field(
+        description=(
+            "受控成因码：group_not_found / no_committed_offsets / watermark_unavailable / "
+            "offset_fetch_failed（与日志事件 `consumer_group_lag_undetermined` 的 cause= 同源）"
+        )
+    )
+    cause_text: str = Field(description="成因的人话短标签（看板逐行渲染，如「组不存在」）")
+    hint: str = Field(description="一句处置提示（悬浮提示/巡检文案），说清下一步查什么")
+
+
 class PipelineStats(BaseModel):
     """数据管道块（遥测样本 / 入库延迟 / 消费滞后 / DLQ 水位）。"""
 
@@ -55,11 +69,12 @@ class PipelineStats(BaseModel):
         default_factory=dict,
         description="按消费组的消息滞后总数（group → lag）；**仅包含确有提交位点的组**，无位点组见 unknown_groups",
     )
-    unknown_groups: list[str] = Field(
+    unknown_groups: list[UndeterminedGroup] = Field(
         default_factory=list,
         description=(
-            "本轮无法确定滞后的消费组（组不存在 / 从未提交位点 / 水位不可取）；"
-            "这些组**不在** kafka_consumer_lag 中，绝不可读成「零积压」（V1.19.14）"
+            "本轮无法确定滞后的消费组（组不存在 / 从未提交位点 / 水位不可取），带成因与处置提示；"
+            "这些组**不在** kafka_consumer_lag 中，绝不可读成「零积压」（V1.19.14 定口径、"
+            "V1.21.14 补成因）"
         ),
     )
     dlq_messages: dict[str, int] = Field(default_factory=dict, description="DLQ（dead_letter_queue）消息堆积数")

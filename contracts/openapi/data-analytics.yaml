@@ -1004,13 +1004,31 @@ components:
             `unknown_groups` 里，含义是「无法判定」，**不得读成零积压**。
         unknown_groups:
           type: array
-          items: { type: string }
           description: |
-            本轮无法确定滞后的消费组（组不存在 / 从未提交位点 / 末端水位不可取）。
+            本轮无法确定滞后的消费组（组不存在 / 从未提交位点 / 末端水位不可取 / 位点读取失败）。
             Kafka 对不存在的组返回空分区列表而**不报错**，旧实现遂把它折算成 `lag=0`（假绿）；
-            现一律列入本字段。成因（group_not_found / no_committed_offsets / watermark_unavailable）
-            记在服务日志事件 `consumer_group_lag_undetermined`。运维对账以
-            `kafka-consumer-groups.sh --describe`（本仓推荐走 `kafka_groups_cli` 封装）为准。
+            现一律列入本字段，并且**带成因**（V1.21.14）：只看组名时运维分不出「作业从未提交位点」
+            与「位点读不到」，面板对四个组只能显示同一个「未判定」，形同「没有数据」。
+            `cause` 为受控码，与日志事件 `consumer_group_lag_undetermined` 的 `cause=` 同源；
+            `cause_text`/`hint` 是服务端翻好的人话（展示层只渲染，不得重新判定成因）。
+            运维对账以 `kafka-consumer-groups.sh --describe`（本仓推荐走 `kafka_groups_cli` 封装）为准。
+          items:
+            type: object
+            required: [group, cause, cause_text, hint]
+            properties:
+              group:
+                type: string
+                description: 消费组 ID
+              cause:
+                type: string
+                enum: [group_not_found, no_committed_offsets, watermark_unavailable, offset_fetch_failed]
+                description: 受控成因码（枚举即受控词表；新增码须同步服务端 `UNKNOWN_GROUP_CAUSES`）
+              cause_text:
+                type: string
+                description: 成因的人话短标签（看板逐行渲染，如「组不存在」）
+              hint:
+                type: string
+                description: 一句处置提示（悬浮提示/巡检文案），说清下一步查什么
         dlq_messages:
           type: object
           additionalProperties: { type: integer }
@@ -2011,7 +2029,7 @@ x-hunter-dashboard-contract:
         - "data_collector.vehicle_telemetry（只读账号，count / 近似计数，按 time 分区裁剪）"
         - "Redis analytics:ingest_latency（只读：入库延迟 P95，由本服务 Flink data_quality_monitor 写入）"
       limits: "单块聚合时间窗上限 ANALYTICS_QUERY_MAX_RANGE_DAYS(7d)；禁止全表精确 COUNT（hypertable 开销）"
-      lag_semantics: "【已结案 V1.19.14】消费组滞后只返「已确证」的组：Kafka 对不存在的组 / 从未提交位点的组都返回空分区列表而不报错，因此这类组**不写 lag=0**，而是列入 `unknown_groups`（两者互斥）；`available=false` 仅用于 Kafka 整体不可达，与「读不到位点」分属两条降级路径（旧行为：看板永远显示各组零积压）"
+      lag_semantics: "【已结案 V1.19.14；成因面 V1.21.14】消费组滞后只返「已确证」的组：Kafka 对不存在的组 / 从未提交位点的组都返回空分区列表而不报错，因此这类组**不写 lag=0**，而是列入 `unknown_groups`（两者互斥）；`available=false` 仅用于 Kafka 整体不可达，与「读不到位点」分属两条降级路径（旧行为：看板永远显示各组零积压）。推定未判定组的成因时必须**同时带上成因码与处置提示**（`cause`/`cause_text`/`hint`，受控四值：group_not_found / no_committed_offsets / watermark_unavailable / offset_fetch_failed）——只给组名的形态已在现场被读成「没有数据」：四个组同显「未判定」，运维无法区分「作业从未提交位点」与「位点读不到」"
       ingest_latency: "遥测入库延迟 P95【已结案 pending #10】：采用 Kafka 时间戳差估算——Flink data_quality_monitor 统计（车端 timestamp ↔ Kafka 到达时间差，60s 事件时间滚动窗口车队级 P95）写 Redis 指标键 analytics:ingest_latency，本服务只读展示；键缺失/过期（作业停摆 TTL 兜底）→ ingest_latency_ms_p95=null（不伪造、不取 Prometheus）。【V1.19.21 可观测性】null 不再无信息：写端逐条计数丢弃路径，有输入但无有效样本时按 60s 诊断节拍写一份 p95_ms=null + reason + dropped 的诊断载荷（**绝不用 null 载荷覆盖已有 P95**），本服务将其与「键不存在=作业未产出」两档一并透出到 `ingest_latency_reason`"
     algorithm:
       sources:

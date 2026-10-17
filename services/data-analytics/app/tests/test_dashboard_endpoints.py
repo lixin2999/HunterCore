@@ -128,21 +128,23 @@ async def test_dashboard_all_degraded_service_unavailable(clean_state: None) -> 
 
 @pytest.mark.asyncio
 async def test_dashboard_pipeline_unknown_groups_are_not_reported_as_zero(clean_state: None) -> None:
-    """组不存在/无提交位点 → 不进 kafka_consumer_lag、只进 unknown_groups（V1.19.14 第七类假绿）。
+    """组不存在/无提交位点 → 不进 kafka_consumer_lag、只进 unknown_groups，且**带成因**。
 
-    旧行为：四个组全部回 `0` 且 `available=true`，运维把「什么都没消费过」读成「零积压」。
-    现要求两者**互斥**（同一组不得同时出现在映射与清单里），且 Kafka 仍可达 ⇒ 不算块降级。
+    V1.19.14（第七类假绿）：旧行为是四个组全部回 `0` 且 `available=true`，运维把「什么都没消费过」
+    读成「零积压」；现要求两者**互斥**，且 Kafka 仍可达 ⇒ 不算块降级。
+    V1.21.14（未判定也要能归因）：只给组名时看板对四个组只能显示同一个「未判定」（现场被读成
+    「没有数据」），故每个条目必须带受控成因码 + 人话文案 + 处置提示。
     """
     _seed_dashboard(
         pipeline=FakePipelineRepository(
             points=1000,
             lag={"data-collector-telemetry": 7},
-            unknown_groups=[
-                "data-analytics-telemetry-alert",
-                "data-analytics-telemetry-algo",
-                "data-analytics-telemetry-raw",
-                "data-analytics-algorithm-metrics",
-            ],
+            unknown_groups={
+                "data-analytics-telemetry-alert": "no_committed_offsets",
+                "data-analytics-telemetry-algo": "group_not_found",
+                "data-analytics-telemetry-raw": "no_committed_offsets",
+                "data-analytics-algorithm-metrics": "watermark_unavailable",
+            },
             dlq={},
             averages={},
             ingest_latency=None,
@@ -154,8 +156,17 @@ async def test_dashboard_pipeline_unknown_groups_are_not_reported_as_zero(clean_
     pipeline = resp.json()["data"]["pipeline"]
     assert pipeline["available"] is True, "Kafka 可达而仅缺位点，不应把整块标为降级"
     assert pipeline["kafka_consumer_lag"] == {"data-collector-telemetry": 7}
-    assert "data-analytics-telemetry-algo" in pipeline["unknown_groups"]
-    assert not set(pipeline["kafka_consumer_lag"]) & set(pipeline["unknown_groups"]), "映射与清单必须互斥"
+    by_group = {item["group"]: item for item in pipeline["unknown_groups"]}
+    assert set(by_group) == {
+        "data-analytics-telemetry-alert",
+        "data-analytics-telemetry-algo",
+        "data-analytics-telemetry-raw",
+        "data-analytics-algorithm-metrics",
+    }
+    assert by_group["data-analytics-telemetry-algo"]["cause"] == "group_not_found"
+    assert by_group["data-analytics-telemetry-algo"]["cause_text"], "必须给看板可直接渲染的人话"
+    assert by_group["data-analytics-telemetry-algo"]["hint"], "必须给一句可执行的下一步"
+    assert not set(pipeline["kafka_consumer_lag"]) & set(by_group), "映射与清单必须互斥"
     assert 0 not in pipeline["kafka_consumer_lag"].values(), "未判定的组不得以 lag=0 混进映射"
 
 

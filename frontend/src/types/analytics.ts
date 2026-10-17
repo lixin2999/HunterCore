@@ -95,6 +95,18 @@ export interface FleetOverview {
   by_status?: Record<string, number>
 }
 
+/** 无法确定滞后的消费组条目（V1.21.14：带成因与处置提示，不再只有一个组名） */
+export interface UndeterminedGroup {
+  /** 消费组 ID */
+  group: string
+  /** 受控成因码：group_not_found / no_committed_offsets / watermark_unavailable / offset_fetch_failed */
+  cause: string
+  /** 成因的人话短标签（看板逐行渲染，如「组不存在」） */
+  cause_text: string
+  /** 一句处置提示（悬浮提示用），说清下一步查什么 */
+  hint: string
+}
+
 /** 数据管道指标 */
 export interface PipelineStats {
   available: boolean
@@ -110,7 +122,7 @@ export interface PipelineStats {
   /** Kafka consumer lag（仅包含确有提交位点的组，V1.19.14） */
   kafka_consumer_lag?: Record<string, number>
   /** 无法确定滞后的消费组（不存在 / 无位点 / 水位不可取）——不在 lag 映射里，不得当零积压 */
-  unknown_groups?: string[]
+  unknown_groups?: UndeterminedGroup[]
   dlq_messages?: Record<string, unknown>
 }
 

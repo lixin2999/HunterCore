@@ -46,6 +46,50 @@ LATENCY_REASON_LABELS: dict[str, str] = {
 
 
 @dataclass(frozen=True)
+class UndeterminedCause:
+    """未判定成因的受控文案（V1.21.14）。
+
+    ``label`` 是图上逐行渲染的短标签（≤6 字，与组名同一行），``hint`` 是一句「怎么办」
+    （悬浮提示/巡检文案用）。两者都属**展示文案**：判定与归因一律在探测侧
+    (:meth:`KafkaLagProbe._lag_sync`)，展示层只做查表，不得重新推断成因。
+    """
+
+    label: str
+    hint: str
+
+
+#: 未判定成因 → 受控文案（V1.21.14）。**码与 :meth:`KafkaLagProbe._lag_sync` 的 ``cause=`` 日志同源**，
+#: 新增成因必须两边同步（契约用例锁定键集）。背景：V1.19.14 把「组不存在 / 从未提交位点 / 水位不可取」
+#: 从 lag 映射里剔出后，看板只拿到一串组名 ⇒ 面板对同一批组永远只显示「未判定」，运维看不出
+#: 「作业压根没跑」与「作业在跑但位点读不到」的区别（现场实录：四个组全灰、形同「没有数据」）。
+UNKNOWN_GROUP_CAUSES: dict[str, UndeterminedCause] = {
+    "group_not_found": UndeterminedCause(
+        label="组不存在",
+        hint="该消费组从未在集群上注册（作业从未提交过位点）：查作业是否 RUNNING（flink list -a）"
+        "与提交脚本 submit-flink-jobs.sh，再看该组对应的消费方是否真的在跑",
+    ),
+    "no_committed_offsets": UndeterminedCause(
+        label="从未提交位点",
+        hint="组已存在但一个分区都没提交位点：作业未完成首批消费/写库，或位点已被 "
+        "offsets.retention.minutes 清理（本组不可读成零积压）",
+    ),
+    "watermark_unavailable": UndeterminedCause(
+        label="水位不可取",
+        hint="有提交位点但末端水位一个都取不到（分区 leader 不可达/超时）：本组不可读成零积压",
+    ),
+    "offset_fetch_failed": UndeterminedCause(
+        label="位点读取失败",
+        hint="读取该组位点抛错（协调器未就绪/超时/ACL）：本组不可读成零积压，先看服务日志里的异常堆栈",
+    ),
+}
+
+
+def undetermined_cause(code: str) -> UndeterminedCause:
+    """把成因码翻成受控文案（未知码原样回显——绝不猜、也不给「零积压」这类默认结论）。"""
+    return UNKNOWN_GROUP_CAUSES.get(code, UndeterminedCause(label=code, hint=code))
+
+
+@dataclass(frozen=True)
 class IngestLatencyReading:
     """入库延迟读数（值 + 诊断）；两者可同时为空（键不存在 = 作业从未产出）。"""
 
@@ -66,11 +110,13 @@ class PipelineSource(Protocol):
         """窗口内算法指标均值（失败返回 None）。"""
         ...
 
-    async def consumer_lag(self) -> tuple[dict[str, int], list[str]] | None:
+    async def consumer_lag(self) -> tuple[dict[str, int], dict[str, str]] | None:
         """按消费组的消息滞后（失败返回 None）。
 
-        成功时返回 ``(group → lag 映射, 未判定组清单)``：**未进映射的组一律不可读成「零积压」**
-        （组不存在 / 从未提交位点 / 水位不可取，见 :meth:`KafkaLagProbe._lag_sync`）。
+        成功时返回 ``(group → lag 映射, group → 未判定成因码)``：**未进映射的组一律不可读成
+        「零积压」**（组不存在 / 从未提交位点 / 水位不可取，见 :meth:`KafkaLagProbe._lag_sync`）。
+        成因码是受控词表 :data:`UNKNOWN_GROUP_CAUSES` 的键（V1.21.14：过去只返回组名，展示层
+        无法区分「作业没跑」与「位点读不到」）。
         """
         ...
 
@@ -270,7 +316,7 @@ class KafkaLagProbe:
                 inventory.add(str(name))
         return inventory
 
-    def _lag_sync(self) -> tuple[dict[str, int], list[str]]:
+    def _lag_sync(self) -> tuple[dict[str, int], dict[str, str]]:
         """同步读取各消费组提交位点与末端水位差（仅阻塞工作线程，不阻塞事件循环）。
 
         confluent-kafka（2.16 实测）的 ``list_consumer_group_offsets`` 单次仅支持
@@ -282,12 +328,17 @@ class KafkaLagProbe:
         对拼错的组名同样不抛错），旧实现遂逐组 ``result[group] = 0``，看板永远显示「各组零延迟」
         （V1.19.11 登记为待办③，现场兑现于 V1.19.13 实录：四个组 ``--describe`` 全部
         ``does not exist``，看板却回四个 ``0``）。现把「无位点」「水位全取不到」「位点读取失败」
-        三类一律归入第二个返回值（未判定组清单），不再进入 lag 映射。
+        三类一律归入第二个返回值，不再进入 lag 映射。
+
+        ℞ V1.21.14（未判定也要能归因）：第二个返回值是 ``group → 成因码``（受控词表
+        :data:`UNKNOWN_GROUP_CAUSES`）而非裸组名——只给组名时看板对四个组只能显示同一个
+        「未判定」，运维分不出「作业从未提交位点」与「位点读不到」，形同「没有数据」。
+        判定与归因留在本方法内，展示层只查表翻译。
         """
         admin = AdminClient(self._conf)
         consumer = Consumer(self._conf)
         result: dict[str, int] = {}
-        unknown: list[str] = []
+        unknown: dict[str, str] = {}
         try:
             inventory = self._group_inventory(admin)
             for group in self._groups:
@@ -296,17 +347,17 @@ class KafkaLagProbe:
                     offsets = next(iter(futmap.values())).result(timeout=self._timeout)
                 except Exception:  # 单组位点失败不阻塞其余消费组探测（带异常上下文便于定位）
                     logger.exception("consumer_group_offset_fetch_failed", group=group)
-                    unknown.append(group)
+                    unknown[group] = "offset_fetch_failed"
                     continue
                 partitions = list(getattr(offsets, "partitions", None) or [])
                 if not partitions:
-                    logger.info(
-                        "consumer_group_lag_undetermined",
-                        group=group,
-                        cause="group_not_found" if inventory is not None and group not in inventory
-                        else "no_committed_offsets",
+                    cause = (
+                        "group_not_found"
+                        if inventory is not None and group not in inventory
+                        else "no_committed_offsets"
                     )
-                    unknown.append(group)
+                    logger.info("consumer_group_lag_undetermined", group=group, cause=cause)
+                    unknown[group] = cause
                     continue
                 total_lag = 0
                 measured = 0
@@ -324,8 +375,10 @@ class KafkaLagProbe:
                     base = low if committed in (None, OFFSET_INVALID) else committed
                     total_lag += max(0, high - base)
                 if not measured:  # 有位点却一个水位都取不到：与「零积压」无关，同样不得写 0
-                    logger.info("consumer_group_lag_undetermined", group=group, cause="watermark_unavailable")
-                    unknown.append(group)
+                    logger.info(
+                        "consumer_group_lag_undetermined", group=group, cause="watermark_unavailable"
+                    )
+                    unknown[group] = "watermark_unavailable"
                     continue
                 result[group] = total_lag
             return result, unknown
@@ -355,7 +408,7 @@ class KafkaLagProbe:
         finally:
             consumer.close()
 
-    async def consumer_lag(self) -> tuple[dict[str, int], list[str]] | None:
+    async def consumer_lag(self) -> tuple[dict[str, int], dict[str, str]] | None:
         try:
             return await asyncio.wait_for(asyncio.to_thread(self._lag_sync), timeout=self._timeout + 1.0)
         except Exception:  # 探测失败降级为 None（上层按不可用处理），不向请求路径抛出；带堆栈便于定位真因
@@ -466,7 +519,7 @@ class PipelineRepository:
     async def algorithm_averages(self, start_ts: float, end_ts: float) -> dict[str, float] | None:
         return await self._db.algorithm_averages(start_ts, end_ts)
 
-    async def consumer_lag(self) -> tuple[dict[str, int], list[str]] | None:
+    async def consumer_lag(self) -> tuple[dict[str, int], dict[str, str]] | None:
         return await self._kafka.consumer_lag()
 
     async def dlq_depth(self) -> dict[str, int] | None:

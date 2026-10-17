@@ -11,7 +11,11 @@ from hunter_common.logging import get_logger
 from app.config import Settings
 from app.repositories.events import EventSource
 from app.repositories.fleet import VEHICLE_STATES, FleetSource
-from app.repositories.pipeline import IngestLatencyReading, PipelineSource
+from app.repositories.pipeline import (
+    IngestLatencyReading,
+    PipelineSource,
+    undetermined_cause,
+)
 from app.repositories.vehicles import VehicleSource
 from app.schemas.dashboard import (
     TIME_RANGE_SECONDS,
@@ -21,6 +25,7 @@ from app.schemas.dashboard import (
     EventStats,
     FleetOverview,
     PipelineStats,
+    UndeterminedGroup,
 )
 
 logger = get_logger("app.services.dashboard")
@@ -55,6 +60,21 @@ def ingest_latency_diagnostic(reading: IngestLatencyReading) -> str | None:
     if reading.reason is not None:
         return reading.reason
     return LATENCY_KEY_ABSENT_REASON
+
+
+def undetermined_groups(probe: dict[str, str]) -> list[UndeterminedGroup]:
+    """把探测侧 ``group → 成因码`` 翻成响应体条目（V1.21.14：**只查表，不重新判定**）。
+
+    成因码 → 人话文案由 :func:`app.repositories.pipeline.undetermined_cause` 唯一提供；
+    本函数只负责组装（顺序即探测顺序，看板按此逐行渲染）。
+    """
+    items: list[UndeterminedGroup] = []
+    for group, cause in probe.items():
+        copy = undetermined_cause(cause)
+        items.append(
+            UndeterminedGroup(group=group, cause=cause, cause_text=copy.label, hint=copy.hint)
+        )
+    return items
 
 
 class DashboardService:
@@ -131,7 +151,9 @@ class DashboardService:
         )
         # ℞ V1.19.14：探测侧已把「组不存在 / 无提交位点」从 lag 映射里剔出，此处只负责原样透出；
         #   lag_probe is None 才是「Kafka 整体不可达」（走降级），与「读不到位点」不是同一回事。
-        lag_map, unknown_groups = lag_probe if lag_probe is not None else ({}, [])
+        # ℞ V1.21.14：第二个返回值由「组名清单」升级为「组 → 成因码」，此处翻成带处置提示的条目，
+        #   看板才能在页面上说清「为什么未判定」（过去四个组只显示同一个「未判定」，形同没数据）。
+        lag_map, unknown = lag_probe if lag_probe is not None else ({}, {})
         reasons: list[str] = []
         if points is None:
             reasons.append("database unavailable")
@@ -146,7 +168,7 @@ class DashboardService:
             ingest_latency_ms_p95=latency.p95_ms,
             ingest_latency_reason=ingest_latency_diagnostic(latency),
             kafka_consumer_lag=lag_map,
-            unknown_groups=unknown_groups,
+            unknown_groups=undetermined_groups(unknown),
             dlq_messages=dlq or {},
         )
 

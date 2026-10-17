@@ -33,7 +33,8 @@ from hunter_common.exceptions import ErrorCode
 from app.config import Settings
 from app.core.error_handlers import HTTP_STATUS_BY_CODE
 from app.main import app
-from app.schemas.dashboard import PipelineStats
+from app.repositories.pipeline import UNKNOWN_GROUP_CAUSES
+from app.schemas.dashboard import PipelineStats, UndeterminedGroup
 
 ROOT = Path(__file__).resolve().parents[4]
 CONTRACT_PATH = ROOT / "contracts" / "openapi" / "data-analytics.yaml"
@@ -992,27 +993,43 @@ def test_kafka_lag_probe_monitors_real_contract_groups() -> None:
 
 
 def test_dashboard_pipeline_lag_separates_unknown_groups_from_zero(contract: dict[str, Any]) -> None:
-    """「组不存在」必须与「零积压」分两个字段表达（V1.19.14，第七类假绿）。
+    """「组不存在」必须与「零积压」分两个字段表达（V1.19.14，第七类假绿）；未判定必须带成因（V1.21.14）。
 
     Kafka 的 ``list_consumer_group_offsets`` 对不存在的组返回**空分区列表且不报错**，
     只改组名清单（V1.19.11）并不能防住同类问题——下次拼错又是四个 0。
     所以返回体本身必须能区分两者，且契约/实现两边得一起改。
+
+    V1.21.14：只给组名时看板对四个组只能显示同一个「未判定」（现场被读成「没有数据」），
+    故条目升级为对象（group/cause/cause_text/hint），且**成因枚举必须与服务端受控词表逐项同形**。
     """
     props = contract["components"]["schemas"]["PipelineStats"]["properties"]
     unknown = props["unknown_groups"]
-    assert unknown["type"] == "array" and unknown["items"] == {"type": "string"}
+    assert unknown["type"] == "array"
+    item = unknown["items"]
+    assert item["type"] == "object", "未判定条目必须带成因（不再是裸组名）"
+    assert set(item["required"]) == {"group", "cause", "cause_text", "hint"}
+    assert set(item["properties"]["cause"]["enum"]) == set(UNKNOWN_GROUP_CAUSES), (
+        "契约里的成因枚举与服务端受控词表必须同形（新增成因码漏改一边即红）"
+    )
     assert "不得读成零积压" in props["kafka_consumer_lag"]["description"], "lag 映射的语义边界必须在契约里说清"
     assert "unknown_groups" in unknown["description"] or "无法确定滞后" in unknown["description"]
 
-    # 实现侧同形：字段存在且默认空列表（新字段不得变成必填）
+    # 实现侧同形：字段存在且默认空列表（新字段不得变成必填），条目形状与契约一致
     assert "unknown_groups" in PipelineStats.model_fields
     assert PipelineStats.model_fields["unknown_groups"].default_factory is not None
     assert PipelineStats(available=True).unknown_groups == []
+    fields = set(UndeterminedGroup.model_fields)
+    assert fields == {"group", "cause", "cause_text", "hint"}
+    for code, copy in UNKNOWN_GROUP_CAUSES.items():
+        assert copy.label and copy.hint, f"{code} 的人话文案不得为空"
 
     # 降级路径不得合并：available=false 只给“Kafka 不可达”，不能拿块降级当“无位点”信号
     semantics = contract["x-hunter-dashboard-contract"]["blocks"]["pipeline"]["lag_semantics"]
     assert "空分区列表" in semantics and "unknown_groups" in semantics
     assert "整体不可达" in semantics, "必须区分「Kafka 不可达」与「读不到位点」两条降级路径"
+    assert "cause" in semantics and "没有数据" in semantics, (
+        "只给组名会被读成「没有数据」这件事必须写进契约口径（V1.21.14）"
+    )
 
 
 def test_k8s_manifest_matches_service_meta(contract: dict[str, Any]) -> None:

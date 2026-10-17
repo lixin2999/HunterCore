@@ -35,12 +35,15 @@
 数据访问边界（`contracts/database/er.md` 第 3 节）：只读例外仅 `data_collector.vehicle_telemetry`
 （`hunter_analytics_ro` 账号）；events / scenes / vehicles 一律经服务 REST；不新增 DB 表与 Redis 键模式。
 
-看板 `pipeline` 块读数口径（V1.19.14）：`kafka_consumer_lag` **只包含确有提交位点的消费组**；
-组不存在 / 从未提交位点 / 末端水位不可取三类一律进 `unknown_groups`（与 lag 映射互斥）。
+看板 `pipeline` 块读数口径（V1.19.14，V1.21.14 补成因）：`kafka_consumer_lag` **只包含确有提交位点的消费组**；
+组不存在 / 从未提交位点 / 末端水位不可取 / 位点读取失败四类一律进 `unknown_groups`（与 lag 映射互斥）。
 原因：Kafka 的 `list_consumer_group_offsets` 对不存在的组返回**空分区列表而不报错**，折算成 `0`
-就是“零积压”假绿（历史上的幽灵组名、拆组后从未跑动的组，都是这么被报成 0 的）。成因（`group_not_found` /
-`no_committed_offsets` / `watermark_unavailable`）记在日志事件 `consumer_group_lag_undetermined`；
-`available=false` 只用于“Kafka 整体不可达”，与“读不到位点”不混用。
+就是“零积压”假绿（历史上的幽灵组名、拆组后从未跑动的组，都是这么被报成 0 的）。
+`unknown_groups` 每条是**对象** `{group, cause, cause_text, hint}`（V1.21.14 起，此前为纯字符串）：
+`cause` 为受控四值枚举 `group_not_found` / `no_committed_offsets` / `watermark_unavailable` /
+`offset_fetch_failed`，`cause_text` 是前端逐行渲染的人话短标签，`hint` 是一句处置提示（悬浮显示）；
+前端按成因展示（不再把“未判定”画成零长灰条）。同一成因码也记在日志事件
+`consumer_group_lag_undetermined` 的 `cause=`；`available=false` 只用于“Kafka 整体不可达”，与“读不到位点”不混用。
 
 ## 本地运行
 

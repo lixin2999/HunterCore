@@ -280,7 +280,13 @@ const eventTypeOption = computed<EChartsOption>(() => {
   }
 })
 
-/** Kafka 消费组积压（known lag 渐变柱 + unknown_groups 显式标注「未判定」，不当零） */
+/**
+ * Kafka 消费组积压（known lag 渐变柱 + unknown_groups 按**成因**逐行标注「未判定」，不当零）
+ *
+ * V1.21.14：未判定行**不再画成 0 长度灰条**（与「一条积压为 0 的组」视觉上无法区分，且全组未判定时
+ * 坐标轴退化成 0~1，整块被读成「没有数据」）。改为：灰底行带 + 行内写着成因人话
+ * （后端 `cause_text`），成因与处置提示在悬浮里给全；一条可测的滞后都没有时直接收起数值轴。
+ */
 const kafkaLagOption = computed<EChartsOption>(() => {
   const lag = pipeline.value?.kafka_consumer_lag ?? {}
   const unknown = pipeline.value?.unknown_groups ?? []
@@ -291,13 +297,20 @@ const kafkaLagOption = computed<EChartsOption>(() => {
       itemStyle: { color: horizontalGradient('#a78bfa'), borderRadius: [0, 6, 6, 0] },
       real: true,
     })),
-    ...unknown.map(() => ({
+    ...unknown.map((item) => ({
       value: 0,
-      itemStyle: { color: '#475569', borderRadius: [0, 6, 6, 0] },
+      itemStyle: { color: 'transparent' },
       real: false,
+      cause: item.cause_text || item.cause || '成因未取到',
+      hint: item.hint || '',
     })),
   ]
-  const categories = [...knownEntries.map(([group]) => group), ...unknown.map((group) => `${group} ?`)]
+  // 未判定行的类目名整体压暗（确定性做法：不依赖类目轴上按行铺灰底的坐标换算——
+  // markArea 在类目轴上按小数下标铺行带会错位，实测行带会盖到相邻两行）
+  const categories = [
+    ...knownEntries.map(([group]) => group),
+    ...unknown.map((item) => ({ value: item.group, textStyle: { color: '#8298b3' } })),
+  ]
   return {
     animationDuration: 700,
     animationDurationUpdate: 600,
@@ -305,21 +318,33 @@ const kafkaLagOption = computed<EChartsOption>(() => {
       trigger: 'axis',
       axisPointer: { type: 'shadow' },
       formatter: (params: unknown) => {
-        const list = params as { name: string; value: number; data?: { real?: boolean } }[]
+        const list = params as {
+          name: string
+          value: number
+          data?: { real?: boolean; cause?: string; hint?: string }
+        }[]
         const item = list[0]
         if (!item) {
           return ''
         }
-        return item.data?.real === false
-          ? `${item.name}<br/>滞后：未判定（组不存在 / 无提交位点 / 水位不可取）`
-          : `${item.name}<br/>滞后：${item.value}`
+        if (item.data?.real !== false) {
+          return `${item.name}<br/>滞后：${item.value}`
+        }
+        const detail = [item.data?.hint].filter(Boolean).join('')
+        return (
+          `${item.name}<br/>滞后：未判定（${item.data?.cause ?? '成因未取到'}）` +
+          `${detail ? `<br/>${detail}` : ''}<br/>⚠ 未判定 ≠ 零积压`
+        )
       },
     },
     grid: { left: 12, right: 32, top: 16, bottom: 24, containLabel: true },
     xAxis: {
       type: 'value',
+      // 一条可测的滞后都没有时，数值轴只是噪声（旧渲染的 0~1 空轴正是「没有数据」的观感来源）
+      show: knownEntries.length > 0,
+      max: knownEntries.length > 0 ? undefined : 1,
       axisLabel: { color: '#6f849f' },
-      splitLine: { lineStyle: { color: 'rgba(120,150,190,0.12)' } },
+      splitLine: { show: knownEntries.length > 0, lineStyle: { color: 'rgba(120,150,190,0.12)' } },
     },
     yAxis: {
       type: 'category',
@@ -337,13 +362,28 @@ const kafkaLagOption = computed<EChartsOption>(() => {
           position: 'right',
           color: '#cfe0f5',
           formatter: (params: unknown) => {
-            const item = params as { data?: { real?: boolean } }
-            return item.data?.real === false ? '未判定' : String((params as { value: number }).value)
+            const item = params as { value: number; data?: { real?: boolean; cause?: string } }
+            // 未判定行把成因写在行内（以前这里只有一个「未判定」，四个组同形 ⇒ 读成「没有数据」）
+            return item.data?.real === false
+              ? `未判定 · ${item.data.cause ?? '成因未取到'}`
+              : String(item.value)
           },
         },
       },
     ],
   }
+})
+
+/** 面板抬头口径（V1.21.14）：全组未判定时不能只留一句静态说明，得先说出「有几个组、为什么」 */
+const kafkaLagNote = computed<string>(() => {
+  const known = Object.keys(pipeline.value?.kafka_consumer_lag ?? {}).length
+  const unknown = (pipeline.value?.unknown_groups ?? []).length
+  if (!unknown) {
+    return '灰条「未判定」= 无提交位点/组不存在，非零积压'
+  }
+  return known === 0
+    ? `全部 ${unknown} 个消费组未判定（成因见行内；未判定 ≠ 零积压）`
+    : `${unknown} 个组未判定（成因见行内；未判定 ≠ 零积压）`
 })
 
 /** 入库延迟趋势（面积图 + SLO 1000ms 标线，数据来自轮询环形缓冲） */
@@ -526,7 +566,7 @@ onMounted(() => {
       <div class="dash__panel dash__panel--half">
         <div class="dash__panel-head">
           Kafka 消费组积压
-          <span class="dash__panel-note">灰条「未判定」= 无提交位点/组不存在，非零积压</span>
+          <span class="dash__panel-note">{{ kafkaLagNote }}</span>
         </div>
         <EchartBase :option="kafkaLagOption" :loading="loading" :not-merge="false" height="300px" />
       </div>
