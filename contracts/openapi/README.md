@@ -60,7 +60,8 @@
 ## 数据采集契约要点（data-collector.yaml）
 
 - **业务端点**（推导清单，`x-hunter-endpoints` 逐条登记依据与风险 —— 12.2 节未随仓库提供）：
-  `GET /api/v1/data/telemetry`（附录 D 限流端点）、`GET /api/v1/data/events`、`GET /api/v1/data/events/{event_id}`、
+  `GET /api/v1/data/telemetry`（附录 D 限流端点）、`GET /api/v1/data/events`、`GET /api/v1/data/events/stats`、
+  `GET /api/v1/data/events/{event_id}`、
   `POST /api/v1/data/events/{event_id}/acknowledge`、`GET /api/v1/data/files`、
   `POST /api/v1/data/files/presign`、`POST /api/v1/data/files/complete`
 - **数据结构**：遥测查询响应（`TelemetrySample` + 六段嵌套）与 5.3.3 节消息结构逐字段一致，

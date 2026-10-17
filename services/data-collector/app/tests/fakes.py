@@ -235,6 +235,26 @@ class FakeEventRepository:
             event.acknowledge_time = datetime.fromtimestamp(1724035200.0, tz=UTC)
         return event
 
+    async def stats(
+        self,
+        vehicle_id: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> tuple[int, int, dict[str, int], dict[str, int]]:
+        """精确聚合替身（与真实仓储同语义：total / 未确认 / 未确认分级 / 按类型）。"""
+        events = [
+            event
+            for event in self.events.values()
+            if vehicle_id is None or event.vehicle_id == vehicle_id
+        ]
+        by_type: dict[str, int] = {}
+        by_level: dict[str, int] = {}
+        for event in events:
+            by_type[event.event_type.value] = by_type.get(event.event_type.value, 0) + 1
+            if not event.acknowledged:
+                by_level[event.event_level.value] = by_level.get(event.event_level.value, 0) + 1
+        return len(events), sum(by_level.values()), by_level, by_type
+
 
 def make_event(
     *,

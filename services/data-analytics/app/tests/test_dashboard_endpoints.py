@@ -20,10 +20,7 @@ from app.tests.fakes import (
 class UnavailableEventClient(FakeEventClient):
     """事件块不可用替身（模拟 data-collector 宕机）。"""
 
-    async def count(self, **kwargs: Any) -> int | None:
-        return None
-
-    async def fetch_latest(self, **kwargs: Any) -> list[dict[str, Any]] | None:
+    async def stats(self, **kwargs: Any) -> dict[str, Any] | None:
         return None
 
 
@@ -91,9 +88,16 @@ async def test_dashboard_all_blocks_available(clean_state: None) -> None:
     assert algorithm["planning_latency_ms_avg"] == pytest.approx(40.0)
     events = data["events"]
     assert events["total"] == 3
-    assert events["warning"] == 1
+    # V1.21.16 定口径：info/warning/critical = **未确认**各等级（不是窗口内各级总数）。
+    # 种子：warning(已确认) / info(已确认) / critical(未确认) ⇒ 只有 critical 计入未确认分级。
+    assert events["info"] == 0
+    assert events["warning"] == 0
     assert events["critical"] == 1
     assert events["unacknowledged"] == 1
+    assert (
+        events["unacknowledged"]
+        == events["info"] + events["warning"] + events["critical"]
+    )
     assert events["by_type"] == {"harsh_braking": 1, "battery_low": 1, "collision_warning": 1}
 
 

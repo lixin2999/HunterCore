@@ -11,6 +11,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from botocore.exceptions import ParamValidationError
+from botocore.session import get_session
+from botocore.validate import ParamValidator
+
 from app.repositories import storage as storage_module
 from app.repositories.storage import MinioStorage
 
@@ -100,3 +104,52 @@ async def test_get_storage_builds_clients_per_endpoint(monkeypatch: Any) -> None
     store2 = await storage_module.get_storage()
     assert endpoints == ["http://minio:9000", "http://minio:9000"]
     assert store2._presign_client.name == "http://minio:9000"  # type: ignore[attr-defined]
+
+
+class _SdkValidatingClient:
+    """按**真实 botocore 服务模型**校验 ``list_objects_v2`` 入参的客户端替身。
+
+    未知入参（如把 v1 的 ``Marker`` 传给 v2）即抛 ``ParamValidationError``——模拟真实
+    SDK 客户端行为。V1.21.16 形状门禁：替身不得靠「收得下就算通过」掩盖入参漂移。
+    """
+
+    def __init__(self) -> None:
+        self.list_calls: list[dict[str, Any]] = []
+        self._shape = (
+            get_session().get_service_model("s3").operation_model("ListObjectsV2").input_shape
+        )
+
+    def list_objects_v2(self, **kwargs: Any) -> dict[str, Any]:
+        report = ParamValidator().validate(kwargs, self._shape)
+        if report.has_errors():
+            raise ParamValidationError(report=report.generate_report())
+        self.list_calls.append(kwargs)
+        return {
+            "Contents": [
+                {"Key": "rosbag/a.bag", "Size": 1, "ETag": '"e1"'},
+                {"Key": "rosbag/b.bag", "Size": 2, "ETag": '"e2"'},
+            ],
+            "IsTruncated": True,  # v2 无 NextMarker → 实现回退末项 Key 作游标
+        }
+
+
+def test_list_objects_v2_cursor_is_accepted_by_real_sdk_model() -> None:
+    """回归（V1.21.16）：「加载更多（游标分页）」不得 500。
+
+    实机判据：首页（无游标）正常、带 marker 的第二页恒 500「服务器内部错误」；根因是旧实现
+    把 v1 的 ``Marker`` 传给 ``list_objects_v2``（botocore 判未知入参 → ParamValidationError）。
+    """
+    client = _SdkValidatingClient()
+    store = MinioStorage(internal_client=client)
+
+    store.list_objects("hunter-rosbag", "rosbag/", 100)  # 首页：无游标
+    # 加载更多：带游标必须被真实 SDK 模型接受（旧实现此处抛 ParamValidationError → 500）
+    items, truncated, next_marker = store.list_objects(
+        "hunter-rosbag", "rosbag/", 100, marker="rosbag/a.bag"
+    )
+
+    assert client.list_calls[-1]["StartAfter"] == "rosbag/a.bag"
+    assert "Marker" not in client.list_calls[-1]
+    assert truncated is True
+    assert next_marker == "rosbag/b.bag"  # v2 无 NextMarker → 回退末项 Key
+    assert [item["object_key"] for item in items] == ["rosbag/a.bag", "rosbag/b.bag"]

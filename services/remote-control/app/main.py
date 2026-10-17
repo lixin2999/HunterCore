@@ -49,6 +49,7 @@ from app.services.history_service import HistoryService
 from app.services.session_reaper import SessionReaper
 from app.services.session_service import SessionService
 from app.services.vehicle_view import VehicleViewReader
+from app.services.video_sealer import LocalDvrRecordingSource, VideoSealer
 from app.services.ws_hub import WsHub
 
 logger = get_logger("app.main")
@@ -98,6 +99,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.geofence = GeofenceChecker(
         fence_repo=app.state.fence_repo, redis=app.state.redis, settings=settings
     )
+    # 录像封存（V1.21.16）：SRS DVR 产物 → hunter-video；未配置来源目录则禁用（sidecar size_bytes=0）
+    video_sealer: VideoSealer | None = None
+    if settings.rc_video_source_dir:
+        video_sealer = VideoSealer(
+            storage=app.state.storage,
+            source=LocalDvrRecordingSource(
+                settings.rc_video_source_dir,
+                app=settings.rc_srs_app,
+                stream_prefix=settings.rc_srs_stream_prefix,
+                container=settings.rc_video_container,
+            ),
+            settings=settings,
+        )
+    else:
+        logger.warning(
+            "video_sealing_disabled",
+            reason="RC_VIDEO_SOURCE_DIR 未配置，录像不会封存（播放录像将返回 3001）",
+        )
     app.state.session_service = SessionService(
         redis=app.state.redis,
         vehicle_view=app.state.vehicle_view,
@@ -106,6 +125,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         storage=app.state.storage,
         settings=settings,
         geofence=app.state.geofence,
+        video_sealer=video_sealer,
     )
     app.state.history_service = HistoryService(
         storage=app.state.storage, settings=settings

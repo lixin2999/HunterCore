@@ -187,6 +187,11 @@ class FakeVideoStorage:
             raise RuntimeError("storage unavailable")
         self.objects[key] = json.dumps(doc, ensure_ascii=False).encode("utf-8")
 
+    async def put_video(self, key: str, data: bytes, content_type: str = "video/mp4") -> None:
+        if self.fail_write:
+            raise RuntimeError("storage unavailable")
+        self.objects[key] = data
+
     async def list_sidecars(
         self, prefix: str, *, limit: int | None = None
     ) -> list[tuple[str, dict[str, Any]]]:

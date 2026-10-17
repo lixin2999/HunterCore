@@ -75,6 +75,36 @@ class EventResponse(BaseModel):
     timestamp: int = Field(default_factory=lambda: int(time.time()))
 
 
+class EventStatsData(BaseModel):
+    """事件精确聚合（窗口内 GROUP BY；供看板 Top N / 未确认分级直接使用）。
+
+    V1.21.16：看板此前的 by_type 是「最近 200 条近似采样」，与事件列表精确值不一致，
+    现在改由本端点提供精确计数（SQL GROUP BY），前端/看板无需再做近似。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    total: int = Field(ge=0, description="窗口内事件总数（精确计数）")
+    unacknowledged: int = Field(ge=0, description="窗口内未确认事件数（精确计数）")
+    unacknowledged_by_level: dict[str, int] = Field(
+        default_factory=dict,
+        description="未确认事件按等级（info/warning/critical）精确计数；三级之和 = unacknowledged",
+    )
+    by_type: dict[str, int] = Field(
+        default_factory=dict, description="按事件类型精确计数（19 种受控词表）"
+    )
+
+
+class EventStatsResponse(BaseModel):
+    """GET /events/stats 统一响应。"""
+
+    code: int = 0
+    message: str = "success"
+    data: EventStatsData | None = None
+    request_id: str
+    timestamp: int = Field(default_factory=lambda: int(time.time()))
+
+
 __all__ = [
     "VEHICLE_ID_PATTERN",
     "EventItem",
@@ -82,5 +112,7 @@ __all__ = [
     "EventListData",
     "EventListResponse",
     "EventResponse",
+    "EventStatsData",
+    "EventStatsResponse",
     "EventType",
 ]

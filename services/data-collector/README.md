@@ -17,7 +17,8 @@
 | `contracts/kafka/schemas/sensor_file.schema.json` | 5.5 节上传完成通知（本模块补全；bucket/object_key 命名规范/md5/sha256） |
 | `contracts/database/ddl/04_events.sql`、`05_timeseries.sql` | 写 `data_collector.vehicle_telemetry`（批量 + `ON CONFLICT DO NOTHING`）、读写 `data_collector.events` |
 
-业务端点：`GET /api/v1/data/telemetry`、`GET /api/v1/data/events`、`GET /api/v1/data/events/{event_id}`、
+业务端点：`GET /api/v1/data/telemetry`、`GET /api/v1/data/events`、`GET /api/v1/data/events/stats`、
+`GET /api/v1/data/events/{event_id}`、
 `POST /api/v1/data/events/{event_id}/acknowledge`、`GET /api/v1/data/files`、
 `POST /api/v1/data/files/presign`、`POST /api/v1/data/files/complete`。
 

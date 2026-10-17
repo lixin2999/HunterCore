@@ -93,16 +93,28 @@ class AlgorithmHealth(BaseModel):
 
 
 class EventStats(BaseModel):
-    """事件统计块（data-collector GET /api/v1/data/events total 精确计数）。"""
+    """事件统计块（data-collector GET /api/v1/data/events/stats 精确聚合）。"""
 
     available: bool = Field(description="数据源是否可用（false 表示降级展示）")
     reason: str | None = Field(default=None, description="不可用原因")
-    total: int = Field(ge=0, description="窗口内事件总数")
-    info: int | None = Field(default=None, ge=0, description="info 级事件数")
-    warning: int | None = Field(default=None, ge=0, description="warning 级事件数")
-    critical: int | None = Field(default=None, ge=0, description="critical 级事件数")
-    unacknowledged: int | None = Field(default=None, ge=0, description="未确认事件数")
-    by_type: dict[str, int] = Field(default_factory=dict, description="按事件类型计数（最近 200 条近似）")
+    total: int = Field(ge=0, description="窗口内事件总数（精确计数）")
+    info: int | None = Field(
+        default=None, ge=0, description="窗口内**未确认** info 级事件数（与 unacknowledged 同口径）"
+    )
+    warning: int | None = Field(
+        default=None, ge=0, description="窗口内**未确认** warning 级事件数"
+    )
+    critical: int | None = Field(
+        default=None, ge=0, description="窗口内**未确认** critical 级事件数"
+    )
+    unacknowledged: int | None = Field(
+        default=None,
+        ge=0,
+        description="窗口内未确认事件数；等于 info + warning + critical（三级之和，V1.21.16 定口径）",
+    )
+    by_type: dict[str, int] = Field(
+        default_factory=dict, description="按事件类型精确计数（SQL GROUP BY，非近似采样）"
+    )
 
 
 class DashboardData(BaseModel):

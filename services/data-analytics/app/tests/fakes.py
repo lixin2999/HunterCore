@@ -113,40 +113,38 @@ class FakePipelineRepository:
 
 
 class FakeEventClient:
-    """EventSource 替身：seeded 事件列表（窗口过滤在替身内模拟）。"""
+    """EventSource 替身：seeded 事件列表（窗口过滤 + 精确聚合在替身内模拟）。"""
 
     def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
         self.events = events or []
         self.closed = False
 
-    async def count(
-        self,
-        *,
-        start_time: float,
-        end_time: float,
-        event_level: str | None = None,
-        acknowledged: bool | None = None,
-        vehicle_id: str | None = None,
-    ) -> int | None:
-        return sum(
-            1
-            for event in self.events
-            if start_time <= float(event["event_time"]) < end_time
-            and (event_level is None or event.get("event_level") == event_level)
-            and (acknowledged is None or bool(event.get("acknowledged")) is acknowledged)
-            and (vehicle_id is None or event.get("vehicle_id") == vehicle_id)
-        )
-
-    async def fetch_latest(
-        self, *, start_time: float, end_time: float, limit: int, vehicle_id: str | None = None
-    ) -> list[dict[str, Any]] | None:
+    async def stats(
+        self, *, start_time: float, end_time: float, vehicle_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """精确聚合（与 data-collector GET /events/stats 同语义）。"""
         selected = [
             event
             for event in self.events
             if start_time <= float(event["event_time"]) < end_time
             and (vehicle_id is None or event.get("vehicle_id") == vehicle_id)
         ]
-        return sorted(selected, key=lambda event: float(event["event_time"]), reverse=True)[:limit]
+        by_type: dict[str, int] = {}
+        by_level: dict[str, int] = {}
+        for event in selected:
+            event_type = event.get("event_type")
+            if event_type:
+                by_type[str(event_type)] = by_type.get(str(event_type), 0) + 1
+            if not event.get("acknowledged"):
+                event_level = event.get("event_level")
+                if event_level:
+                    by_level[str(event_level)] = by_level.get(str(event_level), 0) + 1
+        return {
+            "total": len(selected),
+            "unacknowledged": sum(by_level.values()),
+            "unacknowledged_by_level": by_level,
+            "by_type": by_type,
+        }
 
     async def close(self) -> None:
         self.closed = True

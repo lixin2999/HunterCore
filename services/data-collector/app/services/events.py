@@ -9,7 +9,7 @@ from hunter_common.exceptions import ResourceNotFoundError
 
 from app.repositories.events import EventRepository
 from app.repositories.storage import MinioStorage
-from app.schemas.events import EventItem, EventListData
+from app.schemas.events import EventItem, EventListData, EventStatsData
 
 
 class EventService:
@@ -46,6 +46,25 @@ class EventService:
             total=total,
             page=page,
             page_size=page_size,
+        )
+
+    async def event_stats(
+        self,
+        vehicle_id: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> EventStatsData:
+        """窗口内事件精确聚合（total / 未确认 / 未确认分级 / 按类型）。"""
+        total, unacknowledged, by_level, by_type = await self._repository.stats(
+            vehicle_id=vehicle_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        return EventStatsData(
+            total=total,
+            unacknowledged=unacknowledged,
+            unacknowledged_by_level=by_level,
+            by_type=by_type,
         )
 
     async def get_event(self, event_id: int) -> EventItem:

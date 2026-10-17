@@ -174,7 +174,7 @@ class MinioStorage:
             body.close()
         return size, md5.hexdigest(), sha256.hexdigest()
 
-    # ---------- 清单（list_objects_v2，marker 游标分页） ----------
+    # ---------- 清单（list_objects_v2，游标分页） ----------
 
     def list_objects(
         self,
@@ -186,11 +186,18 @@ class MinioStorage:
         """列举对象；返回 (items, truncated, next_marker)。
 
         - items 元素含 object_key/size_bytes/etag/last_modified；
-        - NextMarker 仅在截断时有值（is_truncated=True），缺省回退到末项 Key。
+        - 游标续列用 **``StartAfter``**（对象键）；``IsTruncated`` 时缺省回退末项 Key。
+
+        ℞ V1.21.16（实机确诊）：``list_objects_v2`` **没有 ``Marker`` 参数**——那是 v1
+        ``list_objects`` 的续列入参。旧实现把 ``Marker`` 传给 v2，会被 botocore 判为
+        未知入参并抛 ``ParamValidationError`` → HTTP 500「服务器内部错误」。症状正是：
+        **首页（marker 为 None）正常，一点「加载更多（游标分页）」即 500**。
+        v2 的续列入参是不透明 ``ContinuationToken`` 或对象键 ``StartAfter``；本服务自产
+        ``next_marker`` = 末项 object_key，故用 ``StartAfter`` 与之语义对齐。
         """
         kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": max_keys}
         if marker:
-            kwargs["Marker"] = marker
+            kwargs["StartAfter"] = marker
         resp = self._client.list_objects_v2(**kwargs)
         items = [
             {

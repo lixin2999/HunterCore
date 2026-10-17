@@ -304,6 +304,9 @@ services:
     network_mode: host
     volumes:
       - ./config/srs.conf:/usr/local/srs/conf/srs.conf:ro
+      # V1.21.16 录像封存：SRS DVR 输出目录（独立挂载，**不**挂 /usr/local/srs/objs——见下条警告）。
+      # remote-control 容器只读挂同一宿主目录（RC_VIDEO_SOURCE_DIR），会话结束时把本会话 mp4 上传到 hunter-video。
+      - ${DATA_DIR:-/data}/srs-dvr:/data/srs-dvr
       # ⚠ 禁止挂载到 /usr/local/srs/objs：该目录含镜像自带的 srs 二进制（command ./objs/srs），
       #    空宿主机目录覆盖会清空二进制导致容器启动失败；日志走 console（见 config/srs.conf），由 docker logs 采集
     healthcheck:
@@ -691,11 +694,15 @@ services:
       RC_TURN_SHARED_SECRET: ${RC_TURN_SHARED_SECRET:-}
       RC_COMMAND_HZ: ${RC_COMMAND_HZ:-20}
       RC_MAX_SPEED_MPS: ${RC_MAX_SPEED_MPS:-2.0}
+      # V1.21.16 录像封存：只读挂载 SRS DVR 输出目录（与 srs 服务同一宿主目录），
+      # 会话结束时把本会话 mp4 上传到 hunter-video（契约 x-hunter-history-archive.upload）。
+      RC_VIDEO_SOURCE_DIR: /data/srs-dvr
     ports:
       - "127.0.0.1:${REMOTE_CONTROL_PORT:-8085}:8085"
     volumes:
       - *contracts-vol
       - ${DATA_DIR:-/data}/kafka-buffer/remote-control:/app/data/kafka-buffer
+      - ${DATA_DIR:-/data}/srs-dvr:/data/srs-dvr:ro
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }

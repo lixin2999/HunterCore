@@ -81,6 +81,7 @@ from app.services.metrics import (
     SESSIONS_ACTIVE,
 )
 from app.services.vehicle_view import KEY_VEHICLE_STATUS, VehicleViewReader
+from app.services.video_sealer import VideoSealer
 
 if TYPE_CHECKING:
     # 循环依赖规避：dependencies.py 装配本服务，类型仅注解期引用（运行时鸭子类型）
@@ -118,6 +119,7 @@ class SessionService:
         storage: VideoArchiveStorage,
         settings: Settings,
         geofence: GeofenceChecker | None = None,
+        video_sealer: VideoSealer | None = None,
     ) -> None:
         self._redis = redis
         self._vehicle_view = vehicle_view
@@ -127,6 +129,8 @@ class SessionService:
         self._settings = settings
         # G-11 围栏门禁（未装配时跳过；生产 lifespan 必接，测试可注入替身）
         self._geofence = geofence
+        # 录像封存（V1.21.16）：未配置录像来源目录时为 None（不改旧行为，sidecar size_bytes=0）
+        self._video_sealer = video_sealer
 
     # ---------- 创建（POST /session；契约 x-hunter-session-lifecycle） ----------
     async def create_session(
@@ -642,6 +646,14 @@ class SessionService:
             ARCHIVE_FAILED_TOTAL.labels(stage="sidecar").inc()
             return False
         video = self._negotiate_video(VideoPreference())
+        # V1.21.16 封存链路：先上传录像对象（契约 sealing 顺序：video → sidecar），
+        # 再把真实字节数写入 sidecar；未配置封存或未就绪时保持 0（播放时以 head_video 为准）。
+        video_size_bytes = 0
+        if self._video_sealer is not None:
+            sealed_size = await self._video_sealer.seal(
+                vehicle_id=vehicle_id, session_id=session_id, object_key=video_key
+            )
+            video_size_bytes = sealed_size or 0
         try:
             doc = SessionSidecar(
                 session_id=session_id,
@@ -656,7 +668,7 @@ class SessionService:
                 degraded_events=[],  # 降级事件随 WS 控制通道接入记录（pending #4/#13-#16）
                 video=SidecarVideo(
                     object_key=video_key,
-                    size_bytes=0,  # 录像管线（SRS 封存上传）回写前为 0；历史查询以 head_video 为准
+                    size_bytes=video_size_bytes,  # 封存成功为真实字节数；未就绪为 0
                     sha256="",  # 录像管线未回写校验和时为空串
                     fps=video.fps,
                     bitrate_kbps_avg=video.max_bitrate_kbps,  # 协商上限作为平均码率占位

@@ -63,6 +63,7 @@ DDL_TIMESERIES = ROOT / "contracts" / "database" / "ddl" / "05_timeseries.sql"
 EXPECTED_ENDPOINTS: set[tuple[str, str]] = {
     ("GET", "/api/v1/data/telemetry"),
     ("GET", "/api/v1/data/events"),
+    ("GET", "/api/v1/data/events/stats"),
     ("GET", "/api/v1/data/events/{event_id}"),
     ("POST", "/api/v1/data/events/{event_id}/acknowledge"),
     ("GET", "/api/v1/data/files"),
@@ -790,6 +791,38 @@ def test_generated_openapi_paths_equal_contract(contract: dict[str, Any]) -> Non
     assert generated == expected, (
         f"路径漂移: 仅契约有={sorted(set(expected) - set(generated))} "
         f"仅实现有={sorted(set(generated) - set(expected))}"
+    )
+
+
+def _operation_query_params(contract: dict[str, Any], operation: dict[str, Any]) -> set[str]:
+    """展开某操作的 query 参数名（解析 `$ref` 参数引用，忽略 header/path 参数）。"""
+    names: set[str] = set()
+    for param in operation.get("parameters", []):
+        resolved = resolve_pointer(contract, param["$ref"]) if "$ref" in param else param
+        if resolved.get("in") == "query":
+            names.add(resolved["name"])
+    return names
+
+
+def test_files_endpoint_query_parameters_match_contract(contract: dict[str, Any]) -> None:
+    """GET /files 的 query 参数名必须与契约双向一致（V1.21.16 回归门禁）。
+
+    实机教训：实现私增 ``prefix`` 且漏了契约的 ``date``/``data_type``，前端按契约发
+    date/data_type 被 FastAPI 静默忽略 ⇒ 筛查形同虚设。路径级契约测试查不到参数，故补此门禁。
+
+    说明：events 的 ``sort``/``order`` 与 telemetry 的 ``order`` 参数漂移属存量已知项，
+    单独跟踪；本门禁先锁定本次修复的 /files 端点。
+    """
+    operation = contract["paths"]["/api/v1/data/files"]["get"]
+    expected = _operation_query_params(contract, operation)
+    generated = {
+        param["name"]
+        for param in app.openapi()["paths"]["/api/v1/data/files"]["get"].get("parameters", [])
+        if param.get("in") == "query"
+    }
+    assert generated == expected, (
+        f"query 参数漂移: 仅契约有={sorted(expected - generated)} "
+        f"仅实现有={sorted(generated - expected)}"
     )
 
 

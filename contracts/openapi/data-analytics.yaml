@@ -214,7 +214,7 @@ paths:
         - `fleet`：车辆在线与状态分布（Redis `vehicle:online:set` / `vehicle:status:{vehicle_id}` 只读聚合）
         - `pipeline`：数据管道健康（Kafka 消费滞后 + DLQ 水位 + 只读账号统计的遥测写入量）
         - `algorithm`：算法模块指标（`data_analytics.algorithm_metrics` 只读聚合，模块 ∈ perception/planning/control）
-        - `events`：事件与告警统计（经 data-collector REST `GET /api/v1/data/events` 的计数）
+        - `events`：事件与告警统计（经 data-collector REST `GET /api/v1/data/events/stats` 的**精确聚合**）
 
         **数据源不可用时降级**：对应聚合块返回 `available=false` + `reason`，HTTP 仍为 200（看板不允许整页失败）；
         全部数据源不可用才返回 503（code=5001）。禁止跨服务直查他人 schema（仅 `hunter_analytics_ro` 只读例外）。
@@ -1061,23 +1061,23 @@ components:
 
     EventStats:
       type: object
-      description: 事件与告警统计（车端事件经 data-collector REST 计数；平台告警统计待告警消费方落位）
+      description: 事件与告警统计（data-collector GET /api/v1/data/events/stats **精确聚合**；车端事件经 data-collector，平台告警统计待告警消费方落位）
       required: [available, total]
       properties:
         available: { type: boolean }
         reason: { type: string, nullable: true }
-        total: { type: integer, minimum: 0, description: 窗口内事件总数 }
-        info: { type: integer, minimum: 0 }
-        warning: { type: integer, minimum: 0 }
-        critical: { type: integer, minimum: 0 }
+        total: { type: integer, minimum: 0, description: 窗口内事件总数（精确计数） }
+        info: { type: integer, minimum: 0, description: "窗口内**未确认** info 级事件数（与 unacknowledged 同口径；非窗口内 info 总数）" }
+        warning: { type: integer, minimum: 0, description: "窗口内**未确认** warning 级事件数" }
+        critical: { type: integer, minimum: 0, description: "窗口内**未确认** critical 级事件数" }
         unacknowledged:
           type: integer
           minimum: 0
-          description: 未确认事件数（告警中心默认视图）
+          description: 未确认事件数（告警中心默认视图）；等于 info + warning + critical（V1.21.16 定口径）
         by_type:
           type: object
           additionalProperties: { type: integer }
-          description: 按事件类型分布（19 种受控类型）
+          description: 按事件类型精确计数（19 种受控类型；SQL GROUP BY，非「最近 N 条近似」采样）
 
     DashboardData:
       type: object
@@ -1485,7 +1485,7 @@ x-hunter-service:
     read: ["vehicle:online:set", "vehicle:status:{vehicle_id}", "analytics:ingest_latency"]
   dependencies:
     - service: data-collector
-      usage: "REST GET /api/v1/data/events（看板事件统计）；Kafka 平台内部 Topic 由 data-collector 产出"
+      usage: "REST GET /api/v1/data/events/stats（看板事件精确聚合）；Kafka 平台内部 Topic 由 data-collector 产出"
     - service: scene-service
       usage: "REST GET /api/v1/scene（场景覆盖率分析的场景库维度）"
     - service: vehicle-service
@@ -1793,7 +1793,7 @@ x-hunter-offline-jobs:
       - "data_analytics.algorithm_metrics（只读/自拥有）"
       - "MinIO hunter-rosbag / hunter-raw-data / hunter-reports"
     cross_service:
-      - "data-collector REST GET /api/v1/data/events（事件维度统计，禁止直查 events 表）"
+      - "data-collector REST GET /api/v1/data/events/stats（事件维度精确统计，禁止直查 events 表）"
       - "scene-service REST GET /api/v1/scene（场景库维度 / 场景测试报告）"
       - "vehicle-service REST（车辆台账，⚠ 归属待确认）"
   outputs:
@@ -2037,7 +2037,7 @@ x-hunter-dashboard-contract:
       metrics: [fps, latency_ms, planning_latency_ms, control_latency_ms, velocity_error_abs, steer_error_abs]
     events:
       sources:
-        - "data-collector REST GET /api/v1/data/events（event_level / acknowledged 维度计数，取返回 total）"
+        - "data-collector REST GET /api/v1/data/events/stats（精确聚合：未确认分级 unacknowledged_by_level + 按类型 by_type）"
       degradation: "data-collector 不可用 → available=false + reason，HTTP 仍为 200"
       note: "⚠ 平台侧 alert_event 统计（本服务生产）暂无落位（alert_event 消费方待定，pending #4）"
   response_semantics:

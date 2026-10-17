@@ -79,6 +79,65 @@ class EventRepository:
             total = int((await session.execute(count_stmt)).scalar_one())
             return items, total
 
+    async def stats(
+        self,
+        vehicle_id: str | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
+    ) -> tuple[int, int, dict[str, int], dict[str, int]]:
+        """窗口内事件精确聚合；返回 (total, unacknowledged, unack_by_level, by_type)。
+
+        V1.21.16：看板「事件类型 Top N / 未确认分级」此前靠客户端拉最近 200 条近似，
+        与事件列表的精确值不一致；此处用 SQL ``GROUP BY`` 给出精确计数（无近似、无截断）。
+        """
+        filters = self._build_filters(
+            vehicle_id=vehicle_id,
+            event_type=None,
+            event_level=None,
+            acknowledged=None,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        unack_filters = [*filters, Event.acknowledged.is_(False)]
+        async with self._db.session() as session:
+            total = int(
+                (
+                    await session.execute(
+                        select(func.count()).select_from(Event).where(*filters)
+                    )
+                ).scalar_one()
+            )
+            unacknowledged = int(
+                (
+                    await session.execute(
+                        select(func.count()).select_from(Event).where(*unack_filters)
+                    )
+                ).scalar_one()
+            )
+            level_rows = (
+                await session.execute(
+                    select(Event.event_level, func.count())
+                    .where(*unack_filters)
+                    .group_by(Event.event_level)
+                )
+            ).all()
+            type_rows = (
+                await session.execute(
+                    select(Event.event_type, func.count())
+                    .where(*filters)
+                    .group_by(Event.event_type)
+                )
+            ).all()
+        by_level = {
+            (level.value if isinstance(level, EventLevel) else str(level)): int(count)
+            for level, count in level_rows
+        }
+        by_type = {
+            (etype.value if isinstance(etype, EventType) else str(etype)): int(count)
+            for etype, count in type_rows
+        }
+        return total, unacknowledged, by_level, by_type
+
     async def get_by_id(self, event_id: int) -> Event | None:
         """按主键读取事件（不存在返回 None）。"""
         async with self._db.session() as session:

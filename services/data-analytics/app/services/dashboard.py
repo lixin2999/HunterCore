@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import Counter
 
 from hunter_common.exceptions import ServiceUnavailableError
 from hunter_common.logging import get_logger
@@ -187,46 +186,27 @@ class DashboardService:
         )
 
     async def _events_block(self, start: float, end: float, vehicle_id: str | None) -> EventStats:
-        """事件统计块：total 精确计数 + 最近 N 条类型分布近似（下游不可用整块降级）。
+        """事件统计块：单次**精确聚合**（V1.21.16）。
 
-        审查 Y5：6 次 data-collector 查询**并发**发起（串行会累积 6 次网络往返，
-        在 P95 ≤ 200ms 预算内不可接受）；任一返回 None 即整块降级。
+        - 由 data-collector ``GET /api/v1/data/events/stats`` 一次取回
+          total / 未确认 / 未确认分级 / 按类型（SQL GROUP BY，**非近似采样**）；
+        - ``info``/``warning``/``critical`` = **未确认**各等级：与卡片「未确认事件」同口径，
+          三级之和等于 ``unacknowledged``；此前误用「窗口内各级总数（含已确认）」，
+          现场表现为「主值 0 而分项 提示 29」这类自相矛盾的读数；
+        - ``by_type`` = 精确计数，不再是最接近 N 条近似（看板 Top N 与事件列表从此同口径）；
+        - 下游不可用（None）→ 整块降级（reason 不变）。
         """
-        total, info, warning, critical, unacknowledged, latest = await asyncio.gather(
-            self._events.count(start_time=start, end_time=end, vehicle_id=vehicle_id),
-            self._events.count(
-                start_time=start, end_time=end, event_level="info", vehicle_id=vehicle_id
-            ),
-            self._events.count(
-                start_time=start, end_time=end, event_level="warning", vehicle_id=vehicle_id
-            ),
-            self._events.count(
-                start_time=start, end_time=end, event_level="critical", vehicle_id=vehicle_id
-            ),
-            self._events.count(
-                start_time=start, end_time=end, acknowledged=False, vehicle_id=vehicle_id
-            ),
-            self._events.fetch_latest(
-                start_time=start,
-                end_time=end,
-                limit=self._settings.dashboard_event_fetch_size,
-                vehicle_id=vehicle_id,
-            ),
-        )
-        if None in (total, info, warning, critical, unacknowledged, latest):
+        stats = await self._events.stats(start_time=start, end_time=end, vehicle_id=vehicle_id)
+        if stats is None:
             return EventStats(available=False, reason="data-collector unavailable", total=0)
-        counter: Counter[str] = Counter()
-        for item in latest or []:
-            event_type = item.get("event_type")
-            if event_type:
-                counter[str(event_type)] += 1
+        by_level = stats.get("unacknowledged_by_level") or {}
+        by_type = stats.get("by_type") or {}
         return EventStats(
             available=True,
-            total=int(total or 0),
-            info=info,
-            warning=warning,
-            critical=critical,
-            unacknowledged=unacknowledged,
-            # by_type 仅统计最近 200 条（data-collector 无聚合端点，见契约端点说明）
-            by_type=dict(counter),
+            total=int(stats.get("total") or 0),
+            info=int(by_level.get("info", 0)),
+            warning=int(by_level.get("warning", 0)),
+            critical=int(by_level.get("critical", 0)),
+            unacknowledged=int(stats.get("unacknowledged") or 0),
+            by_type={str(key): int(value) for key, value in by_type.items()},
         )

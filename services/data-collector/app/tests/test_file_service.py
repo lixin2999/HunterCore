@@ -6,7 +6,7 @@
   multipart 合并与合并失败回滚（2001）、sensor_file 投递载荷、Kafka 故障（5001）；
 - 生命周期归类打标（G-12）：hunter-rosbag 按 retention 打 Tag、非 rosbag 不打标、
   打标失败 5001 且不发布 sensor_file；
-- 清单：车辆前缀隔离、limit+1 截断与 next_marker 游标、预签名下载地址。
+- 清单：车辆/日期/数据类型前缀段隔离、limit+1 截断与 next_marker 游标、预签名下载地址。
 
 **关键回归（审查 R2）**：完整性校验必须基于「对象真实内容摘要」——
 sha256 必须参与判定，且不得以 ETag 代替内容校验（multipart 对象 ETag 带 ``-N`` 后缀）。
@@ -445,7 +445,7 @@ async def test_list_files_scopes_prefix_to_vehicle_and_presigns_download() -> No
     storage.put(RAW_BUCKET, other, CONTENT)
 
     data = await service.list_files(
-        vehicle_id=VEHICLE_ID, bucket=RAW_BUCKET, prefix=None, marker=None, limit=100
+        vehicle_id=VEHICLE_ID, bucket=RAW_BUCKET, date=None, data_type=None, marker=None, limit=100
     )
 
     assert [item.object_key for item in data.items] == [mine]
@@ -464,7 +464,7 @@ async def test_list_files_truncates_and_returns_marker_cursor() -> None:
         storage.put(RAW_BUCKET, key, CONTENT)
 
     data = await service.list_files(
-        vehicle_id=VEHICLE_ID, bucket=RAW_BUCKET, prefix=None, marker=None, limit=2
+        vehicle_id=VEHICLE_ID, bucket=RAW_BUCKET, date=None, data_type=None, marker=None, limit=2
     )
 
     assert [item.object_key for item in data.items] == keys[:2]
@@ -472,7 +472,12 @@ async def test_list_files_truncates_and_returns_marker_cursor() -> None:
     assert data.next_marker == keys[1]
 
     page2 = await service.list_files(
-        vehicle_id=VEHICLE_ID, bucket=RAW_BUCKET, prefix=None, marker=data.next_marker, limit=2
+        vehicle_id=VEHICLE_ID,
+        bucket=RAW_BUCKET,
+        date=None,
+        data_type=None,
+        marker=data.next_marker,
+        limit=2,
     )
     assert [item.object_key for item in page2.items] == keys[2:]
     assert page2.truncated is False and page2.next_marker is None
@@ -485,8 +490,39 @@ async def test_list_files_without_vehicle_lists_all_buckets_objects() -> None:
     storage.put(RAW_BUCKET, "HUNTER-002/2026-09-18/point_cloud/b.pcd", CONTENT)
 
     data = await service.list_files(
-        vehicle_id=None, bucket=RAW_BUCKET, prefix=None, marker=None, limit=10
+        vehicle_id=None, bucket=RAW_BUCKET, date=None, data_type=None, marker=None, limit=10
     )
 
     assert len(data.items) == 2
     assert storage.list_calls[0]["prefix"] == ""
+
+
+async def test_list_files_filters_by_date_and_data_type_prefix_segments() -> None:
+    """清单：date / data_type 必须落进对象键前缀（契约 GET /files 的 date/data_type 过滤）。
+
+    回归（V1.21.16）：旧实现漏了这两个参数，前端按契约发 date/data_type 被静默忽略。
+    """
+    service, storage, _ = make_service()
+    wanted = f"{VEHICLE_ID}/2026-09-18/rosbag/1724035200_1.bag"
+    other_date = f"{VEHICLE_ID}/2026-09-19/rosbag/1724035200_2.bag"
+    other_type = f"{VEHICLE_ID}/2026-09-18/point_cloud/1724035200_3.pcd"
+    for key in (wanted, other_date, other_type):
+        storage.put(RAW_BUCKET, key, CONTENT)
+
+    data = await service.list_files(
+        vehicle_id=VEHICLE_ID,
+        bucket=RAW_BUCKET,
+        date="2026-09-18",
+        data_type="rosbag",
+        marker=None,
+        limit=100,
+    )
+
+    assert storage.list_calls[0]["prefix"] == f"{VEHICLE_ID}/2026-09-18/rosbag/"
+    assert [item.object_key for item in data.items] == [wanted]
+
+    # 只给 date（含跨车辆）：前缀 = {date}/，不带车辆段也不带类型段
+    await service.list_files(
+        vehicle_id=None, bucket=RAW_BUCKET, date="2026-09-19", data_type=None, marker=None, limit=100
+    )
+    assert storage.list_calls[-1]["prefix"] == "2026-09-19/"

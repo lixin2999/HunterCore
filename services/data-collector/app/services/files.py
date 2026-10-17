@@ -7,7 +7,7 @@
   任一不符 → 6001 / HTTP 422，审查 R2 修复）→ multipart 先合并分片再校验 →
   hunter-rosbag 对象打生命周期归类 Tag（G-12，hunter-retention=regular|event，
   打标失败 → 5001 不通知下游）→ 发布 sensor_file（key=vehicle_id，载荷契约固定）；
-- list：prefix 列举 + marker 游标分页，即时签发 15 分钟下载 URL。
+- list：对象键前缀列举（vehicle_id/date/data_type 段）+ marker 游标分页，即时签发 15 分钟下载 URL。
 """
 from __future__ import annotations
 
@@ -393,16 +393,22 @@ class FileService:
         self,
         vehicle_id: str | None,
         bucket: str,
-        prefix: str | None,
+        date: str | None,
+        data_type: str | None,
         marker: str | None,
         limit: int,
     ) -> FileListData:
-        """文件清单（契约 GET /files：prefix 列举 + marker 游标分页）。
+        """文件清单（契约 GET /files：对象键前缀列举 + marker 游标分页）。
 
-        - max_keys = limit + 1 判断截断（契约 limit ≤ 1000）；
+        - 前缀 = 非空段 ``{vehicle_id}/{date}/{data_type}`` 依次拼接（对象键规范
+          ``{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}``，契约 x-hunter-file-upload-flow）；
+          三段全缺省则列举整桶（运维/管理端跨车辆检索）；
+        - max_keys = limit + 1 判断截断（契约 limit ≤ 200）；
         - 每项即时签发 15 分钟预签名下载 URL（900s，支持 Range）。
         """
-        full_prefix = f"{vehicle_id}/{prefix or ''}" if vehicle_id else (prefix or "")
+        full_prefix = "".join(
+            f"{segment}/" for segment in (vehicle_id, date, data_type) if segment
+        )
         items, truncated, next_marker = await asyncio.to_thread(
             self._storage.list_objects,
             bucket,

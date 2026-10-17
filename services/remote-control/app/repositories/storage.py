@@ -62,6 +62,10 @@ class VideoArchiveStorage(Protocol):
         """写入 sidecar JSON（覆盖语义）。"""
         ...
 
+    async def put_video(self, key: str, data: bytes, content_type: str = "video/mp4") -> None:
+        """写入录像对象（V1.21.16 封存链路：覆盖语义）。"""
+        ...
+
     async def list_sidecars(
         self, prefix: str, *, limit: int | None = None
     ) -> list[tuple[str, dict[str, Any]]]:
@@ -168,6 +172,20 @@ class S3VideoArchiveStorage:
         except Exception as exc:
             logger.exception("storage_put_failed", key=key)
             raise ServiceUnavailableError("对象存储写入失败") from exc
+
+    async def put_video(self, key: str, data: bytes, content_type: str = "video/mp4") -> None:
+        """写入录像对象（V1.21.16 封存链路）。"""
+        client = await self._ensure_client()
+        try:
+            await client.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            )
+        except Exception as exc:
+            logger.exception("storage_put_video_failed", key=key)
+            raise ServiceUnavailableError("录像对象写入失败") from exc
 
     async def list_sidecars(
         self, prefix: str, *, limit: int | None = None

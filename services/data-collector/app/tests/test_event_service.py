@@ -106,3 +106,28 @@ async def test_acknowledge_missing_returns_3001() -> None:
     with pytest.raises(ResourceNotFoundError) as exc:
         await service.acknowledge_event(404, user_id=USER_ID)
     assert exc.value.code == 3001
+
+
+async def test_event_stats_are_exact_and_split_unacknowledged_by_level() -> None:
+    """聚合：total/按类型为窗口全量精确计数；info/warning/critical 仅统计**未确认**。
+
+    V1.21.16：看板「未确认事件」分项此前误用「窗口内各级总数（含已确认）」，与「未确认」
+    语义冲突（例：Acknowledged 的提示级也会被算进来）；此处固化「分项=未确认分级」口径。
+    """
+    service, repository, _ = make_service(
+        [
+            make_event(event_id=1, event_type=EventType.HARSH_BRAKING, event_level=EventLevel.WARNING, acknowledged=True),
+            make_event(event_id=2, event_type=EventType.BATTERY_LOW, event_level=EventLevel.INFO, acknowledged=True),
+            make_event(event_id=3, event_type=EventType.COLLISION_WARNING, event_level=EventLevel.CRITICAL, acknowledged=False),
+            make_event(event_id=4, event_type=EventType.HARSH_BRAKING, event_level=EventLevel.WARNING, acknowledged=False),
+        ]
+    )
+
+    data = await service.event_stats(vehicle_id=VEHICLE_ID)
+
+    assert data.total == 4
+    assert data.unacknowledged == 2
+    assert data.unacknowledged_by_level == {"warning": 1, "critical": 1}
+    assert sum(data.unacknowledged_by_level.values()) == data.unacknowledged
+    assert data.by_type == {"harsh_braking": 2, "battery_low": 1, "collision_warning": 1}
+    assert repository.list_calls == []  # 聚合不经过明细分页路径

@@ -12,7 +12,7 @@ from app.core.dependencies import (
     require_uploader_identity,
     trace_request_id,
 )
-from app.schemas.common import VEHICLE_ID_PATTERN, UploadBucket
+from app.schemas.common import VEHICLE_ID_PATTERN, FileDataType, UploadBucket
 from app.schemas.files import (
     FileCompleteRequest,
     FileCompleteResponse,
@@ -41,15 +41,24 @@ async def list_files(
     _user_id: Annotated[str, Depends(require_read_permission)],
     bucket: Annotated[UploadBucket, Query(description="对象存储桶（必选，仅上传类 Bucket）")],
     vehicle_id: Annotated[str | None, Query(pattern=VEHICLE_ID_PATTERN, description="车辆标识（可选过滤）")] = None,
-    prefix: Annotated[str | None, Query(max_length=256, description="对象路径前缀（可选）")] = None,
-    marker: Annotated[str | None, Query(max_length=256, description="分页游标（上一页 next_marker）")] = None,
-    limit: Annotated[int, Query(ge=1, le=1000, description="单页上限（≤1000，默认 100）")] = 100,
+    date: Annotated[
+        str | None,
+        Query(pattern=r"^\d{4}-\d{2}-\d{2}$", description="上传日期（YYYY-MM-DD，UTC；可选过滤）"),
+    ] = None,
+    data_type: Annotated[FileDataType | None, Query(description="数据类型（可选过滤）")] = None,
+    marker: Annotated[str | None, Query(max_length=1024, description="分页游标（上一页 next_marker）")] = None,
+    limit: Annotated[int, Query(ge=1, le=200, description="单页上限（≤200，默认 50）")] = 50,
 ) -> FileListResponse:
-    """文件清单（prefix 列举 + marker 游标；每项即时签发 15 分钟下载 URL）。"""
+    """文件清单（对象键前缀列举 + marker 游标；每项即时签发 15 分钟下载 URL）。
+
+    R1（V1.21.16）：此前实现私增 ``prefix`` 且漏了契约要求的 ``date``/``data_type``，
+    前端按契约发 date/data_type 被 FastAPI 静默忽略 ⇒ 筛查形同虚设；本版与契约对齐。
+    """
     data = await service.list_files(
         vehicle_id=vehicle_id,
         bucket=bucket.value,
-        prefix=prefix,
+        date=date,
+        data_type=data_type.value if data_type else None,
         marker=marker,
         limit=limit,
     )

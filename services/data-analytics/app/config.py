@@ -113,8 +113,6 @@ class Settings(HunterBaseConfig):
     analytics_query_max_range_days: int = 7
     # 算法指标聚合回看窗口（秒，看板 algorithm 块下限保护）
     algorithm_metrics_window_seconds: int = 60
-    # 事件类型分布抓取条数上限（≤200，与 BaseRepository.MAX_PAGE_SIZE 对齐）
-    dashboard_event_fetch_size: int = 200
 
     # ---------- Kafka 管道健康（组名唯一来源：contracts/kafka/consumer-groups.yaml） ----------
     # ℞ V1.19.11：原默认值的六个组名（analytics-stream-consumer / alert-engine-consumer / ota-status-consumer /

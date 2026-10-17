@@ -13,7 +13,7 @@ from app.core.dependencies import (
     trace_request_id,
 )
 from app.schemas.common import VEHICLE_ID_PATTERN
-from app.schemas.events import EventListResponse, EventResponse
+from app.schemas.events import EventListResponse, EventResponse, EventStatsResponse
 from app.services.events import EventService
 
 router = APIRouter(prefix="/api/v1/data", tags=["events"])
@@ -53,6 +53,28 @@ async def list_events(
         page_size=page_size,
     )
     return EventListResponse(code=0, message="success", data=data, request_id=trace_request_id())
+
+
+@router.get(
+    "/events/stats",
+    response_model=EventStatsResponse,
+    summary="聚合事件统计（按等级/类型精确计数）",
+)
+async def event_stats(
+    service: Annotated[EventService, Depends(get_event_service)],
+    _user_id: Annotated[str, Depends(require_read_permission)],
+    vehicle_id: Annotated[str | None, Query(pattern=VEHICLE_ID_PATTERN, description="车辆标识（可选）")] = None,
+    start_time: Annotated[float | None, Query(ge=0, description="窗口起点（Unix epoch 秒，可选）")] = None,
+    end_time: Annotated[float | None, Query(ge=0, description="窗口终点（Unix epoch 秒，可选）")] = None,
+) -> EventStatsResponse:
+    """窗口内事件精确聚合（SQL GROUP BY；看板 Top N / 未确认分级的数据源）。
+
+    ⚠ 路由必须声明在 ``/events/{event_id}`` **之前**，否则 "stats" 会被当作 event_id 解析。
+    """
+    data = await service.event_stats(
+        vehicle_id=vehicle_id, start_time=start_time, end_time=end_time
+    )
+    return EventStatsResponse(code=0, message="success", data=data, request_id=trace_request_id())
 
 
 @router.get(

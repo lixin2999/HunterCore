@@ -198,6 +198,52 @@ paths:
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/data/events/stats:
+    get:
+      tags: [events]
+      summary: 聚合事件统计（按等级/类型精确计数）
+      description: |
+        窗口内事件的**精确聚合**（SQL ``GROUP BY``，非「最近 N 条近似采样」）：
+
+        - ``total``：窗口内事件总数；
+        - ``unacknowledged``：未确认事件数；
+        - ``unacknowledged_by_level``：未确认事件按等级（info/warning/critical），三级之和 = ``unacknowledged``；
+        - ``by_type``：按 19 种受控事件类型精确计数（供看板「事件类型 Top N」直接使用）。
+
+        过滤条件与 ``GET /events`` 一致（``vehicle_id`` / ``start_time`` / ``end_time``），
+        但不返回明细与分页（禁用于明细分页）。
+      operationId: getEventStats
+      parameters:
+        - name: vehicle_id
+          in: query
+          required: false
+          description: 车辆标识（单车聚合）；不传则跨车辆聚合
+          schema: { type: string, minLength: 1, maxLength: 64 }
+        - name: start_time
+          in: query
+          required: false
+          description: 窗口起点（Unix epoch 秒；不传则不设下界）
+          schema: { type: number, minimum: 0 }
+        - name: end_time
+          in: query
+          required: false
+          description: 窗口终点（Unix epoch 秒；不传则不设上界）
+          schema: { type: number, minimum: 0 }
+        - $ref: "#/components/parameters/TraceRequestId"
+      responses:
+        "200":
+          description: 聚合统计
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventStatsResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /api/v1/data/events/{event_id}:
     get:
       tags: [events]
@@ -943,6 +989,30 @@ components:
           properties:
             data: { $ref: "#/components/schemas/EventItem" }
 
+    EventStatsData:
+      type: object
+      description: 窗口内事件精确聚合（SQL GROUP BY，非近似采样）
+      required: [total, unacknowledged, unacknowledged_by_level, by_type]
+      properties:
+        total: { type: integer, minimum: 0, description: "窗口内事件总数（精确计数）" }
+        unacknowledged: { type: integer, minimum: 0, description: "窗口内未确认事件数（精确计数）" }
+        unacknowledged_by_level:
+          type: object
+          description: "未确认事件按等级（info/warning/critical）精确计数；三级之和 = unacknowledged"
+          additionalProperties: { type: integer, minimum: 0 }
+        by_type:
+          type: object
+          description: "按事件类型（19 种受控词表）精确计数"
+          additionalProperties: { type: integer, minimum: 0 }
+
+    EventStatsResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/EventStatsData" }
+
     # ---------- 文件上传（5.5 节：预签名直传 + 完整性校验） ----------
     UploadBucket:
       type: string
@@ -1237,6 +1307,7 @@ x-hunter-endpoints:
   endpoints:
     - "GET /api/v1/data/telemetry"
     - "GET /api/v1/data/events"
+    - "GET /api/v1/data/events/stats"
     - "GET /api/v1/data/events/{event_id}"
     - "POST /api/v1/data/events/{event_id}/acknowledge"
     - "GET /api/v1/data/files"
@@ -1247,8 +1318,8 @@ x-hunter-endpoints:
     - endpoint: "GET /api/v1/data/telemetry"
       basis: "附录 D：`GET /data/telemetry` 单用户 20 QPS（api-gateway.yaml x-hunter-rate-limits）；数据源 data_collector.vehicle_telemetry"
       risk: "低（限流清单已明确该路径存在）"
-    - endpoint: "GET /api/v1/data/events + {event_id}"
-      basis: "events 表索引意图：单车事件时间线 / 按类型统计（ddl/04_events.sql 注释）"
+    - endpoint: "GET /api/v1/data/events + /stats + {event_id}"
+      basis: "events 表索引意图：单车事件时间线 / 按类型统计（ddl/04_events.sql 注释）；`/stats` 为 V1.21.16 新增，供看板「事件类型 Top N / 未确认分级」取**精确**聚合（替代客户端拉最近 200 条近似）"
       risk: "中（路径与分页形态待 12.2 节核对）"
     - endpoint: "POST /api/v1/data/events/{event_id}/acknowledge"
       basis: "events.acknowledged / acknowledged_by / acknowledge_time 三列 + 未确认告警部分索引"
@@ -1517,7 +1588,7 @@ x-hunter-pending-confirmation:
   items:
     - id: 1
       question: "data-collector 的 REST 端点清单（设计文档 12.2 节未随仓库提供，无法逐条比对）"
-      contract_decision: "按附录 D 限流端点 + 5.5 上传流程 + events 表列能力推导 7 个业务端点（见 x-hunter-endpoints.derivation，逐条标注依据与风险）"
+      contract_decision: "按附录 D 限流端点 + 5.5 上传流程 + events 表列能力推导 8 个业务端点（见 x-hunter-endpoints.derivation，逐条标注依据与风险）"
       impact: "Step 4 路由层实现范围；若 12.2 节存在差异（如文件清单端点不存在/路径不同）需回改契约与实现"
     - id: 2
       question: "5.5 节步骤 6「元信息入库」在 contracts/database 无对应表（data_collector schema 仅 events / vehicle_telemetry）"

@@ -100,6 +100,15 @@ class Settings(HunterBaseConfig):
     rc_history_query_max_range_days: int = 31
     rc_presign_get_ttl_s: int = 900        # 下载预签名有效期（契约上限 900s）
     rc_sidecar_schema_version: str = "1"
+    # 录像封存（V1.21.16）：SRS DVR 输出目录（SRS 与 remote-control 容器共享挂载；
+    # 空=未启用封存，sidecar video.size_bytes 保持 0 且「播放录像」返回 3001）。
+    # 路径约定：{rc_video_source_dir}/{rc_srs_app}/{stream}.mp4，
+    # stream = srs_stream_name = {rc_srs_stream_prefix}_{vehicle_id}_{session_id}。
+    rc_video_source_dir: str = ""
+    # 封存等待上限（秒）：会话结束到 SRS 落地 mp4 之间有延迟（车端停推 → SRS unpublish →
+    # DVR 封装完成），在此时限内轮询文件出现且大小稳定后再上传；超时视为封存未就绪。
+    rc_video_seal_wait_s: int = 15
+    rc_video_seal_poll_s: float = 1.0
 
     # ---------- 会话枚举扫描上限（SCAN 防放大；内部保护值，非契约项） ----------
     rc_sessions_scan_limit: int = 500
