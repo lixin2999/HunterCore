@@ -24,7 +24,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 from hunter_common.exceptions import ResourceNotFoundError, ServiceUnavailableError
-from hunter_common.internal_auth import build_identity_headers
+from hunter_common.internal_auth import HEADER_DEVICE_VEHICLE_ID, build_identity_headers
 from hunter_common.logging import get_logger, get_trace_id
 from starlette.background import BackgroundTask
 
@@ -58,6 +58,8 @@ _STRIPPED_REQUEST_HEADERS: Final[frozenset[str]] = _HOP_BY_HOP | {
     "x-identity-timestamp",  # G-02：身份头签名字段同样覆盖防伪造
     "x-internal-mac",
     "x-request-id",
+    "x-device-vehicle-id",  # 设备主体头仅由网关证书重验后注入（契约 x-hunter-device-ingress）
+    "x-client-cert",        # 客户端证书 PEM 禁止向后端扩散（日志/后端均不接触敏感材料）
 }
 
 _BODY_METHODS: Final[frozenset[str]] = frozenset({"POST", "PUT", "PATCH"})
@@ -228,6 +230,10 @@ class ProxyService:
             headers[name] = value
         trace_id = get_trace_id()
         roles = ",".join(str(role) for role in (claims.get("roles") or []))
+        # 设备主体（证书重验通过）：X-Device-Vehicle-Id 纳入 HMAC 签名第 5 段，防集群内冒充他车
+        device_vehicle_id = (
+            str(claims["vehicle_id"]) if claims.get("type") == "device" else None
+        )
         # G-02：配置了 GATEWAY_HMAC_SECRET 时身份头附 HMAC-SHA256 签名 + 时间戳
         # （后端校验，防集群内伪造 X-User-Id 绕过 RBAC；未配置时仅注入明文头，行为与历史一致）
         if self._settings.gateway_hmac_secret:
@@ -237,12 +243,15 @@ class ProxyService:
                     user_id=str(claims["sub"]),
                     roles=roles,
                     trace_id=trace_id,
+                    device_vehicle_id=device_vehicle_id,
                 )
             )
         else:
             headers["X-User-Id"] = str(claims["sub"])
             headers["X-Roles"] = roles
             headers["X-Trace-Id"] = trace_id
+            if device_vehicle_id is not None:
+                headers[HEADER_DEVICE_VEHICLE_ID] = device_vehicle_id
         # X-Request-ID = trace_id（契约 info：链路追踪优先透传/生成 UUID）
         headers["X-Request-ID"] = trace_id
         return headers

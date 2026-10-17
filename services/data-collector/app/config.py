@@ -82,6 +82,10 @@ class Settings(HunterBaseConfig):
     # ---------- RBAC（网关注入 X-Roles；角色→动作映射待 RBAC 服务化后收敛为权限查询） ----------
     data_read_roles: str = "admin,analyst,operator"
     data_execute_roles: str = "admin,operator"
+    # 设备主体角色（契约 x-hunter-device-ingress：网关证书重验后注入；仅认可 presign/complete
+    # 且强制 body.vehicle_id == CN；故意**不**加入 data_read/data_execute 白名单——
+    # 设备访问其余端点经 RBAC 自然 403/1002）
+    device_role: str = "device"
 
     @property
     def data_read_role_set(self) -> frozenset[str]:

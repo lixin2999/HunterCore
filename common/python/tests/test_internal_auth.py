@@ -6,12 +6,14 @@ import time
 import pytest
 
 from hunter_common.internal_auth import (
+    HEADER_DEVICE_VEHICLE_ID,
     HEADER_MAC,
     HEADER_ROLES,
     HEADER_TIMESTAMP,
     HEADER_TRACE_ID,
     HEADER_USER_ID,
     build_identity_headers,
+    canonical_identity,
     sign_identity,
     verify_identity_headers,
 )
@@ -74,3 +76,42 @@ def test_verify_rejects_missing_required_headers(empty_field: str) -> None:
     headers = build_identity_headers(SECRET, user_id="u1", roles="viewer", trace_id="tr-1")
     headers[empty_field] = None
     assert not verify_identity_headers(SECRET, headers)
+
+
+# =====================================================================
+# 设备通道（V1.21.13）：X-Device-Vehicle-Id 纳入签名第 5 段
+# =====================================================================
+
+
+def test_console_channel_canonical_stays_four_segments() -> None:
+    # 向后兼容硬约束：无设备头时签名串与历史格式逐字节一致
+    assert canonical_identity("u1", "admin", "tr-1", "1000") == "u1|admin|tr-1|1000"
+    headers = build_identity_headers(SECRET, user_id="u1", roles="admin", trace_id="tr-1")
+    assert HEADER_DEVICE_VEHICLE_ID not in headers
+
+
+def test_device_channel_roundtrip_and_injection() -> None:
+    headers = build_identity_headers(
+        SECRET, user_id="device:HUNTER-001", roles="device", trace_id="tr-1",
+        device_vehicle_id="HUNTER-001",
+    )
+    assert headers[HEADER_DEVICE_VEHICLE_ID] == "HUNTER-001"
+    assert verify_identity_headers(SECRET, headers)
+
+
+def test_device_header_forgery_breaks_mac() -> None:
+    """集群内篡改 X-Device-Vehicle-Id（冒充他车）→ MAC 失配拒绝。"""
+    headers = build_identity_headers(
+        SECRET, user_id="device:HUNTER-001", roles="device", trace_id="tr-1",
+        device_vehicle_id="HUNTER-001",
+    )
+    headers[HEADER_DEVICE_VEHICLE_ID] = "HUNTER-999"
+    assert not verify_identity_headers(SECRET, headers)
+
+
+def test_device_signed_headers_rejected_by_legacy_four_segment_mac() -> None:
+    """跨版本语义：设备通道签名≠同字段 4 段签名（旧后端验新头必失败，fail-closed 预期）。"""
+    ts = str(int(time.time()))
+    mac5 = sign_identity(SECRET, "device:V1", "device", "tr-1", ts, "V1")
+    mac4 = sign_identity(SECRET, "device:V1", "device", "tr-1", ts)
+    assert mac5 != mac4

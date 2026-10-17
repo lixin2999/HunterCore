@@ -316,8 +316,9 @@ paths:
         （`{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}`，禁止客户端指定）→
         返回预签名上传地址（有效期 1 小时 = 3600s，MinIO 契约）。
 
-        - `vehicle_id` 必须等于车端证书 CommonName（`deviceCertificate`）；控制台用户仅可为其有权限的车辆申请，
-          不匹配返回 1002（防越权写入他车目录）
+        - `vehicle_id` 必须等于设备主体认证的车辆（车端证书 CN → 网关注入 `X-Device-Vehicle-Id`，
+          服务端强校验 body.vehicle_id == 该头，不匹配 1002）；控制台用户仅可为其有权限的车辆申请（代传路线保留）
+        - 设备主体（roles=[device]）仅可访问本端点与 complete；访问其余端点→ 1002（不入 data:read 角色白名单）
         - `part_count > 1` 时返回分片上传：`upload_id` + `parts[].upload_url`（大文件 ROS Bag 分片上传）
         - 车辆维度带宽 ≤ 10 Mbps、单车辆限流见 `x-hunter-rate-limits`；超限返回 429/5001
       operationId: presignFileUpload
@@ -1289,10 +1290,10 @@ x-hunter-ingest-pipeline:
 x-hunter-file-upload-flow:
   source: "设计文档 5.5 节（文件上传管理：预签名 URL + 完整性校验）"
   steps:
-    - "1) 车辆请求上传：POST /api/v1/data/files/presign（车端证书 CN = vehicle_id，见 securitySchemes.deviceCertificate）"
+    - "1) 车辆请求上传：POST /api/v1/data/files/presign（车端经 mTLS 入口 :8443，证书 CN=vehicle_id 由网关重验后注入 X-Device-Vehicle-Id；服务端校验 body.vehicle_id == CN，不符 1002）"
     - "2) 服务端校验身份与配额 → 生成 MinIO 预签名 URL（上传有效期 1 小时；分片上传返回 upload_id + parts[]）"
     - "3) 车辆直传 MinIO（不经平台转发，支持 Range / 分片；单车带宽 ≤ 10 Mbps）"
-    - "4) 车辆上报完成：POST /api/v1/data/files/complete（size_bytes + md5 + sha256；分片上传附 parts[].etag）"
+    - "4) 车辆上报完成：POST /api/v1/data/files/complete（同上设备认证；size_bytes + md5 + sha256；分片上传附 parts[].etag）"
     - "5) 服务端校验完整性（三者必须全部一致；不匹配返回 6001）"
     - "5.5) hunter-rosbag 对象：校验通过后、发布 sensor_file 前，服务端 put_object_tagging 打 Tag hunter-retention=<retention>（打标失败返回 5001 且不通知下游）"
     - "6) 登记元信息并投递 Kafka sensor_file（⚠ 无 DB 元信息表，见 x-hunter-pending-confirmation #2）"
@@ -1536,8 +1537,8 @@ x-hunter-pending-confirmation:
       impact: "车端上传重试逻辑与前端错误提示文案"
     - id: 6
       question: "车端 REST 接入方式：presign/complete 由车端调用（设备认证），入口是经网关还是独立 Ingress mTLS 端口"
-      contract_decision: "契约按 dual security 声明（deviceCertificate + bearerAuth）；vehicle_id 一律以证书 CN 为准，禁止请求体指定他车"
-      impact: "Ingress / mTLS 证书链配置；网关是否需要放行车端流量（附录 D 单 IP 200 QPS 是否适用车端）"
+      contract_decision: "已定案（V1.21.13）：独立 mTLS 入口（单机 nginx :8443，K8s 独立 Ingress 为 P2）终止 TLS 后转发网关，网关用同一 CA 重验证书链→注入设备主体（roles=[device] + X-Device-Vehicle-Id=CN）；仅放行 presign/complete，后端强校验请求体 vehicle_id == CN（不符 1002）。详见 api-gateway 契约 x-hunter-device-ingress"
+      impact: "已消化：入口配置 nginx :8443 + DEVICE_CA_CERTFILE；限流沿用附录 D 单 IP 200 QPS。二期待办（由本条派生）：设备证书吊销（CRL/OCSP）与台账下线联动、K8s 设备 Ingress + NetworkPolicy 放通——吊销前已签证书在 TTL 内仍可用"
     - id: 7
       question: "遥测查询单次时间跨度上限与 total 计数成本（hypertable COUNT 开销）"
       contract_decision: "时间跨度上限环境变量 TELEMETRY_QUERY_MAX_RANGE_HOURS（默认 24h）；保留 total 字段但仍需确认是否改为 estimate/游标"

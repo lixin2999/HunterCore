@@ -6,7 +6,12 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request
 from hunter_common.exceptions import InvalidParameterError
 
-from app.core.dependencies import require_read_permission, trace_request_id
+from app.core.dependencies import (
+    UploaderPrincipal,
+    require_read_permission,
+    require_uploader_identity,
+    trace_request_id,
+)
 from app.schemas.common import VEHICLE_ID_PATTERN, UploadBucket
 from app.schemas.files import (
     FileCompleteRequest,
@@ -60,10 +65,14 @@ async def list_files(
 async def presign_upload(
     payload: FilePresignRequest,
     service: Annotated[FileService, Depends(get_file_service)],
-    _user_id: Annotated[str, Depends(require_read_permission)],
+    principal: Annotated[UploaderPrincipal, Depends(require_uploader_identity)],
 ) -> FilePresignResponse:
-    """预签名直传（method=put 单地址 / multipart 分片地址；有效期 1 小时）。"""
-    data = await service.presign(payload)
+    """预签名直传（method=put 单地址 / multipart 分片地址；有效期 1 小时）。
+
+    双主体（契约 x-hunter-device-ingress）：设备主体经证书 CN 一致性校验后仅能为本车申请；
+    控制台主体为代传路线（data:read）。
+    """
+    data = await service.presign(payload, device_vehicle_id=principal.device_vehicle_id)
     return FilePresignResponse(code=0, message="success", data=data, request_id=trace_request_id())
 
 
@@ -79,11 +88,16 @@ async def presign_upload(
 async def complete_upload(
     payload: FileCompleteRequest,
     service: Annotated[FileService, Depends(get_file_service)],
-    user_id: Annotated[str, Depends(require_read_permission)],
+    principal: Annotated[UploaderPrincipal, Depends(require_uploader_identity)],
 ) -> FileCompleteResponse:
-    """上传完成通知（size/md5/sha256 一致性校验通过后发布 sensor_file 通知）。"""
+    """上传完成通知（size/md5/sha256 一致性校验通过后发布 sensor_file 通知）。
+
+    设备主体额外强校 vehicle_id == 证书 CN（不符 1002）；审计日志 operator 记录主体 user_id。
+    """
     if payload.sha256 and len(payload.sha256) != 64:
         # Pydantic pattern 已兜底；此处防御式校验避免绕过（不可达分支，双保险）
         raise InvalidParameterError(message="sha256 必须为 64 位小写十六进制")
-    data = await service.complete(payload, user_id=user_id)
+    data = await service.complete(
+        payload, user_id=principal.user_id, device_vehicle_id=principal.device_vehicle_id
+    )
     return FileCompleteResponse(code=0, message="success", data=data, request_id=trace_request_id())

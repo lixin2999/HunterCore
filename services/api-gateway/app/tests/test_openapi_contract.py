@@ -270,7 +270,20 @@ def test_gateway_routes_match_route_table(contract: dict[str, Any]) -> None:
     routes = contract["x-hunter-gateway-routes"]["routes"]
     assert tuple(route["prefix"] for route in routes) == EXPECTED_ROUTE_PREFIXES
     headers = contract["x-hunter-gateway-routes"]["route_headers"]["headers"]
-    assert headers == ["X-User-Id", "X-Roles", "X-Trace-Id", "X-Identity-Timestamp", "X-Internal-MAC"]
+    # V1.21.13：X-Device-Vehicle-Id 入契约（设备主体专用，HMAC 第 5 段覆盖）
+    assert headers == ["X-User-Id", "X-Roles", "X-Trace-Id", "X-Identity-Timestamp", "X-Internal-MAC", "X-Device-Vehicle-Id"]
+
+
+def test_device_ingress_contract_matches_implementation(contract: dict[str, Any]) -> None:
+    """车端 REST mTLS 接入面（x-hunter-device-ingress）实现↔契约一致性护栏。"""
+    from app.core.device_auth import DEVICE_ALLOWED_PATHS
+
+    ingress = contract["x-hunter-device-ingress"]
+    contract_paths = {entry.split(" ", 1)[1] for entry in ingress["device_paths"]}
+    assert contract_paths == set(DEVICE_ALLOWED_PATHS)  # 白名单双源漂移 → 红灯
+    assert ingress["identity"]["claims"]["roles"] == ["device"]
+    assert "X-Device-Vehicle-Id" in ingress["identity"]["injected_headers"]
+    assert [c["key"] for c in ingress["config"]] == ["DEVICE_CA_CERTFILE"]
 
 
 def test_proxy_routes_target_correct_service_ports(contract: dict[str, Any]) -> None:

@@ -29,7 +29,8 @@ async def test_per_ip_global_limit(client: AsyncClient, monkeypatch: pytest.Monk
     body = blocked.json()
     assert set(body) == RESPONSE_FIELDS
     assert body["code"] == 5001         # 附录 A 无专用错误码，复用 5001
-    assert blocked.headers["retry-after"] == "60"
+    # V1.21.9 窗口改 1s（QPS 语义）后 Retry-After≈整窗=1；原断言 60 为改窗漏同步的存量错（V1.21.13 顺手修正）
+    assert blocked.headers["retry-after"] == "1"
     assert blocked.headers["x-ratelimit-limit"] == "2"
     assert blocked.headers["x-ratelimit-remaining"] == "0"
 

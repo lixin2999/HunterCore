@@ -11,6 +11,11 @@
 
 签名串（顺序固定，禁止改动）：``user_id|roles|trace_id|timestamp``
 （roles 为逗号分隔小写、去空白后的原样字符串，与服务端解析口径一致）。
+
+设备通道扩展（V1.21.13，契约 api-gateway x-hunter-device-ingress）：存在
+``X-Device-Vehicle-Id`` 时签名串追加第 5 段（``...|timestamp|vehicle_id``）；
+控制台通道（无设备头）签名串保持 4 段不变，滚动升级期间旧后端对设备请求
+验签失败 → 401 属预期 fail-closed。
 彻底消除身份头信任仍需网关↔后端 mTLS/Istio（NetworkPolicy 为纵深防御第一层）。
 """
 
@@ -26,33 +31,63 @@ HEADER_ROLES = "X-Roles"
 HEADER_TRACE_ID = "X-Trace-Id"
 HEADER_TIMESTAMP = "X-Identity-Timestamp"
 HEADER_MAC = "X-Internal-MAC"
+HEADER_DEVICE_VEHICLE_ID = "X-Device-Vehicle-Id"  # 设备主体专属（证书 CN 重验后由网关注入）
 
 _ALGORITHM = hashlib.sha256
 
 
-def canonical_identity(user_id: str, roles: str, trace_id: str, timestamp: str) -> str:
-    """构造待签名规范串（字段以 ``|`` 连接，空值以空串参与）。"""
-    return f"{user_id}|{roles}|{trace_id}|{timestamp}"
+def canonical_identity(
+    user_id: str,
+    roles: str,
+    trace_id: str,
+    timestamp: str,
+    device_vehicle_id: str | None = None,
+) -> str:
+    """构造待签名规范串（字段以 ``|`` 连接，空值以空串参与）。
+
+    ``device_vehicle_id`` 非 None 时追加为第 5 段（设备通道）；None（控制台通道）保持
+    历史 4 段格式不变——旧签名的验签方与新签名互不兼容属预期（fail-closed）。
+    """
+    base = f"{user_id}|{roles}|{trace_id}|{timestamp}"
+    return base if device_vehicle_id is None else f"{base}|{device_vehicle_id}"
 
 
-def sign_identity(secret: str, user_id: str, roles: str, trace_id: str, timestamp: str) -> str:
+def sign_identity(
+    secret: str,
+    user_id: str,
+    roles: str,
+    trace_id: str,
+    timestamp: str,
+    device_vehicle_id: str | None = None,
+) -> str:
     """HMAC-SHA256 十六进制摘要（网关侧注入用）。"""
-    message = canonical_identity(user_id, roles, trace_id, timestamp).encode("utf-8")
+    message = canonical_identity(user_id, roles, trace_id, timestamp, device_vehicle_id).encode("utf-8")
     return hmac.new(secret.encode("utf-8"), message, _ALGORITHM).hexdigest()
 
 
 def build_identity_headers(
-    secret: str, *, user_id: str, roles: str, trace_id: str
+    secret: str,
+    *,
+    user_id: str,
+    roles: str,
+    trace_id: str,
+    device_vehicle_id: str | None = None,
 ) -> dict[str, str]:
-    """网关转发注入的全套身份头（含防伪造覆盖语义由调用方保证）。"""
+    """网关转发注入的全套身份头（含防伪造覆盖语义由调用方保证）。
+
+    ``device_vehicle_id`` 非 None → 额外注入 X-Device-Vehicle-Id 并纳入签名第 5 段。
+    """
     timestamp = str(int(time.time()))
-    return {
+    headers = {
         HEADER_USER_ID: user_id,
         HEADER_ROLES: roles,
         HEADER_TRACE_ID: trace_id,
         HEADER_TIMESTAMP: timestamp,
-        HEADER_MAC: sign_identity(secret, user_id, roles, trace_id, timestamp),
+        HEADER_MAC: sign_identity(secret, user_id, roles, trace_id, timestamp, device_vehicle_id),
     }
+    if device_vehicle_id is not None:
+        headers[HEADER_DEVICE_VEHICLE_ID] = device_vehicle_id
+    return headers
 
 
 def verify_identity_headers(
@@ -78,6 +113,7 @@ def verify_identity_headers(
     trace_id = _get(HEADER_TRACE_ID) or ""
     timestamp = _get(HEADER_TIMESTAMP)
     mac = _get(HEADER_MAC)
+    device_vehicle_id = _get(HEADER_DEVICE_VEHICLE_ID)
     if not user_id or roles is None or not timestamp or not mac:
         return False
     try:
@@ -87,5 +123,8 @@ def verify_identity_headers(
     current = time.time() if now is None else now
     if abs(current - ts) > max_age_seconds:
         return False
-    expected = sign_identity(secret, user_id, roles, trace_id, timestamp)
+    expected = sign_identity(
+        secret, user_id, roles, trace_id, timestamp,
+        device_vehicle_id if device_vehicle_id else None,
+    )
     return hmac.compare_digest(expected, mac)

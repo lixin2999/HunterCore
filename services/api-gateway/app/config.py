@@ -57,5 +57,11 @@ class Settings(HunterBaseConfig):
     # 反向代理后是否信任 X-Forwarded-For（K8s Ingress 覆盖该头时可开启；直连部署建议关闭防伪造）
     trust_forwarded_for: bool = True
 
+    # ---------- 车端 REST mTLS 设备通道（契约 x-hunter-device-ingress；pending #6 决议） ----------
+    # 重验证书链用的 CA Bundle 路径（与 Kafka 接入包同一 CA；单机挂载 /srv/device-ca/ca-cert.pem:ro）。
+    # 未配置 → 设备通道整体禁用（fail-closed：带 X-Client-Cert 的设备路径请求直接 1001，仅控制台 JWT 路线可用）
+    device_ca_certfile: str | None = None
+    device_role: str = "device"            # 设备主体角色（后端仅上传端点认可，不入 data:read 白名单）
+
 
 settings = Settings()

@@ -336,9 +336,15 @@ components:
     deviceCertificate:
       type: mutualTLS
       description: |
-        车辆设备认证：X.509 双向 TLS，证书 CommonName = vehicle_id（出厂烧录，CRL / OCSP 吊销）。
-        车端另经 Kafka `SASL_SSL + SCRAM-SHA-512` 接入；本契约不含车端 REST 资源端点
-        （文件上传走 MinIO 预签名 URL 直传，见数据采集契约）。
+        车辆设备认证：X.509 双向 TLS，证书 CommonName = vehicle_id（开通流程签发，与 Kafka 接入包
+        同一张证书/同一 CA；CRL / OCSP 吊销为二期）。
+        车端 REST 入口已定案（pending #6）：独立 mTLS 端口（单机 web-portal nginx :8443，
+        `ssl_verify_client on` + CA=certs/kafka/ca-cert.pem）→ 转发 api-gateway，附
+        `X-Client-Cert`（URL 编码 PEM，$ssl_client_escaped_cert）；网关用同一 CA **本地重验证书链**
+        （签名/有效期/clientAuth EKU）后按设备主体注入身份头（roles=[device] + X-Device-Vehicle-Id=CN），
+        设备通道仅放行文件上传两端点（见 x-hunter-device-ingress）。
+        车端遥测走 Kafka `SASL_SSL + SCRAM-SHA-512`（SCRAM 口令与 REST 通道无关，不进入 REST 认证）；
+        本契约不含车端 REST 资源端点（文件上传走 MinIO 预签名 URL 直传，见数据采集契约）。
 
   headers:
     RequestId:
@@ -746,14 +752,38 @@ components:
 # 实现与校验脚本（服务单测 / scripts/verify_*.py）以本节为准，禁止在代码中另立事实来源
 # =====================================================================
 
+# ---------- 车端 REST mTLS 接入面（pending #6 决议，V1.21.13；禁止在此面外新增车端端点） ----------
+x-hunter-device-ingress:
+  source: "contracts/openapi/data-collector.yaml x-hunter-pending-confirmation #6 决议"
+  entry:
+    compose: "web-portal nginx :8443（ssl_verify_client on，ssl_client_certificate=certs/kafka/ca-cert.pem，服务端证书复用 certs/kafka/broker-cert.pem——SAN 需含车端访问地址）"
+    k8s: "独立 Ingress（auth-tls-verify-client: on + 叶子证书转发 ssl-client-cert 头）：P2 待交付"
+  trust_model: |
+    网关不可直接信任反代头（:8080 本身对外）：对 X-Client-Cert 转发的 PEM 用同一 CA 本地重验
+    （verify_directly_issued_by + 有效期 + clientAuth EKU + CN 非空），伪造头无 CA 私钥无法通过；
+    验签失败/证书过期/缺头 → 1001。证书 PEM 禁止写入日志。
+  device_paths:                    # 设备主体唯一可达的业务路径（其余路径设备 → 后端 RBAC 403/1002）
+    - POST /api/v1/data/files/presign
+    - POST /api/v1/data/files/complete
+  identity:
+    claims: { sub: "device:{vehicle_id}", roles: ["device"], vehicle_id: "{CN}" }
+    injected_headers: [X-User-Id, X-Roles, X-Device-Vehicle-Id, X-Trace-Id, X-Identity-Timestamp, X-Internal-MAC]
+    enforcement: "后端必须校验请求体 vehicle_id 与 X-Device-Vehicle-Id 一致（不符 1002），见 data-collector 契约"
+  config:
+    - key: DEVICE_CA_CERTFILE
+      note: "网关重验用 CA Bundle 路径（单机挂载 /srv/device-ca/ca-cert.pem:ro）；未配置 → 设备通道禁用（fail-closed，仅控制台 JWT 路线）"
+  rate_limit: "入口粗限沿用单 IP 200 QPS（附录 D，单车单 IP 语义成立）；车辆带宽 ≤10 Mbps 在服务内实现不进网关"
+
 # ---------- 网关路由表（设计文档 3.4 节；路径前缀不可更改） ----------
 x-hunter-gateway-routes:
   source: "设计文档 3.4 节 + 系统上下文基座「网关路由表」"
   route_headers:
     description: 网关转发至后端时注入的请求头（客户端同名头一律被覆盖，防身份伪造）；
       X-Identity-Timestamp/X-Internal-MAC 为 G-02 身份头 HMAC-SHA256 签名加固
-      （密钥 GATEWAY_HMAC_SECRET，网关与后端共享，后端配置后强制验签，防集群内伪造身份绕过 RBAC）
-    headers: [X-User-Id, X-Roles, X-Trace-Id, X-Identity-Timestamp, X-Internal-MAC]
+      （密钥 GATEWAY_HMAC_SECRET，网关与后端共享，后端配置后强制验签，防集群内伪造身份绕过 RBAC）；
+      X-Device-Vehicle-Id 仅设备主体注入（证书 CN 重验通过后；HMAC 签名串在设备通道追加该字段为第 5 段，
+      控制台通道签名串保持 4 段不变——滚动升级时旧后端对设备请求验签失败 → 401 属预期 fail-closed）
+    headers: [X-User-Id, X-Roles, X-Trace-Id, X-Identity-Timestamp, X-Internal-MAC, X-Device-Vehicle-Id]
   strip_prefix: false        # 后端按 /api/v1/<domain>/... 全路径注册路由（与各服务契约一致）
   routes:
     - prefix: /api/v1/scene

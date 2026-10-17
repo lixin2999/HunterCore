@@ -83,13 +83,18 @@ class FileService:
 
     # ---------- presign ----------
 
-    async def presign(self, payload: FilePresignRequest) -> FilePresignData:
+    async def presign(
+        self, payload: FilePresignRequest, device_vehicle_id: str | None = None
+    ) -> FilePresignData:
         """预签名（契约 POST /files/presign 唯一入口）。
 
         - data_type 必须落在请求 bucket 的合法映射内（1002：Bucket 与数据类型不匹配）；
-        - part_count > 1 → multipart（upload_id + parts[]），否则 put 单地址。
+        - part_count > 1 → multipart（upload_id + parts[]），否则 put 单地址；
+        - 设备主体（x-hunter-device-ingress）：请求体 vehicle_id 必须等于证书 CN（不符 1002，
+          防已认证设备越权写入他车目录）；控制台代传主体 device_vehicle_id=None 不约束。
         """
         self._validate_bucket_mapping(payload.bucket.value, payload.data_type.value)
+        self._validate_device_vehicle(payload.vehicle_id, device_vehicle_id)
         bucket = payload.bucket.value
         key = await asyncio.to_thread(self._build_object_key, payload)
         content_type = payload.content_type or MIME_BY_EXTENSION.get(
@@ -131,6 +136,20 @@ class FileService:
             expires_in=settings.presigned_upload_expire_seconds,
         )
 
+    def _validate_device_vehicle(
+        self, vehicle_id: str, device_vehicle_id: str | None
+    ) -> None:
+        """设备主体身份一致性（契约 pending #6 决议：vehicle_id 一律以证书 CN 为准）。
+
+        非设备主体（device_vehicle_id=None）不校验；越权 → 1002（不区分"存在/不存在"避免探测）。
+        """
+        if device_vehicle_id is not None and vehicle_id != device_vehicle_id:
+            raise PermissionDeniedError(
+                message=(
+                    "vehicle_id 与设备证书 CN 不一致（禁止以本车身份写入他车目录）"
+                )
+            )
+
     def _validate_bucket_mapping(self, bucket: str, data_type: str) -> None:
         """Bucket 与 data_type 映射校验（x-hunter-file-upload-flow.bucket_mapping）。
 
@@ -166,11 +185,12 @@ class FileService:
     # ---------- complete ----------
 
     async def complete(
-        self, payload: FileCompleteRequest, user_id: str
+        self, payload: FileCompleteRequest, user_id: str, device_vehicle_id: str | None = None
     ) -> FileCompleteData:
         """上传完成校验（契约 POST /files/complete 唯一入口）。
 
         步骤（x-hunter-file-upload-flow.complete，全部满足才发通知）：
+        0. 设备主体：请求体 vehicle_id 必须等于证书 CN（否则 1002，同 presign）；
         1. 对象路径必须归属请求车辆目录（前缀 {bucket}/{vehicle_id}/，否则 1002）；
         2. multipart：先合并分片（缺 upload_id/parts → 2001，非法会话中止并回滚）；
         3. head_object：对象不存在 → 3001；
@@ -178,6 +198,7 @@ class FileService:
         5. hunter-rosbag：校验通过后打 Tag hunter-retention=<retention>（G-12，失败 → 5001）；
         6. 校验通过发布 sensor_file（key=vehicle_id；Kafka 故障 → 5001）。
         """
+        self._validate_device_vehicle(payload.vehicle_id, device_vehicle_id)
         self._validate_vehicle_prefix(
             vehicle_id=payload.vehicle_id, bucket=payload.bucket.value, object_key=payload.object_key
         )
