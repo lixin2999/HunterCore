@@ -4,15 +4,17 @@
 Kafka 的 ``list_consumer_group_offsets`` 对**不存在的组**与**存在但从未提交位点的组**都返回
 **空分区列表且不报错**（对拼错的组名同样不抛错）。因此「空位点」在语义上是
 **「无法判定」**，绝不能折算成 ``lag=0``——旧实现正是这样把四个不存在的组报成「零积压」。
-本文件锁死四件事：未判定组一律进第二个返回值、绝不进映射、映射里永不出现兜底的 0、
-且第二个返回值必须**带成因码**（只给组名会让看板四个组同显「未判定」，形同「没有数据」）。
+本文件锁死五件事：未判定组一律进第二个返回值、绝不进映射、映射里永不出现兜底的 0、
+第二个返回值必须**带成因码**（只给组名会让看板四个组同显「未判定」，形同「没有数据」）、
+以及**结果对象的取值必须与真库同形**（V1.21.15：分区属性是 `topic_partitions` 而非 `partitions`——
+按想象取名会让 `partitions` 恒空、每个组都被误判「无提交位点」）。
 """
 from __future__ import annotations
 
 from typing import Any
 
 import pytest
-from confluent_kafka import OFFSET_INVALID
+from confluent_kafka import OFFSET_INVALID, ConsumerGroupTopicPartitions, TopicPartition
 
 from app.config import Settings
 from app.repositories import pipeline as pipeline_mod
@@ -52,16 +54,14 @@ class _ListResult:
         self.errors = errors or []
 
 
-class _Offsets:
-    def __init__(self, partitions: list[Any]) -> None:
-        self.partitions = partitions
+def _Committed(topic: str, partition: int, offset: int) -> TopicPartition:
+    """提交位点条目——**直接用真库的 ``TopicPartition``**（属性 topic/partition/offset）。
 
-
-class _Committed:
-    """提交位点条目（对齐 confluent-kafka 返回的 TopicPartition 属性名）。"""
-
-    def __init__(self, topic: str, partition: int, offset: int) -> None:
-        self.topic, self.partition, self.offset = topic, partition, offset
+    V1.21.15 教训：曾用自造类冒充条目、并给结果容器自造 ``partitions`` 属性，与真库
+    ``ConsumerGroupTopicPartitions.topic_partitions`` 不同形 ⇒ 单测全绿、线上恒空。
+    形状必须来自库本身，不得按读方想象发明字段（同 V1.19.20/21 的 Mock 纪律）。
+    """
+    return TopicPartition(topic, partition, offset)
 
 
 def _build(
@@ -111,7 +111,8 @@ def _build(
             entry = state["offsets"][group]
             if isinstance(entry, Exception):
                 return {group: _Future(error=entry)}
-            return {group: _Future(_Offsets(entry))}
+            # 结果对象用真库类型（形状门禁 V1.21.15：分区列表属性名是 topic_partitions，非 partitions）
+            return {group: _Future(ConsumerGroupTopicPartitions(group, entry))}
 
     class _Consumer:
         def __init__(self, conf: dict[str, Any]) -> None:
@@ -231,6 +232,21 @@ def test_unknown_cause_code_is_echoed_not_guessed() -> None:
     """未登记的码原样回显：宁可露出英文码，也不给它套一句「大概是零积压」的默认结论。"""
     copy = undetermined_cause("some_new_cause")
     assert copy.label == "some_new_cause" and copy.hint == "some_new_cause"
+
+
+def test_offset_result_uses_real_confluent_attr_name() -> None:
+    """形状门禁（V1.21.15）：结果对象的分区属性是 **``topic_partitions``**，不是 ``partitions``。
+
+    实机确诊的根因：``_lag_sync`` 旧代码读 ``getattr(offsets, "partitions")`` 恒为空 ⇒ 每个组都被
+    判成「无提交位点」，而 ``--describe`` 明明有位点。此测试直接对**真库类**断言属性名，
+    并验证 ``_lag_sync`` 能从真实结果对象里取到条目——替身再也不能按想象发明字段名。
+    """
+    result = ConsumerGroupTopicPartitions("g", [TopicPartition("telemetry_clean", 0, 5)])
+    assert result.topic_partitions and result.topic_partitions[0].offset == 5
+    assert not hasattr(result, "partitions"), (
+        "真库结果对象若出现/改名 `partitions`，须同步 `_lag_sync` 的取值与本断言"
+    )
+
 
 
 def test_partial_watermark_failure_still_reports_measured_lag(monkeypatch: pytest.MonkeyPatch) -> None:

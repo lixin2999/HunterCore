@@ -45,6 +45,11 @@
 前端按成因展示（不再把“未判定”画成零长灰条）。同一成因码也记在日志事件
 `consumer_group_lag_undetermined` 的 `cause=`；`available=false` 只用于“Kafka 整体不可达”，与“读不到位点”不混用。
 
+> ⚠ 取值实现（V1.21.15）：`KafkaLagProbe._lag_sync` 从 confluent-kafka 的
+> `ConsumerGroupTopicPartitions.topic_partitions` 取提交位点（**不是** `partitions`——真库无此属性，
+> 旧代码按它取值恒空 ⇒ **所有组**被误判「无提交位点」，看板永远没有可测滞后；V1.19.14 之前同一处被折算成 `lag=0` 假绿）。
+> 单测替身必须构造真库类型（`ConsumerGroupTopicPartitions` / `TopicPartition`），**不得自造字段名**。
+
 ## 本地运行
 
 ```bash

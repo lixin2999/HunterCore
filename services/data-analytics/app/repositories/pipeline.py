@@ -349,7 +349,14 @@ class KafkaLagProbe:
                     logger.exception("consumer_group_offset_fetch_failed", group=group)
                     unknown[group] = "offset_fetch_failed"
                     continue
-                partitions = list(getattr(offsets, "partitions", None) or [])
+                # ℞ V1.21.15（实机确诊的真根因）：结果对象是 confluent-kafka 的
+                #   ``ConsumerGroupTopicPartitions``，其分区列表属性名是 **``topic_partitions``**
+                #   （不是 ``partitions``——该属性在真库类上根本不存在）。旧代码按 ``partitions``
+                #   取值恒为 None ⇒ ``partitions`` 恒空 ⇒ **每个组**都落进「无提交位点/未判定」分支，
+                #   看板因此永远没有可测的滞后（此前旧口径表现为「永远 0」的假绿）。
+                #   实机判据：``kafka_groups_cli --describe`` 明明有 CURRENT-OFFSET，本函数却报
+                #   ``cause=no_committed_offsets``。取值必须与真库属性同形，不再按想象猜字段名。
+                partitions = list(getattr(offsets, "topic_partitions", None) or [])
                 if not partitions:
                     cause = (
                         "group_not_found"
