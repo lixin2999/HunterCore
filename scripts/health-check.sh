@@ -126,7 +126,7 @@ HunterCore 全栈健康检查脚本
   Flink 作业健康（flink list -a：FAILED 不会被默认列表列出）、Flink 检查点目录可写、
   业务服务 Kafka 本地磁盘缓冲目录可写（宿主 kafka-buffer 属主 10001 预检，V1.20.4）、
   入库延迟指标键（analytics:ingest_latency 存否/ TTL/诊断载荷，V1.19.21）、
-  视频链路（SRS 实例唯一 / WebRTC candidate / 同源 /rtc/ 反代 / SRS 活跃流 / WHEP 基址同源 / /rtc/ 上游解析方式，V1.21.6、V1.21.7）。
+  视频链路（SRS 实例唯一 / WebRTC candidate / 同源 /rtc/ 反代 / SRS 活跃流 / WHEP 基址同源 / 反代上游解析方式——`/api/`、`/ws/`、`/rtc/` 三入口，V1.21.6、V1.21.7、V1.21.17）。
 EOF
 }
 
@@ -899,6 +899,11 @@ check_service_error_logs() {
 # V1.21.7 补两个：WHEP 基址改读**容器生效值**（实机假 FAIL：compose 有默认值、.env 里根本没这行），
 #   并新增 f) /rtc/ 上游解析方式——静态 proxy_pass 在 srs 每次重建后确实会把拉流打成 502（结构性隐患，
 #   已根治），但 V1.21.7 实机证明它不是当时那条 502 的成因（见上方定案）。
+# V1.21.17 把 f) 从 /rtc/ 扩到**三入口**（/api/、/ws/、/rtc/）：同一条机制（upstream 块/不带变量的
+#   proxy_pass 只在加载配置时解析一次域名），后果却是“最不像反代故障”的那一类——/ws/ 表现为操控台
+#   恒 reconnecting（浏览器只拿到 1006，不在前端终态关闭码内 ⇒ 不报错）、服务端 commands_sent 恒 0、
+#   车端超时刹停；/api/ 表现为全站 REST（含登录）502。故本项同时检查三条 `set $*_upstream` 与
+#   “文件内不得再有 upstream 块”，任一不满足即 WARN（V1.21.17 实机就栽在 /ws/ 上）。
 check_video_chain() {
   local pids pid expect_ip current raw code body resp streams names whep nginx_conf
   local probe_stream first_stream frames_now kbps_now f2
@@ -1033,18 +1038,30 @@ check_video_chain() {
     *) record_result "PASS" "视频链路（WHEP 基址）" "${whep}（同源反代口径）" ;;
   esac
 
-  # f) /rtc/ 上游解析方式（V1.21.7）：静态写法在 srs 每次重建后都会把拉流打成 502
-  #    nginx 对 proxy_pass http://srs:9090 只在加载配置时解析一次域名；而改 candidate 必须
-  #    up -d --force-recreate srs（单文件 bind，restart 不重挂）→ 重建后旧 IP 失效。
+  # f) 反代上游解析方式（V1.21.7 立 /rtc/；V1.21.17 扩为三入口 /api/、/ws/、/rtc/）
+  #    机制：upstream 块与不带变量的 proxy_pass 都只在 nginx 加载配置时解析一次域名，而任一后端被
+  #    `up -d --force-recreate`/`--build` 重建即换容器 IP（改 .env / 换镜像 / 单文件 bind 配置更新都走这条路）。
+  #    后果：/ws/ = 操控台恒 reconnecting（浏览器只拿 1006，前端不报错）+ 服务端 commands_sent 恒 0 + 车端刹停；
+  #          /api/ = 全站 REST（含登录）502；/rtc/ = WHEP 502（V1.21.7 实机首个踩到）。
+  #    判定：三条 `set $*_upstream` 齐备 **且** 文件内无 upstream 块 = PASS。
   nginx_conf="${APP_DIR:-.}/config/nginx.conf"
   if [ ! -f "$nginx_conf" ]; then
-    record_result "WARN" "视频链路（/rtc/ 上游解析）" "未找到渲染副本 ${nginx_conf}，本项未判定"
-  elif grep -qE '^[[:space:]]*set[[:space:]]+\$srs_upstream' "$nginx_conf"; then
-    record_result "PASS" "视频链路（/rtc/ 上游解析）" "运行期解析（resolver + 变量）→ srs 重建不需 restart hunter-web"
-  elif grep -q 'location /rtc/' "$nginx_conf"; then
-    record_result "WARN" "视频链路（/rtc/ 上游解析）" "${nginx_conf} 仍是静态 proxy_pass http://srs:9090：每次 up -d --force-recreate srs 后必须 sudo docker restart hunter-web，否则 WHEP 502（本项 c 会报）；升级：sudo bash scripts/install.sh --only-step 4 -y 后 --force-recreate web-portal"
+    record_result "WARN" "视频链路（反代上游解析）" "未找到渲染副本 ${nginx_conf}，本项未判定"
+  elif ! grep -q 'location /rtc/' "$nginx_conf"; then
+    record_result "FAIL" "视频链路（反代上游解析）" "${nginx_conf} 没有 location /rtc/（V1.21.1 之前的旧副本）→ 同源反代未就位，浏览器跨源必被 CSP/CORS 拦；从仓库 infra/deploy/config/nginx.conf 覆盖后 --force-recreate web-portal"
   else
-    record_result "FAIL" "视频链路（/rtc/ 上游解析）" "${nginx_conf} 没有 location /rtc/（V1.21.1 之前的旧副本）→ 同源反代未就位，浏览器跨源必被 CSP/CORS 拦；从仓库 infra/deploy/config/nginx.conf 覆盖后 --force-recreate web-portal"
+    static_entries=""
+    grep -qE '^[[:space:]]*set[[:space:]]+\$gw_upstream[[:space:]]'  "$nginx_conf" || static_entries="${static_entries} /api/"
+    grep -qE '^[[:space:]]*set[[:space:]]+\$rc_upstream[[:space:]]'  "$nginx_conf" || static_entries="${static_entries} /ws/"
+    grep -qE '^[[:space:]]*set[[:space:]]+\$srs_upstream[[:space:]]' "$nginx_conf" || static_entries="${static_entries} /rtc/"
+    upstream_blocks="$(grep -cE '^[[:space:]]*upstream[[:space:]]' "$nginx_conf" 2>/dev/null || true)"
+    if [ -n "$static_entries" ]; then
+      record_result "WARN" "视频链路（反代上游解析）" "${nginx_conf} 仍是静态上游：${static_entries} → 重建对应后端后必 502（/ws/ 表现为操控台恒 reconnecting、服务端 commands_sent 恒 0、车端刹停；/api/ 为全站 REST 502）。根治：sudo bash scripts/install.sh --only-step 4 -y 后 --force-recreate web-portal"
+    elif [ "${upstream_blocks:-0}" -ne 0 ]; then
+      record_result "WARN" "视频链路（反代上游解析）" "三条 set \$*_upstream 都在，但仍有 ${upstream_blocks} 个 upstream 块（V1.21.17 起应为 0）：upstream 块只在加载配置时解析域名，重建后端仍会断；删除该块改用「变量 + resolver」"
+    else
+      record_result "PASS" "视频链路（反代上游解析）" "三入口均运行期解析（resolver + 变量）、无 upstream 块 → 任一后端重建（api-gateway/remote-control/srs）都不需 restart hunter-web"
+    fi
   fi
   return 0
 }
