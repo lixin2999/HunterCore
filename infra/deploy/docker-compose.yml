@@ -685,7 +685,8 @@ services:
       RC_SRS_RTMP_URL: ${RC_SRS_RTMP_URL:-rtmp://${SERVER_IP}:1935/remote_control}
       RC_SRS_WHEP_URL: ${RC_SRS_WHEP_URL:-http://${SERVER_IP}/rtc/v1/whep/}
       RC_SRS_WHIP_URL: ${RC_SRS_WHIP_URL:-http://${SERVER_IP}/rtc/v1/whip/}
-      RC_PUBLIC_WS_BASE_URL: ${RC_PUBLIC_WS_BASE_URL:-ws://${SERVER_IP}/ws/remote}
+      # V1.21.17：基址语义 = scheme://host[:port]，**不含路径**（通道路径由后端按会话拼装）
+      RC_PUBLIC_WS_BASE_URL: ${RC_PUBLIC_WS_BASE_URL:-ws://${SERVER_IP}}
       RC_STUN_URLS: ${RC_STUN_URLS:-}
       # V1.21.11：TURN 透传（t5 跨网段落地硬前提；共享密钥短期凭据模式见 config.py rc_turn_*）。
       # 默认空=不启用；启用需另部署 coturn 并在 .env 填 RC_TURN_URLS/RC_TURN_SHARED_SECRET（后者优先经 Secret 注入）

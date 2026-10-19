@@ -103,6 +103,8 @@ bash /opt/hunter-core/scripts/collect-logs.sh     # 收集日志供排障
 
 > **Step 7 中间件启动常见阻断（Kafka）**：`install.sh --step 7` 卡在 Kafka 90s 未就绪时，多为逐层暴露的多重根因（config 目录不可写 → inter-broker advertised → OS 孤儿网桥重复子网 → keystore JKS 对 uid 1001 不可读 → healthcheck 无 nc）。以 `docker logs hunter-kafka` 实际异常为准逐层定位，处置命令见 `docs/运维操作手册.md` §3.4.1 与 `docs/故障排查指南.md`（背景与根因见 `release.md` V1.16.2）。
 
+> **反代上游纪律（V1.21.17，不可回退）**：`infra/deploy/config/nginx.conf` 的 `/api/`、`/ws/`、`/rtc/` 三个 location **一律**写「`resolver` + 变量」（`set $xxx_upstream http://<service>:<port>;` + `proxy_pass $xxx_upstream$request_uri;`），且本文件**不留任何 `upstream` 块**。原因：`upstream` 块与不带变量的 `proxy_pass` 只在 nginx **加载配置时**解析一次域名，而任一后端被 `up -d --force-recreate` 重建即换容器 IP ⇒ 对应入口恒 502，且现象**像业务故障**：`/ws/` 是操控台恒 `reconnecting`（浏览器只拿到 1006，不在前端终态关闭码内 ⇒ 不报错）、服务端 `commands_sent` 恒 0、车端超时刹停（V1.21.17 实机）；`/api/` 是全站 REST（含登录）502。代价是失去 `upstream keepalive` 连接池（nginx 1.25 无 `server … resolve`），详见 `docs/deployment.md` §15 硬约束 5；取证与处置见 `docs/故障排查指南.md` 9.1/9.9 与 `docs/运维操作手册.md` §3.8 巡检 ⑰-f。
+
 ### 微服务内部结构（固定，不可更改）
 
 ```
@@ -499,6 +501,7 @@ python scripts/verify_test_layer.py
 | 数据分析契约校验 | `cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -q`（契约 ↔ 设计文档 6 章/12.4 节 ↔ DDL ↔ Kafka ↔ K8s，32 项） |
 | 远程操控契约校验 | `cd services/remote-control && pytest app/tests/test_remote_control_contract.py -q`（契约 ↔ 设计文档 15 条安全约束/12.6 节推导 ↔ Kafka ↔ MinIO 归档 ↔ K8s，契约测试随实现步骤落地） |
 | remote-control SRS/WHEP 配置测试 | `python scripts/run_unit_tests.py services/remote-control`（含 `app/tests/test_config_srs.py`：`srs_stream_name`/`srs_{whep,whip,rtmp}_url_for` 拼装与基址空降级，V1.21.0） |
+| remote-control WS 通道地址测试 | `python scripts/run_unit_tests.py services/remote-control`（含 `app/tests/test_config_ws_url.py`：`RC_PUBLIC_WS_BASE_URL` 基址幂等归一 + `/ws/remote/{sid}/{channel}` 单前缀拼装（双前缀回归），V1.21.17） |
 | 内置车辆模拟器测试 | `cd tools/vehicle-simulator && pytest -q`（一维运动学/超时停车、telemetry/health/command_result schema 自校验、内存桩 Kafka 编排，18 项，V1.21.0；需 `pip install -e tools/vehicle-simulator`） |
 | 契约文件静态校验 | `python -c "import yaml; yaml.safe_load(open('contracts/openapi/remote-control.yaml', encoding='utf-8'))"`（YAML 语法 + `$ref` 解析，无需服务） |
 | 数据库迁移 | `alembic -c common/python/alembic.ini current` / `... upgrade head` / `... upgrade head --sql`（离线预览） |

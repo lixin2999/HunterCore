@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from hunter_common.config import HunterBaseConfig
 from pydantic import model_validator
 
@@ -22,6 +24,32 @@ from pydantic import model_validator
 def _split_csv(raw: str) -> set[str]:
     """逗号分隔配置 → 集合（去空白、去空项）。"""
     return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+#: 远程操控 WS 通道路径前缀（契约 x-hunter-websocket-contract；网关/nginx 路由 /ws/remote/**）
+_WS_PATH_PREFIX = "/ws/remote"
+
+
+def _normalize_ws_base_url(value: str) -> str:
+    """归一化 ``RC_PUBLIC_WS_BASE_URL`` 为「scheme://host[:port]」基址（幂等）。
+
+    契约语义（openapi ``WebRtcConnectionInfo.control_ws_url`` 示例）中基址**不含路径**，
+    通道路径由 :meth:`Settings.rc_ws_url_for` 统一拼装；但部署模板曾把基址写成含路径形态
+    （``ws://<ip>/ws/remote``，见 infra/deploy/.env.example），叠加拼装即产出
+    ``ws://<ip>/ws/remote/ws/remote/<sid>/control`` —— **双前缀**，浏览器握手必失败
+    （前端虽有同源兜底，但一旦兜底失效或基址改为相对路径即当场断链）。
+
+    归一规则：去首尾空白与结尾 ``/`` 后，剥掉结尾的 ``/ws/remote`` 或 ``/ws``；
+    仅当剥掉后仍是绝对 URL（含 ``://``）才生效——避免把"唯一前缀"也吃掉而产出无 host 地址。
+    """
+    base = (value or "").strip().rstrip("/")
+    for suffix in (_WS_PATH_PREFIX, "/ws"):
+        if base.endswith(suffix):
+            candidate = base[: -len(suffix)]
+            if "://" in candidate:
+                base = candidate
+            break
+    return base
 
 
 class Settings(HunterBaseConfig):
@@ -36,6 +64,8 @@ class Settings(HunterBaseConfig):
     minio_region: str = "us-east-1"
 
     # ---------- 公网入口（WebRTC 信令/控制通道 URL 下发用；网关 TLS 终结） ----------
+    # 语义 = 「scheme://host[:port]」基址（契约 openapi 示例），**不含路径**；
+    # 通道路径由 rc_ws_url_for 统一拼装（含路径的历史配置值会被幂等归一，见下）。
     rc_public_ws_base_url: str = "wss://hunter-core.example.com"
 
     # ---------- 控制安全（x-hunter-control-safety；系统约束第 15 条，不可放宽） ----------
@@ -193,6 +223,19 @@ class Settings(HunterBaseConfig):
         if not self.rc_srs_rtmp_url:
             return None
         return f"{self.rc_srs_rtmp_url.rstrip('/')}/{self.srs_stream_name(vehicle_id, session_id)}"
+
+    # ---------- WS 通道地址拼装（G-09；契约 x-hunter-websocket-contract） ----------
+    def rc_ws_url_for(self, session_id: str, channel: Literal["control", "signal"]) -> str:
+        """远程操控 WS 通道完整地址（归一化基址 + 单一 ``/ws/remote/{sid}/{channel}`` 路径）。
+
+        基址归一化语义见 :func:`_normalize_ws_base_url` —— 无论 ``RC_PUBLIC_WS_BASE_URL``
+        写成契约形态（``wss://host``）还是部署模板的历史形态（``ws://host/ws/remote``），
+        产出的 URL 都只含一个 ``/ws/remote`` 前缀（回归：双前缀导致 WS 握手必失败）。
+        """
+        return (
+            f"{_normalize_ws_base_url(self.rc_public_ws_base_url)}"
+            f"{_WS_PATH_PREFIX}/{session_id}/{channel}"
+        )
 
     @model_validator(mode="after")
     def _validate_contract_invariants(self) -> Settings:

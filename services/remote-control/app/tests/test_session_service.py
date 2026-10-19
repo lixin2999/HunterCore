@@ -104,6 +104,28 @@ async def test_create_session_success(rc_env) -> None:
     assert info.record.bucket == "hunter-video" and info.record.retention_days == 90
 
 
+async def test_create_session_ws_urls_have_single_path_prefix(
+    rc_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回归（V1.21.17）：基址含 `/ws/remote` 时，下发的 control/signal URL 不得双前缀。
+
+    实机断链形态：`.env` 的 `RC_PUBLIC_WS_BASE_URL=ws://<ip>/ws/remote` + 代码再拼一次
+    → `ws://<ip>/ws/remote/ws/remote/<sid>/control`。此处以部署模板真实取值断言归一结果。
+    """
+    monkeypatch.setattr(
+        rc_env.session_service._settings, "rc_public_ws_base_url", "ws://192.168.31.35/ws/remote"
+    )
+    info = await rc_env.session_service.create_session(
+        VEHICLE_ONLINE, make_operator(), _request()
+    )
+    assert info.webrtc.control_ws_url == (
+        f"ws://192.168.31.35/ws/remote/{info.session_id}/control"
+    )
+    assert info.webrtc.signal_ws_url == (
+        f"ws://192.168.31.35/ws/remote/{info.session_id}/signal"
+    )
+
+
 async def test_create_session_sets_hard_ttl_on_session_key(rc_env) -> None:
     """审查 R7 回归：会话 Hash 必须带硬 TTL（兜底副本崩溃/未走 DELETE 的残留会话）。"""
     service: SessionService = rc_env.session_service

@@ -811,12 +811,13 @@ class SessionService:
         V1.21.0：视频链路改为 SRS 媒体架构——车端 RTMP 推流、浏览器 WHEP 拉流；
         signal 通道保留但不作为视频必经路径。媒体地址由配置基址按会话 stream 拼装
         （见 Settings.srs_*_url_for），基址未配置时对应字段为 None（契约 optional）。
-        通道路径对齐网关路由 /ws/remote/**。
+        通道路径对齐网关路由 /ws/remote/**（V1.21.17：基址经 rc_ws_url_for 幂等归一，
+        杜绝 `RC_PUBLIC_WS_BASE_URL` 含 `/ws/remote` 时拼出双前缀的断链形态）。
         """
         settings = self._settings
         return WebRtcConnectionInfo(
-            signal_ws_url=f"{settings.rc_public_ws_base_url}/ws/remote/{session_id}/signal",
-            control_ws_url=f"{settings.rc_public_ws_base_url}/ws/remote/{session_id}/control",
+            signal_ws_url=settings.rc_ws_url_for(session_id, "signal"),
+            control_ws_url=settings.rc_ws_url_for(session_id, "control"),
             publisher="vehicle",
             subscriber="browser",
             ice_servers=self._build_ice_servers(),
