@@ -158,6 +158,15 @@ class FileObjectItem(BaseModel):
     last_modified: float = Field(description="对象最后修改时间（Unix epoch 秒）")
     download_url: str = Field(description="预签名下载地址（有效期 900s，支持 Range 分片下载）")
     expires_in: int = Field(description="下载地址有效期（秒），固定 900", examples=[900])
+    # ↓ 仅 hunter-video 桶（操控录像 sidecar↔视频配对）填充；其余桶为 null/false（V1.21.22）
+    video_size_bytes: int | None = Field(
+        default=None,
+        description="所属会话的 .mp4 实际字节数（.json 行经配对探测；.mp4 行为自身大小；无对应视频为 null）",
+    )
+    is_orphan: bool = Field(
+        default=False,
+        description="是否为可安全删除的孤儿（对应视频缺失或 0 B）；true=无效记录，false=有效录像受保护",
+    )
 
 
 class FileListData(BaseModel):
@@ -191,6 +200,14 @@ class FileDeleteRequest(BaseModel):
         max_length=200,
         description="待删除对象键列表（相对 bucket，≤200/次；与 GET /files 返回的 object_key 一致）",
     )
+    include_valid: bool = Field(
+        default=False,
+        description=(
+            "hunter-video 桶专用护栏（V1.21.22）：默认 false——拒删对应视频有效（>0 B）的会话"
+            "（避免误删有效录像），此类项计入 skipped；true 时强制连有效会话一并删除。"
+            "删除按会话配对（.json+.mp4 同删），不留失联对象。非 video 桶忽略本字段。"
+        ),
+    )
 
 
 class FileDeleteFailure(BaseModel):
@@ -212,6 +229,12 @@ class FileDeleteData(BaseModel):
     deleted: list[str] = Field(default_factory=list, description="已成功删除的对象键")
     failed: list[FileDeleteFailure] = Field(default_factory=list, description="删除失败项")
     deleted_count: int = Field(ge=0, description="删除成功数")
+    # ↓ hunter-video 护栏（V1.21.22）：被保护而未删的请求键
+    skipped: list[str] = Field(
+        default_factory=list,
+        description="因对应视频有效（>0 B）且未指定 include_valid 而被跳过未删的请求键",
+    )
+    skipped_count: int = Field(default=0, ge=0, description="被护栏跳过数")
 
 
 class FileDeleteResponse(BaseModel):

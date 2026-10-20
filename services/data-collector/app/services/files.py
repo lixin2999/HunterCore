@@ -423,55 +423,77 @@ class FileService:
             items = items[:limit]
         if has_more and not next_marker and items:
             next_marker = items[-1]["object_key"]
-        file_items = [
-            FileObjectItem(
-                bucket=bucket,  # type: ignore[arg-type]  # 契约枚举校验在路由层完成
-                object_key=item["object_key"],
-                size_bytes=item["size_bytes"],
-                etag=item["etag"],
-                last_modified=item["last_modified"],
-                download_url=await asyncio.to_thread(
-                    self._storage.presign_get, bucket, item["object_key"]
-                ),
-                expires_in=settings.presigned_download_expire_seconds,
+        file_items: list[FileObjectItem] = []
+        for item in items:
+            video_size, is_orphan = await self._annotate_video(
+                bucket, item["object_key"], item["size_bytes"]
             )
-            for item in items
-        ]
+            file_items.append(
+                FileObjectItem(
+                    bucket=bucket,  # type: ignore[arg-type]  # 契约枚举校验在路由层完成
+                    object_key=item["object_key"],
+                    size_bytes=item["size_bytes"],
+                    etag=item["etag"],
+                    last_modified=item["last_modified"],
+                    download_url=await asyncio.to_thread(
+                        self._storage.presign_get, bucket, item["object_key"]
+                    ),
+                    expires_in=settings.presigned_download_expire_seconds,
+                    video_size_bytes=video_size,
+                    is_orphan=is_orphan,
+                )
+            )
         return FileListData(
             items=file_items,
             next_marker=next_marker if has_more else None,
             truncated=has_more,
         )
 
-    # ---------- delete（数据清理，V1.21.20） ----------
+    # ---------- delete（数据清理，V1.21.20；V1.21.22 配对 + 有效录像护栏） ----------
 
     async def delete_files(
-        self, bucket: str, object_keys: list[str], user_id: str
+        self,
+        bucket: str,
+        object_keys: list[str],
+        user_id: str,
+        include_valid: bool = False,
     ) -> FileDeleteData:
-        """批量删除对象（清理无效/过期记录；契约 POST /files/delete，data:execute + 审计）。
+        """批量删除对象（契约 POST /files/delete，data:execute + 审计）。
 
         - 去重去空（保序）；全空 → 2001；
-        - 交由 MinIO ``DeleteObjects``（幂等：不存在对象亦计成功，适合“清空”）；
+        - **hunter-video 桶**（V1.21.22）：按会话配对删除（`.json`+`.mp4` 同删，不留失联对象），
+          并默认启用有效录像护栏——对应视频 >0 B 的会话不删（计入 ``skipped``），除非
+          ``include_valid=True``；仅真正清理孤儿（视频缺失/0 B）；
+        - 其余桶：保持原裸对象删除语义（无配对/无护栏）；
+        - 交由 MinIO ``DeleteObjects``（幂等：不存在对象亦计成功）；
         - 审计日志记录操作者与被删对象键（不记对象内容）。
         """
         keys = [k for k in dict.fromkeys(object_keys) if k]
         if not keys:
             raise InvalidParameterError(message="object_keys 不能全为空")
-        try:
-            deleted, errors = await asyncio.to_thread(
-                self._storage.delete_objects, bucket, keys
-            )
-        except Exception as exc:  # 统一转 5001，不因存储故障静默返回部分成功
-            logger.exception("file_delete_failed", bucket=bucket, requested=len(keys))
-            raise ServiceUnavailableError(
-                message=f"对象删除失败（bucket={bucket}）：{exc}"
-            ) from exc
+        if bucket == settings.minio_bucket_video:
+            to_delete, skipped = await self._plan_video_session_delete(bucket, keys, include_valid)
+        else:
+            to_delete, skipped = keys, []
+        deleted: list[str] = []
+        errors: list[dict[str, str]] = []
+        if to_delete:
+            try:
+                deleted, errors = await asyncio.to_thread(
+                    self._storage.delete_objects, bucket, to_delete
+                )
+            except Exception as exc:  # 统一转 5001，不因存储故障静默返回部分成功
+                logger.exception("file_delete_failed", bucket=bucket, requested=len(to_delete))
+                raise ServiceUnavailableError(
+                    message=f"对象删除失败（bucket={bucket}）：{exc}"
+                ) from exc
         logger.info(
             "file_objects_deleted",
             bucket=bucket,
             requested=len(keys),
             deleted=len(deleted),
             failed=len(errors),
+            skipped=len(skipped),
             operator=user_id,
         )
         return FileDeleteData(
@@ -479,4 +501,80 @@ class FileService:
             deleted=deleted,
             failed=[FileDeleteFailure(**e) for e in errors],
             deleted_count=len(deleted),
+            skipped=skipped,
+            skipped_count=len(skipped),
         )
+
+    async def _plan_video_session_delete(
+        self, bucket: str, keys: list[str], include_valid: bool
+    ) -> tuple[list[str], list[str]]:
+        """hunter-video 会话级删除规划：配对展开 + 有效录像护栏。
+
+        返回 ``(to_delete, skipped)``：
+        - 有效（对应 ``.mp4`` >0 B）且 ``include_valid=False`` 的会话整段跳过（保护真实录像）；
+        - 否则删除该会话存在的 ``.json``/``.mp4``（含 0 B 视频），避免留下失联对象。
+        """
+        to_delete: list[str] = []
+        skipped: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            base, ext = self._split_ext(key)
+            if ext not in (".json", ".mp4"):
+                # video 桶内的非配对对象（如其他上传件）：按裸对象处理
+                if key not in seen:
+                    to_delete.append(key)
+                    seen.add(key)
+                continue
+            video_key = key if ext == ".mp4" else f"{base}.mp4"
+            sidecar_key = key if ext == ".json" else f"{base}.json"
+            video_meta = await asyncio.to_thread(self._storage.head_object, bucket, video_key)
+            video_size = video_meta["size_bytes"] if video_meta else None
+            if video_size is not None and video_size > 0 and not include_valid:
+                skipped.append(key)  # 有效录像：护栏保护整会话
+                continue
+            # 孤儿会话：请求键本身 + 存在的配对对象一并删（幂等，仅计真实存在者）
+            for candidate in (key, sidecar_key, video_key):
+                if candidate in seen:
+                    continue
+                if candidate == key:
+                    to_delete.append(candidate)
+                    seen.add(candidate)
+                    continue
+                # 配对对象需确认存在才纳入（避免把不存在的键计入 deleted）
+                meta = await asyncio.to_thread(self._storage.head_object, bucket, candidate)
+                if meta is not None:
+                    to_delete.append(candidate)
+                    seen.add(candidate)
+        return to_delete, skipped
+
+    @staticmethod
+    def _split_ext(key: str) -> tuple[str, str]:
+        """拆分对象键为 ``(去扩展名的 base, 含点的扩展名)``；末段无点则扩展名为空。"""
+        idx = key.rfind(".")
+        if idx == -1 or "/" in key[idx:]:
+            return key, ""
+        return key[:idx], key[idx:]
+
+    async def _annotate_video(
+        self, bucket: str, key: str, own_size: int
+    ) -> tuple[int | None, bool]:
+        """hunter-video 桶的清单项有效性标注 ``(video_size_bytes, is_orphan)``。
+
+        - ``.mp4``：video_size = 自身大小；``.json``：配对探测 ``.mp4`` 的 head 大小；
+        - 其余桶/其余扩展名：``(None, False)``（不标注、不判孤儿）；
+        - ``is_orphan`` = 对应视频缺失或 0 B（可安全删除）。
+        """
+        if bucket != settings.minio_bucket_video:
+            return None, False
+        base, ext = self._split_ext(key)
+        if ext == ".mp4":
+            video_size: int | None = own_size
+        elif ext == ".json":
+            meta = await asyncio.to_thread(
+                self._storage.head_object, bucket, f"{base}.mp4"
+            )
+            video_size = meta["size_bytes"] if meta else None
+        else:
+            return None, False
+        is_orphan = video_size is None or video_size == 0
+        return video_size, is_orphan

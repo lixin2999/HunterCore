@@ -256,6 +256,10 @@ export interface FileObjectItem {
   last_modified: number
   download_url: string
   expires_in: number
+  /** 仅 hunter-video 桶填充：所属会话 .mp4 实际字节数（其余桶为 null） */
+  video_size_bytes?: number | null
+  /** 仅 hunter-video 桶有意义：true=对应视频缺失/0B 的无效记录（可安全删除） */
+  is_orphan?: boolean
 }
 
 /** 文件列表响应数据（游标分页） */
@@ -280,6 +284,8 @@ export interface FileListQuery {
 export interface FileDeleteRequest {
   bucket: UploadBucket
   object_keys: string[]
+  /** hunter-video 护栏：默认 false 拒删有效录像；true 时连有效会话一并删 */
+  include_valid?: boolean
 }
 
 /** 单对象删除失败项 */
@@ -295,5 +301,8 @@ export interface FileDeleteData {
   deleted: string[]
   failed: FileDeleteFailure[]
   deleted_count: number
+  /** hunter-video 护栏：因视频有效且未 include_valid 而被跳过未删的请求键 */
+  skipped?: string[]
+  skipped_count?: number
 }
 

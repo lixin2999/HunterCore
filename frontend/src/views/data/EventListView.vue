@@ -130,6 +130,15 @@ const hasNext = ref(false)
 
 const canDelete = computed(() => userStore.hasPermission(PERMISSIONS.dataExecute))
 
+/** hunter-video 桶：启用 sidecar↔视频配对标注与有效录像护栏（V1.21.22） */
+const VIDEO_BUCKET: UploadBucket = 'hunter-video'
+const isVideoBucket = computed(() => fileQuery.bucket === VIDEO_BUCKET)
+
+/** 仅孤儿行可勾选（video 桶）；非 video 桶全部可勾（无有效性概念） */
+function isRowSelectable(row: FileObjectItem): boolean {
+  return !isVideoBucket.value || row.is_orphan === true
+}
+
 const bucketOptions = computed(() =>
   Object.entries(UPLOAD_BUCKET_LABELS).map(([value, label]) => ({ value, label })),
 )
@@ -187,13 +196,16 @@ function handleSelectionChange(rows: FileObjectItem[]): void {
   selectedKeys.value = rows.map((row) => row.object_key)
 }
 
-/** 批量删除选中对象（权限 data:execute；幂等，含孤儿 sidecar 清理） */
+/** 批量删除选中对象（权限 data:execute；video 桶按会话配对删且护栏保护有效录像） */
 async function handleDelete(): Promise<void> {
   if (!selectedKeys.value.length) return
   const count = selectedKeys.value.length
+  const hint = isVideoBucket.value
+    ? '将按会话配对删除（.json 记录 + .mp4 视频一并移除）；有效录像（视频 >0B）受护栏保护不会删除。'
+    : '删除后不可恢复。'
   try {
     await ElMessageBox.confirm(
-      `确认删除选中的 ${count} 个对象？删除后不可恢复（用于清理 0 B 无效录像等遗留记录）。`,
+      `确认删除选中的 ${count} 个对象？${hint}`,
       '批量删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -203,10 +215,15 @@ async function handleDelete(): Promise<void> {
   deleting.value = true
   try {
     const data = await deleteFiles({ bucket: fileQuery.bucket, object_keys: selectedKeys.value })
-    if (data.failed.length) {
-      ElMessage.warning(`已删除 ${data.deleted_count} 个，${data.failed.length} 个失败`)
+    const skipped = data.skipped_count ?? 0
+    const parts = [`已删除 ${data.deleted_count} 个`]
+    if (skipped) parts.push(`${skipped} 个有效录像被护栏跳过未删`)
+    if (data.failed.length) parts.push(`${data.failed.length} 个失败`)
+    const text = parts.join('，')
+    if (data.failed.length || skipped) {
+      ElMessage.warning(text)
     } else {
-      ElMessage.success(`已删除 ${data.deleted_count} 个对象`)
+      ElMessage.success(text)
     }
     await loadFilePage(filePageIndex.value)
   } catch (error) {
@@ -398,10 +415,16 @@ onMounted(async () => {
           empty-text="暂无文件"
           @selection-change="handleSelectionChange"
         >
-          <el-table-column v-if="canDelete" type="selection" width="48" />
+          <el-table-column v-if="canDelete" type="selection" width="48" :selectable="isRowSelectable" />
           <el-table-column prop="object_key" label="对象键" min-width="320" show-overflow-tooltip />
           <el-table-column label="大小" width="120">
             <template #default="{ row }">{{ formatBytes(row.size_bytes) }}</template>
+          </el-table-column>
+          <el-table-column v-if="isVideoBucket" label="录像有效性" width="150">
+            <template #default="{ row }">
+              <el-tag v-if="row.is_orphan" type="info" size="small">无效（视频缺失/0B）</el-tag>
+              <el-tag v-else type="success" size="small">有效（{{ formatBytes(row.video_size_bytes ?? 0) }}）</el-tag>
+            </template>
           </el-table-column>
           <el-table-column label="修改时间" width="170">
             <template #default="{ row }">{{ formatTime(row.last_modified) }}</template>

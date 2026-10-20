@@ -82,10 +82,17 @@ async def delete_files(
     """批量删除 MinIO 对象（清理无效/过期记录，如 DVR 修复前的 0 B 孤儿 sidecar）。
 
     权限 data:execute（与事件确认同档）；逐次审计（operator + 对象键）。幂等：
-    不存在的对象计入 deleted（DeleteObjects 语义）。“清空无效记录”由前端多选后批量提交。
+    不存在的对象计入 deleted（DeleteObjects 语义）。
+
+    **hunter-video 桶（V1.21.22）**：按会话配对删除（`.json`+`.mp4` 同删）且默认启用
+    有效录像护栏——对应视频 >0 B 的会话不删（回带于 ``skipped``），除非 ``include_valid=true``；
+    避免误删有效录像、不留失联对象。其余桶保持裸对象删除语义。
     """
     data = await service.delete_files(
-        bucket=payload.bucket.value, object_keys=payload.object_keys, user_id=user_id
+        bucket=payload.bucket.value,
+        object_keys=payload.object_keys,
+        user_id=user_id,
+        include_valid=payload.include_valid,
     )
     return FileDeleteResponse(code=0, message="success", data=data, request_id=trace_request_id())
 

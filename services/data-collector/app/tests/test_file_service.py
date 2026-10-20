@@ -39,6 +39,7 @@ VEHICLE_ID = "HUNTER-001"
 USER_ID = "11111111-1111-4111-8111-111111111111"
 RAW_BUCKET = UploadBucket.RAW_DATA.value
 ROSBAG_BUCKET = UploadBucket.ROSBAG.value
+VIDEO_BUCKET = UploadBucket.VIDEO.value
 DATE = "2026-09-18"
 TIMESTAMP = 1724035200.0
 CONTENT = b"point-cloud-binary-content"
@@ -610,3 +611,118 @@ async def test_delete_files_reports_partial_failures() -> None:
     assert data.deleted_count == 1
     assert [f.object_key for f in data.failed] == [bad_key]
     assert (RAW_BUCKET, bad_key) in storage.objects  # 失败键未被移除
+
+
+# ---------------------------------------------------------------------------
+# hunter-video 会话配对删除 + 有效录像护栏（V1.21.22）
+# ---------------------------------------------------------------------------
+async def test_delete_video_orphan_removes_sidecar_and_zero_byte_video() -> None:
+    """孤儿会话（视频 0 B）：删 sidecar 时连带删 0 B 视频，不留失联对象。"""
+    service, storage, _ = make_service()
+    base = "remote-control/HUNTER-001/2026/10/20/sess-1"
+    sidecar, video = f"{base}.json", f"{base}.mp4"
+    storage.put(VIDEO_BUCKET, sidecar, b'{"session_id":"sess-1"}')
+    storage.put(VIDEO_BUCKET, video, b"")  # 0 B 无效视频
+
+    data = await service.delete_files(bucket=VIDEO_BUCKET, object_keys=[sidecar], user_id=USER_ID)
+
+    assert sorted(data.deleted) == sorted([sidecar, video])
+    assert data.skipped == []
+    assert (VIDEO_BUCKET, sidecar) not in storage.objects
+    assert (VIDEO_BUCKET, video) not in storage.objects
+
+
+async def test_delete_video_orphan_without_video_only_removes_sidecar() -> None:
+    """孤儿 sidecar（视频根本不存在）：仅删 sidecar，不把不存在的键计入 deleted。"""
+    service, storage, _ = make_service()
+    sidecar = "remote-control/HUNTER-001/2026/10/20/sess-2.json"
+    storage.put(VIDEO_BUCKET, sidecar, b"{}")
+
+    data = await service.delete_files(bucket=VIDEO_BUCKET, object_keys=[sidecar], user_id=USER_ID)
+
+    assert data.deleted == [sidecar]
+    assert data.deleted_count == 1
+
+
+async def test_delete_video_valid_session_is_skipped_by_guard() -> None:
+    """有效会话（视频 >0 B）默认被护栏跳过：不删 sidecar/视频，计入 skipped（防误删有效录像）。"""
+    service, storage, _ = make_service()
+    base = "remote-control/HUNTER-001/2026/10/20/sess-3"
+    sidecar, video = f"{base}.json", f"{base}.mp4"
+    storage.put(VIDEO_BUCKET, sidecar, b"{}")
+    storage.put(VIDEO_BUCKET, video, b"real-video-bytes")
+
+    data = await service.delete_files(bucket=VIDEO_BUCKET, object_keys=[sidecar], user_id=USER_ID)
+
+    assert data.deleted == []
+    assert data.deleted_count == 0
+    assert data.skipped == [sidecar]
+    assert data.skipped_count == 1
+    assert (VIDEO_BUCKET, sidecar) in storage.objects  # 有效录像未被删
+    assert (VIDEO_BUCKET, video) in storage.objects
+
+
+async def test_delete_video_valid_session_deleted_when_include_valid() -> None:
+    """include_valid=True 显式越过护栏：有效会话也配对删除。"""
+    service, storage, _ = make_service()
+    base = "remote-control/HUNTER-001/2026/10/20/sess-4"
+    sidecar, video = f"{base}.json", f"{base}.mp4"
+    storage.put(VIDEO_BUCKET, sidecar, b"{}")
+    storage.put(VIDEO_BUCKET, video, b"real-video-bytes")
+
+    data = await service.delete_files(
+        bucket=VIDEO_BUCKET, object_keys=[sidecar], user_id=USER_ID, include_valid=True
+    )
+
+    assert sorted(data.deleted) == sorted([sidecar, video])
+    assert data.skipped == []
+
+
+async def test_delete_video_non_paired_ext_deleted_as_is() -> None:
+    """video 桶内非 .json/.mp4 对象：按裸对象删除，无配对展开。"""
+    service, storage, _ = make_service()
+    key = "remote-control/HUNTER-001/2026/10/20/notes.txt"
+    storage.put(VIDEO_BUCKET, key, b"hi")
+
+    data = await service.delete_files(bucket=VIDEO_BUCKET, object_keys=[key], user_id=USER_ID)
+
+    assert data.deleted == [key]
+
+
+async def test_list_files_annotates_video_orphan_and_valid() -> None:
+    """清单标注：有效 sidecar（视频>0）is_orphan=False 且带真实大小；0 B 视频 sidecar is_orphan=True。"""
+    service, storage, _ = make_service()
+    valid_base = "remote-control/HUNTER-001/2026/10/20/sess-a"
+    orphan_base = "remote-control/HUNTER-001/2026/10/20/sess-b"
+    storage.put(VIDEO_BUCKET, f"{valid_base}.json", b"{}")
+    storage.put(VIDEO_BUCKET, f"{valid_base}.mp4", b"12345")  # 5 B 有效
+    storage.put(VIDEO_BUCKET, f"{orphan_base}.json", b"{}")
+    storage.put(VIDEO_BUCKET, f"{orphan_base}.mp4", b"")  # 0 B 孤儿
+
+    data = await service.list_files(
+        vehicle_id=None, bucket=VIDEO_BUCKET, date=None, data_type=None, marker=None, limit=50
+    )
+    by_key = {item.object_key: item for item in data.items}
+
+    assert by_key[f"{valid_base}.json"].is_orphan is False
+    assert by_key[f"{valid_base}.json"].video_size_bytes == 5
+    assert by_key[f"{orphan_base}.json"].is_orphan is True
+    assert by_key[f"{orphan_base}.json"].video_size_bytes == 0
+    # .mp4 行：有效视频自身大小、非孤儿；0 B 视频为孤儿
+    assert by_key[f"{valid_base}.mp4"].video_size_bytes == 5
+    assert by_key[f"{valid_base}.mp4"].is_orphan is False
+    assert by_key[f"{orphan_base}.mp4"].is_orphan is True
+
+
+async def test_list_files_no_annotation_for_non_video_bucket() -> None:
+    """非 video 桶：不标注（video_size_bytes=None、is_orphan=False），保持通用文件浏览语义。"""
+    service, storage, _ = make_service()
+    key = f"{VEHICLE_ID}/2026-09-18/video/1724035200_1.mp4"
+    storage.put(RAW_BUCKET, key, b"bytes")
+
+    data = await service.list_files(
+        vehicle_id=None, bucket=RAW_BUCKET, date=None, data_type=None, marker=None, limit=50
+    )
+
+    assert data.items[0].video_size_bytes is None
+    assert data.items[0].is_orphan is False

@@ -1232,6 +1232,19 @@ components:
           type: integer
           description: "下载地址有效期（秒），固定 900（MinIO 契约：下载 15 分钟）"
           example: 900
+        video_size_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            仅 hunter-video 桶填充（V1.21.22）：所属会话的 .mp4 实际字节数
+            （.json 行经配对探测；.mp4 行为自身大小；无对应视频为 null）。其余桶为 null。
+        is_orphan:
+          type: boolean
+          default: false
+          description: >-
+            仅 hunter-video 桶有意义（V1.21.22）：true=对应视频缺失或 0 B 的无效记录（可安全删除）；
+            false=有效录像（受护栏保护）。其余桶恒为 false。
 
     FileListData:
       type: object
@@ -1266,6 +1279,13 @@ components:
           maxItems: 200
           description: "待删除对象键列表（相对 bucket，与 GET /files 返回的 object_key 一致；≤200/次）"
           items: { type: string, minLength: 1 }
+        include_valid:
+          type: boolean
+          default: false
+          description: >-
+            hunter-video 桶专用护栏（V1.21.22）：默认 false——拒删对应视频有效（>0 B）的会话
+            （避免误删有效录像），此类项计入 skipped；true 时强制连有效会话一并删除。
+            删除按会话配对（.json+.mp4 同删），不留失联对象。非 video 桶忽略本字段。
 
     FileDeleteFailure:
       type: object
@@ -1291,6 +1311,12 @@ components:
           description: "删除失败项"
           items: { $ref: "#/components/schemas/FileDeleteFailure" }
         deleted_count: { type: integer, minimum: 0, description: "删除成功数" }
+        skipped:
+          type: array
+          description: >-
+            hunter-video 护栏（V1.21.22）：因对应视频有效（>0 B）且未指定 include_valid 而被跳过未删的请求键。
+          items: { type: string }
+        skipped_count: { type: integer, minimum: 0, default: 0, description: "被护栏跳过数" }
 
     FileDeleteResponse:
       allOf:
