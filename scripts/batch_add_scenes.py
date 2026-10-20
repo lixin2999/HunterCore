@@ -1160,11 +1160,17 @@ async def _publish_scene(
                 await asyncio.sleep(_retry_delay(None, attempt, args))
                 continue
         body = _safe_json(resp) or {}
-        if resp.status_code in (200, 201) and body.get("code") == 0:
+        code = body.get("code")
+        if resp.status_code in (200, 201) and code == 0:
             stats["published"] += 1
             return
+        if code == 3003 or resp.status_code == 409:
+            # 幂等：3003 = “仅 draft 可发布”，说明该场景已非 draft（已发布）
+            # → 发布态已达成，视为幂等成功（类比 create 的 3002→existed），不计入失败
+            stats["pub_existed"] += 1
+            return
         if resp.status_code in (429, 500, 502, 503, 504):
-            last_err = f"HTTP {resp.status_code} code={body.get('code')}"
+            last_err = f"HTTP {resp.status_code} code={code}"
             await asyncio.sleep(_retry_delay(resp, attempt, args))
             continue
         failures.append(f"{name}(publish): HTTP {resp.status_code} code={body.get('code')}")
@@ -1175,7 +1181,7 @@ async def _publish_scene(
 async def submit_scenes(scenes: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, int]:
     import httpx
 
-    stats = {"created": 0, "existed": 0, "failed": 0, "published": 0}
+    stats = {"created": 0, "existed": 0, "failed": 0, "published": 0, "pub_existed": 0}
     failures: list[str] = []
     sem = asyncio.Semaphore(max(1, args.concurrency))
     limiter = _RateLimiter(args.qps)
@@ -1210,7 +1216,7 @@ async def publish_drafts(args: argparse.Namespace) -> dict[str, int]:
     重新登录后重跑本通道即可把存量 draft 全部闭环，无需重建场景。"""
     import httpx
 
-    stats = {"published": 0, "failed": 0}
+    stats = {"published": 0, "already": 0, "failed": 0}
     failures: list[str] = []
     sem = asyncio.Semaphore(max(1, args.concurrency))
     limiter = _RateLimiter(args.qps)
@@ -1257,8 +1263,12 @@ async def publish_drafts(args: argparse.Namespace) -> dict[str, int]:
                         await asyncio.sleep(_retry_delay(None, attempt, args))
                         continue
                 body = _safe_json(resp) or {}
-                if resp.status_code in (200, 201) and body.get("code") == 0:
+                code = body.get("code")
+                if resp.status_code in (200, 201) and code == 0:
                     stats["published"] += 1
+                    return
+                if code == 3003 or resp.status_code == 409:
+                    stats["already"] += 1  # 幂等：已非 draft（已发布），发布态已达成
                     return
                 if resp.status_code in (429, 500, 502, 503, 504):
                     await asyncio.sleep(_retry_delay(resp, attempt, args))
@@ -1438,7 +1448,7 @@ def main(argv: list[str] | None = None) -> int:
     # 分批修复通道：不生成/不新建，直接把存量 draft 全部发布
     if args.publish_drafts:
         pd = asyncio.run(publish_drafts(args))
-        print(f"\n=== 补发布结果 === 已发布: {pd['published']}  失败: {pd['failed']}")
+        print(f"\n=== 补发布结果 === 已发布: {pd['published']}（幂等已发布: {pd.get('already', 0)}）  失败: {pd['failed']}")
         return 1 if pd["failed"] else 0
 
     scenes = generate_scenes(seed=args.seed, ratio=_parse_ratio(args.ratio))
@@ -1467,7 +1477,7 @@ def main(argv: list[str] | None = None) -> int:
     stats = asyncio.run(submit_scenes(scenes, args))
     print("\n=== 提交结果 ===")
     print(f"新建: {stats['created']}  幂等跳过(已存在): {stats['existed']}  "
-          f"发布: {stats['published']}  失败: {stats['failed_total']}")
+          f"发布: {stats['published']}（幂等已发布: {stats['pub_existed']}）  失败: {stats['failed_total']}")
     return 1 if stats["failed_total"] else 0
 
 
