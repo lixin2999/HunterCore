@@ -21,7 +21,15 @@ release.md
 
 # ---------- 构建上下文裁剪（L1：服务镜像仅需 common/python + services/<service>） ----------
 # 注意：禁止忽略 *.md —— common/python/pyproject.toml 的 readme 字段依赖 README.md
-contracts
+# contracts 默认整目录不进构建上下文，但 scene-service/Dockerfile 需
+#   COPY contracts/scene-taxonomy.yaml（启动即加载、缺失不降级），故改为
+#   “排除 contracts 内容但反选这一个文件”（不能直接 `contracts`+`!文件`：
+#   父目录整体被排除时子文件无法反选）。
+# ⚠ V1.22.1 实机教训：原 `contracts` 整目录排除曾使 `dcompose build scene-service`
+#   在 COPY 行报 `"/contracts/scene-taxonomy.yaml": not found`（compose 靠 bind mount 才在运行
+#   容器内看到字典，但镜像本身无法构建 → 裸 docker run / K8s 会启动失败）。
+contracts/*
+!contracts/scene-taxonomy.yaml
 # ⚠ 禁止再排除 flink-jobs/：hunter-flink/jobs 镜像（flink-jobs/Dockerfile，compose 与 K8s 共用）
 #   需要 COPY flink-jobs/hunter_flink；L1 旧裁剪曾在首次实机构建时报 `COPY ... not found`（V1.19.3 修正）
 spark-jobs
