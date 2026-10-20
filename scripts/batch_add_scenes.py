@@ -1,46 +1,49 @@
 #!/usr/bin/env python3
-"""HunterCore 场景库批量添加脚本（自动驾驶训练场景数据集：300 个高频场景）。
+"""HunterCore 场景库批量生成脚本（高斯扰动场景生成引擎，重构版）。
 
-用途
-----
-按系统「场景库规范」（设计文档 4.2.1 分类体系 + 4.2.2 场景配置结构，落库
-``scene_svc.scenes.config_json``）批量生成 **300 个** 覆盖自动驾驶全功能与极端环境的
-高频训练场景，并通过 scene-service ``POST /api/v1/scene`` 接口入库，供 Carla 仿真训练
-（``POST /api/v1/scene/export`` 可导出 ScenarioRunner XML / OpenSCENARIO 1.2）。
-
-设计要点
+设计依据
 --------
-1. **300 个高频场景**：按 ``SCENE_QUOTAS`` 分配到 4 大类 16 个叶子场景类型
-   （basic / interactive / environment / corner_case），配额之和恒等于 300；
-2. **满足 Carla 仿真训练**：``map_type=carla_town``（Town01~Town07）、自车基线车型
-   ``HUNTER_SE``、天气段严格对齐 ``carla.WeatherParameters`` 语义（7 字段全必填）、
-   参与者行为编排采用 ScenarioRunner 行为词汇（lane_follow / cut_in / cross_road /
-   static / constant_velocity / forward ...）；
-3. **覆盖全部功能与极端环境**：感知预测（切入/行人/多车混行/障碍突现）、决策规划
-   （跟车/换道/路口会车/紧急制动/施工绕行）、控制（直线巡航/弯道）、鲁棒性（雨/雾/夜/
-   逆光）、失效安全（传感器失效）；极端环境含暴雨/浓雾/黑夜/冬季暴雪/大风/强逆光等；
-4. **严守场景库规范**：每条 config 在提交前以 ``SceneCreateRequest``（4.2.2 结构，
-   ``extra="forbid"``）自校验；命名全局唯一（重名 → 3002 幂等跳过）；时长 ≤ 600s。
+《场景生成器与场景管理详细设计文档》V1.0（2026-10-20）：
+- 二、场景生成器：以「高斯泼溅（Gaussian Perturbation）」为核心技术路线——以场景关键参数的
+  统计分布为基底构建多维高斯模型，从分布中心高密度生成**常用场景**、向尾部定向采样生成
+  **边缘/长尾场景**（§2.1、§2.3.1 参数化高斯扰动、§2.3.3 长尾定向生成）；
+- §2.2.3 场景参数字典：每类场景定义可扰动参数及其取值范围与物理约束；
+- §2.4 核心算法：分层采样引擎（§2.4.2）、场景有效性三层校验（§2.4.3）、场景多样性度量与
+  去重（§2.4.4、§2.3.1 步骤 6）；
+- §2.5 分类体系：功能一级标签（§2.5.1）+ 风险等级 L1~L4（§2.5.2）+ 数据来源（§2.5.3）；
+- §5.1 场景元数据：category/sub_category/risk_level/distribution_zone/source 等分类维度。
 
-用法（仓库根目录；Linux 解释器为 ``python3``，需 3.11+ 方可启用契约 Schema 校验）::
+与旧版（固定 ``i % n`` 轮换）的根本差异
+--------------------------------------
+旧版 300 个场景由确定性取模轮换拼装，同类型内参与者/事件/天气高度复制 → **场景详情内容雷同**。
+本版对每条场景独立执行「按分布区间分层的高斯采样 → 物理可行性校验（拒绝采样）→ 参数向量
+余弦相似度去重」，使每条场景的速度/间距/横向偏移/参与者数量/天气强度/事件阈值等**逐条不同**，
+并按 60% 常用 / 30% 边缘 / 10% 长尾的比例覆盖风险梯度。
 
-    # 1) 仅生成 + 校验 + 落盘，不提交（推荐先跑，产出可读的数据集清单）
-    #    目标目录不可写时自动回退临时目录；也可 --output ~/scene_batch_300.json 或 --output -
+契约映射说明（不改动 DDL / OpenAPI 固定契约）
+--------------------------------------------
+设计文档 §5.1 的扩展元数据（category / risk_level / distribution_zone / source）落在现有
+``scenes`` 已具备且被 GIN 索引、前端已展示的 **tags** 与 **description** 上（受控标签前缀
+``cat:`` / ``risk:`` / ``zone:`` / ``src:``），场景仿真参数仍严格写入 ``config_json``（4.2.2 结构，
+经 ``SceneCreateRequest`` ``extra="forbid"`` 自校验）。新增独立列需改契约与 ORM 映射，属后续演进项。
+
+用法（仓库根目录；需 Python 3.11+ 启用契约 Schema 校验）::
+
+    # 1) 生成 + 校验 + 落盘 + 多样性报告，不提交（先跑这个看效果）
     python3 scripts/batch_add_scenes.py --dry-run
 
-    # 2) 直连 scene-service 批量入库（开发/集群内，可选 GATEWAY_HMAC_SECRET 验签头）
+    # 2) 直连 scene-service 批量入库（先跑 clear-scenes.sh 清空旧数据）
     python3 scripts/batch_add_scenes.py --mode direct \
         --base-url http://localhost:8081 \
         --user-id 00000000-0000-0000-0000-000000000001 --roles admin
 
-    # 3) 经 api-gateway（先登录换 JWT，再带 Bearer 提交）
+    # 3) 经 api-gateway（登录换 JWT 后带 Bearer 提交），并固定随机种子以复现
     python3 scripts/batch_add_scenes.py --mode gateway \
         --base-url http://localhost:8080 --username admin --password 'Admin@12345' \
-        --publish
+        --publish --seed 20261020
 
 环境变量（CLI 优先）：HUNTER_BATCH_MODE / HUNTER_BATCH_BASE_URL / HUNTER_BATCH_USER_ID /
-HUNTER_BATCH_ROLES / HUNTER_BATCH_GATEWAY_HMAC_SECRET / HUNTER_BATCH_USERNAME /
-HUNTER_BATCH_PASSWORD。
+HUNTER_BATCH_ROLES / HUNTER_BATCH_GATEWAY_HMAC_SECRET / HUNTER_BATCH_USERNAME / HUNTER_BATCH_PASSWORD。
 
 退出码：0 全部成功（或幂等跳过）；1 存在失败项；2 参数/环境错误。
 """
@@ -51,11 +54,13 @@ import asyncio
 import json
 import math
 import os
+import random
 import sys
 import tempfile
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -69,32 +74,35 @@ DEFAULT_OUTPUT = ROOT / "scripts" / "output" / "scene_batch_300.json"
 EGO_MODEL = "HUNTER_SE"
 #: 契约 SCENE_DURATION_MAX_SECONDS 默认上限
 DURATION_MAX = 600.0
-#: Carla 内置城镇（map_type=carla_town；⚠ 地图资源清单待确认，按内置镇轮换）
+#: Carla 内置城镇（map_type=carla_town）
 MAPS = ("Town01", "Town02", "Town03", "Town04", "Town05", "Town06", "Town07")
 PI = math.pi
 
+#: 生成分布比例（设计文档 §2.3.1：60% 常用 / 30% 边缘 / 10% 长尾）
+ZONE_RATIO: dict[str, float] = {"common": 0.60, "edge": 0.30, "longtail": 0.10}
+#: 去重阈值：参数向量余弦相似度 > 该值判为重复，重采样（设计文档 §2.3.1 步骤 6）
+DEDUP_COSINE_THRESHOLD = 0.95
+#: 单条场景「采样→可行性→去重」最大重试次数（拒绝采样，设计文档 §2.1.2）
+MAX_SAMPLE_TRIES = 64
+
 
 # =====================================================================
-# 一、场景类型 → 配额（之和恒等于 300；覆盖 4 大类 16 个高频叶子场景）
+# 一、场景类型：配额 + 功能分类 + 风险/分布/来源标签（设计文档 §2.5）
 # =====================================================================
 SCENE_QUOTAS: OrderedDict[str, int] = OrderedDict(
     [
-        # basic（基础行驶能力）
         ("straight_cruise", 12),
         ("curve_driving", 15),
         ("car_following", 22),
         ("lane_change", 22),
-        # interactive（交互博弈）
         ("cut_in", 25),
         ("pedestrian_crossing", 28),
         ("intersection_meeting", 22),
         ("construction_detour", 14),
-        # environment（环境鲁棒性，含极端天气）
         ("rainy", 22),
         ("night", 20),
         ("foggy", 14),
         ("backlight", 10),
-        # corner_case（长尾 / 安全边界）
         ("emergency_braking", 24),
         ("obstacle_appearance", 20),
         ("sensor_failure", 12),
@@ -103,145 +111,254 @@ SCENE_QUOTAS: OrderedDict[str, int] = OrderedDict(
 )
 assert sum(SCENE_QUOTAS.values()) == 300, "场景配额之和必须为 300"
 
-#: 类型 → 分类（4.2.1 两级结构第一级；写入 tags 与描述）
+#: 类型 → 平台契约分类（4.2.1 两级结构第一级；写入 tags 与 config 校验）
 CATEGORY_BY_TYPE: dict[str, str] = {
-    "straight_cruise": "basic",
-    "curve_driving": "basic",
-    "car_following": "basic",
-    "lane_change": "basic",
-    "cut_in": "interactive",
-    "pedestrian_crossing": "interactive",
-    "intersection_meeting": "interactive",
+    "straight_cruise": "basic", "curve_driving": "basic", "car_following": "basic", "lane_change": "basic",
+    "cut_in": "interactive", "pedestrian_crossing": "interactive", "intersection_meeting": "interactive",
     "construction_detour": "interactive",
-    "rainy": "environment",
-    "night": "environment",
-    "foggy": "environment",
-    "backlight": "environment",
-    "emergency_braking": "corner_case",
-    "obstacle_appearance": "corner_case",
-    "sensor_failure": "corner_case",
+    "rainy": "environment", "night": "environment", "foggy": "environment", "backlight": "environment",
+    "emergency_braking": "corner_case", "obstacle_appearance": "corner_case", "sensor_failure": "corner_case",
     "multi_vehicle_mixed": "corner_case",
+}
+
+#: 类型 → 设计文档 §2.5.1 功能一级标签（cat: 标签，与契约分类互补）
+FUNC_CATEGORY: dict[str, str] = {
+    "car_following": "following", "cut_in": "following", "lane_change": "following", "emergency_braking": "following",
+    "pedestrian_crossing": "avoidance", "obstacle_appearance": "avoidance", "construction_detour": "avoidance",
+    "multi_vehicle_mixed": "avoidance",
+    "straight_cruise": "road-structure", "curve_driving": "road-structure", "intersection_meeting": "road-structure",
+    "rainy": "environment", "night": "environment", "foggy": "environment", "backlight": "environment",
+    "sensor_failure": "anomaly",
 }
 
 #: 类型 → 中文标签（契约 SCENE_TYPE_LABELS 同源）
 LABEL_BY_TYPE: dict[str, str] = {
-    "straight_cruise": "直线巡航",
-    "curve_driving": "弯道行驶",
-    "car_following": "跟车行驶",
-    "lane_change": "变道行驶",
-    "cut_in": "前车切入",
-    "pedestrian_crossing": "行人横穿",
-    "intersection_meeting": "路口会车",
-    "construction_detour": "施工绕行",
-    "rainy": "雨天",
-    "night": "夜间",
-    "foggy": "雾天",
-    "backlight": "强光逆光",
-    "emergency_braking": "紧急制动",
-    "obstacle_appearance": "障碍物突现",
-    "sensor_failure": "传感器失效",
+    "straight_cruise": "直线巡航", "curve_driving": "弯道行驶", "car_following": "跟车行驶", "lane_change": "变道行驶",
+    "cut_in": "前车切入", "pedestrian_crossing": "行人横穿", "intersection_meeting": "路口会车",
+    "construction_detour": "施工绕行", "rainy": "雨天", "night": "夜间", "foggy": "雾天", "backlight": "强光逆光",
+    "emergency_braking": "紧急制动", "obstacle_appearance": "障碍物突现", "sensor_failure": "传感器失效",
     "multi_vehicle_mixed": "多车混行",
 }
 
-#: 类型 → 名称缩写（保证 scene_name 全局唯一且可读，≤128 字符）
+#: 类型 → 名称缩写（保证 scene_name 全局唯一且可读）
 ABBR_BY_TYPE: dict[str, str] = {
-    "straight_cruise": "CRS",
-    "curve_driving": "CRV",
-    "car_following": "FOL",
-    "lane_change": "LNC",
-    "cut_in": "CUT",
-    "pedestrian_crossing": "PED",
-    "intersection_meeting": "INT",
-    "construction_detour": "CST",
-    "rainy": "RUN",
-    "night": "NGT",
-    "foggy": "FOG",
-    "backlight": "GLR",
-    "emergency_braking": "EBR",
-    "obstacle_appearance": "OBS",
-    "sensor_failure": "SNF",
-    "multi_vehicle_mixed": "MVM",
+    "straight_cruise": "CRS", "curve_driving": "CRV", "car_following": "FOL", "lane_change": "LNC",
+    "cut_in": "CUT", "pedestrian_crossing": "PED", "intersection_meeting": "INT", "construction_detour": "CST",
+    "rainy": "RUN", "night": "NGT", "foggy": "FOG", "backlight": "GLR", "emergency_braking": "EBR",
+    "obstacle_appearance": "OBS", "sensor_failure": "SNF", "multi_vehicle_mixed": "MVM",
 }
 
-
-# =====================================================================
-# 二、天气段（对齐 carla.WeatherParameters 语义，7 字段全必填）
-#    cloudiness/rain/wetness/fog/wind: 0..100；sun_azimuth: 0..360；sun_altitude: -90..90
-# =====================================================================
-WEATHER: dict[str, dict[str, float]] = {
-    # —— 常规 ——
-    "clear_day": {"cloudiness": 10, "rain": 0, "wetness": 0, "fog": 0, "wind": 5, "sun_azimuth": 0, "sun_altitude": 60},
-    "cloudy": {"cloudiness": 70, "rain": 0, "wetness": 0, "fog": 5, "wind": 10, "sun_azimuth": 45, "sun_altitude": 40},
-    "overcast": {"cloudiness": 85, "rain": 0, "wetness": 5, "fog": 8, "wind": 12, "sun_azimuth": 90, "sun_altitude": 30},
-    # —— 雨天（含极端）——
-    "light_rain": {"cloudiness": 70, "rain": 30, "wetness": 25, "fog": 8, "wind": 15, "sun_azimuth": 90, "sun_altitude": 35},
-    "heavy_rain": {"cloudiness": 100, "rain": 90, "wetness": 90, "fog": 20, "wind": 45, "sun_azimuth": 120, "sun_altitude": 25},
-    "torrential_rain": {"cloudiness": 100, "rain": 100, "wetness": 100, "fog": 35, "wind": 70, "sun_azimuth": 150, "sun_altitude": 12},
-    # —— 雾天（含极端）——
-    "mist": {"cloudiness": 50, "rain": 0, "wetness": 15, "fog": 30, "wind": 5, "sun_azimuth": 60, "sun_altitude": 28},
-    "dense_fog": {"cloudiness": 80, "rain": 0, "wetness": 20, "fog": 70, "wind": 8, "sun_azimuth": 200, "sun_altitude": 10},
-    "super_fog": {"cloudiness": 95, "rain": 5, "wetness": 40, "fog": 100, "wind": 6, "sun_azimuth": 210, "sun_altitude": 4},
-    # —— 夜间 ——
-    "night_clear": {"cloudiness": 20, "rain": 0, "wetness": 0, "fog": 0, "wind": 5, "sun_azimuth": 180, "sun_altitude": -15},
-    "night_rain": {"cloudiness": 90, "rain": 60, "wetness": 75, "fog": 15, "wind": 25, "sun_azimuth": 200, "sun_altitude": -20},
-    "dusk": {"cloudiness": 40, "rain": 0, "wetness": 0, "fog": 10, "wind": 10, "sun_azimuth": 270, "sun_altitude": 5},
-    # —— 逆光 / 强光 ——
-    "dawn_glare": {"cloudiness": 30, "rain": 0, "wetness": 5, "fog": 12, "wind": 8, "sun_azimuth": 90, "sun_altitude": 6},
-    "sun_glare": {"cloudiness": 15, "rain": 0, "wetness": 0, "fog": 5, "wind": 5, "sun_azimuth": 0, "sun_altitude": 3},
-    # —— 其他极端 ——
-    "high_wind": {"cloudiness": 60, "rain": 10, "wetness": 20, "fog": 10, "wind": 90, "sun_azimuth": 100, "sun_altitude": 20},
-    "winter_snow": {"cloudiness": 95, "rain": 0, "wetness": 60, "fog": 55, "wind": 50, "sun_azimuth": 220, "sun_altitude": -5},
-}
-
-#: 通用轮换天气序列（贯穿所有类型，保证环境多样性；含极端天气）
-FULL_CYCLE: tuple[str, ...] = (
-    "clear_day", "cloudy", "light_rain", "mist", "night_clear", "dusk",
-    "heavy_rain", "dense_fog", "overcast", "dawn_glare", "high_wind", "night_rain",
-    "torrential_rain", "super_fog", "winter_snow", "sun_glare",
-)
-#: 环境专项天气序列
-WEATHER_CYCLE_BY_TYPE: dict[str, tuple[str, ...]] = {
-    "rainy": ("light_rain", "heavy_rain", "torrential_rain", "night_rain"),
-    "night": ("night_clear", "night_rain", "dusk"),
-    "foggy": ("mist", "dense_fog", "super_fog"),
-    "backlight": ("dawn_glare", "sun_glare", "dusk"),
-}
-
-#: 各类型默认难度标签（写入 tags，供场景库筛选）
+#: 类型 → 功能能力标签（写入 tags，供场景库筛选）
 FUNCTION_TAGS: dict[str, tuple[str, ...]] = {
-    "straight_cruise": ("control", "cruise"),
-    "curve_driving": ("control", "lateral"),
-    "car_following": ("planning", "longitudinal"),
-    "lane_change": ("planning", "lateral"),
-    "cut_in": ("prediction", "interaction"),
-    "pedestrian_crossing": ("perception", "vru"),
-    "intersection_meeting": ("planning", "decision"),
-    "construction_detour": ("perception", "static-avoid"),
-    "rainy": ("robustness", "wet-road"),
-    "night": ("robustness", "low-light"),
-    "foggy": ("robustness", "low-visibility"),
-    "backlight": ("robustness", "glare"),
-    "emergency_braking": ("safety", "aeb"),
-    "obstacle_appearance": ("safety", "corner-case"),
-    "sensor_failure": ("safety", "fail-degraded"),
-    "multi_vehicle_mixed": ("perception", "complex-traffic"),
+    "straight_cruise": ("control", "cruise"), "curve_driving": ("control", "lateral"),
+    "car_following": ("planning", "longitudinal"), "lane_change": ("planning", "lateral"),
+    "cut_in": ("prediction", "interaction"), "pedestrian_crossing": ("perception", "vru"),
+    "intersection_meeting": ("planning", "decision"), "construction_detour": ("perception", "static-avoid"),
+    "rainy": ("robustness", "wet-road"), "night": ("robustness", "low-light"),
+    "foggy": ("robustness", "low-visibility"), "backlight": ("robustness", "glare"),
+    "emergency_braking": ("safety", "aeb"), "obstacle_appearance": ("safety", "corner-case"),
+    "sensor_failure": ("safety", "fail-degraded"), "multi_vehicle_mixed": ("perception", "complex-traffic"),
 }
+
+#: 分布区间 → 风险等级（设计文档 §2.5.2：L1 常规 / L2 边缘 / L3 危险 / L4 极端）
+RISK_BY_ZONE: dict[str, str] = {"common": "L1", "edge": "L2", "longtail": "L4"}
 
 
 # =====================================================================
-# 三、4.2.2 结构构造helper（全部返回 dict，落库前经 SceneCreateRequest 校验）
+# 二、场景参数字典（设计文档 §2.2.3）：每参数 (mean, std, lo, hi, risk)
+#     risk: +1 值越大越危险 / -1 值越小越危险 / 0 中性；长尾按风险方向做「极值组合」
+# =====================================================================
+@dataclass(frozen=True)
+class Param:
+    mean: float
+    std: float
+    lo: float
+    hi: float
+    risk: int = 0
+    discrete: bool = False
+
+
+#: 所有场景共享的天气/时长子向量（保证逐条天气多样——旧版雷同的直接修复点）
+SHARED_PARAMS: dict[str, Param] = {
+    "rain": Param(12, 26, 0, 100, +1),
+    "fog": Param(8, 18, 0, 100, +1),
+    "wind": Param(15, 25, 0, 100, +1),
+    "sun_alt": Param(40, 35, -25, 90, -1),   # 越低越暗越危险
+    "sun_az": Param(120, 100, 0, 360, 0),
+    "duration": Param(80, 45, 30, 300, 0),
+}
+
+#: 类型专属几何/动力学参数（覆盖/追加共享段）
+TYPE_PARAMS: dict[str, dict[str, Param]] = {
+    "straight_cruise": {"ego_speed": Param(16, 7, 2, 24, +1)},
+    "curve_driving": {"ego_speed": Param(6, 2.2, 2, 11, +1), "steer_mag": Param(0.5, 0.28, 0.1, 0.95, +1)},
+    "car_following": {
+        "ego_speed": Param(14, 6, 4, 24, +1), "gap": Param(16, 7, 6, 32, -1),
+        "lead_ratio": Param(0.85, 0.12, 0.5, 1.05, 0),
+    },
+    "lane_change": {
+        "ego_speed": Param(12, 6, 4, 22, +1), "lat": Param(3.5, 0.4, 3.0, 4.2, 0),
+        "complete_in": Param(5, 1.6, 3, 9, -1), "target_ratio": Param(1.05, 0.12, 0.8, 1.3, 0),
+    },
+    "cut_in": {
+        "ego_speed": Param(18, 5, 10, 24, +1), "cut_gap": Param(28, 8, 15, 42, -1),
+        "lat": Param(3.5, 0.5, 2.5, 4.5, -1), "aggr": Param(2.0, 1.3, 0.5, 5.0, +1),
+    },
+    "pedestrian_crossing": {
+        "ego_speed": Param(6, 2.6, 2, 11, +1), "n_ped": Param(2, 1.3, 1, 5, +1, discrete=True),
+        "ped_speed": Param(1.6, 0.6, 0.8, 2.6, +1), "cross_dist": Param(22, 7, 10, 36, -1),
+    },
+    "intersection_meeting": {
+        "ego_speed": Param(6, 2.2, 3, 11, +1), "cross_speed": Param(6.5, 2.4, 3, 11, +1),
+        "cross_dist": Param(30, 9, 15, 52, -1),
+    },
+    "construction_detour": {
+        "ego_speed": Param(6, 2.2, 3, 10, +1), "n_bar": Param(3, 1.4, 2, 6, +1, discrete=True),
+        "bar_dist": Param(16, 6, 8, 30, -1),
+    },
+    "rainy": {
+        "ego_speed": Param(6, 2.4, 2, 11, +1),
+        "rain": Param(72, 24, 25, 100, +1), "fog": Param(18, 15, 0, 60, +1),
+    },
+    "night": {
+        "ego_speed": Param(6, 2.4, 2, 11, +1), "sun_alt": Param(-20, 10, -45, 2, -1),
+        "n_ped": Param(1, 1.0, 0, 3, +1, discrete=True),
+    },
+    "foggy": {
+        "ego_speed": Param(4, 1.6, 2, 8, +1), "fog": Param(82, 16, 45, 100, +1),
+        "vis_dist": Param(14, 6, 6, 32, -1),
+    },
+    "backlight": {
+        "ego_speed": Param(6, 2.2, 2, 11, +1), "sun_alt": Param(5, 4, -2, 16, +1),
+        "sun_az": Param(0, 30, 0, 360, 0), "rain": Param(4, 8, 0, 30, 0),
+    },
+    "emergency_braking": {
+        "ego_speed": Param(16, 6, 8, 24, +1), "gap": Param(13, 5, 6, 24, -1),
+        "decel": Param(6, 2.2, 3, 9.5, +1), "ttc": Param(1.6, 0.8, 0.8, 3.2, -1),
+    },
+    "obstacle_appearance": {
+        "ego_speed": Param(9, 4, 3, 18, +1), "appear_x": Param(15, 5, 8, 24, -1),
+        "kind_idx": Param(2, 1.6, 0, 4, 0, discrete=True),
+    },
+    "sensor_failure": {
+        "ego_speed": Param(6, 2.4, 2, 11, +1), "fail_x": Param(11, 5, 4, 22, -1),
+        "sensor_idx": Param(2, 1.6, 0, 4, 0, discrete=True), "fault_idx": Param(2, 1.6, 0, 4, 0, discrete=True),
+    },
+    "multi_vehicle_mixed": {
+        "ego_speed": Param(6, 2.4, 2, 11, +1), "n_v": Param(5, 1.6, 3, 7, +1, discrete=True),
+        "n_p": Param(2, 1.2, 1, 4, +1, discrete=True), "spread": Param(7, 3, 3, 14, +1),
+    },
+}
+
+_OBSTACLE_KINDS = ("debris", "cone", "animal", "fallen-load", "tyre")
+_SENSORS = ("camera_front", "lidar_top", "radar_front", "camera_rear", "gnss")
+_FAULTS = ("black_frame", "point_dropout", "ghost_return", "freeze", "denied")
+_CURVES = ("left", "right", "s-ramp", "hairpin")
+_MANEUVERS = ("straight", "left-turn", "right-turn", "uturn")
+
+
+# =====================================================================
+# 三、高斯分层采样引擎（设计文档 §2.4.2 分层采样 + §2.3.3 长尾定向）
+# =====================================================================
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _zone_magnitude(rng: random.Random, zone: str) -> float:
+    """按分布区间抽取 |z| 倍数（常用 ±1σ / 边缘 1~3σ / 长尾 >3σ，§2.1.1）。"""
+    if zone == "common":
+        return rng.uniform(0.0, 1.0)
+    if zone == "edge":
+        return rng.uniform(1.0, 3.0)
+    # longtail：重要性采样向尾部偏移（3~4.5σ，再按物理边界裁剪）
+    return rng.uniform(3.0, 4.5)
+
+
+def _sample_param(rng: random.Random, name: str, p: Param, zone: str, coherent: int) -> float:
+    """单参数高斯抽样；长尾沿风险方向做极值组合（§2.3.3），常用/边缘部分独立。"""
+    mag = _zone_magnitude(rng, zone)
+    if p.risk != 0 and zone == "longtail":
+        sign = coherent * p.risk                 # 多参数同向推向极限
+    elif p.risk != 0 and zone == "edge" and rng.random() < 0.5:
+        sign = coherent * p.risk
+    else:
+        sign = rng.choice((-1, 1))
+    val = _clamp(p.mean + sign * mag * p.std, p.lo, p.hi)
+    if p.discrete:
+        val = float(int(round(val)))
+        val = _clamp(val, p.lo, p.hi)
+    return val
+
+
+def _sample_vector(rng: random.Random, spec: dict[str, Param], zone: str) -> dict[str, float]:
+    coherent = rng.choice((-1, 1))
+    return {name: _sample_param(rng, name, p, zone, coherent) for name, p in spec.items()}
+
+
+def _normalize_vector(spec: dict[str, Param], params: dict[str, float]) -> list[float]:
+    """参数向量归一化到 [0,1]（用于余弦相似度去重，§2.4.4）。"""
+    vec: list[float] = []
+    for name, p in spec.items():
+        v = params[name]
+        vec.append((v - p.lo) / (p.hi - p.lo) if p.hi > p.lo else 0.0)
+    return vec
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 1.0
+    return dot / (na * nb)
+
+
+def _feasible(stype: str, p: dict[str, float]) -> bool:
+    """物理可行性/初始状态校验（§2.4.3 第 2/3 层）：核心是初始不碰撞、运动连续。"""
+    speed = p.get("ego_speed", 0.0)
+    stop_dist = speed * 0.6 + 3.0            # 简化制动距离
+    if stype in {"car_following", "emergency_braking"} and p["gap"] < stop_dist:
+        return False
+    if stype == "cut_in" and p["cut_gap"] < stop_dist:
+        return False
+    if stype == "pedestrian_crossing" and p["cross_dist"] < stop_dist:
+        return False
+    if stype == "obstacle_appearance" and p["appear_x"] < stop_dist:
+        return False
+    if stype == "foggy" and p["vis_dist"] < stop_dist:
+        return False
+    if stype == "sensor_failure" and p["fail_x"] < stop_dist:
+        return False
+    return True
+
+
+def _zone_counts(total: int, ratio: dict[str, float]) -> OrderedDict[str, int]:
+    """按比例把类型配额拆到三个分布区间，舍入余数补给 common（和恒等于 total）。"""
+    keys = ("common", "edge", "longtail")
+    counts = {k: int(round(total * ratio.get(k, 0.0))) for k in keys}
+    counts["common"] += total - sum(counts.values())   # 舍入余数归常用
+    if counts["common"] < 0:                            # 极端舍入致常用为负时回补
+        deficit = -counts["common"]
+        counts["common"] = 0
+        for k in ("edge", "longtail"):
+            take = min(counts[k], deficit)
+            counts[k] -= take
+            deficit -= take
+            if deficit <= 0:
+                break
+    return OrderedDict((k, counts[k]) for k in keys)
+
+
+# =====================================================================
+# 四、4.2.2 结构构造 helper（全部返回 dict，落库前经 SceneCreateRequest 校验）
 # =====================================================================
 def _spawn(x: float, y: float = 0.0, yaw: float = 0.0, z: float = 0.0, lane_id: str | None = None) -> dict[str, Any]:
     return {"x": round(x, 3), "y": round(y, 3), "z": round(z, 3), "yaw": round(yaw, 5), "lane_id": lane_id}
 
 
 def _actor(aid: str, atype: str, spawn: dict[str, Any], behavior: str, **params: Any) -> dict[str, Any]:
-    return {
-        "actor_id": aid,
-        "type": atype,
-        "spawn_point": spawn,
-        "behavior": {"behavior_type": behavior, "parameters": dict(params)},
-    }
+    return {"actor_id": aid, "type": atype, "spawn_point": spawn,
+            "behavior": {"behavior_type": behavior, "parameters": dict(params)}}
 
 
 def _vehicle(aid: str, x: float, y: float, behavior: str, yaw: float = 0.0, **params: Any) -> dict[str, Any]:
@@ -256,362 +373,218 @@ def _static(aid: str, x: float, y: float, kind: str = "debris") -> dict[str, Any
     return _actor(aid, "other", _spawn(x, y, 0.0), "static", object_kind=kind)
 
 
-def _event(eid: str, etype: str, condition: str, action: str, trigger: dict[str, Any] | None = None, **action_params: Any) -> dict[str, Any]:
+def _event(eid: str, etype: str, condition: str, action: str, **action_params: Any) -> dict[str, Any]:
+    return {"event_id": eid, "type": etype,
+            "trigger": {"condition": condition, "parameters": {"source": "gaussian-batch"}},
+            "action": {"action_type": action, "parameters": dict(action_params)}}
+
+
+def _build_weather(p: dict[str, float]) -> dict[str, float]:
+    """由采样参数装配 Carla 7 字段天气段（严格落范围）。"""
+    rain = p["rain"]
+    fog = p["fog"]
+    cloud = _clamp(rain * 0.7 + fog * 0.4 + 10.0, 0.0, 100.0)
     return {
-        "event_id": eid,
-        "type": etype,
-        "trigger": {"condition": condition, "parameters": trigger or {"source": "batch"}},
-        "action": {"action_type": action, "parameters": dict(action_params)},
+        "cloudiness": round(cloud, 1),
+        "rain": round(rain, 1),
+        "wetness": round(_clamp(rain * 0.9, 0.0, 100.0), 1),
+        "fog": round(fog, 1),
+        "wind": round(p["wind"], 1),
+        "sun_azimuth": round(p["sun_az"], 1),
+        "sun_altitude": round(_clamp(p["sun_alt"], -90.0, 90.0), 1),
     }
 
 
-def _weather(name: str) -> dict[str, float]:
-    cfg = WEATHER[name]
-    # 复制并保证 7 字段齐全（校验阶段兜底，禁止漏字段）
-    return {
-        "cloudiness": cfg["cloudiness"],
-        "rain": cfg["rain"],
-        "wetness": cfg["wetness"],
-        "fog": cfg["fog"],
-        "wind": cfg["wind"],
-        "sun_azimuth": cfg["sun_azimuth"],
-        "sun_altitude": cfg["sun_altitude"],
-    }
+def _derive_criteria(stype: str, p: dict[str, float]) -> tuple[float, float]:
+    """由速度/类型推导 (min_safe, max_dev)，随场景强度自适应。"""
+    speed = p.get("ego_speed", 6.0)
+    base = {"emergency_braking": 2.0, "obstacle_appearance": 2.5, "cut_in": 6.0, "car_following": 4.0}.get(stype, 3.5)
+    min_safe = _clamp(base + speed * 0.25, 1.0, 25.0)
+    max_dev = _clamp(1.0 + speed * 0.05, 0.5, 3.5)
+    return round(min_safe, 2), round(max_dev, 2)
 
 
 def _config(
-    *,
-    map_id: str,
-    ego_speed: float,
-    ego_steer: float,
-    weather: str,
-    actors: list[dict[str, Any]],
-    events: list[dict[str, Any]],
-    duration: float,
-    spawn: dict[str, Any] | None = None,
-    min_safe: float = 5.0,
-    max_dev: float = 2.0,
-    no_collision: bool = True,
+    *, map_id: str, ego_speed: float, ego_steer: float, weather: dict[str, float],
+    actors: list[dict[str, Any]], events: list[dict[str, Any]], duration: float,
+    min_safe: float, max_dev: float, no_collision: bool = True,
 ) -> dict[str, Any]:
     return {
-        "map": {
-            "map_id": map_id,
-            "map_type": "carla_town",
-            "spawn_point": spawn or _spawn(0.0, 0.0, 0.0, lane_id="lane-1"),
-        },
-        "ego_vehicle": {
-            "model": EGO_MODEL,
-            "initial_speed": round(max(0.0, ego_speed), 3),
-            "initial_steer": round(min(1.0, max(-1.0, ego_steer)), 3),
-        },
-        "weather": _weather(weather),
+        "map": {"map_id": map_id, "map_type": "carla_town",
+                "spawn_point": _spawn(0.0, 0.0, 0.0, lane_id="lane-1")},
+        "ego_vehicle": {"model": EGO_MODEL, "initial_speed": round(max(0.0, ego_speed), 3),
+                        "initial_steer": round(_clamp(ego_steer, -1.0, 1.0), 3)},
+        "weather": weather,
         "actors": actors,
         "events": events,
-        "success_criteria": {
-            "max_speed_deviation": round(max_dev, 3),
-            "no_collision": no_collision,
-            "min_safe_distance": round(max(0.0, min_safe), 3),
-        },
+        "success_criteria": {"max_speed_deviation": max_dev, "no_collision": no_collision,
+                             "min_safe_distance": min_safe},
         "duration": round(min(duration, DURATION_MAX), 1),
     }
 
 
-def _cyclic(seq: tuple[str, ...] | list[str], i: int) -> str:
-    return seq[i % len(seq)]
-
-
 # =====================================================================
-# 四、各类型场景生成器：builder(i, total) -> (name_token, config, extra_tags)
-#     i 为该类型内序号（0 基）；通过轮换 map / weather / speed / actor 参数制造多样性
+# 五、各类型装配器：assembler(p) -> (actors, events, ego_steer, token)
+#     数值全部来自高斯采样参数 p，逐条不同；结构保持语义正确（参与者/事件类型合法）
 # =====================================================================
-Builder = Callable[[int, int], tuple[str, dict[str, Any], list[str]]]
-
-# 速度档（m/s）：低速城区 → 高速巡航，轮换使用
-SPEED_CITY = (2.0, 4.0, 6.0, 8.0)
-SPEED_HIGHWAY = (12.0, 16.0, 20.0, 24.0)
+Assembler = Callable[[dict[str, float]], tuple[list[dict[str, Any]], list[dict[str, Any]], float, str]]
 
 
-def _b_straight(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    highway = i % 2 == 0
-    speed = _cyclic(SPEED_HIGHWAY if highway else SPEED_CITY, i)
-    w = _cyclic(FULL_CYCLE, i)
-    actors = []
-    if i % 3 == 0:  # 远处背景车
-        actors.append(_vehicle("bg-vehicle", 80.0, 3.5, "lane_follow", target_speed=round(speed * 0.9, 2)))
-    events = []
-    if i % 4 == 0:
-        events.append(_event("ev-cruise-brake", "emergency_brake", "ego.distance.headway < 2.0", "hold_speed"))
-    cfg = _config(
-        map_id=MAPS[i % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=60 + 10 * (i % 6),
-        min_safe=3.0 if not highway else 8.0, max_dev=1.0,
-    )
-    return f"{'highway' if highway else 'city'}-{w}", cfg, ["carla"]
+def _a_straight(p):
+    speed = p["ego_speed"]
+    actors = [_vehicle("bg-vehicle", 60.0 + speed * 3, 3.5, "lane_follow", target_speed=round(speed * 0.9, 2))]
+    events = [_event("ev-cruise", "emergency_brake", f"ego.distance.headway < {round(2.0 + speed * 0.05, 2)}", "hold_speed")]
+    return actors, events, 0.0, f"v{speed:.1f}"
 
 
-def _b_curve(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    curve = ("left", "right", "s-ramp", "hairpin")[i % 4]
-    steer = {"left": -0.5, "right": 0.5, "s-ramp": 0.2, "hairpin": -0.9}[curve]
-    speed = (4.0, 6.0, 8.0, 3.0)[i % 4]
-    w = _cyclic(FULL_CYCLE, i + 1)
-    actors = []
-    if i % 2 == 0:
-        actors.append(_vehicle("oncoming", 60.0, -3.5, "lane_follow", yaw=PI, target_speed=6.0))
-    events = [_event("ev-curve-limit", "collision", "ego.lateral.accel > 5.0", "speed_limit", target_speed=round(speed, 2))]
-    cfg = _config(
-        map_id=MAPS[(i + 1) % len(MAPS)], ego_speed=speed, ego_steer=steer, weather=w,
-        actors=actors, events=events, duration=50 + 10 * (i % 5), min_safe=4.0, max_dev=1.5,
-    )
-    return f"{curve}-{w}", cfg, ["carla"]
+def _a_curve(p):
+    speed, steer = p["ego_speed"], p["steer_mag"]
+    curve = _CURVES[int(round((steer - 0.1) / 0.85 * 3)) % 4]
+    signed = -steer if curve in ("left", "hairpin") else steer
+    actors = [_vehicle("oncoming", 50.0 + speed * 3, -3.5, "lane_follow", yaw=PI, target_speed=round(speed * 0.8, 2))]
+    events = [_event("ev-curve-limit", "collision", f"ego.lateral.accel > {round(3.0 + steer * 3, 2)}", "speed_limit", target_speed=round(speed, 2))]
+    return actors, events, signed, f"{curve}-s{steer:.2f}"
 
 
-def _b_follow(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    speed = _cyclic(SPEED_HIGHWAY + SPEED_CITY, i)
-    gap = (6.0, 10.0, 15.0, 20.0, 25.0)[i % 5]
-    lead_speed = round(speed * (0.7 + 0.1 * (i % 3)), 2)
-    w = _cyclic(FULL_CYCLE, i)
-    actors = [_vehicle("lead-vehicle", gap, 0.0, "lane_follow", target_speed=lead_speed)]
-    if i % 3 == 0:
-        actors.append(_vehicle("adjacent", gap + 12.0, 3.5, "lane_follow", target_speed=round(speed * 0.95, 2)))
-    events = []
-    if i % 2 == 0:
-        events.append(_event("ev-lead-brake", "emergency_brake", "ego.distance.lead < 8.0", "brake", deceleration=round(3.0 + 0.5 * (i % 4), 2)))
-    cfg = _config(
-        map_id=MAPS[i % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=70 + 10 * (i % 6),
-        min_safe=max(3.0, gap * 0.5), max_dev=1.5,
-    )
-    return f"gap{int(gap)}m-{w}", cfg, ["carla"]
+def _a_follow(p):
+    speed, gap, ratio = p["ego_speed"], p["gap"], p["lead_ratio"]
+    actors = [_vehicle("lead-vehicle", gap, 0.0, "lane_follow", target_speed=round(speed * ratio, 2))]
+    events = [_event("ev-lead-brake", "emergency_brake", f"ego.distance.lead < {round(gap * 0.5, 2)}", "brake", deceleration=round(3.0 + speed * 0.15, 2))]
+    return actors, events, 0.0, f"g{gap:.1f}m-v{speed:.1f}"
 
 
-def _b_lane_change(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    direction = ("left", "right")[i % 2]
-    speed = _cyclic(SPEED_CITY + SPEED_HIGHWAY, i)
-    w = _cyclic(FULL_CYCLE, i + 2)
-    lat = -3.5 if direction == "left" else 3.5
+def _a_lane_change(p):
+    speed, lat, cin, tratio = p["ego_speed"], p["lat"], p["complete_in"], p["target_ratio"]
+    direction = "left" if lat > 3.5 else "right"
+    y = -lat if direction == "left" else lat
     actors = [
-        _vehicle("target-gap", 18.0, lat, "lane_follow", target_speed=round(speed * 1.05, 2)),
-        _vehicle("behind", -6.0, lat, "constant_velocity", target_speed=round(speed * 1.1, 2)),
+        _vehicle("target-gap", 18.0, y, "lane_follow", target_speed=round(speed * tratio, 2)),
+        _vehicle("behind", -6.0, y, "constant_velocity", target_speed=round(speed * 1.1, 2)),
     ]
-    if i % 3 == 0:
-        actors.append(_vehicle("lead", 12.0, 0.0, "lane_follow", target_speed=round(speed * 0.9, 2)))
-    events = [_event("ev-lane-change", "cut_in", f"ego.position.x > {10 + i}", "lane_change", target_lane=direction, complete_in=round(4.0 + (i % 4), 2))]
-    cfg = _config(
-        map_id=MAPS[(i + 2) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=50 + 10 * (i % 5), min_safe=4.0, max_dev=2.0,
-    )
-    return f"{direction}-{w}", cfg, ["carla"]
+    events = [_event("ev-lane-change", "cut_in", f"ego.position.x > {round(10 + speed, 1)}", "lane_change", target_lane=direction, complete_in=round(cin, 2))]
+    return actors, events, 0.0, f"{direction}-t{cin:.1f}s"
 
 
-def _b_cut_in(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    speed = _cyclic(SPEED_HIGHWAY, i)
-    side = -3.5 if i % 2 == 0 else 3.5
-    aggressiveness = (0.8, 1.5, 2.5, 4.0)[i % 4]  # 切入横向速度 → 难度递增
-    cut_gap = (20.0, 28.0, 35.0)[i % 3]
-    w = _cyclic(FULL_CYCLE, i + 3)
+def _a_cut_in(p):
+    speed, gap, lat, aggr = p["ego_speed"], p["cut_gap"], p["lat"], p["aggr"]
+    side = -lat if int(gap) % 2 == 0 else lat
     actors = [
-        _vehicle("cut-in-vehicle", cut_gap, side, "cut_in", target_lane="ego_lane", cut_in_speed=aggressiveness),
-        _vehicle("lead", cut_gap + 15.0, 0.0, "lane_follow", target_speed=round(speed * 0.85, 2)),
+        _vehicle("cut-in-vehicle", gap, side, "cut_in", target_lane="ego_lane", cut_in_speed=round(aggr, 2)),
+        _vehicle("lead", gap + 15.0, 0.0, "lane_follow", target_speed=round(speed * 0.85, 2)),
     ]
-    events = [_event("ev-cut-in", "cut_in", f"ego.position.x > {cut_gap - 5}", "speed_change", target_speed=round(speed * 0.6, 2))]
-    cfg = _config(
-        map_id=MAPS[(i + 1) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=45 + 10 * (i % 5), min_safe=6.0, max_dev=2.0,
-    )
-    return f"agg{aggressiveness}-{w}", cfg, ["carla"]
+    events = [_event("ev-cut-in", "cut_in", f"ego.position.x > {round(gap - 5, 1)}", "speed_change", target_speed=round(speed * 0.6, 2))]
+    return actors, events, 0.0, f"agg{aggr:.1f}-d{gap:.1f}"
 
 
-def _b_pedestrian(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    speed = (3.0, 5.0, 7.0, 9.0)[i % 4]
-    n_ped = 1 + (i % 4)
-    peds = (6.0, 8.0, 10.0)[i % 3]
-    w = _cyclic(FULL_CYCLE, i + 4)
-    actors = []
-    for k in range(n_ped):
-        actors.append(_pedestrian(f"ped-{k + 1}", 22.0 + k * 1.5, -peds - k * 0.6, speed=round(1.2 + 0.4 * (k % 3), 2)))
-    if i % 3 == 0:
-        actors.append(_vehicle("cross-vehicle", 40.0, -3.5, "lane_follow", yaw=PI, target_speed=6.0))
-    events = [_event("ev-ped-crossing", "pedestrian_crossing", "ego.position.x > 15", "stop", min_safe_distance=2.0)]
-    cfg = _config(
-        map_id=MAPS[(i + 3) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=40 + 10 * (i % 5), min_safe=2.0, max_dev=1.0,
-    )
-    return f"{n_ped}ped-{w}", cfg, ["carla", "vru"]
+def _a_pedestrian(p):
+    speed, n, ps, dist = p["ego_speed"], int(p["n_ped"]), p["ped_speed"], p["cross_dist"]
+    actors = [_pedestrian(f"ped-{k + 1}", dist + k * 1.5, -6.0 - k * 0.6, speed=round(ps + 0.1 * k, 2)) for k in range(n)]
+    events = [_event("ev-ped-crossing", "pedestrian_crossing", f"ego.position.x > {round(dist - 5, 1)}", "stop", min_safe_distance=2.0)]
+    return actors, events, 0.0, f"{n}ped-{ps:.1f}"
 
 
-def _b_intersection(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    maneuver = ("straight", "left-turn", "right-turn", "uturn")[i % 4]
-    speed = (4.0, 6.0, 8.0)[i % 3]
-    w = _cyclic(FULL_CYCLE, i + 5)
+def _a_intersection(p):
+    speed, cs, dist = p["ego_speed"], p["cross_speed"], p["cross_dist"]
+    maneuver = _MANEUVERS[int(round(speed)) % 4]
     actors = [
-        _vehicle("cross-vehicle-1", 30.0, -8.0, "forward", yaw=PI / 2, target_speed=7.0),
-        _vehicle("cross-vehicle-2", 30.0, 8.0, "forward", yaw=-PI / 2, target_speed=6.0),
-        _vehicle("opposite", 45.0, 0.0, "lane_follow", yaw=PI, target_speed=6.0),
+        _vehicle("cross-vehicle-1", dist, -8.0, "forward", yaw=PI / 2, target_speed=round(cs, 2)),
+        _vehicle("cross-vehicle-2", dist, 8.0, "forward", yaw=-PI / 2, target_speed=round(cs * 0.9, 2)),
+        _vehicle("opposite", dist + 15.0, 0.0, "lane_follow", yaw=PI, target_speed=round(cs, 2)),
     ]
-    if i % 2 == 0:
-        actors.append(_pedestrian("ped-zebra", 18.0, -6.0))
-    events = [_event("ev-signal", "collision", "ego.position.x > 10", "traffic_light", phase=("green" if i % 2 else "yellow"))]
-    cfg = _config(
-        map_id=MAPS[(i + 4) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=55 + 10 * (i % 5), min_safe=4.0, max_dev=2.0,
-    )
-    return f"{maneuver}-{w}", cfg, ["carla"]
+    events = [_event("ev-signal", "collision", f"ego.position.x > {round(dist * 0.4, 1)}", "traffic_light", phase=("green" if int(speed) % 2 else "yellow"))]
+    return actors, events, 0.0, f"{maneuver}-cd{dist:.0f}"
 
 
-def _b_construction(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    speed = (4.0, 6.0, 8.0)[i % 3]
-    n_bar = 2 + (i % 3)
-    w = _cyclic(FULL_CYCLE, i + 6)
-    actors = [_static(f"barrier-{k + 1}", 15.0 + k * 4.0, 1.8, kind="construction") for k in range(n_bar)]
-    actors.append(_vehicle("worker-vehicle", 40.0, 3.5, "static"))
-    events = [_event("ev-detour", "obstacle_appearance", "ego.position.x > 8", "lane_change", target_lane="left", complete_in=6.0)]
-    cfg = _config(
-        map_id=MAPS[(i + 5) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=50 + 10 * (i % 4), min_safe=3.0, max_dev=1.5,
-    )
-    return f"{n_bar}barrier-{w}", cfg, ["carla"]
+def _a_construction(p):
+    speed, n, dist = p["ego_speed"], int(p["n_bar"]), p["bar_dist"]
+    actors = [_static(f"barrier-{k + 1}", dist + k * 4.0, 1.8, kind="construction") for k in range(n)]
+    actors.append(_vehicle("worker-vehicle", dist + n * 4.0 + 8.0, 3.5, "static"))
+    events = [_event("ev-detour", "obstacle_appearance", f"ego.position.x > {round(dist - 6, 1)}", "lane_change", target_lane="left", complete_in=6.0)]
+    return actors, events, 0.0, f"{n}bar-d{dist:.0f}"
 
 
-def _b_rain(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    w = _cyclic(WEATHER_CYCLE_BY_TYPE["rainy"], i)
-    speed = _cyclic(SPEED_CITY, i)
+def _a_rain(p):
+    speed = p["ego_speed"]
     actors = [_vehicle("lead-vehicle", 18.0, 0.0, "lane_follow", target_speed=round(speed * 0.8, 2))]
-    events = [_event("ev-wet-brake", "emergency_brake", "ttc < 2.5", "brake", deceleration=3.0)]
-    cfg = _config(
-        map_id=MAPS[i % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=60 + 10 * (i % 5), min_safe=6.0, max_dev=2.0,
-    )
-    return f"rain-{w}", cfg, ["carla", "extreme"]
+    events = [_event("ev-wet-brake", "emergency_brake", f"ttc < {round(2.5 - speed * 0.03, 2)}", "brake", deceleration=round(3.0 + p["rain"] * 0.02, 2))]
+    return actors, events, 0.0, f"r{p['rain']:.0f}"
 
 
-def _b_night(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    w = _cyclic(WEATHER_CYCLE_BY_TYPE["night"], i)
-    speed = _cyclic(SPEED_CITY, i)
+def _a_night(p):
+    speed, n = p["ego_speed"], int(p["n_ped"])
     actors = [_vehicle("lead-vehicle", 22.0, 0.0, "lane_follow", target_speed=round(speed * 0.85, 2))]
-    if i % 2 == 0:
-        actors.append(_pedestrian("ped-dark", 26.0, -4.0))
-    events = [_event("ev-night-detect", "obstacle_appearance", "ego.position.x > 12", "brake", deceleration=2.5)]
-    cfg = _config(
-        map_id=MAPS[(i + 2) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=60 + 10 * (i % 4), min_safe=5.0, max_dev=2.0,
-    )
-    return f"night-{w}", cfg, ["carla", "extreme"]
+    actors += [_pedestrian(f"ped-dark-{k + 1}", 26.0 + k * 2.0, -4.0) for k in range(n)]
+    events = [_event("ev-night-detect", "obstacle_appearance", f"ego.position.x > {round(12 + speed, 1)}", "brake", deceleration=2.5)]
+    return actors, events, 0.0, f"alt{p['sun_alt']:.0f}-{n}ped"
 
 
-def _b_fog(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    w = _cyclic(WEATHER_CYCLE_BY_TYPE["foggy"], i)
-    speed = (3.0, 4.0, 5.0)[i % 3]
-    actors = [_vehicle("lead-emerge", 14.0 + i, 0.0, "lane_follow", target_speed=round(speed * 0.7, 2))]
-    events = [_event("ev-fog-appear", "obstacle_appearance", "ego.position.x > 8", "emergency_stop")]
-    cfg = _config(
-        map_id=MAPS[(i + 3) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=55 + 10 * (i % 4), min_safe=4.0, max_dev=1.5,
-    )
-    return f"fog-{w}", cfg, ["carla", "extreme"]
+def _a_fog(p):
+    speed, vis = p["ego_speed"], p["vis_dist"]
+    actors = [_vehicle("lead-emerge", vis, 0.0, "lane_follow", target_speed=round(speed * 0.7, 2))]
+    events = [_event("ev-fog-appear", "obstacle_appearance", f"ego.position.x > {round(vis - 6, 1)}", "emergency_stop")]
+    return actors, events, 0.0, f"fog{p['fog']:.0f}-v{vis:.0f}"
 
 
-def _b_backlight(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    w = _cyclic(WEATHER_CYCLE_BY_TYPE["backlight"], i)
-    speed = _cyclic(SPEED_CITY, i)
+def _a_backlight(p):
+    speed = p["ego_speed"]
     actors = [_vehicle("lead-vehicle", 20.0, 0.0, "lane_follow", target_speed=round(speed * 0.9, 2))]
-    if i % 2 == 0:
-        actors.append(_static("roadside", 24.0, 3.0, kind="sign"))
-    events = [_event("ev-glare", "pedestrian_crossing", "ego.position.x > 10", "hold_speed")]
-    cfg = _config(
-        map_id=MAPS[(i + 4) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=50 + 10 * (i % 4), min_safe=4.0, max_dev=1.5,
-    )
-    return f"glare-{w}", cfg, ["carla", "extreme"]
+    actors.append(_static("roadside", 24.0, 3.0, kind="sign"))
+    events = [_event("ev-glare", "pedestrian_crossing", f"ego.position.x > {round(10 + speed, 1)}", "hold_speed")]
+    return actors, events, 0.0, f"alt{p['sun_alt']:.0f}-az{p['sun_az']:.0f}"
 
 
-def _b_emergency(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    speed = _cyclic(SPEED_HIGHWAY + SPEED_CITY, i)
-    gap = (8.0, 12.0, 16.0, 20.0)[i % 4]
-    decel = (4.0, 6.0, 8.0, 9.5)[i % 4]
-    w = _cyclic(FULL_CYCLE, i + 7)
+def _a_emergency(p):
+    speed, gap, decel, ttc = p["ego_speed"], p["gap"], p["decel"], p["ttc"]
     actors = [_vehicle("lead-hard-brake", gap, 0.0, "lane_follow", target_speed=round(speed * 0.5, 2))]
-    events = [_event("ev-aeb", "emergency_brake", f"ttc < {round(1.0 + 0.3 * (i % 3), 2)}", "emergency_stop", deceleration=decel)]
-    cfg = _config(
-        map_id=MAPS[(i + 1) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=40 + 10 * (i % 4), min_safe=2.0, max_dev=2.0, no_collision=True,
-    )
-    return f"decel{decel}-{w}", cfg, ["carla", "safety"]
+    events = [_event("ev-aeb", "emergency_brake", f"ttc < {round(ttc, 2)}", "emergency_stop", deceleration=round(decel, 2))]
+    return actors, events, 0.0, f"dec{decel:.1f}-ttc{ttc:.1f}"
 
 
-def _b_obstacle(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    speed = _cyclic(SPEED_CITY + SPEED_HIGHWAY, i)
-    kind = ("debris", "cone", "animal", "fallen-load", "tyre")[i % 5]
-    appear_x = (10.0, 14.0, 18.0)[i % 3]
-    w = _cyclic(FULL_CYCLE, i + 8)
-    actors = [_static("sudden-obstacle", appear_x, 0.4, kind=kind)]
-    events = [_event("ev-obstacle", "obstacle_appearance", f"ego.position.x > {appear_x - 4}", "emergency_stop")]
-    cfg = _config(
-        map_id=MAPS[(i + 2) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=40 + 10 * (i % 4), min_safe=2.0, max_dev=2.0,
-    )
-    return f"{kind}-{w}", cfg, ["carla", "corner-case"]
+def _a_obstacle(p):
+    speed, ax = p["ego_speed"], p["appear_x"]
+    kind = _OBSTACLE_KINDS[int(p["kind_idx"]) % len(_OBSTACLE_KINDS)]
+    actors = [_static("sudden-obstacle", ax, 0.4, kind=kind)]
+    events = [_event("ev-obstacle", "obstacle_appearance", f"ego.position.x > {round(ax - 4, 1)}", "emergency_stop")]
+    return actors, events, 0.0, f"{kind}-x{ax:.0f}"
 
 
-def _b_sensor(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    sensor = ("camera_front", "lidar_top", "radar_front", "camera_rear", "gnss")[i % 5]
-    fault = ("black_frame", "point_dropout", "ghost_return", "freeze", "denied")[i % 5]
-    speed = _cyclic(SPEED_CITY, i)
-    w = _cyclic(FULL_CYCLE, i + 9)
+def _a_sensor(p):
+    speed, fx = p["ego_speed"], p["fail_x"]
+    sensor = _SENSORS[int(p["sensor_idx"]) % len(_SENSORS)]
+    fault = _FAULTS[int(p["fault_idx"]) % len(_FAULTS)]
     actors = [_vehicle("lead-vehicle", 20.0, 0.0, "lane_follow", target_speed=round(speed * 0.8, 2))]
-    events = [_event("ev-sensor-fail", "sensor_failure", f"ego.position.x > {8 + 2 * (i % 3)}", "degrade_control", sensor=sensor, fault=fault, fallback="limp_home")]
-    cfg = _config(
-        map_id=MAPS[(i + 3) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=45 + 10 * (i % 4), min_safe=5.0, max_dev=3.0, no_collision=True,
-    )
-    return f"{sensor}-{fault}", cfg, ["carla", "fail-degraded"]
+    events = [_event("ev-sensor-fail", "sensor_failure", f"ego.position.x > {round(fx, 1)}", "degrade_control", sensor=sensor, fault=fault, fallback="limp_home")]
+    return actors, events, 0.0, f"{sensor}-{fault}"
 
 
-def _b_multi(i: int, total: int) -> tuple[str, dict[str, Any], list[str]]:
-    n_v = 3 + (i % 4)
-    n_p = 1 + (i % 3)
-    speed = _cyclic(SPEED_CITY, i)
-    w = _cyclic(FULL_CYCLE, i + 10)
+def _a_multi(p):
+    speed, nv, np_, spread = p["ego_speed"], int(p["n_v"]), int(p["n_p"]), p["spread"]
     actors: list[dict[str, Any]] = []
-    for k in range(n_v):
+    for k in range(nv):
         lat = (3.5, -3.5)[k % 2]
-        actors.append(_vehicle(f"veh-{k + 1}", 12.0 + k * 6.0, lat, ("lane_follow", "cut_in")[k % 2], target_speed=round(speed * (0.8 + 0.1 * k), 2)))
-    for k in range(n_p):
-        actors.append(_pedestrian(f"ped-{k + 1}", 24.0 + k * 2.0, -6.0 - k))
-    actors.append(_static("roadside-obj", 30.0, 4.5, kind="bin"))
+        actors.append(_vehicle(f"veh-{k + 1}", spread + k * 6.0, lat, ("lane_follow", "cut_in")[k % 2], target_speed=round(speed * (0.8 + 0.1 * k), 2)))
+    for k in range(np_):
+        actors.append(_pedestrian(f"ped-{k + 1}", spread * 2 + k * 2.0, -6.0 - k))
+    actors.append(_static("roadside-obj", spread * 3 + 10.0, 4.5, kind="bin"))
     events = [
-        _event("ev-mix-cutin", "cut_in", f"ego.position.x > {16 + i}", "speed_change", target_speed=round(speed * 0.5, 2)),
-        _event("ev-mix-ped", "pedestrian_crossing", "ego.position.x > 22", "yield"),
+        _event("ev-mix-cutin", "cut_in", f"ego.position.x > {round(spread * 2, 1)}", "speed_change", target_speed=round(speed * 0.5, 2)),
+        _event("ev-mix-ped", "pedestrian_crossing", f"ego.position.x > {round(spread * 3 + 6, 1)}", "yield"),
     ]
-    cfg = _config(
-        map_id=MAPS[(i + 4) % len(MAPS)], ego_speed=speed, ego_steer=0.0, weather=w,
-        actors=actors, events=events, duration=70 + 10 * (i % 5), min_safe=3.0, max_dev=2.5,
-    )
-    return f"{n_v}v{n_p}p-{w}", cfg, ["carla", "complex"]
+    return actors, events, 0.0, f"{nv}v{np_}p-s{spread:.0f}"
 
 
-BUILDERS: dict[str, Builder] = {
-    "straight_cruise": _b_straight,
-    "curve_driving": _b_curve,
-    "car_following": _b_follow,
-    "lane_change": _b_lane_change,
-    "cut_in": _b_cut_in,
-    "pedestrian_crossing": _b_pedestrian,
-    "intersection_meeting": _b_intersection,
-    "construction_detour": _b_construction,
-    "rainy": _b_rain,
-    "night": _b_night,
-    "foggy": _b_fog,
-    "backlight": _b_backlight,
-    "emergency_braking": _b_emergency,
-    "obstacle_appearance": _b_obstacle,
-    "sensor_failure": _b_sensor,
-    "multi_vehicle_mixed": _b_multi,
+ASSEMBLERS: dict[str, Assembler] = {
+    "straight_cruise": _a_straight, "curve_driving": _a_curve, "car_following": _a_follow,
+    "lane_change": _a_lane_change, "cut_in": _a_cut_in, "pedestrian_crossing": _a_pedestrian,
+    "intersection_meeting": _a_intersection, "construction_detour": _a_construction, "rainy": _a_rain,
+    "night": _a_night, "foggy": _a_fog, "backlight": _a_backlight, "emergency_braking": _a_emergency,
+    "obstacle_appearance": _a_obstacle, "sensor_failure": _a_sensor, "multi_vehicle_mixed": _a_multi,
 }
-assert set(BUILDERS) == set(SCENE_QUOTAS), "生成器必须覆盖全部配额场景类型"
+assert set(ASSEMBLERS) == set(SCENE_QUOTAS), "装配器必须覆盖全部配额场景类型"
 
 
 # =====================================================================
-# 五、组装 300 条场景（全局唯一命名 + tags 规范）
+# 六、组装 300 条场景（分层采样 + 可行性拒绝 + 余弦去重 + 唯一命名）
 # =====================================================================
 def _dedup_tags(tags: list[str], *, limit: int = 20, maxlen: int = 32) -> list[str]:
     out: list[str] = []
@@ -624,42 +597,93 @@ def _dedup_tags(tags: list[str], *, limit: int = 20, maxlen: int = 32) -> list[s
     return out
 
 
-def generate_scenes() -> list[dict[str, Any]]:
-    """按配额生成 300 条场景载荷（dict，字段严格对齐 SceneCreateRequest）。"""
+def _make_scene(
+    stype: str, spec: dict[str, Param], zone: str, rng: random.Random, accepted: list[list[float]],
+) -> tuple[dict[str, Any], dict[str, float], str, int]:
+    """采样一条通过可行性 + 去重的场景；返回 (config, params, token, tries)。"""
+    last: tuple[dict[str, float], bool] | None = None
+    for attempt in range(1, MAX_SAMPLE_TRIES + 1):
+        params = _sample_vector(rng, spec, zone)
+        if not _feasible(stype, params):
+            continue
+        vec = _normalize_vector(spec, params)
+        if any(_cosine(vec, a) > DEDUP_COSINE_THRESHOLD for a in accepted):
+            last = (params, False)
+            continue
+        accepted.append(vec)
+        cfg = _assemble_config(stype, params, zone)
+        token = ASSEMBLERS[stype](params)[3]
+        return cfg, params, token, attempt
+    # 重试耗尽：接受最后一次可行样本（或强制放宽），保证数量恒等于配额
+    params = last[0] if last and last[0] else _sample_vector(rng, spec, "common")
+    cfg = _assemble_config(stype, params, zone)
+    token = ASSEMBLERS[stype](params)[3]
+    return cfg, params, token, MAX_SAMPLE_TRIES
+
+
+def _assemble_config(stype: str, params: dict[str, float], zone: str) -> dict[str, Any]:
+    actors, events, steer, _token = ASSEMBLERS[stype](params)
+    min_safe, max_dev = _derive_criteria(stype, params)
+    spec = {**SHARED_PARAMS, **TYPE_PARAMS[stype]}
+    map_id = MAPS[hash(tuple(round(v, 2) for v in params.values())) % len(MAPS)]
+    return _config(
+        map_id=map_id, ego_speed=params.get("ego_speed", 6.0), ego_steer=steer,
+        weather=_build_weather({**spec_default_weather(spec), **params}),
+        actors=actors, events=events, duration=params["duration"],
+        min_safe=min_safe, max_dev=max_dev, no_collision=True,
+    )
+
+
+def spec_default_weather(spec: dict[str, Param]) -> dict[str, float]:
+    """补齐天气装配所需键（当某类型未显式采样该参数时用其均值兜底）。"""
+    keys = ("rain", "fog", "wind", "sun_alt", "sun_az")
+    return {k: spec[k].mean for k in keys if k in spec}
+
+
+def generate_scenes(seed: int | None = None, ratio: dict[str, float] | None = None) -> list[dict[str, Any]]:
+    """按配额 + 高斯分层采样生成 300 条场景载荷（字段严格对齐 SceneCreateRequest）。"""
+    rng = random.Random(seed)
+    zone_ratio = ratio or ZONE_RATIO
     scenes: list[dict[str, Any]] = []
+    stats = {"tries_total": 0, "dedup_drop": 0}
     g = 0
     for stype, count in SCENE_QUOTAS.items():
-        builder = BUILDERS[stype]
-        abbr = ABBR_BY_TYPE[stype]
-        label = LABEL_BY_TYPE[stype]
-        category = CATEGORY_BY_TYPE[stype]
-        for i in range(count):
-            g += 1
-            token, cfg, extra = builder(i, count)
-            # SCN-<全局序号>-<类型缩写>-<类型内序号>-<关键参数>：全局唯一、可读、≤128
-            name = f"SCN-{g:03d}-{abbr}-{i + 1:02d}-{token}"[:128]
-            tags = _dedup_tags([
-                category, stype, "ad-training", "carla",
-                *FUNCTION_TAGS[stype], *extra,
-            ])
-            description = (
-                f"[{label}] {category} 类高频训练场景 #{i + 1}/{count}"
-                f"（地图 {cfg['map']['map_id']}，天气 {token.rsplit('-', 1)[-1]}，"
-                f"自车初速 {cfg['ego_vehicle']['initial_speed']}m/s，时长 {cfg['duration']}s；"
-                f"参与者 {len(cfg['actors'])}，事件 {len(cfg['events'])}）。"
-            )[:1024]
-            scenes.append({
-                "scene_name": name,
-                "scene_type": stype,
-                "description": description,
-                "tags": tags,
-                "config": cfg,
-            })
+        spec = {**SHARED_PARAMS, **TYPE_PARAMS[stype]}
+        accepted: list[list[float]] = []
+        zone_counts = _zone_counts(count, zone_ratio)
+        per_type: list[dict[str, Any]] = []
+        for zone, n in zone_counts.items():
+            for _ in range(n):
+                cfg, params, token, tries = _make_scene(stype, spec, zone, rng, accepted)
+                stats["tries_total"] += tries
+                stats["dedup_drop"] += max(0, tries - 1)
+                g += 1
+                risk = RISK_BY_ZONE[zone]
+                name = f"SCN-{g:03d}-{ABBR_BY_TYPE[stype]}-{risk}-{token[:24]}"[:128]
+                tags = _dedup_tags([
+                    f"cat:{FUNC_CATEGORY[stype]}", CATEGORY_BY_TYPE[stype], stype,
+                    f"risk:{risk}", f"zone:{zone}", "src:synthetic",
+                    "ad-training", "carla", *FUNCTION_TAGS[stype],
+                ])
+                w = cfg["weather"]
+                description = (
+                    f"[{LABEL_BY_TYPE[stype]}] {FUNC_CATEGORY[stype]}/{CATEGORY_BY_TYPE[stype]} 类"
+                    f"高斯扰动训练场景（风险 {risk}·{zone} 区）。"
+                    f"地图 {cfg['map']['map_id']}，自车初速 {cfg['ego_vehicle']['initial_speed']}m/s，"
+                    f"时长 {cfg['duration']}s；天气 雨{w['rain']}/雾{w['fog']}/风{w['wind']}"
+                    f"/高度角{w['sun_altitude']}；参与者 {len(cfg['actors'])}，事件 {len(cfg['events'])}。"
+                )[:1024]
+                per_type.append({
+                    "scene_name": name, "scene_type": stype, "description": description,
+                    "tags": tags, "config": cfg,
+                })
+        scenes.extend(per_type)
+    generate_scenes.stats = stats  # type: ignore[attr-defined]
     return scenes
 
 
 # =====================================================================
-# 六、场景库规范校验（优先用 4.2.2 Schema；不可导入时降级为轻量内部校验）
+# 七、场景库规范校验（优先用 4.2.2 Schema；不可导入时降级为轻量内部校验）
 # =====================================================================
 VALID_SCENE_TYPES = set(SCENE_QUOTAS)
 _SCENE_EVENT_TYPES = {"collision", "cut_in", "pedestrian_crossing", "emergency_brake",
@@ -673,8 +697,7 @@ def _light_validate(payload: dict[str, Any]) -> None:
     for key in ("scene_name", "scene_type", "config"):
         if not payload.get(key):
             raise ValueError(f"缺少必填字段: {key}")
-    name = payload["scene_name"]
-    if not 1 <= len(name) <= 128:
+    if not 1 <= len(payload["scene_name"]) <= 128:
         raise ValueError("scene_name 长度越界")
     if payload["scene_type"] not in VALID_SCENE_TYPES:
         raise ValueError(f"非法 scene_type: {payload['scene_type']}")
@@ -701,9 +724,8 @@ def _light_validate(payload: dict[str, Any]) -> None:
     for e in cfg["events"]:
         if e["type"] not in _SCENE_EVENT_TYPES:
             raise ValueError(f"非法 event.type: {e['type']}")
-    dur = cfg["duration"]
-    if not 0 < dur <= DURATION_MAX:
-        raise ValueError(f"duration={dur} 越界(0,{DURATION_MAX}]")
+    if not 0 < cfg["duration"] <= DURATION_MAX:
+        raise ValueError(f"duration={cfg['duration']} 越界(0,{DURATION_MAX}]")
     sc = cfg["success_criteria"]
     if sc["max_speed_deviation"] < 0 or sc["min_safe_distance"] < 0:
         raise ValueError("success_criteria 取值越界")
@@ -714,7 +736,7 @@ _SCHEMA_VALIDATOR_LOADED = False
 
 
 def load_schema_validator() -> Any:
-    """尝试导入 4.2.2 契约 Schema（SceneCreateRequest）；失败返回 None（结果缓存，只告警一次）。"""
+    """尝试导入 4.2.2 契约 Schema（SceneCreateRequest）；失败返回 None（缓存，只告警一次）。"""
     global _SCHEMA_VALIDATOR, _SCHEMA_VALIDATOR_LOADED
     if _SCHEMA_VALIDATOR_LOADED:
         return _SCHEMA_VALIDATOR
@@ -734,7 +756,6 @@ def load_schema_validator() -> Any:
 
 
 def validate_scenes(scenes: list[dict[str, Any]]) -> tuple[int, list[str]]:
-    """逐条校验；返回 (通过数, 错误列表)。"""
     validator = load_schema_validator()
     errors: list[str] = []
     passed = 0
@@ -751,8 +772,22 @@ def validate_scenes(scenes: list[dict[str, Any]]) -> tuple[int, list[str]]:
     return passed, errors
 
 
+def diversity_report(scenes: list[dict[str, Any]]) -> None:
+    """打印多样性摘要：唯一 config 指纹数 / 平均参与者 / 平均事件 / 采样重试。"""
+    fp: set[str] = set()
+    actor_ct: dict[str, int] = {}
+    for s in scenes:
+        fp.add(json.dumps(s["config"], sort_keys=True, ensure_ascii=False))
+        actor_ct[s["scene_type"]] = actor_ct.get(s["scene_type"], 0) + len(s["config"]["actors"])
+    stats = getattr(generate_scenes, "stats", {})
+    print("\n=== 多样性摘要（重构核心指标）===")
+    print(f"场景总数: {len(scenes)}；唯一 config 指纹: {len(fp)}（旧版固定轮换远低于此）")
+    print(f"平均参与者/场景: {sum(actor_ct.values()) / max(1, len(scenes)):.2f}")
+    print(f"采样总尝试: {stats.get('tries_total', 'NA')}；因去重/可行性重采样: {stats.get('dedup_drop', 'NA')} 次")
+
+
 # =====================================================================
-# 七、认证与批量提交（direct：X-User-Id/X-Roles[可选 HMAC 验签]；gateway：JWT Bearer）
+# 八、认证与批量提交（direct：X-User-Id/X-Roles[可选 HMAC 验签]；gateway：JWT Bearer）
 # =====================================================================
 def _make_header_factory(args: argparse.Namespace, token: str | None) -> Callable[[], dict[str, str]]:
     if args.mode == "gateway":
@@ -818,7 +853,6 @@ class _RateLimiter:
 
 
 def _retry_delay(resp: Any, attempt: int, args: argparse.Namespace) -> float:
-    """429 优先遵循 Retry-After；否则指数退避（封顶 --retry-max）。"""
     if resp is not None and getattr(resp, "status_code", None) == 429:
         ra = resp.headers.get("Retry-After")
         if ra:
@@ -922,12 +956,11 @@ async def submit_scenes(scenes: list[dict[str, Any]], args: argparse.Namespace) 
         print("\n[failures]（前 30 条）", file=sys.stderr)
         for f in failures[:30]:
             print("  - " + f, file=sys.stderr)
-    stats_with_fail = {**stats, "failed_total": len(failures)}
-    return stats_with_fail
+    return {**stats, "failed_total": len(failures)}
 
 
 # =====================================================================
-# 八、CLI
+# 九、CLI
 # =====================================================================
 def _env(name: str, default: str | None = None) -> str | None:
     return os.environ.get(name) or default
@@ -935,7 +968,7 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="批量添加 300 个自动驾驶训练场景到 HunterCore 场景库（Carla 仿真）",
+        description="高斯扰动场景生成引擎：批量生成 300 个多样化自动驾驶训练场景（Carla 仿真）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--dry-run", action="store_true", help="仅生成 + 校验 + 落盘 JSON，不提交 API")
@@ -952,18 +985,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--username", default=_env("HUNTER_BATCH_USERNAME", ""), help="gateway 模式登录用户名")
     p.add_argument("--password", default=_env("HUNTER_BATCH_PASSWORD", ""), help="gateway 模式登录密码")
     p.add_argument("--publish", action="store_true", help="创建后立即发布（draft→published，需 execute 权限）")
+    p.add_argument("--seed", type=int, default=None, help="随机种子（复现任意一批生成结果，设计文档 §九.5）")
+    p.add_argument("--ratio", default="", help="分布比例 common:edge:longtail，如 0.6:0.3:0.1（缺省内置）")
     p.add_argument("--concurrency", type=int, default=5, help="并发提交数（配合 --qps 使用）")
-    p.add_argument("--qps", type=float, default=8.0,
-                   help="全局请求速率上限（须低于网关 RATE_LIMIT_PER_USER_QPS；0=不限速）")
+    p.add_argument("--qps", type=float, default=8.0, help="全局请求速率上限（须低于网关阈值；0=不限速）")
     p.add_argument("--timeout", type=float, default=15.0, help="单请求超时（秒）")
     p.add_argument("--max-retries", type=int, default=4, help="可重试错误(429/5xx/超时)最大重试次数")
     p.add_argument("--backoff", type=float, default=1.0, help="重试指数退避基数（秒）")
     p.add_argument("--retry-max", type=float, default=30.0, help="单次重试等待封顶（秒）")
-    p.add_argument("--limit", type=int, default=0, help="仅提交前 N 条（0=全部；用于冒烟测试）")
+    p.add_argument("--limit", type=int, default=0, help="仅提交前 N 条（0=全部；冒烟测试）")
     p.add_argument("--start", type=int, default=0, help="跳过前 N 条（断点续跑）")
     p.add_argument("--only-type", default="", help="仅生成指定场景类型（逗号分隔，如 rainy,night）")
     p.add_argument("--output", default=str(DEFAULT_OUTPUT), help="dry-run JSON 输出路径")
     return p
+
+
+def _parse_ratio(raw: str) -> dict[str, float] | None:
+    if not raw:
+        return None
+    parts = [x.strip() for x in raw.split(":") if x.strip()]
+    if len(parts) != 3:
+        raise SystemExit("[error] --ratio 需三段 common:edge:longtail，如 0.6:0.3:0.1")
+    try:
+        vals = [float(x) for x in parts]
+    except ValueError:
+        raise SystemExit("[error] --ratio 三段须为数字")
+    total = sum(vals)
+    if total <= 0:
+        raise SystemExit("[error] --ratio 之和须 > 0")
+    keys = ("common", "edge", "longtail")
+    return dict(zip(keys, (v / total for v in vals)))
 
 
 def _filter_types(scenes: list[dict[str, Any]], only: str) -> list[dict[str, Any]]:
@@ -979,27 +1030,26 @@ def _filter_types(scenes: list[dict[str, Any]], only: str) -> list[dict[str, Any
 def _print_distribution(scenes: list[dict[str, Any]]) -> None:
     by_type: dict[str, int] = {}
     by_cat: dict[str, int] = {}
-    extreme = 0
+    by_risk: dict[str, int] = {}
     for s in scenes:
         by_type[s["scene_type"]] = by_type.get(s["scene_type"], 0) + 1
-        cat = CATEGORY_BY_TYPE[s["scene_type"]]
-        by_cat[cat] = by_cat.get(cat, 0) + 1
-        if "extreme" in s["tags"] or "safety" in s["tags"] or "fail-degraded" in s["tags"] or "corner-case" in s["tags"]:
-            extreme += 1
+        by_cat[CATEGORY_BY_TYPE[s["scene_type"]]] = by_cat.get(CATEGORY_BY_TYPE[s["scene_type"]], 0) + 1
+        for t in s["tags"]:
+            if t.startswith("risk:"):
+                by_risk[t] = by_risk.get(t, 0) + 1
     print("\n=== 场景数据集分布 ===")
-    print(f"总计: {len(scenes)} 条；覆盖类型: {len(by_type)}/16；极端/安全长尾场景: {extreme} 条")
-    print("按分类:")
+    print(f"总计: {len(scenes)} 条；覆盖类型: {len(by_type)}/16")
+    print("按契约分类:")
     for cat in ("basic", "interactive", "environment", "corner_case"):
         if cat in by_cat:
             print(f"  - {cat:<12} {by_cat[cat]:>3} 条")
-    print("按类型:")
-    for stype in SCENE_QUOTAS:
-        if stype in by_type:
-            print(f"  - {LABEL_BY_TYPE[stype]:<6}({stype:<20}) {by_type[stype]:>3} 条")
+    print("按风险梯度（设计文档 §2.5.2）:")
+    for rk in ("risk:L1", "risk:L2", "risk:L4"):
+        if rk in by_risk:
+            print(f"  - {rk:<9} {by_risk[rk]:>3} 条")
 
 
 def _dump_scenes(scenes: list[dict[str, Any]], args: argparse.Namespace) -> int:
-    """写出 dry-run 产物：目标不可写时自动回退临时目录，仍失败则输出到 stdout（绝不崩溃）。"""
     data = json.dumps(scenes, ensure_ascii=False, indent=2)
     if args.output == "-":
         print(data)
@@ -1016,17 +1066,7 @@ def _dump_scenes(scenes: list[dict[str, Any]], args: argparse.Namespace) -> int:
             continue
         print(f"\n[dry-run] 已写出 {len(scenes)} 条场景 → {cand}")
         if cand != out:
-            print(
-                f"[dry-run] 原目标不可写（{type(last_err).__name__}: {last_err}），已回退到临时目录",
-                file=sys.stderr,
-            )
-            print(
-                f"[hint] 若要写入原路径，先确保可写（任选其一）：\n"
-                f"       ① sudo mkdir -p {out.parent} && sudo chown -R \"$(id -un)\":\"$(id -gn)\" {out.parent}\n"
-                f"       ② 改用可写路径：--output ~/scene_batch_300.json\n"
-                f"       ③ 直接输出到 stdout 并重定向：--output - > ~/scene_batch_300.json",
-                file=sys.stderr,
-            )
+            print(f"[dry-run] 原目标不可写（{type(last_err).__name__}: {last_err}），已回退到临时目录", file=sys.stderr)
         return 0
     print(f"\n[dry-run] 无法写入 {out}（{type(last_err).__name__}: {last_err}）；改为输出到 stdout：", file=sys.stderr)
     print(data)
@@ -1041,16 +1081,13 @@ def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(argv)
 
-    # 基址默认值（按模式）
     if not args.base_url:
         args.base_url = "http://localhost:8081" if args.mode == "direct" else "http://localhost:8080"
     args.base_url = args.base_url.rstrip("/")
 
-    # gateway 模式校验凭据
     if args.mode == "gateway" and not args.dry_run and not (args.username and args.password):
         print("[error] gateway 模式需 --username/--password（或环境变量）登录", file=sys.stderr)
         return 2
-    # direct 模式校验 UUID + 写角色
     if args.mode == "direct" and not args.dry_run:
         try:
             uuid.UUID(args.user_id)
@@ -1061,7 +1098,7 @@ def main(argv: list[str] | None = None) -> int:
             print("[error] direct 模式 --roles 须包含 admin 或 operator（scene:create 权限）", file=sys.stderr)
             return 2
 
-    scenes = generate_scenes()
+    scenes = generate_scenes(seed=args.seed, ratio=_parse_ratio(args.ratio))
     scenes = _filter_types(scenes, args.only_type)
     if args.start:
         scenes = scenes[args.start:]
@@ -1069,8 +1106,8 @@ def main(argv: list[str] | None = None) -> int:
         scenes = scenes[:args.limit]
 
     _print_distribution(scenes)
+    diversity_report(scenes)
 
-    # 规范校验
     passed, errors = validate_scenes(scenes)
     print(f"\n[validate] 通过 {passed}/{len(scenes)} 条（Schema={load_schema_validator() is not None}）")
     if errors:
