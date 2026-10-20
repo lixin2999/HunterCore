@@ -140,7 +140,10 @@ class S3ObjectStorage:
     async def presign_get(self, key: str, expires_in: int) -> str:
         client = await self._ensure_client()
         try:
-            return client.generate_presigned_url(
+            # ⚠ aioboto3 的 generate_presigned_url 是协程（与同步 boto3 不同），必须 await；
+            #   漏 await 会把协程对象当字符串返回，下游按 str 校验时抛 ValidationError → 500
+            #   （与 remote-control 录像预签名同源缺陷，一并修正）。
+            return await client.generate_presigned_url(
                 "get_object", Params={"Bucket": self._bucket, "Key": key}, ExpiresIn=expires_in
             )
         except Exception as exc:
