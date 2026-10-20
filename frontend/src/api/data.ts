@@ -10,6 +10,8 @@ import type {
   EventListQuery,
   FileCompleteData,
   FileCompleteRequest,
+  FileDeleteData,
+  FileDeleteRequest,
   FileListData,
   FileListQuery,
   FilePresignData,
@@ -54,4 +56,9 @@ export function completeUpload(payload: FileCompleteRequest): Promise<FileComple
 /** 文件列表（GET /api/v1/data/files，游标分页） */
 export function listFiles(params: FileListQuery): Promise<FileListData> {
   return request<FileListData>({ url: '/data/files', method: 'get', params })
+}
+
+/** 批量删除对象（POST /api/v1/data/files/delete，权限 data:execute；清理无效/过期记录） */
+export function deleteFiles(payload: FileDeleteRequest): Promise<FileDeleteData> {
+  return request<FileDeleteData>({ url: '/data/files/delete', method: 'post', data: payload })
 }

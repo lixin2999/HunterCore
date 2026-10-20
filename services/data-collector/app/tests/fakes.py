@@ -54,6 +54,12 @@ class FakeMinioStorage:
         self.tags: dict[tuple[str, str], str] = {}
         #: 非空时 put_object_tags 抛出该异常（验证打标失败阻断发布）
         self.tag_fail_with: Exception | None = None
+        #: delete_objects 调用记录：(bucket, keys)
+        self.delete_calls: list[tuple[str, list[str]]] = []
+        #: 非空时 delete_objects 抛出该异常（验证存储故障 → 5001）
+        self.delete_fail_with: Exception | None = None
+        #: 命中这些键时作为部分失败返回（模拟 DeleteObjects Errors）
+        self.delete_error_keys: set[str] = set()
         self._upload_seq = 0
 
     # ---------- 测试辅助 ----------
@@ -134,6 +140,28 @@ class FakeMinioStorage:
         if self.tag_fail_with is not None:
             raise self.tag_fail_with
         self.tags[(bucket, key)] = retention
+
+    def delete_objects(
+        self, bucket: str, keys: list[str]
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        """批量删除（幂等：不存在对象亦计 deleted；可注入异常/部分失败）。
+
+        与真实 MinioStorage.delete_objects 同返回形状 ``(deleted_keys, errors)``。
+        """
+        self.delete_calls.append((bucket, list(keys)))
+        if self.delete_fail_with is not None:
+            raise self.delete_fail_with
+        deleted: list[str] = []
+        errors: list[dict[str, str]] = []
+        for key in keys:
+            if key in self.delete_error_keys:
+                errors.append(
+                    {"object_key": key, "code": "AccessDenied", "message": "denied"}
+                )
+                continue
+            self.objects.pop((bucket, key), None)
+            deleted.append(key)
+        return deleted, errors
 
     def complete_multipart_upload(
         self, bucket: str, key: str, upload_id: str, parts: list[dict[str, Any]]

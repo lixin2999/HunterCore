@@ -28,6 +28,7 @@ export const PERMISSIONS = {
   sceneDelete: 'scene:delete',
   sceneExecute: 'scene:execute',
   dataRead: 'data:read',
+  dataExecute: 'data:execute',
   analyticsRead: 'analytics:read',
   analyticsExecute: 'analytics:execute',
   otaRead: 'ota:read',

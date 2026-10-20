@@ -276,3 +276,24 @@ export interface FileListQuery {
   limit?: number
 }
 
+/** 批量删除请求（POST /api/v1/data/files/delete；object_keys 相对 bucket，≤200/次） */
+export interface FileDeleteRequest {
+  bucket: UploadBucket
+  object_keys: string[]
+}
+
+/** 单对象删除失败项 */
+export interface FileDeleteFailure {
+  object_key: string
+  code: string
+  message: string
+}
+
+/** 批量删除结果（幂等：不存在对象亦计入 deleted） */
+export interface FileDeleteData {
+  bucket: UploadBucket
+  deleted: string[]
+  failed: FileDeleteFailure[]
+  deleted_count: number
+}
+

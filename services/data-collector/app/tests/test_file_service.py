@@ -526,3 +526,87 @@ async def test_list_files_filters_by_date_and_data_type_prefix_segments() -> Non
         vehicle_id=None, bucket=RAW_BUCKET, date="2026-09-19", data_type=None, marker=None, limit=100
     )
     assert storage.list_calls[-1]["prefix"] == "2026-09-19/"
+
+
+# ---------------------------------------------------------------------------
+# delete_files（V1.21.20：批量删除 / 清理无效记录）
+# ---------------------------------------------------------------------------
+async def test_delete_files_removes_objects_and_counts_deleted() -> None:
+    """删除存在的对象：从存储移除并回报 deleted/deleted_count。"""
+    service, storage, _ = make_service()
+    key_a = f"{VEHICLE_ID}/2026-09-18/video/1724035200_1.mp4"
+    key_b = f"{VEHICLE_ID}/2026-09-18/video/1724035200_2.json"
+    storage.put(RAW_BUCKET, key_a, CONTENT)
+    storage.put(RAW_BUCKET, key_b, CONTENT)
+
+    data = await service.delete_files(bucket=RAW_BUCKET, object_keys=[key_a, key_b], user_id=USER_ID)
+
+    assert (RAW_BUCKET, key_a) not in storage.objects
+    assert (RAW_BUCKET, key_b) not in storage.objects
+    assert sorted(data.deleted) == sorted([key_a, key_b])
+    assert data.failed == []
+    assert data.deleted_count == 2
+    assert data.bucket == RAW_BUCKET
+
+
+async def test_delete_files_dedupes_and_drops_empty_keys() -> None:
+    """去重去空（保序）：传给存储的键列表已剔除重复与空串。"""
+    service, storage, _ = make_service()
+    key = f"{VEHICLE_ID}/2026-09-18/video/1724035200_1.mp4"
+    storage.put(RAW_BUCKET, key, CONTENT)
+
+    await service.delete_files(
+        bucket=RAW_BUCKET, object_keys=[key, "", key, "  "], user_id=USER_ID
+    )
+
+    # 空串被剔除；"  "（含空白）非空保留；key 去重后仅一次
+    assert storage.delete_calls[-1] == (RAW_BUCKET, [key, "  "])
+
+
+async def test_delete_files_all_empty_keys_raises_invalid_parameter() -> None:
+    """object_keys 全为空 → InvalidParameterError（2001），不下发存储调用。"""
+    service, storage, _ = make_service()
+    with pytest.raises(InvalidParameterError):
+        await service.delete_files(bucket=RAW_BUCKET, object_keys=["", ""], user_id=USER_ID)
+    assert storage.delete_calls == []
+
+
+async def test_delete_files_is_idempotent_for_missing_objects() -> None:
+    """幂等：不存在的对象亦计 deleted（适配“清空无效记录”）。"""
+    service, _storage, _ = make_service()
+    missing = f"{VEHICLE_ID}/2026-09-18/video/1724035200_9.mp4"
+
+    data = await service.delete_files(bucket=RAW_BUCKET, object_keys=[missing], user_id=USER_ID)
+
+    assert data.deleted == [missing]
+    assert data.deleted_count == 1
+    assert data.failed == []
+
+
+async def test_delete_files_storage_failure_maps_to_service_unavailable() -> None:
+    """存储故障 → 5001（ServiceUnavailableError），不静默返回部分成功。"""
+    service, storage, _ = make_service()
+    storage.delete_fail_with = RuntimeError("minio down")
+    with pytest.raises(ServiceUnavailableError):
+        await service.delete_files(
+            bucket=RAW_BUCKET, object_keys=[f"{VEHICLE_ID}/a.pcd"], user_id=USER_ID
+        )
+
+
+async def test_delete_files_reports_partial_failures() -> None:
+    """部分失败：失败键进 failed，不计入 deleted/deleted_count。"""
+    service, storage, _ = make_service()
+    ok_key = f"{VEHICLE_ID}/2026-09-18/video/a.mp4"
+    bad_key = f"{VEHICLE_ID}/2026-09-18/video/b.mp4"
+    storage.put(RAW_BUCKET, ok_key, CONTENT)
+    storage.put(RAW_BUCKET, bad_key, CONTENT)
+    storage.delete_error_keys = {bad_key}
+
+    data = await service.delete_files(
+        bucket=RAW_BUCKET, object_keys=[ok_key, bad_key], user_id=USER_ID
+    )
+
+    assert data.deleted == [ok_key]
+    assert data.deleted_count == 1
+    assert [f.object_key for f in data.failed] == [bad_key]
+    assert (RAW_BUCKET, bad_key) in storage.objects  # 失败键未被移除

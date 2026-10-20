@@ -4,7 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!-- CSP：禁止内联脚本兜底（前端转义 + CSP，系统约束第 9 条 XSS 防护） -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: https:; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'" />
+    <!-- media-src 放开 http:/https:：操控录像回放走 MinIO 预签名直连（http://<SERVER_IP>:9000，跨源），
+         否则被本 meta CSP 拦成「Loading media ... blocked」（V1.21.20）；与 nginx.conf 头级 CSP 取交集，两处须一致。 -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: http: https:; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'" />
     <link rel="icon" href="/favicon.ico" />
     <title>HunterCore 运营管理后台</title>
   </head>

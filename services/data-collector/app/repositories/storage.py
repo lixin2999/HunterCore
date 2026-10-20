@@ -216,6 +216,35 @@ class MinioStorage:
             next_marker = items[-1]["object_key"]
         return items, truncated, next_marker
 
+    # ---------- 批量删除（数据清理，V1.21.20） ----------
+
+    def delete_objects(
+        self, bucket: str, keys: list[str]
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        """批量删除对象；返回 ``(deleted_keys, errors[{object_key, code, message}])``。
+
+        S3 ``DeleteObjects`` 幂等：不存在的对象同样计入 ``Deleted``（“清空无效记录”场景友好）。
+        单次上限 1000（本服务路由层已限 ≤200）。
+        """
+        if not keys:
+            return [], []
+        resp = self._client.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": [{"Key": k} for k in keys], "Quiet": False},
+        )
+        deleted = [
+            str(d.get("Key") or "") for d in resp.get("Deleted", []) if d.get("Key")
+        ]
+        errors = [
+            {
+                "object_key": str(e.get("Key") or ""),
+                "code": str(e.get("Code") or ""),
+                "message": str(e.get("Message") or ""),
+            }
+            for e in resp.get("Errors", [])
+        ]
+        return deleted, errors
+
     # ---------- 生命周期归类打标（G-12） ----------
 
     def put_object_tags(self, bucket: str, key: str, retention: str) -> None:

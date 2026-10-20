@@ -178,3 +178,47 @@ class FileListResponse(BaseModel):
     data: FileListData | None = None
     request_id: str
     timestamp: int = Field(default_factory=lambda: int(time.time()))
+
+
+class FileDeleteRequest(BaseModel):
+    """批量删除请求（POST /files/delete，V1.21.20：清理无效/过期对象）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bucket: UploadBucket
+    object_keys: list[str] = Field(
+        min_length=1,
+        max_length=200,
+        description="待删除对象键列表（相对 bucket，≤200/次；与 GET /files 返回的 object_key 一致）",
+    )
+
+
+class FileDeleteFailure(BaseModel):
+    """单对象删除失败项（DeleteObjects 部分失败时回带）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    object_key: str
+    code: str = Field(default="", description="S3 错误码")
+    message: str = Field(default="", description="错误描述")
+
+
+class FileDeleteData(BaseModel):
+    """批量删除结果（幂等：不存在对象亦计入 deleted）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bucket: UploadBucket
+    deleted: list[str] = Field(default_factory=list, description="已成功删除的对象键")
+    failed: list[FileDeleteFailure] = Field(default_factory=list, description="删除失败项")
+    deleted_count: int = Field(ge=0, description="删除成功数")
+
+
+class FileDeleteResponse(BaseModel):
+    """POST /files/delete 统一响应。"""
+
+    code: int = 0
+    message: str = "success"
+    data: FileDeleteData | None = None
+    request_id: str
+    timestamp: int = Field(default_factory=lambda: int(time.time()))

@@ -353,6 +353,38 @@ paths:
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/data/files/delete:
+    post:
+      tags: [files]
+      summary: 批量删除对象（数据清理）
+      description: |
+        按 `bucket` + `object_keys`（相对 bucket 的对象键，与 GET /files 返回一致）批量删除 MinIO 对象，
+        用于清理无效/过期记录（如 DVR 修复前遗留的 0 B 孤儿 sidecar）。
+
+        权限：`data:execute`（与事件确认同档）；逐次审计（operator + 对象键，不记对象内容）。
+        幂等：不存在的对象计入 `deleted`（S3 DeleteObjects 语义），单次 ≤ 200。
+      operationId: deleteFiles
+      parameters:
+        - $ref: "#/components/parameters/TraceRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FileDeleteRequest" }
+      responses:
+        "200":
+          description: 删除结果（deleted / failed / deleted_count）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileDeleteResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /api/v1/data/files/presign:
     post:
       tags: [files]
@@ -1222,6 +1254,52 @@ components:
           properties:
             data: { $ref: "#/components/schemas/FileListData" }
 
+    FileDeleteRequest:
+      type: object
+      additionalProperties: false
+      required: [bucket, object_keys]
+      properties:
+        bucket: { $ref: "#/components/schemas/UploadBucket" }
+        object_keys:
+          type: array
+          minItems: 1
+          maxItems: 200
+          description: "待删除对象键列表（相对 bucket，与 GET /files 返回的 object_key 一致；≤200/次）"
+          items: { type: string, minLength: 1 }
+
+    FileDeleteFailure:
+      type: object
+      additionalProperties: false
+      required: [object_key, code, message]
+      properties:
+        object_key: { type: string }
+        code: { type: string, description: "S3 错误码" }
+        message: { type: string, description: "错误描述" }
+
+    FileDeleteData:
+      type: object
+      additionalProperties: false
+      required: [bucket, deleted, failed, deleted_count]
+      properties:
+        bucket: { $ref: "#/components/schemas/UploadBucket" }
+        deleted:
+          type: array
+          description: "已成功删除的对象键（幂等：不存在对象亦计入，S3 DeleteObjects 语义）"
+          items: { type: string }
+        failed:
+          type: array
+          description: "删除失败项"
+          items: { $ref: "#/components/schemas/FileDeleteFailure" }
+        deleted_count: { type: integer, minimum: 0, description: "删除成功数" }
+
+    FileDeleteResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/FileDeleteData" }
+
 
     # （运维探针响应模型见 HealthStatus / ReadyChecks / ApiResponseHealthy / ApiResponseReady）
 
@@ -1311,6 +1389,7 @@ x-hunter-endpoints:
     - "GET /api/v1/data/events/{event_id}"
     - "POST /api/v1/data/events/{event_id}/acknowledge"
     - "GET /api/v1/data/files"
+    - "POST /api/v1/data/files/delete"
     - "POST /api/v1/data/files/presign"
     - "POST /api/v1/data/files/complete"
   ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]

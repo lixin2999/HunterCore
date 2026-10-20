@@ -67,6 +67,7 @@ EXPECTED_ENDPOINTS: set[tuple[str, str]] = {
     ("GET", "/api/v1/data/events/{event_id}"),
     ("POST", "/api/v1/data/events/{event_id}/acknowledge"),
     ("GET", "/api/v1/data/files"),
+    ("POST", "/api/v1/data/files/delete"),
     ("POST", "/api/v1/data/files/presign"),
     ("POST", "/api/v1/data/files/complete"),
 }

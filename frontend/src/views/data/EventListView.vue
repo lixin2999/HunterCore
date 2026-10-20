@@ -9,9 +9,9 @@
  * 说明：事件类型与等级为受控词表（系统约束第 13 条），等级不可由前端放宽。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
-import { acknowledgeEvent, listEvents, listFiles } from '@/api/data'
+import { acknowledgeEvent, deleteFiles, listEvents, listFiles } from '@/api/data'
 import StatusTag from '@/components/common/StatusTag.vue'
 import {
   DEFAULT_PAGE_SIZE,
@@ -24,7 +24,13 @@ import {
 import { PERMISSIONS } from '@/constants/permissions'
 import { useUserStore } from '@/stores/user'
 import { useVehicleStore } from '@/stores/vehicle'
-import type { EventItem, EventListQuery, FileObjectItem, FileListQuery, UploadBucket } from '@/types/data'
+import type {
+  EventItem,
+  EventListQuery,
+  FileObjectItem,
+  FileListQuery,
+  UploadBucket,
+} from '@/types/data'
 import { HunterApiError } from '@/utils/error-code'
 import { downloadByUrl } from '@/utils/hash'
 import { formatBytes, formatNumber, formatTime } from '@/utils/format'
@@ -106,29 +112,107 @@ const fileQuery = reactive<FileListQuery>({
   vehicle_id: undefined,
   data_type: undefined,
   date: undefined,
-  limit: 50,
 })
 const files = ref<FileObjectItem[]>([])
-const nextMarker = ref<string | null>(null)
 const fileLoading = ref(false)
+const fileLimit = ref(50)
+const selectedKeys = ref<string[]>([])
+const deleting = ref(false)
+
+/**
+ * 游标 marker 栈分页（契约 GET /files 仅返回 next_marker，无 total）：
+ * `markers[i]` = 请求第 i+1 页所用的 marker（首页为 undefined）；
+ * 加载后据 truncated/next_marker 写回 `markers[i+1]`，实现上一页 / 下一页双向导航。
+ */
+const markers = ref<(string | undefined)[]>([undefined])
+const filePageIndex = ref(0)
+const hasNext = ref(false)
+
+const canDelete = computed(() => userStore.hasPermission(PERMISSIONS.dataExecute))
 
 const bucketOptions = computed(() =>
   Object.entries(UPLOAD_BUCKET_LABELS).map(([value, label]) => ({ value, label })),
 )
 
-async function loadFiles(reset = true): Promise<void> {
+function resetFilePagination(): void {
+  markers.value = [undefined]
+  filePageIndex.value = 0
+  hasNext.value = false
+  files.value = []
+  selectedKeys.value = []
+}
+
+/** 加载指定页（index 对应 markers[index]；过滤条件变更时从第 0 页重来） */
+async function loadFilePage(index: number): Promise<void> {
   fileLoading.value = true
   try {
     const data = await listFiles({
       ...fileQuery,
-      marker: reset ? undefined : (nextMarker.value ?? undefined),
+      limit: fileLimit.value,
+      marker: markers.value[index],
     })
-    files.value = reset ? data.items : [...files.value, ...data.items]
-    nextMarker.value = data.next_marker
+    files.value = data.items
+    filePageIndex.value = index
+    selectedKeys.value = []
+    // 丢弃比当前页更深的已知游标，再登记下一页游标
+    markers.value = markers.value.slice(0, index + 1)
+    if (data.truncated && data.next_marker) {
+      markers.value[index + 1] = data.next_marker
+      hasNext.value = true
+    } else {
+      hasNext.value = false
+    }
   } catch (error) {
     ElMessage.error(error instanceof HunterApiError ? error.message : '文件列表加载失败')
   } finally {
     fileLoading.value = false
+  }
+}
+
+/** 条件/每页条数变更：回到首页重新列举 */
+function handleFileSearch(): void {
+  resetFilePagination()
+  void loadFilePage(0)
+}
+
+function goFilePrev(): void {
+  if (filePageIndex.value > 0) void loadFilePage(filePageIndex.value - 1)
+}
+
+function goFileNext(): void {
+  if (hasNext.value) void loadFilePage(filePageIndex.value + 1)
+}
+
+function handleSelectionChange(rows: FileObjectItem[]): void {
+  selectedKeys.value = rows.map((row) => row.object_key)
+}
+
+/** 批量删除选中对象（权限 data:execute；幂等，含孤儿 sidecar 清理） */
+async function handleDelete(): Promise<void> {
+  if (!selectedKeys.value.length) return
+  const count = selectedKeys.value.length
+  try {
+    await ElMessageBox.confirm(
+      `确认删除选中的 ${count} 个对象？删除后不可恢复（用于清理 0 B 无效录像等遗留记录）。`,
+      '批量删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return // 用户取消
+  }
+  deleting.value = true
+  try {
+    const data = await deleteFiles({ bucket: fileQuery.bucket, object_keys: selectedKeys.value })
+    if (data.failed.length) {
+      ElMessage.warning(`已删除 ${data.deleted_count} 个，${data.failed.length} 个失败`)
+    } else {
+      ElMessage.success(`已删除 ${data.deleted_count} 个对象`)
+    }
+    await loadFilePage(filePageIndex.value)
+  } catch (error) {
+    ElMessage.error(error instanceof HunterApiError ? error.message : '删除失败')
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -261,7 +345,7 @@ onMounted(async () => {
       <el-tab-pane label="文件浏览（MinIO）" name="files">
         <el-form :inline="true" class="filter">
           <el-form-item label="Bucket">
-            <el-select v-model="fileQuery.bucket" placeholder="选择 Bucket" style="width: 220px" @change="loadFiles(true)">
+            <el-select v-model="fileQuery.bucket" placeholder="选择 Bucket" style="width: 220px" @change="handleFileSearch">
               <el-option
                 v-for="option in bucketOptions"
                 :key="option.value"
@@ -288,12 +372,33 @@ onMounted(async () => {
           <el-form-item label="日期">
             <el-date-picker v-model="fileQuery.date" type="date" value-format="YYYY-MM-DD" placeholder="全部日期" />
           </el-form-item>
+          <el-form-item label="每页">
+            <el-select v-model="fileLimit" style="width: 110px" @change="handleFileSearch">
+              <el-option v-for="size in [20, 50, 100, MAX_PAGE_SIZE]" :key="size" :label="`${size} 条`" :value="size" />
+            </el-select>
+          </el-form-item>
           <el-form-item>
-            <el-button type="primary" :loading="fileLoading" @click="loadFiles(true)">查询</el-button>
+            <el-button type="primary" :loading="fileLoading" @click="handleFileSearch">查询</el-button>
+            <el-button
+              v-if="canDelete"
+              type="danger"
+              :disabled="!selectedKeys.length"
+              :loading="deleting"
+              @click="handleDelete"
+            >
+              删除选中{{ selectedKeys.length ? `（${selectedKeys.length}）` : '' }}
+            </el-button>
           </el-form-item>
         </el-form>
 
-        <el-table v-loading="fileLoading" :data="files" size="small" empty-text="暂无文件">
+        <el-table
+          v-loading="fileLoading"
+          :data="files"
+          size="small"
+          empty-text="暂无文件"
+          @selection-change="handleSelectionChange"
+        >
+          <el-table-column v-if="canDelete" type="selection" width="48" />
           <el-table-column prop="object_key" label="对象键" min-width="320" show-overflow-tooltip />
           <el-table-column label="大小" width="120">
             <template #default="{ row }">{{ formatBytes(row.size_bytes) }}</template>
@@ -312,9 +417,9 @@ onMounted(async () => {
         </el-table>
 
         <div class="pager">
-          <el-button :disabled="!nextMarker" :loading="fileLoading" @click="loadFiles(false)">
-            加载更多（游标分页）
-          </el-button>
+          <span class="pager-info">第 {{ filePageIndex + 1 }} 页</span>
+          <el-button :disabled="filePageIndex === 0 || fileLoading" @click="goFilePrev">上一页</el-button>
+          <el-button :disabled="!hasNext || fileLoading" @click="goFileNext">下一页</el-button>
         </div>
       </el-tab-pane>
     </el-tabs>
@@ -329,5 +434,11 @@ onMounted(async () => {
 .pager {
   margin-top: 12px;
   text-align: right;
+}
+
+.pager-info {
+  margin-right: 12px;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
 }
 </style>

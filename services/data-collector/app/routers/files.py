@@ -8,6 +8,7 @@ from hunter_common.exceptions import InvalidParameterError
 
 from app.core.dependencies import (
     UploaderPrincipal,
+    require_execute_permission,
     require_read_permission,
     require_uploader_identity,
     trace_request_id,
@@ -16,6 +17,8 @@ from app.schemas.common import VEHICLE_ID_PATTERN, FileDataType, UploadBucket
 from app.schemas.files import (
     FileCompleteRequest,
     FileCompleteResponse,
+    FileDeleteRequest,
+    FileDeleteResponse,
     FileListResponse,
     FilePresignRequest,
     FilePresignResponse,
@@ -63,6 +66,28 @@ async def list_files(
         limit=limit,
     )
     return FileListResponse(code=0, message="success", data=data, request_id=trace_request_id())
+
+
+@router.post(
+    "/files/delete",
+    response_model=FileDeleteResponse,
+    summary="批量删除对象（数据清理）",
+    response_model_exclude_none=False,
+)
+async def delete_files(
+    payload: FileDeleteRequest,
+    service: Annotated[FileService, Depends(get_file_service)],
+    user_id: Annotated[str, Depends(require_execute_permission)],
+) -> FileDeleteResponse:
+    """批量删除 MinIO 对象（清理无效/过期记录，如 DVR 修复前的 0 B 孤儿 sidecar）。
+
+    权限 data:execute（与事件确认同档）；逐次审计（operator + 对象键）。幂等：
+    不存在的对象计入 deleted（DeleteObjects 语义）。“清空无效记录”由前端多选后批量提交。
+    """
+    data = await service.delete_files(
+        bucket=payload.bucket.value, object_keys=payload.object_keys, user_id=user_id
+    )
+    return FileDeleteResponse(code=0, message="success", data=data, request_id=trace_request_id())
 
 
 @router.post(

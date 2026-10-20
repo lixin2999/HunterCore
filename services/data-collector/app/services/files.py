@@ -38,6 +38,8 @@ from app.schemas.common import (
 from app.schemas.files import (
     FileCompleteData,
     FileCompleteRequest,
+    FileDeleteData,
+    FileDeleteFailure,
     FileListData,
     FileObjectItem,
     FilePresignData,
@@ -439,4 +441,42 @@ class FileService:
             items=file_items,
             next_marker=next_marker if has_more else None,
             truncated=has_more,
+        )
+
+    # ---------- delete（数据清理，V1.21.20） ----------
+
+    async def delete_files(
+        self, bucket: str, object_keys: list[str], user_id: str
+    ) -> FileDeleteData:
+        """批量删除对象（清理无效/过期记录；契约 POST /files/delete，data:execute + 审计）。
+
+        - 去重去空（保序）；全空 → 2001；
+        - 交由 MinIO ``DeleteObjects``（幂等：不存在对象亦计成功，适合“清空”）；
+        - 审计日志记录操作者与被删对象键（不记对象内容）。
+        """
+        keys = [k for k in dict.fromkeys(object_keys) if k]
+        if not keys:
+            raise InvalidParameterError(message="object_keys 不能全为空")
+        try:
+            deleted, errors = await asyncio.to_thread(
+                self._storage.delete_objects, bucket, keys
+            )
+        except Exception as exc:  # 统一转 5001，不因存储故障静默返回部分成功
+            logger.exception("file_delete_failed", bucket=bucket, requested=len(keys))
+            raise ServiceUnavailableError(
+                message=f"对象删除失败（bucket={bucket}）：{exc}"
+            ) from exc
+        logger.info(
+            "file_objects_deleted",
+            bucket=bucket,
+            requested=len(keys),
+            deleted=len(deleted),
+            failed=len(errors),
+            operator=user_id,
+        )
+        return FileDeleteData(
+            bucket=bucket,  # type: ignore[arg-type]  # 枚举校验在路由层完成
+            deleted=deleted,
+            failed=[FileDeleteFailure(**e) for e in errors],
+            deleted_count=len(deleted),
         )
