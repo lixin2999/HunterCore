@@ -124,11 +124,22 @@ G-18 决策②定稿，设计文档 §7.2.2 审核流）：
 | `permissions` | `resource` | `scene` / `data` / `analytics` / `ota` / `remote` / `vehicle` / `user`（与网关路由表资源域一致） |
 | `permissions` | `action` | `create` / `read` / `update` / `delete` / `execute` |
 
-## 9. 尚未定稿的取值域（⚠ 需设计文档核对，禁止前端/后端硬编码分支）
+## 9. 场景类型 `scenes.scene_type`（受控字典词表，非定长枚举）
+
+`scenes.scene_type` 为 TEXT、**无 DB CHECK 约束**：取值域由应用层**可扩展受控字典**把关，
+单一事实来源为 [`contracts/scene-taxonomy.yaml`](../scene-taxonomy.yaml)（48 个叶子类型，对齐
+GB/T 47025—2026 覆盖面；六大分类 basic / interactive / environment / corner_case / custom / real_vehicle 不变）。
+
+- **无需 DDL / 迁移**：新增类型仅需编辑 `scene-taxonomy.yaml`，无需改本表结构或后端逻辑即可入库。
+- **入库校验**：`scene-service`（`hunter_common.scene_taxonomy`）在 create/update 时按字典校验
+  `scene_type` / `behavior_type` / `action_type` / `trigger.condition_type` 与受控枚举参数值，越界拦截；
+  **存量数据读取不受影响**（校验仅在写入时触发，故新字典必须是现有值的超集）。
+- 运行时由环境变量 `SCENE_TAXONOMY_FILE` 或镜像内置 / bind-mount 的 `contracts/` 提供字典文件。
+
+## 10. 尚未定稿的取值域（⚠ 需设计文档核对，禁止前端/后端硬编码分支）
 
 | 字段 | 现状 | 待确认 |
 |------|------|--------|
-| `scenes.scene_type` | TEXT，无 CHECK | 场景分类枚举值 |
 | `ota_versions.release_type` | TEXT，无 CHECK | 发布类型枚举值 |
 | `ota_versions.status` | 已定稿（G-18②）：CHECK 六值 draft/testing/reviewing/published/deprecated/disabled，见 §4 | — |
 | `data_collector.vehicle_telemetry.control_mode` | TEXT（遥测示例值 `CAN`） | 完整取值域 |

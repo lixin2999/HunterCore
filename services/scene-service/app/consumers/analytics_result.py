@@ -30,7 +30,6 @@ from app.schemas.scene import (
     SceneEventTrigger,
     SceneEventType,
     SceneMap,
-    SceneType,
     SpawnPoint,
     SuccessCriteria,
     Weather,
@@ -38,6 +37,9 @@ from app.schemas.scene import (
 from app.services.scenes import SceneService
 
 logger = get_logger("app.consumers.analytics_result")
+
+#: 4.5 节实车回放自动提取产物的场景类型（受控字典值；非硬编码枚举成员）
+REAL_VEHICLE_REPLAY_TYPE = "real_vehicle_replay"
 
 #: 契约 4.5 节触发事件（harsh_braking / collision_warning / manual_takeover）
 TRIGGER_RULES: dict[str, tuple[SceneEventType, str]] = {
@@ -219,9 +221,9 @@ class AnalyticsResultConsumer:
         )
         return SceneCreateRequest(
             scene_name=name,
-            scene_type=SceneType.REAL_VEHICLE_REPLAY,
+            scene_type=REAL_VEHICLE_REPLAY_TYPE,
             description=description[:1024],
-            tags=[SceneType.REAL_VEHICLE_REPLAY.value, trigger],
+            tags=[REAL_VEHICLE_REPLAY_TYPE, trigger],
             config=config,
         )
 

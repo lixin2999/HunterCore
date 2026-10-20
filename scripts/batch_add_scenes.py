@@ -20,13 +20,16 @@
 余弦相似度去重」，使每条场景的速度/间距/横向偏移/参与者数量/天气强度/事件阈值等**逐条不同**，
 并按 60% 常用 / 30% 边缘 / 10% 长尾的比例覆盖风险梯度。
 
-覆盖面扩展（V1.21.25：300 → 1200）
+覆盖面扩展（受控字典驱动：类型 16 → 全字典类型）
 --------------------------------
-``SceneType`` 的 18 个取值是固定契约，不可新增。故覆盖面扩展不改类型，而在每个类型内引入
-**子场景（variant）层**：枚举业界典型测试场景（如鬼探头、AEB 行人触发、多传感器级联失效、
-夜间雨天行人等），通过 ``overrides``（调参数分布）、``force``（强制恶劣天气/夜间构造多风险叠加）、
-``augment``（注入遮挡车辆/对向来车/级联失效事件等结构化要素）三种手段差异化，总量按测试重要性
-加权扩至 1200，逐类型 → 逐子场景 → 逐分布区间分层采样，兼顾常见、极端与组合极端场景。
+``SceneType`` 不再是固定 18 值枚举，而是 ``contracts/scene-taxonomy.yaml`` 驱动的可扩展受控字典。
+本脚本按字典顺序为**除 ``real_vehicle_replay``（实车自动提取产物）与 ``custom``（人工自定义）外**
+的全部叶子类型批量合成场景：重点类型保留手工加权与专属子场景，其余类型由**通用装配器/默认配额/
+默认子场景**兜底覆盖，从而「编辑 YAML 新增类型 → 无需改本脚本即可批量生成」。每个类型内仍以
+**子场景（variant）层**枚举业界典型危险场景（鬼探头、AEB 行人触发、多传感器级联失效、夜间雨天
+行人等），通过 ``overrides``（调参数分布）、``force``（强制恶劣天气/夜间构造多风险叠加）、
+``augment``（注入遮挡车辆/对向来车/级联失效事件等结构化要素）三种手段差异化，逐类型 → 逐子场景 →
+逐分布区间分层采样，兼顾常见、极端与组合极端场景。
 
 契约映射说明（不改动 DDL / OpenAPI 固定契约）
 --------------------------------------------
@@ -77,7 +80,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "common" / "python"))
 sys.path.insert(0, str(ROOT / "services" / "scene-service"))
 
-DEFAULT_OUTPUT = ROOT / "scripts" / "output" / "scene_batch_1200.json"
+from hunter_common.scene_taxonomy import get_scene_taxonomy
+
+#: 受控字典单一事实来源（contracts/scene-taxonomy.yaml；派生分类/标签/类型全集）
+_TAXONOMY = get_scene_taxonomy()
+
+DEFAULT_OUTPUT = ROOT / "scripts" / "output" / "scene_batch_generated.json"
 #: 车端基线车型（见 config.SCENE_EXTRACTION_DEFAULT_EGO_MODEL）
 EGO_MODEL = "HUNTER_SE"
 #: 契约 SCENE_DURATION_MAX_SECONDS 默认上限
@@ -97,40 +105,41 @@ MAX_SAMPLE_TRIES = 64
 # =====================================================================
 # 一、场景类型：配额 + 功能分类 + 风险/分布/来源标签（设计文档 §2.5）
 # =====================================================================
-# 场景类型配额（V1.21.25：300 → 1200，按测试重要性加权；和恒为 TOTAL_SCENES）
-#: 覆盖面不再靠新增 scene_type（18 值为固定契约），而是靠每个类型内的子场景（VARIANTS）扩展。
-TOTAL_SCENES = 1200
-SCENE_QUOTAS: OrderedDict[str, int] = OrderedDict(
-    [
-        ("straight_cruise", 40),
-        ("curve_driving", 60),
-        ("car_following", 90),
-        ("lane_change", 80),
-        ("cut_in", 100),
-        ("pedestrian_crossing", 120),
-        ("intersection_meeting", 90),
-        ("construction_detour", 60),
-        ("rainy", 80),
-        ("night", 80),
-        ("foggy", 60),
-        ("backlight", 50),
-        ("emergency_braking", 80),
-        ("obstacle_appearance", 70),
-        ("sensor_failure", 60),
-        ("multi_vehicle_mixed", 80),
-    ]
-)
-assert sum(SCENE_QUOTAS.values()) == TOTAL_SCENES, f"场景配额之和必须为 {TOTAL_SCENES}"
-
-#: 类型 → 平台契约分类（4.2.1 两级结构第一级；写入 tags 与 config 校验）
-CATEGORY_BY_TYPE: dict[str, str] = {
-    "straight_cruise": "basic", "curve_driving": "basic", "car_following": "basic", "lane_change": "basic",
-    "cut_in": "interactive", "pedestrian_crossing": "interactive", "intersection_meeting": "interactive",
-    "construction_detour": "interactive",
-    "rainy": "environment", "night": "environment", "foggy": "environment", "backlight": "environment",
-    "emergency_braking": "corner_case", "obstacle_appearance": "corner_case", "sensor_failure": "corner_case",
-    "multi_vehicle_mixed": "corner_case",
+# 场景类型配额（受控字典驱动：重点类型手工加权，其余按分类默认；TOTAL_SCENES 由配额之和导出）
+#: 覆盖面靠「受控字典全类型 + 每类型内子场景（VARIANTS）」双重扩展，不再受限于固定 18 值。
+#: 重点类型手工加权（对齐测试重要性）；其余受控类型由 DEFAULT_QUOTA_BY_CATEGORY 兜底。
+CURATED_QUOTAS: dict[str, int] = {
+    "straight_cruise": 40, "curve_driving": 60, "car_following": 90, "lane_change": 80,
+    "cut_in": 100, "pedestrian_crossing": 120, "intersection_meeting": 90, "construction_detour": 60,
+    "rainy": 80, "night": 80, "foggy": 60, "backlight": 50,
+    "emergency_braking": 80, "obstacle_appearance": 70, "sensor_failure": 60, "multi_vehicle_mixed": 80,
 }
+#: 无专属加权时按契约分类的默认配额
+DEFAULT_QUOTA_BY_CATEGORY: dict[str, int] = {
+    "basic": 40, "interactive": 45, "environment": 40, "corner_case": 45,
+    "custom": 0, "real_vehicle": 0,
+}
+#: 批量合成排除的类型：real_vehicle_replay 为实车自动提取产物、custom 为人工自定义，均不合成
+BATCH_EXCLUDED_TYPES: frozenset[str] = frozenset({"real_vehicle_replay", "custom"})
+
+
+def _build_quotas() -> OrderedDict[str, int]:
+    """按受控字典声明顺序构建全类型配额（排除实车回放/自定义；重点类型取加权值）。"""
+    quotas: OrderedDict[str, int] = OrderedDict()
+    for value, spec in _TAXONOMY.scene_types.items():
+        if value in BATCH_EXCLUDED_TYPES:
+            continue
+        quotas[value] = CURATED_QUOTAS.get(value, DEFAULT_QUOTA_BY_CATEGORY[spec.category])
+    return quotas
+
+
+SCENE_QUOTAS: OrderedDict[str, int] = _build_quotas()
+assert set(CURATED_QUOTAS) <= set(SCENE_QUOTAS), "重点配额类型必须为纳入合成的受控类型"
+TOTAL_SCENES = sum(SCENE_QUOTAS.values())
+assert TOTAL_SCENES > 0, "场景配额之和须为正"
+
+#: 类型 → 平台契约分类（受控字典派生，覆盖全部类型；写入 tags 与 config 校验）
+CATEGORY_BY_TYPE: dict[str, str] = dict(_TAXONOMY.scene_type_to_category)
 
 #: 类型 → 设计文档 §2.5.1 功能一级标签（cat: 标签，与契约分类互补）
 FUNC_CATEGORY: dict[str, str] = {
@@ -142,14 +151,8 @@ FUNC_CATEGORY: dict[str, str] = {
     "sensor_failure": "anomaly",
 }
 
-#: 类型 → 中文标签（契约 SCENE_TYPE_LABELS 同源）
-LABEL_BY_TYPE: dict[str, str] = {
-    "straight_cruise": "直线巡航", "curve_driving": "弯道行驶", "car_following": "跟车行驶", "lane_change": "变道行驶",
-    "cut_in": "前车切入", "pedestrian_crossing": "行人横穿", "intersection_meeting": "路口会车",
-    "construction_detour": "施工绕行", "rainy": "雨天", "night": "夜间", "foggy": "雾天", "backlight": "强光逆光",
-    "emergency_braking": "紧急制动", "obstacle_appearance": "障碍物突现", "sensor_failure": "传感器失效",
-    "multi_vehicle_mixed": "多车混行",
-}
+#: 类型 → 中文标签（受控字典 SCENE_TYPE_LABELS 同源，覆盖全部类型）
+LABEL_BY_TYPE: dict[str, str] = dict(_TAXONOMY.scene_type_labels)
 
 #: 类型 → 名称缩写（保证 scene_name 全局唯一且可读）
 ABBR_BY_TYPE: dict[str, str] = {
@@ -261,6 +264,11 @@ TYPE_PARAMS: dict[str, dict[str, Param]] = {
     },
 }
 
+#: 无专属参数字典的受控类型使用的通用参数 spec（ego_speed + gap 足以驱动通用装配器）
+GENERIC_TYPE_PARAMS: dict[str, Param] = {
+    "ego_speed": Param(10, 5, 3, 22, +1), "gap": Param(18, 7, 8, 34, -1),
+}
+
 _OBSTACLE_KINDS = ("debris", "cone", "animal", "fallen-load", "tyre")
 _SENSORS = ("camera_front", "lidar_top", "radar_front", "camera_rear", "gnss")
 _FAULTS = ("black_frame", "point_dropout", "ghost_return", "freeze", "denied")
@@ -269,7 +277,7 @@ _MANEUVERS = ("straight", "left-turn", "right-turn", "uturn")
 
 
 # =====================================================================
-# 二·五、子场景（variant）层：在不新增 scene_type（18 值固定契约）的前提下扩展覆盖面
+# 二·五、子场景（variant）层：在每个受控类型内进一步扩展覆盖面
 #   每个类型枚举若干典型子场景（对齐全功能/典型测试场景），通过三种手段差异化：
 #   - overrides：替换/扩展该子场景的参数分布（如儿童行人 ped_speed 更高、鬼探头 cross_dist 更短）；
 #   - force：强制固定部分参数（如夜间子场景 sun_alt<0、暴雨 rain=90）——用于构造多风险叠加的极端场景；
@@ -389,7 +397,22 @@ VARIANTS: dict[str, list[Variant]] = {
         _V("peak_dense", "PKD", "高峰密集车流", overrides={"n_v": Param(7, 0.8, 6, 9, +1, discrete=True), "spread": Param(4, 1.5, 3, 8, +1)}, augment="dense"),
     ],
 }
-assert set(VARIANTS) == set(SCENE_QUOTAS), "子场景必须覆盖全部配额场景类型"
+assert set(VARIANTS) <= set(SCENE_QUOTAS), "专属子场景的键必须为纳入配额的受控类型"
+#: 无专属子场景的受控类型使用的通用子场景族（标准 + 临界，保证逐类仍有分布梯度）
+_GENERIC_VARIANTS: list[Variant] = [
+    _V("standard", "STD", "标准工况"),
+    _V("critical", "CRT", "临界工况", overrides={"ego_speed": Param(17, 4, 8, 24, +1)}),
+]
+#: 分类 → 默认功能标签 / 能力标签（无专属映射时兜底）
+_FUNC_CATEGORY_DEFAULT: dict[str, str] = {
+    "basic": "road-structure", "interactive": "interaction", "environment": "environment",
+    "corner_case": "safety", "custom": "custom", "real_vehicle": "replay",
+}
+_FUNCTION_TAGS_DEFAULT: dict[str, tuple[str, ...]] = {
+    "basic": ("control", "planning"), "interactive": ("prediction", "interaction"),
+    "environment": ("robustness",), "corner_case": ("safety", "corner-case"),
+    "custom": ("custom",), "real_vehicle": ("replay",),
+}
 #: 子场景 → 风险定位（供描述/标签提示；实际风险仍由采样 zone 决定）
 
 
@@ -722,14 +745,56 @@ ASSEMBLERS: dict[str, Assembler] = {
     "night": _a_night, "foggy": _a_fog, "backlight": _a_backlight, "emergency_braking": _a_emergency,
     "obstacle_appearance": _a_obstacle, "sensor_failure": _a_sensor, "multi_vehicle_mixed": _a_multi,
 }
-assert set(ASSEMBLERS) == set(SCENE_QUOTAS), "装配器必须覆盖全部配额场景类型"
+assert set(ASSEMBLERS) <= set(SCENE_QUOTAS), "专属装配器的键必须为纳入配额的受控类型"
+
+
+# =====================================================================
+# 五·五、受控字典兜底层：无专属参数/装配器/子场景的类型由通用实现覆盖
+#   使「编辑 scene-taxonomy.yaml 新增类型 → 无需改本脚本即可批量生成」。
+# =====================================================================
+def _a_generic(p):
+    """通用装配器：任意受控类型的最小可跑结构（前车 + 跟停事件）。"""
+    speed, gap = p["ego_speed"], p.get("gap", 18.0)
+    actors = [_vehicle("lead-vehicle", gap, 0.0, "lane_follow", target_speed=round(speed * 0.85, 2))]
+    events = [
+        _event("ev-generic", "emergency_brake", f"ego.distance.lead < {round(gap * 0.5, 2)}", "hold_speed")
+    ]
+    return actors, events, 0.0, f"v{speed:.1f}"
+
+
+def _params_for(stype: str) -> dict[str, Param]:
+    return TYPE_PARAMS.get(stype, GENERIC_TYPE_PARAMS)
+
+
+def _assembler_for(stype: str) -> Assembler:
+    return ASSEMBLERS.get(stype, _a_generic)
+
+
+def _variants_for(stype: str) -> list[Variant]:
+    return VARIANTS.get(stype) or _GENERIC_VARIANTS
+
+
+def _abbr_for(stype: str) -> str:
+    if stype in ABBR_BY_TYPE:
+        return ABBR_BY_TYPE[stype]
+    tokens = stype.split("_")
+    abbr = "".join(t[0] for t in tokens).upper() if len(tokens) > 1 else tokens[0][:3].upper()
+    return abbr[:6]
+
+
+def _func_category_for(stype: str) -> str:
+    return FUNC_CATEGORY.get(stype) or _FUNC_CATEGORY_DEFAULT[CATEGORY_BY_TYPE[stype]]
+
+
+def _func_tags_for(stype: str) -> tuple[str, ...]:
+    return FUNCTION_TAGS.get(stype) or _FUNCTION_TAGS_DEFAULT[CATEGORY_BY_TYPE[stype]]
 
 
 def _augment(cfg: dict[str, Any], stype: str, p: dict[str, float], variant: Variant) -> None:
     """按子场景 augment 标签向已装配的 config 注入额外参与者/事件（就地修改）。
 
-    行为/动作类型与参数均为契约自由字符串/字典（待确认 #3），不触碰受控枚举；
-    事件 type 仅用契约 SceneEventType 七值，参与者 type 仅用 vehicle/pedestrian/other。
+    行为/动作类型均取自受控字典（scene-taxonomy.yaml）；事件 type 仅用契约 SceneEventType
+    七值，参与者 type 仅用 vehicle/pedestrian/other（注入不越界）。
     """
     tag = variant.augment
     if not tag:
@@ -794,7 +859,7 @@ def _augment(cfg: dict[str, Any], stype: str, p: dict[str, float], variant: Vari
 
 
 # =====================================================================
-# 六、组装 1200 条场景（类型 → 子场景 → 分层采样 + 可行性拒绝 + 余弦去重 + 唯一命名）
+# 六、组装全量场景（类型 → 子场景 → 分层采样 + 可行性拒绝 + 余弦去重 + 唯一命名）
 # =====================================================================
 def _dedup_tags(tags: list[str], *, limit: int = 20, maxlen: int = 32) -> list[str]:
     out: list[str] = []
@@ -826,20 +891,20 @@ def _make_scene(
         accepted.append(vec)
         cfg = _assemble_config(stype, params, zone)
         _augment(cfg, stype, params, variant)
-        return cfg, params, ASSEMBLERS[stype](params)[3], attempt
+        return cfg, params, _assembler_for(stype)(params)[3], attempt
     # 重试耗尽：接受最后一次可行样本（或强制放宽），保证数量恒等于配额
     params = last[0] if last and last[0] else _sample_vector(rng, spec, "common")
     if variant.force:
         params.update(variant.force)
     cfg = _assemble_config(stype, params, zone)
     _augment(cfg, stype, params, variant)
-    return cfg, params, ASSEMBLERS[stype](params)[3], MAX_SAMPLE_TRIES
+    return cfg, params, _assembler_for(stype)(params)[3], MAX_SAMPLE_TRIES
 
 
 def _assemble_config(stype: str, params: dict[str, float], zone: str) -> dict[str, Any]:
-    actors, events, steer, _token = ASSEMBLERS[stype](params)
+    actors, events, steer, _token = _assembler_for(stype)(params)
     min_safe, max_dev = _derive_criteria(stype, params)
-    spec = {**SHARED_PARAMS, **TYPE_PARAMS[stype]}
+    spec = {**SHARED_PARAMS, **_params_for(stype)}
     map_id = MAPS[hash(tuple(round(v, 2) for v in params.values())) % len(MAPS)]
     return _config(
         map_id=map_id, ego_speed=params.get("ego_speed", 6.0), ego_steer=steer,
@@ -889,11 +954,11 @@ def generate_scenes(seed: int | None = None, ratio: dict[str, float] | None = No
     stats = {"tries_total": 0, "dedup_drop": 0}
     g = 0
     for stype, count in SCENE_QUOTAS.items():
-        variants = VARIANTS[stype]
+        variants = _variants_for(stype)
         per_variant = _distribute(count, len(variants))
         accepted: list[list[float]] = []          # 同一类型内跨子场景共享，保障类型内逐条唯一
         for variant, vq in zip(variants, per_variant):
-            spec = {**SHARED_PARAMS, **TYPE_PARAMS[stype], **variant.overrides}
+            spec = {**SHARED_PARAMS, **_params_for(stype), **variant.overrides}
             zone_counts = _zone_counts(vq, zone_ratio)
             for zone, n in zone_counts.items():
                 for _ in range(n):
@@ -902,15 +967,15 @@ def generate_scenes(seed: int | None = None, ratio: dict[str, float] | None = No
                     stats["tries_total"] += tries
                     stats["dedup_drop"] += max(0, tries - 1)
                     risk = RISK_BY_ZONE[zone]
-                    name = f"SCN-{g:04d}-{ABBR_BY_TYPE[stype]}-{variant.sub}-{risk}-{token[:20]}"[:128]
+                    name = f"SCN-{g:04d}-{_abbr_for(stype)}-{variant.sub}-{risk}-{token[:20]}"[:128]
                     tags = _dedup_tags([
-                        f"cat:{FUNC_CATEGORY[stype]}", CATEGORY_BY_TYPE[stype], stype,
+                        f"cat:{_func_category_for(stype)}", CATEGORY_BY_TYPE[stype], stype,
                         f"sub:{variant.key}", f"risk:{risk}", f"zone:{zone}", "src:synthetic",
-                        "ad-training", "carla", *FUNCTION_TAGS[stype],
+                        "ad-training", "carla", *_func_tags_for(stype),
                     ])
                     w = cfg["weather"]
                     description = (
-                        f"[{LABEL_BY_TYPE[stype]}·{variant.label}] {FUNC_CATEGORY[stype]}/{CATEGORY_BY_TYPE[stype]} 类"
+                        f"[{LABEL_BY_TYPE[stype]}·{variant.label}] {_func_category_for(stype)}/{CATEGORY_BY_TYPE[stype]} 类"
                         f"高斯扰动训练场景（风险 {risk}·{zone} 区）。"
                         f"地图 {cfg['map']['map_id']}，自车初速 {cfg['ego_vehicle']['initial_speed']}m/s，"
                         f"时长 {cfg['duration']}s；天气 雨{w['rain']}/雾{w['fog']}/风{w['wind']}"
@@ -928,7 +993,9 @@ def generate_scenes(seed: int | None = None, ratio: dict[str, float] | None = No
 # =====================================================================
 # 七、场景库规范校验（优先用 4.2.2 Schema；不可导入时降级为轻量内部校验）
 # =====================================================================
-VALID_SCENE_TYPES = set(SCENE_QUOTAS)
+VALID_SCENE_TYPES = set(_TAXONOMY.scene_type_values)
+VALID_BEHAVIOR_TYPES = set(_TAXONOMY.behavior_type_values)
+VALID_ACTION_TYPES = set(_TAXONOMY.action_type_values)
 _SCENE_EVENT_TYPES = {"collision", "cut_in", "pedestrian_crossing", "emergency_brake",
                       "manual_takeover", "sensor_failure", "obstacle_appearance"}
 _ACTOR_TYPES = {"vehicle", "pedestrian", "other"}
@@ -962,11 +1029,15 @@ def _light_validate(payload: dict[str, Any]) -> None:
     for a in cfg["actors"]:
         if a["type"] not in _ACTOR_TYPES:
             raise ValueError(f"非法 actor.type: {a['type']}")
-        if not a["behavior"]["behavior_type"]:
-            raise ValueError("actor.behavior.behavior_type 不能为空")
+        bt = a["behavior"]["behavior_type"]
+        if bt not in VALID_BEHAVIOR_TYPES:
+            raise ValueError(f"非法 behavior_type: {bt}")
     for e in cfg["events"]:
         if e["type"] not in _SCENE_EVENT_TYPES:
             raise ValueError(f"非法 event.type: {e['type']}")
+        at = e["action"]["action_type"]
+        if at not in VALID_ACTION_TYPES:
+            raise ValueError(f"非法 action_type: {at}")
     if not 0 < cfg["duration"] <= DURATION_MAX:
         raise ValueError(f"duration={cfg['duration']} 越界(0,{DURATION_MAX}]")
     sc = cfg["success_criteria"]
@@ -1297,7 +1368,7 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="高斯扰动场景生成引擎：批量生成 1200 个多样化自动驾驶训练场景（16 类型 × 子场景族，含常见/极端/组合多风险，Carla 仿真）",
+        description="高斯扰动场景生成引擎：按受控字典批量生成多样化自动驾驶训练场景（覆盖全字典类型 × 子场景族，含常见/极端/组合多风险，Carla 仿真）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--dry-run", action="store_true", help="仅生成 + 校验 + 落盘 JSON，不提交 API")
@@ -1372,9 +1443,9 @@ def _print_distribution(scenes: list[dict[str, Any]]) -> None:
                 by_risk[t] = by_risk.get(t, 0) + 1
             elif t.startswith("sub:"):
                 by_sub[t] = by_sub.get(t, 0) + 1
-    total_variants = len({v.key for lst in VARIANTS.values() for v in lst})
+    total_variants = len({(st, v.key) for st in SCENE_QUOTAS for v in _variants_for(st)})
     print("\n=== 场景数据集分布 ===")
-    print(f"总计: {len(scenes)} 条；覆盖类型: {len(by_type)}/16；覆盖子场景: {len(by_sub)}/{total_variants}")
+    print(f"总计: {len(scenes)} 条；覆盖类型: {len(by_type)}/{len(SCENE_QUOTAS)}；覆盖子场景: {len(by_sub)}/{total_variants}")
     print("按契约分类:")
     for cat in ("basic", "interactive", "environment", "corner_case"):
         if cat in by_cat:

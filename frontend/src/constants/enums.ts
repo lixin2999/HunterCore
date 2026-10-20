@@ -1,8 +1,11 @@
 /**
  * 受控词表展示映射（车辆 / 事件 / 场景 / 仿真）
- * 取值域来源：系统约束第 12、13 条 + contracts/openapi/scene-service.yaml、data-collector.yaml 的 enum。
+ * 取值域来源：系统约束第 12、13 条 + contracts/openapi/scene-service.yaml、data-collector.yaml 的 enum；
+ * 场景受控字典（SceneType / behavior_type / action_type / condition_type）以 contracts/scene-taxonomy.yaml
+ * 为单一事实源，由 scripts/gen_scene_taxonomy_ts.py 生成于 ./sceneTaxonomy.ts 并在此再导出。
  * ⚠ 仅用于 UI 展示，禁止据此做业务分支判断（业务以契约 code/enum 为准）。
  */
+export * from './sceneTaxonomy'
 
 /** 车辆状态（系统约束第 12 条：8 态，不可新增/更改） */
 export const VEHICLE_STATUS_LABELS: Record<string, string> = {
@@ -103,27 +106,7 @@ export const SCENE_STATUS_TAG_TYPES: Record<string, string> = {
   archived: 'warning',
 }
 
-/** 场景类型（scene-service 契约 SceneType：18 种，不可新增） */
-export const SCENE_TYPE_LABELS: Record<string, string> = {
-  straight_cruise: '直线巡航',
-  curve_driving: '弯道行驶',
-  car_following: '跟车',
-  lane_change: '变道',
-  cut_in: '加塞切入',
-  pedestrian_crossing: '行人横穿',
-  intersection_meeting: '交叉口会车',
-  construction_detour: '施工绕行',
-  rainy: '雨天',
-  night: '夜间',
-  foggy: '雾天',
-  backlight: '逆光',
-  emergency_braking: '紧急制动',
-  obstacle_appearance: '障碍物突现',
-  sensor_failure: '传感器失效',
-  multi_vehicle_mixed: '多车混行',
-  custom: '自定义',
-  real_vehicle_replay: '实车回放',
-}
+/** 场景类型 SCENE_TYPE_LABELS / SceneCategory / 分类映射等均取自受控字典生成产物 ./sceneTaxonomy.ts（见文件头再导出） */
 
 /** 场景模板分类（GET /api/v1/scene/templates?category=） */
 export const SCENE_TEMPLATE_CATEGORY_LABELS: Record<string, string> = {

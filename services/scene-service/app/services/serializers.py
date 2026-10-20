@@ -105,7 +105,7 @@ def _carla_scenario(scene: Scene) -> list[str]:
     lines = [
         (
             f"  <scenario name={quoteattr(scene.scene_name)} "
-            f"type={quoteattr(scene.scene_type.value)} version={quoteattr(scene.version)} "
+            f"type={quoteattr(str(scene.scene_type))} version={quoteattr(scene.version)} "
             f"uuid={quoteattr(str(scene.scene_id))}>"
         ),
         (

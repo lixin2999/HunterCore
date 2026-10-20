@@ -1,7 +1,9 @@
 """场景 Schema（严格对齐 contracts/openapi/scene-service.yaml components.schemas）。
 
-- 受控词表：SceneType（4.2.1 分类体系 18 个叶子场景）/ SceneStatus（hunter_common 单一事实来源）/
-  SimulationStatus（4.4 节）/ MapType / ActorType / SceneEventType / SceneExportFormat；
+- 受控词表：SceneType（数据驱动，取自 contracts/scene-taxonomy.yaml，不再固定 18 值）/
+  SceneStatus（hunter_common 单一事实来源）/ SimulationStatus（4.4 节）/ MapType / ActorType /
+  SceneEventType / SceneExportFormat；behavior_type / action_type / trigger.condition_type 与
+  受控枚举参数值亦按同一字典入库校验；
 - 场景配置结构（4.2.2 节，字段名不可更改）：SceneMap / EgoVehicle / Weather / Actor / SceneEvent /
   SuccessCriteria → 合成 SceneConfig（落库 scenes.config_json）；元信息 → SceneMeta（对应 scenes 列）；
 - 请求体一律 ``extra="forbid"``（契约 additionalProperties: false，禁止未声明字段）。
@@ -15,7 +17,8 @@ from uuid import UUID
 
 from hunter_common.database.enums import SceneStatus
 from hunter_common.responses import ApiResponse
-from pydantic import BaseModel, ConfigDict, Field
+from hunter_common.scene_taxonomy import get_scene_taxonomy
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.common import (
     ACTORS_MAX_ITEMS,
@@ -30,31 +33,58 @@ from app.schemas.common import (
     VERSION_PATTERN,
 )
 
-
 # =====================================================================
-# 一、受控词表（取值不可新增/更改）
+# 一、受控词表（数据驱动：契约 contracts/scene-taxonomy.yaml 单一事实来源）
 # =====================================================================
-class SceneType(StrEnum):
-    """场景类型（4.2.1 分类体系的叶子场景；「分类 → 类型」映射见 SCENE_TYPES_BY_CATEGORY）。"""
+#: 场景受控字典（进程内加载一次；文件缺失即报错，禁止降级）
+_TAXONOMY = get_scene_taxonomy()
 
-    STRAIGHT_CRUISE = "straight_cruise"
-    CURVE_DRIVING = "curve_driving"
-    CAR_FOLLOWING = "car_following"
-    LANE_CHANGE = "lane_change"
-    CUT_IN = "cut_in"
-    PEDESTRIAN_CROSSING = "pedestrian_crossing"
-    INTERSECTION_MEETING = "intersection_meeting"
-    CONSTRUCTION_DETOUR = "construction_detour"
-    RAINY = "rainy"
-    NIGHT = "night"
-    FOGGY = "foggy"
-    BACKLIGHT = "backlight"
-    EMERGENCY_BRAKING = "emergency_braking"
-    OBSTACLE_APPEARANCE = "obstacle_appearance"
-    SENSOR_FAILURE = "sensor_failure"
-    MULTI_VEHICLE_MIXED = "multi_vehicle_mixed"
-    CUSTOM = "custom"
-    REAL_VEHICLE_REPLAY = "real_vehicle_replay"
+
+def ensure_scene_type(value: str) -> str:
+    """校验 scene_type 是否在受控字典内；越界抛 ValueError（Pydantic 转 422/2001）。"""
+    if value not in _TAXONOMY.scene_type_values:
+        raise ValueError(f"非法 scene_type: {value}")
+    return value
+
+
+def ensure_behavior_type(value: str) -> str:
+    """校验参与者 behavior_type 是否受控。"""
+    if value not in _TAXONOMY.behavior_type_values:
+        raise ValueError(f"非法 behavior_type: {value}")
+    return value
+
+
+def ensure_action_type(value: str) -> str:
+    """校验事件 action_type 是否受控。"""
+    if value not in _TAXONOMY.action_type_values:
+        raise ValueError(f"非法 action_type: {value}")
+    return value
+
+
+def ensure_condition_type(value: str) -> str:
+    """校验触发器 condition_type 是否受控。"""
+    if value not in _TAXONOMY.condition_type_values:
+        raise ValueError(f"非法 trigger.condition_type: {value}")
+    return value
+
+
+def validate_enumerable_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    """校验受控枚举参数键的取值（rule/edge/coordinate_system/... 出现即拦截越界值）。
+
+    自由结构键（result_id/window_start/extracted_from 等）不拒绝，兼容实车回放自动提取。
+    """
+    for key, allowed in _TAXONOMY.enumerable_parameter_values.items():
+        if key in parameters and parameters[key] not in allowed:
+            raise ValueError(f"参数 {key}={parameters[key]!r} 越界，允许: {sorted(allowed)}")
+    return parameters
+
+
+#: SceneType：受控字典校验的字符串（不再固定 18 值，编辑 YAML 即可扩充）
+SceneType = Annotated[str, AfterValidator(ensure_scene_type)]
+#: behavior_type / action_type / condition_type 受控字符串
+BehaviorType = Annotated[str, AfterValidator(ensure_behavior_type)]
+ActionType = Annotated[str, AfterValidator(ensure_action_type)]
+ConditionType = Annotated[str, AfterValidator(ensure_condition_type)]
 
 
 class SceneCategory(StrEnum):
@@ -142,67 +172,24 @@ class SortOrder(StrEnum):
     DESC = "desc"
 
 
-#: 分类 → 类型映射（契约 x-hunter-scene-types，并集必须等于 SceneType 全集）
-SCENE_TYPES_BY_CATEGORY: dict[SceneCategory, tuple[SceneType, ...]] = {
-    SceneCategory.BASIC: (
-        SceneType.STRAIGHT_CRUISE,
-        SceneType.CURVE_DRIVING,
-        SceneType.CAR_FOLLOWING,
-        SceneType.LANE_CHANGE,
-    ),
-    SceneCategory.INTERACTIVE: (
-        SceneType.CUT_IN,
-        SceneType.PEDESTRIAN_CROSSING,
-        SceneType.INTERSECTION_MEETING,
-        SceneType.CONSTRUCTION_DETOUR,
-    ),
-    SceneCategory.ENVIRONMENT: (
-        SceneType.RAINY,
-        SceneType.NIGHT,
-        SceneType.FOGGY,
-        SceneType.BACKLIGHT,
-    ),
-    SceneCategory.CORNER_CASE: (
-        SceneType.EMERGENCY_BRAKING,
-        SceneType.OBSTACLE_APPEARANCE,
-        SceneType.SENSOR_FAILURE,
-        SceneType.MULTI_VEHICLE_MIXED,
-    ),
-    SceneCategory.CUSTOM: (SceneType.CUSTOM,),
-    SceneCategory.REAL_VEHICLE: (SceneType.REAL_VEHICLE_REPLAY,),
+#: 分类 → 类型（由受控字典派生，保持 YAML 声明顺序；并集等于 scene_type 全集）
+SCENE_TYPES_BY_CATEGORY: dict[SceneCategory, tuple[str, ...]] = {
+    SceneCategory(category): tuple(types)
+    for category, types in _TAXONOMY.types_by_category().items()
+    if category in {c.value for c in SceneCategory}
 }
 
-#: 类型 → 中文标签（契约 x-hunter-scene-types.categories[].type_labels）
-SCENE_TYPE_LABELS: dict[SceneType, str] = {
-    SceneType.STRAIGHT_CRUISE: "直线巡航",
-    SceneType.CURVE_DRIVING: "弯道行驶",
-    SceneType.CAR_FOLLOWING: "跟车行驶",
-    SceneType.LANE_CHANGE: "变道行驶",
-    SceneType.CUT_IN: "前车切入",
-    SceneType.PEDESTRIAN_CROSSING: "行人横穿",
-    SceneType.INTERSECTION_MEETING: "路口会车",
-    SceneType.CONSTRUCTION_DETOUR: "施工绕行",
-    SceneType.RAINY: "雨天",
-    SceneType.NIGHT: "夜间",
-    SceneType.FOGGY: "雾天",
-    SceneType.BACKLIGHT: "强光逆光",
-    SceneType.EMERGENCY_BRAKING: "紧急制动",
-    SceneType.OBSTACLE_APPEARANCE: "障碍物突现",
-    SceneType.SENSOR_FAILURE: "传感器失效",
-    SceneType.MULTI_VEHICLE_MIXED: "多车混行",
-    SceneType.CUSTOM: "自定义",
-    SceneType.REAL_VEHICLE_REPLAY: "实车回放",
-}
+#: 类型 → 中文标签（契约 x-hunter-scene-types；由字典派生）
+SCENE_TYPE_LABELS: dict[str, str] = dict(_TAXONOMY.scene_type_labels)
 
-#: 类型 → 分类（由 SCENE_TYPES_BY_CATEGORY 派生，避免两处维护）
-SCENE_CATEGORY_BY_TYPE: dict[SceneType, SceneCategory] = {
-    scene_type: category
-    for category, types in SCENE_TYPES_BY_CATEGORY.items()
-    for scene_type in types
+#: 类型 → 分类（由字典派生，避免两处维护）
+SCENE_CATEGORY_BY_TYPE: dict[str, SceneCategory] = {
+    type_value: SceneCategory(category)
+    for type_value, category in _TAXONOMY.scene_type_to_category.items()
 }
 
 #: 模板筛选分类 → 类型（与契约 templates 端点 category enum 同源，排除实车回放）
-SCENE_TYPES_BY_TEMPLATE_CATEGORY: dict[SceneTemplateCategory, tuple[SceneType, ...]] = {
+SCENE_TYPES_BY_TEMPLATE_CATEGORY: dict[SceneTemplateCategory, tuple[str, ...]] = {
     category: SCENE_TYPES_BY_CATEGORY[SceneCategory(category.value)]
     for category in SceneTemplateCategory
 }
@@ -214,9 +201,9 @@ EXPORT_EXTENSION_BY_FORMAT: dict[SceneExportFormat, str] = {
 }
 
 
-def scene_category_for(scene_type: SceneType) -> SceneCategory:
-    """返回场景类型所属分类（未知类型抛 KeyError，禁止静默降级）。"""
-    return SCENE_CATEGORY_BY_TYPE[SceneType(scene_type)]
+def scene_category_for(scene_type: str) -> SceneCategory:
+    """返回场景类型所属分类（先校验受控，未知类型抛 ValueError，禁止静默降级）。"""
+    return SCENE_CATEGORY_BY_TYPE[ensure_scene_type(scene_type)]
 
 
 # =====================================================================
@@ -261,9 +248,9 @@ class Weather(BaseModel):
 
 
 class ActorBehavior(BaseModel):
-    """参与者行为编排（4.2.2 节 actors[].behavior；⚠ 取值域待确认 #3）。"""
+    """参与者行为编排（4.2.2 节 actors[].behavior；behavior_type 受控字典校验）。"""
 
-    behavior_type: str = Field(min_length=1, max_length=64, description="行为类型")
+    behavior_type: BehaviorType = Field(description="行为类型（受控字典）")
     parameters: dict[str, Any] = Field(default_factory=dict, description="行为参数（自由结构）")
 
 
@@ -277,17 +264,30 @@ class Actor(BaseModel):
 
 
 class SceneEventTrigger(BaseModel):
-    """事件触发条件（4.2.2 节 events[].trigger；⚠ 内部结构待确认 #3）。"""
+    """事件触发条件（4.2.2 节 events[].trigger；condition_type 受控，parameters 自由结构）。"""
 
     condition: str = Field(min_length=1, max_length=256, description="触发条件标识/表达式")
+    condition_type: ConditionType | None = Field(
+        default=None, description="触发条件类型（受控字典，可选）"
+    )
     parameters: dict[str, Any] = Field(default_factory=dict, description="条件参数（自由结构）")
+
+    @model_validator(mode="after")
+    def _check_enumerable(self) -> SceneEventTrigger:
+        validate_enumerable_parameters(self.parameters)
+        return self
 
 
 class SceneEventAction(BaseModel):
-    """事件动作（4.2.2 节 events[].action；⚠ 内部结构待确认 #3）。"""
+    """事件动作（4.2.2 节 events[].action；action_type 受控，parameters 自由结构）。"""
 
-    action_type: str = Field(min_length=1, max_length=64, description="动作类型")
+    action_type: ActionType = Field(description="动作类型（受控字典）")
     parameters: dict[str, Any] = Field(default_factory=dict, description="动作参数（自由结构）")
+
+    @model_validator(mode="after")
+    def _check_enumerable(self) -> SceneEventAction:
+        validate_enumerable_parameters(self.parameters)
+        return self
 
 
 class SceneEvent(BaseModel):

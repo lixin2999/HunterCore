@@ -181,6 +181,107 @@ async def test_create_scene_requires_write_role(client: AsyncClient, scene_env: 
     _assert_envelope(resp.json(), code=1002)
 
 
+# ---------------------------------------------------------------------
+# 受控字典入库校验（数据驱动：取消固定 enum 后由字典把关闭环）
+# ---------------------------------------------------------------------
+def _valid_actor(behavior_type: str = "lane_follow") -> dict[str, object]:
+    return {
+        "actor_id": "a1",
+        "type": "vehicle",
+        "spawn_point": {"x": 5.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+        "behavior": {"behavior_type": behavior_type, "parameters": {}},
+    }
+
+
+def _valid_event(
+    *, action_type: str = "speed_change", condition_type: str = "distance", rule: str = ">="
+) -> dict[str, object]:
+    return {
+        "event_id": "e1",
+        "type": "cut_in",
+        "trigger": {
+            "condition": "distance < 20",
+            "condition_type": condition_type,
+            "parameters": {"rule": rule},
+        },
+        "action": {"action_type": action_type, "parameters": {}},
+    }
+
+
+async def test_create_scene_accepts_extended_dictionary_type(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """合法新类型（鬼探头）随字典扩充即可入库；actors/events 受控值也可入库（201）。"""
+    config = config_payload(actors=[_valid_actor()], events=[_valid_event()])
+    resp = await client.post(
+        SCENE_BASE,
+        headers=ADMIN_HEADERS,
+        json=create_payload("鬼探头场景", scene_type="occluded_pedestrian", config=config),
+    )
+    assert resp.status_code == 201
+    data = _assert_envelope(resp.json())["data"]
+    assert data["scene_type"] == "occluded_pedestrian"  # type: ignore[index]
+
+
+async def test_create_scene_rejects_scene_type_outside_dictionary(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """scene_type 越界（不在字典）→ 422 + code=2001。"""
+    resp = await client.post(
+        SCENE_BASE, headers=ADMIN_HEADERS, json=create_payload(scene_type="not_a_real_type")
+    )
+    assert resp.status_code == 422
+    _assert_envelope(resp.json(), code=2001)
+
+
+async def test_create_scene_rejects_behavior_type_outside_dictionary(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """参与者 behavior_type 越界 → 422 + code=2001。"""
+    config = config_payload(actors=[_valid_actor(behavior_type="fly_away")])
+    resp = await client.post(
+        SCENE_BASE, headers=ADMIN_HEADERS, json=create_payload(config=config)
+    )
+    assert resp.status_code == 422
+    _assert_envelope(resp.json(), code=2001)
+
+
+async def test_create_scene_rejects_action_type_outside_dictionary(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """事件 action_type 越界 → 422 + code=2001。"""
+    config = config_payload(events=[_valid_event(action_type="launch_rocket")])
+    resp = await client.post(
+        SCENE_BASE, headers=ADMIN_HEADERS, json=create_payload(config=config)
+    )
+    assert resp.status_code == 422
+    _assert_envelope(resp.json(), code=2001)
+
+
+async def test_create_scene_rejects_condition_type_outside_dictionary(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """trigger.condition_type 越界 → 422 + code=2001。"""
+    config = config_payload(events=[_valid_event(condition_type="telekinesis")])
+    resp = await client.post(
+        SCENE_BASE, headers=ADMIN_HEADERS, json=create_payload(config=config)
+    )
+    assert resp.status_code == 422
+    _assert_envelope(resp.json(), code=2001)
+
+
+async def test_create_scene_rejects_out_of_vocabulary_parameter_value(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """受控枚举参数值越界（rule="~="）→ 422 + code=2001（自由键不拒绝，仅拦枚举值）。"""
+    config = config_payload(events=[_valid_event(rule="~=")])
+    resp = await client.post(
+        SCENE_BASE, headers=ADMIN_HEADERS, json=create_payload(config=config)
+    )
+    assert resp.status_code == 422
+    _assert_envelope(resp.json(), code=2001)
+
+
 # =====================================================================
 # GET /api/v1/scene/{scene_id}（getScene）
 # =====================================================================
@@ -406,11 +507,11 @@ async def test_publish_scene_state_conflict_returns_3003(
 # GET /api/v1/scene/templates（listSceneTemplates）
 # =====================================================================
 async def test_list_templates_returns_builtin_catalog(client: AsyncClient, scene_env: object) -> None:
-    """模板清单覆盖 4.2.1 分类体系（17 个叶子场景，实车回放无预置模板）。"""
+    """模板清单覆盖受控字典全部叶子（48 类型去除实车回放 = 47 个预置模板）。"""
     resp = await client.get(f"{SCENE_BASE}/templates", headers=ADMIN_HEADERS)
     assert resp.status_code == 200
     data = _assert_envelope(resp.json())["data"]
-    assert data["total"] == 17  # type: ignore[index]
+    assert data["total"] == 47  # type: ignore[index]
     types = {item["scene_type"] for item in data["items"]}  # type: ignore[index]
     assert "real_vehicle_replay" not in types
     first = data["items"][0]  # type: ignore[index]
@@ -428,11 +529,11 @@ async def test_list_templates_returns_builtin_catalog(client: AsyncClient, scene
 async def test_list_templates_filters_by_category_and_type(
     client: AsyncClient, scene_env: object
 ) -> None:
-    """category / scene_type 过滤（环境场景 4 个；前车切入 1 个）。"""
+    """category / scene_type 过滤（环境场景 8 个；前车切入 1 个）。"""
     env_resp = await client.get(
         f"{SCENE_BASE}/templates", headers=ADMIN_HEADERS, params={"category": "environment"}
     )
-    assert env_resp.json()["data"]["total"] == 4
+    assert env_resp.json()["data"]["total"] == 8
 
     cut_in_resp = await client.get(
         f"{SCENE_BASE}/templates", headers=ADMIN_HEADERS, params={"scene_type": "cut_in"}

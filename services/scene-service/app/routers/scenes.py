@@ -78,7 +78,7 @@ async def list_scenes(
         roles=roles,
         page=page,
         page_size=page_size,
-        scene_type=scene_type.value if scene_type is not None else None,
+        scene_type=scene_type if scene_type is not None else None,
         status=status,
         tags=tags,
         keyword=keyword,

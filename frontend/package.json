@@ -11,6 +11,8 @@
     "dev": "vite",
     "build": "npm run type-check && vite build",
     "type-check": "vue-tsc --noEmit -p tsconfig.json",
+    "codegen:scene-taxonomy": "python3 ../scripts/gen_scene_taxonomy_ts.py",
+    "codegen:check": "python3 ../scripts/gen_scene_taxonomy_ts.py --check",
     "preview": "vite preview --port 4173"
   },
   "dependencies": {

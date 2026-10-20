@@ -29,7 +29,6 @@ from app.schemas.scene import (
     SceneTemplate,
     SceneTemplateCategory,
     SceneTemplateListData,
-    SceneType,
     SpawnPoint,
     SuccessCriteria,
     Weather,
@@ -128,26 +127,60 @@ def _lead_vehicle(x: float, yaw: float = 0.0, speed: float = 1.0) -> Actor:
     )
 
 
-def _build_config(scene_type: SceneType) -> SceneConfig:
-    """按场景类型构造模板配置（穷举 SceneType，禁止静默回落）。"""
+def _generic_config(scene_type: str) -> SceneConfig:
+    """通用模板：为无专属清单的受控字典类型生成最小可跑配置（按分类叠加天气/参与者）。
+
+    保证“取消固定枚举”后每个新类型仍可一键创建（config 直接可提交 POST /scene）。
+    """
+    from app.schemas.scene import scene_category_for
+
+    category = scene_category_for(scene_type).value
+    weather: dict[str, float] = {}
+    actors: list[Actor] = []
+    events: list[SceneEvent] = []
+    if category == "environment":
+        weather = {
+            "rainy": {"cloudiness": 90.0, "rain": 80.0, "wetness": 70.0},
+            "night": {"sun_altitude": -10.0, "sun_azimuth": 180.0},
+            "foggy": {"cloudiness": 60.0, "fog": 60.0, "wetness": 30.0},
+            "backlight": {"sun_azimuth": 90.0, "sun_altitude": 10.0},
+            "snowy": {"cloudiness": 85.0, "wetness": 40.0, "fog": 25.0, "sun_altitude": 20.0},
+            "icy": {"cloudiness": 70.0, "wetness": 55.0, "sun_altitude": 15.0},
+            "haze": {"cloudiness": 55.0, "fog": 45.0},
+            "dusk_dawn": {"sun_altitude": 6.0, "sun_azimuth": 270.0},
+        }.get(scene_type, weather)
+        actors = [_lead_vehicle(15.0)]
+    elif category == "interactive":
+        actors = [_lead_vehicle(20.0)]
+        events = [_event("ev-interaction", SceneEventType.CUT_IN, "ego.position.x > 18", "speed_change", target_speed=1.0)]
+    elif category == "corner_case":
+        actors = [_actor("obstacle", ActorType.OTHER, 12.0, 0.5, 0.0, "static")]
+        events = [_event("ev-corner", SceneEventType.EMERGENCY_BRAKE, "ttc < 1.8", "emergency_stop")]
+    else:  # basic / custom
+        actors = [_lead_vehicle(18.0)] if category == "basic" else []
+    return _config(speed=1.2, steer=0.0, actors=actors, events=events, duration=30.0, weather=_weather(**weather))
+
+
+def _build_config(scene_type: str) -> SceneConfig:
+    """按场景类型构造模板配置：专属清单优先，其余受控字典类型回落通用模板。"""
     builder = _CONFIG_BUILDERS.get(scene_type)
-    if builder is None:  # pragma: no cover - 枚举穷举后不可达
-        raise KeyError(f"未定义模板的场景类型: {scene_type}")
-    return builder()
+    if builder is not None:
+        return builder()
+    return _generic_config(scene_type)
 
 
-#: 类型 → 模板配置构造器（4.2.1 分类体系的叶子场景；不含 real_vehicle_replay，4.5 节无预置模板）
-_CONFIG_BUILDERS: dict[SceneType, Any] = {
-    SceneType.STRAIGHT_CRUISE: lambda: _config(
+#: 类型 → 模板配置构造器（受控字典专属清单部分；未列出的类型由 _generic_config 兜底，均不含 real_vehicle_replay）
+_CONFIG_BUILDERS: dict[str, Any] = {
+    "straight_cruise": lambda: _config(
         speed=1.5, steer=0.0, actors=[], events=[], duration=30.0
     ),
-    SceneType.CURVE_DRIVING: lambda: _config(
+    "curve_driving": lambda: _config(
         speed=1.2, steer=0.2, actors=[], events=[], duration=30.0
     ),
-    SceneType.CAR_FOLLOWING: lambda: _config(
+    "car_following": lambda: _config(
         speed=1.5, steer=0.0, actors=[_lead_vehicle(10.0)], events=[], duration=30.0
     ),
-    SceneType.LANE_CHANGE: lambda: _config(
+    "lane_change": lambda: _config(
         speed=1.5,
         steer=0.0,
         actors=[_lead_vehicle(15.0)],
@@ -159,7 +192,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         ],
         duration=25.0,
     ),
-    SceneType.CUT_IN: lambda: _config(
+    "cut_in": lambda: _config(
         speed=1.5,
         steer=0.0,
         actors=[
@@ -175,7 +208,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         ],
         duration=30.0,
     ),
-    SceneType.PEDESTRIAN_CROSSING: lambda: _config(
+    "pedestrian_crossing": lambda: _config(
         speed=1.0,
         steer=0.0,
         actors=[
@@ -189,7 +222,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         ],
         duration=30.0,
     ),
-    SceneType.INTERSECTION_MEETING: lambda: _config(
+    "intersection_meeting": lambda: _config(
         speed=1.0,
         steer=0.0,
         actors=[
@@ -202,7 +235,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         events=[],
         duration=30.0,
     ),
-    SceneType.CONSTRUCTION_DETOUR: lambda: _config(
+    "construction_detour": lambda: _config(
         speed=1.0,
         steer=0.0,
         actors=[_actor("construction-barrier", ActorType.OTHER, 15.0, 2.5, 0.0, "static")],
@@ -214,7 +247,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         ],
         duration=30.0,
     ),
-    SceneType.RAINY: lambda: _config(
+    "rainy": lambda: _config(
         speed=1.0,
         steer=0.0,
         actors=[],
@@ -222,7 +255,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         duration=30.0,
         weather=_weather(cloudiness=90.0, rain=80.0, wetness=70.0, fog=10.0, wind=20.0),
     ),
-    SceneType.NIGHT: lambda: _config(
+    "night": lambda: _config(
         speed=1.0,
         steer=0.0,
         actors=[],
@@ -230,7 +263,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         duration=30.0,
         weather=_weather(sun_altitude=-10.0, sun_azimuth=180.0),
     ),
-    SceneType.FOGGY: lambda: _config(
+    "foggy": lambda: _config(
         speed=0.8,
         steer=0.0,
         actors=[],
@@ -238,7 +271,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         duration=30.0,
         weather=_weather(cloudiness=60.0, fog=60.0, wetness=30.0),
     ),
-    SceneType.BACKLIGHT: lambda: _config(
+    "backlight": lambda: _config(
         speed=1.0,
         steer=0.0,
         actors=[],
@@ -246,7 +279,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         duration=30.0,
         weather=_weather(sun_azimuth=90.0, sun_altitude=10.0),
     ),
-    SceneType.EMERGENCY_BRAKING: lambda: _config(
+    "emergency_braking": lambda: _config(
         speed=1.5,
         steer=0.0,
         actors=[_lead_vehicle(15.0)],
@@ -255,7 +288,7 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         ],
         duration=20.0,
     ),
-    SceneType.OBSTACLE_APPEARANCE: lambda: _config(
+    "obstacle_appearance": lambda: _config(
         speed=1.5,
         steer=0.0,
         actors=[_actor("sudden-obstacle", ActorType.OTHER, 12.0, 0.5, 0.0, "static")],
@@ -267,14 +300,14 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         ],
         duration=20.0,
     ),
-    SceneType.SENSOR_FAILURE: lambda: _config(
+    "sensor_failure": lambda: _config(
         speed=1.0,
         steer=0.0,
         actors=[],
         events=[_event("ev-sensor-failure", SceneEventType.SENSOR_FAILURE, "ego.position.x > 10", "stop")],
         duration=20.0,
     ),
-    SceneType.MULTI_VEHICLE_MIXED: lambda: _config(
+    "multi_vehicle_mixed": lambda: _config(
         speed=1.2,
         steer=0.0,
         actors=[
@@ -291,11 +324,11 @@ _CONFIG_BUILDERS: dict[SceneType, Any] = {
         ],
         duration=40.0,
     ),
-    SceneType.CUSTOM: lambda: _config(speed=1.0, steer=0.0, actors=[], events=[], duration=30.0),
+    "custom": lambda: _config(speed=1.0, steer=0.0, actors=[], events=[], duration=30.0),
 }
 
-#: 模板清单顺序（4.2.1 分类顺序；实车回放无预置模板故排除）
-_TEMPLATE_TYPES: tuple[SceneType, ...] = tuple(
+#: 模板清单顺序（受控字典分类顺序；实车回放无预置模板故排除）
+_TEMPLATE_TYPES: tuple[str, ...] = tuple(
     scene_type
     for types in SCENE_TYPES_BY_TEMPLATE_CATEGORY.values()
     for scene_type in types
@@ -312,7 +345,7 @@ class SceneTemplateService:
         )
 
     def list_templates(
-        self, *, category: SceneTemplateCategory | None, scene_type: SceneType | None
+        self, *, category: SceneTemplateCategory | None, scene_type: str | None
     ) -> SceneTemplateListData:
         """查询模板列表（category / scene_type 过滤；实车回放无模板故不出现）。"""
         items = list(self._templates)
@@ -320,19 +353,19 @@ class SceneTemplateService:
             allowed = set(SCENE_TYPES_BY_TEMPLATE_CATEGORY.get(category, ()))
             items = [item for item in items if item.scene_type in allowed]
         if scene_type is not None:
-            items = [item for item in items if item.scene_type is scene_type]
+            items = [item for item in items if item.scene_type == scene_type]
         return SceneTemplateListData(items=items, total=len(items))
 
-    def get_template(self, scene_type: SceneType) -> SceneTemplate | None:
+    def get_template(self, scene_type: str) -> SceneTemplate | None:
         """按场景类型取模板（不存在返回 None）。"""
-        return next((item for item in self._templates if item.scene_type is scene_type), None)
+        return next((item for item in self._templates if item.scene_type == scene_type), None)
 
     @staticmethod
-    def _build_template(scene_type: SceneType) -> SceneTemplate:
+    def _build_template(scene_type: str) -> SceneTemplate:
         """构造单个模板（template_id 命名 tpl-{scene_type}，config 可直提创建接口）。"""
         label = SCENE_TYPE_LABELS[scene_type]
         return SceneTemplate(
-            template_id=f"tpl-{scene_type.value}",
+            template_id=f"tpl-{scene_type}",
             template_name=f"{label}模板",
             scene_type=scene_type,
             description=f"4.2.1 节预置{label}场景模板（config 可直接作为创建场景请求的 config）",

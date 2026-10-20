@@ -4,7 +4,8 @@
 - `contracts/openapi/scene-service.yaml` 合法：OpenAPI 3.0.3、`$ref` 可解析、`operationId` 唯一
 - 业务端点集合 == 设计文档 12.2 节（不得擅自增删）；运维探针与 `app.main` 实现一致
 - 4.2.2 场景配置结构 ↔ SceneConfig/SceneMeta ↔ `scene_svc.scenes` 列一致
-- 4.2.1 场景分类体系 ↔ SceneType 枚举；`scenes.status` ↔ enums.md 受控词表 ↔ DDL CHECK
+- 4.2.1 场景分类体系 ↔ 受控字典（contracts/scene-taxonomy.yaml）== 契约 x-hunter-scene-types == 后端派生字典；
+  `scenes.status` ↔ enums.md 受控词表 ↔ DDL CHECK
 - 4.3 导出格式、4.4 下发流程、4.5 实车提取（Kafka 契约）与设计文档一致
 - 错误码只取预定义值且与实现 `HTTP_STATUS_BY_CODE` 一致；统一响应五字段
 - Redis 缓存键 / MinIO Bucket 与预签名时效 / 限流继承 / 网关路由 / K8s 清单三方一致
@@ -26,9 +27,11 @@ import yaml
 from hunter_common.database.enums import SceneStatus
 from hunter_common.database.repository import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from hunter_common.exceptions import ErrorCode
+from hunter_common.scene_taxonomy import get_scene_taxonomy
 
 from app.core.error_handlers import HTTP_STATUS_BY_CODE
 from app.main import app
+from app.schemas.scene import SCENE_TYPE_LABELS, SCENE_TYPES_BY_CATEGORY
 
 ROOT = Path(__file__).resolve().parents[4]
 CONTRACT_PATH = ROOT / "contracts" / "openapi" / "scene-service.yaml"
@@ -102,12 +105,12 @@ NESTED_SCHEMA_BY_FIELD: dict[str, str] = {
     "success_criteria": "SuccessCriteria",
 }
 
-#: 设计文档 4.2.1 节分类体系（分类 → 场景数量）
+#: 受控字典 4.2.1 分类体系（分类 → 场景叶子数量；对齐 GB/T 47025 覆盖面 48 项）
 EXPECTED_CATEGORY_SIZES: dict[str, int] = {
-    "basic": 4,
-    "interactive": 4,
-    "environment": 4,
-    "corner_case": 4,
+    "basic": 12,
+    "interactive": 10,
+    "environment": 8,
+    "corner_case": 16,
     "custom": 1,
     "real_vehicle": 1,
 }
@@ -322,18 +325,38 @@ def test_scene_meta_fields_cover_db_columns(contract: dict[str, Any]) -> None:
 
 
 def test_scene_type_enum_matches_classification(contract: dict[str, Any]) -> None:
-    """SceneType 枚举必须等于 4.2.1 分类体系的类型并集（含 4.5 实车回放）。"""
-    scene_types = set(contract["components"]["schemas"]["SceneType"]["enum"])
+    """受控字典为单一事实来源：taxonomy.yaml == 契约 x-hunter-scene-types == 后端派生字典。
+
+    SceneType 已取消固定 enum（数据驱动可扩展），故比对三方取值域一致，并校验契约声明指向字典文件。
+    """
+    taxonomy = get_scene_taxonomy()
+    # SceneType 组件：type: string + x-controlled-vocabulary（不得再出现固定 enum）
+    scene_type_schema = contract["components"]["schemas"]["SceneType"]
+    assert "enum" not in scene_type_schema, "SceneType 已改为数据驱动受控字典，不得再声明固定 enum"
+    assert scene_type_schema["type"] == "string"
+    assert scene_type_schema["x-controlled-vocabulary"] == "contracts/scene-taxonomy.yaml"
+
+    # 契约 x-hunter-scene-types：已确认且可扩展
     classification = contract["x-hunter-scene-types"]
-    assert classification["status"] == "pending_confirmation", "⚠ 编码值未经人工确认，必须标记"
+    assert classification["status"] == "confirmed_extensible", "受控字典已定稿并标注可扩展"
     grouped: set[str] = set()
     for category in classification["categories"]:
         assert len(category["types"]) == EXPECTED_CATEGORY_SIZES[category["value"]]
         assert set(category["type_labels"]) == set(category["types"]), "每个类型必须有中文标签"
         assert not grouped & set(category["types"]), "类型不得跨分类重复"
         grouped |= set(category["types"])
-    assert grouped == scene_types
-    assert "real_vehicle_replay" in scene_types, "4.5 节实车回放类型缺失"
+
+    # 三方一致：契约分类并集 == 字典全集 == 后端派生标签集
+    assert grouped == set(taxonomy.scene_type_values), "契约 x-hunter-scene-types 与字典不一致"
+    assert set(SCENE_TYPE_LABELS) == grouped, "后端派生标签与字典不一致"
+    assert SCENE_TYPE_LABELS == taxonomy.scene_type_labels
+    assert "real_vehicle_replay" in grouped, "4.5 节实车回放类型缺失"
+
+    # 后端 SCENE_TYPES_BY_CATEGORY（分类 → 类型）与字典分类完全一致
+    backend_by_category = {category.value: set(types) for category, types in SCENE_TYPES_BY_CATEGORY.items()}
+    taxonomy_by_category = {c: set(types) for c, types in taxonomy.types_by_category().items()}
+    assert backend_by_category == taxonomy_by_category, "后端分类映射与字典不一致"
+
     # 模板查询接口的分类枚举必须与分类体系一致
     template_params = contract["paths"]["/api/v1/scene/templates"]["get"]["parameters"]
     category_enum = next(p for p in template_params if p["name"] == "category")["schema"]["enum"]
@@ -435,7 +458,7 @@ def test_real_vehicle_extraction_matches_4_5(contract: dict[str, Any]) -> None:
         "post_seconds": EXPECTED_EXTRACTION_WINDOW,
     }
     assert set(extraction["extracted"]) == {"ego_trajectory", "object_trajectories", "environment"}
-    assert extraction["output"]["scene_type"] in contract["components"]["schemas"]["SceneType"]["enum"]
+    assert extraction["output"]["scene_type"] in get_scene_taxonomy().scene_type_values
     assert extraction["output"]["status"] == "draft"
     assert extraction["consume"]["group_id"] == "scene-service-analytics-result"
 

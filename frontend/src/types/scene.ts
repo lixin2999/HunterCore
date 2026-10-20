@@ -1,34 +1,17 @@
 /**
  * 场景生成（scene-service）类型
  * 来源：contracts/openapi/scene-service.yaml —— 字段名与契约完全一致（snake_case）。
- * 规则：枚举取值域严格对齐契约 enum，禁止新增/更改；behavior_type/trigger.condition/
- * action_type 契约未定义取值域，前端按字符串透传（不硬编码分支）。
+ * 规则：受控词表以 contracts/scene-taxonomy.yaml 为单一事实源（可扩展字典，取消固定 18 值枚举），
+ * 由 scripts/gen_scene_taxonomy_ts.py 生成至 constants/sceneTaxonomy.ts；本文件 SceneType 引用该生成产物。
  */
 import type { PageData } from './common'
+import type { SceneType } from '@/constants/sceneTaxonomy'
 
 /** 场景状态（draft 可编辑 / published 可下发导出 / archived 只读可删） */
 export type SceneStatus = 'draft' | 'published' | 'archived'
 
-/** 场景类型（4.2.1 分类体系叶子场景，18 种，不可新增） */
-export type SceneType =
-  | 'straight_cruise'
-  | 'curve_driving'
-  | 'car_following'
-  | 'lane_change'
-  | 'cut_in'
-  | 'pedestrian_crossing'
-  | 'intersection_meeting'
-  | 'construction_detour'
-  | 'rainy'
-  | 'night'
-  | 'foggy'
-  | 'backlight'
-  | 'emergency_braking'
-  | 'obstacle_appearance'
-  | 'sensor_failure'
-  | 'multi_vehicle_mixed'
-  | 'custom'
-  | 'real_vehicle_replay'
+/** 场景类型（4.2.1 分类体系叶子；取自受控字典生成产物，可随字典扩充） */
+export type { SceneType }
 
 /** Carla 仿真实例状态 */
 export type SimulationStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'canceled'

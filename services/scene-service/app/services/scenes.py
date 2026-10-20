@@ -35,8 +35,8 @@ from app.schemas.scene import (
     SceneDuplicateRequest,
     SceneListData,
     ScenePublishRequest,
-    SceneType,
     SceneUpdateRequest,
+    ensure_scene_type,
 )
 
 logger = get_logger("app.services.scenes")
@@ -127,7 +127,7 @@ class SceneService:
             )
         model = await self._repository.create(
             scene_name=payload.scene_name,
-            scene_type=payload.scene_type.value,
+            scene_type=payload.scene_type,
             description=payload.description,
             tags=payload.tags,
             config=payload.config.model_dump(mode="json"),
@@ -155,7 +155,7 @@ class SceneService:
         updated = await self._repository.update(
             scene_id,
             scene_name=payload.scene_name,
-            scene_type=payload.scene_type.value,
+            scene_type=payload.scene_type,
             description=payload.description,
             tags=payload.tags,
             config=payload.config.model_dump(mode="json"),
@@ -268,7 +268,7 @@ class SceneService:
         """ORM → Scene Schema（config_json 结构非法时按 5000 处理，禁止静默丢弃）。"""
         config = self._parse_stored_config(model)
         try:
-            scene_type = SceneType(str(model.scene_type))
+            scene_type = ensure_scene_type(str(model.scene_type))
             status = SceneStatus(str(model.status))
         except ValueError as exc:
             logger.error(

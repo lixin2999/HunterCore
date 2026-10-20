@@ -17,7 +17,7 @@ from app.consumers.analytics_result import (
     TRIGGER_RULES,
     AnalyticsResultConsumer,
 )
-from app.schemas.scene import SceneEventType, SceneType
+from app.schemas.scene import SceneEventType
 from app.services.scenes import SceneService
 from app.tests.fakes import FakeSceneCache, InMemorySceneRepository
 
@@ -71,7 +71,7 @@ async def test_handle_payload_creates_real_vehicle_replay_scene() -> None:
     consumer, repository = _consumer()
     scene = await consumer.handle_payload(copy.deepcopy(MESSAGE))
     assert scene is not None
-    assert scene.scene_type is SceneType.REAL_VEHICLE_REPLAY
+    assert scene.scene_type == "real_vehicle_replay"
     assert scene.status.value == "draft"
     assert scene.tags == ["real_vehicle_replay", "harsh_braking"]
     assert scene.version == "1.0.0"

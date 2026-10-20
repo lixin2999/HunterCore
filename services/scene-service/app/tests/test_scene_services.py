@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 from hunter_common.database.enums import SceneStatus
 from hunter_common.exceptions import InvalidParameterError, ResourceStateConflictError
+from hunter_common.scene_taxonomy import get_scene_taxonomy
 
 from app.config import settings
 from app.repositories.storage import endpoint_url_for
@@ -19,7 +20,6 @@ from app.schemas.scene import (
     SceneConfig,
     SceneExportFormat,
     SceneExportRequest,
-    SceneType,
     SceneUpdateRequest,
 )
 from app.services.export import SceneExportService
@@ -39,24 +39,26 @@ from app.tests.fakes import (
 # 场景分类体系 ↔ 模板清单（4.2.1 节）
 # =====================================================================
 def test_category_mapping_covers_all_scene_types() -> None:
-    """分类 → 类型映射并集必须等于 SceneType 全集（4.2.1 + 4.5 实车回放）。"""
+    """分类 → 类型映射并集必须等于受控字典全集（4.2.1 + 4.5 实车回放）。"""
+    all_types = set(get_scene_taxonomy().scene_type_values)
     grouped = {scene_type for types in SCENE_TYPES_BY_CATEGORY.values() for scene_type in types}
-    assert grouped == set(SceneType)
+    assert grouped == all_types
     assert len(SCENE_TYPES_BY_CATEGORY) == 6  # 6 个分类
-    assert len(SCENE_CATEGORY_BY_TYPE) == len(set(SceneType))
+    assert len(SCENE_CATEGORY_BY_TYPE) == len(all_types)
 
 
 def test_template_catalog_covers_classification() -> None:
     """模板清单 = 全部叶子场景 - 实车回放（4.5 节无预置模板）。"""
+    all_types = set(get_scene_taxonomy().scene_type_values)
     service = SceneTemplateService(settings)
     data = service.list_templates(category=None, scene_type=None)
-    assert data.total == len(set(SceneType)) - 1 == 17
-    assert SceneType.REAL_VEHICLE_REPLAY not in {item.scene_type for item in data.items}
-    for scene_type in (SceneType.CUT_IN, SceneType.RAINY, SceneType.SENSOR_FAILURE):
+    assert data.total == len(all_types) - 1 == 47
+    assert "real_vehicle_replay" not in {item.scene_type for item in data.items}
+    for scene_type in ("cut_in", "rainy", "sensor_failure"):
         template = service.get_template(scene_type)
         assert template is not None
-        assert template.template_id == f"tpl-{scene_type.value}"
-    assert service.get_template(SceneType.REAL_VEHICLE_REPLAY) is None
+        assert template.template_id == f"tpl-{scene_type}"
+    assert service.get_template("real_vehicle_replay") is None
 
 
 def test_template_configs_are_4_2_2_complete() -> None:

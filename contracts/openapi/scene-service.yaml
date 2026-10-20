@@ -12,8 +12,9 @@
 #     （契约 contracts/kafka/schemas/analytics_result.schema.json）
 #
 # ⚠ 待核对（设计文档未明确，需人工确认后回填；禁止擅自新增端点 / 字段 / 错误码 / 阈值）：
-#   1) scenes.scene_type 取值域：4.2.1 节仅给出「分类 → 场景」两级结构，未给出编码值；
-#      本契约按「叶子场景」取值（如 straight_cruise），分类由 x-hunter-scene-types 映射
+#   1) scenes.scene_type 取值域：已定稿为**可扩展受控字典**（单一事实来源
+#      contracts/scene-taxonomy.yaml；48 叶子类型，对齐 GB/T 47025 覆盖面，可按分类持续扩充）；
+#      编码值与「分类 → 类型」映射见 x-hunter-scene-types；入库时由应用层按字典校验（越界拦截）
 #   2) 4.4 节第 6/7 步（实时监控仿真进度、保存仿真结果）：已按决策 G-20① 补
 #      GET /api/v1/scene/simulations/{sim_instance_id}（进度）与 …/result（结果）查询端点，
 #      服务端无状态代理 Carla 管理 API；设计文档 12.2 节清单同步登记见 x-hunter-endpoints
@@ -33,10 +34,9 @@ info:
 
     **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功，非 0 为预定义错误码（附录 A）。
 
-    **场景分类**（4.2.1 节）：基础场景（直线巡航 / 弯道行驶 / 跟车行驶 / 变道行驶）、
-    交互场景（前车切入 / 行人横穿 / 路口会车 / 施工绕行）、环境场景（雨天 / 夜间 / 雾天 / 强光逆光）、
-    极端场景 Corner Case（紧急制动 / 障碍物突现 / 传感器失效 / 多车混行）、自定义场景；
-    另有 4.5 节「实车回放」类型。编码值映射见 `x-hunter-scene-types`。
+    **场景分类**（4.2.1 节）：基础 / 交互 / 环境 / 极端（Corner Case）/ 自定义 / 实车回放六大分类下的
+    **叶子类型为可扩展受控字典**（`contracts/scene-taxonomy.yaml`，当前 48 类，对齐 GB/T 47025 覆盖面，
+    可按分类持续扩充）；编码值与「分类 → 类型」映射见 `x-hunter-scene-types`。
 
     **场景配置结构**（4.2.2 节，不可更改）：场景元信息（scene_id / scene_name / scene_type /
     description / version / creator / tags）+ map / ego_vehicle / weather / actors[] / events[] /
@@ -831,27 +831,15 @@ components:
     SceneType:
       type: string
       description: |
-        场景类型（4.2.1 分类体系的叶子场景；"分类 → 类型"映射见 `x-hunter-scene-types`）。
-        ⚠ 编码值由本契约提出（设计文档未给出编码），需人工确认后落库，禁止前端硬编码分支。
-      enum:
-        - straight_cruise       # 基础场景：直线巡航
-        - curve_driving         # 基础场景：弯道行驶
-        - car_following         # 基础场景：跟车行驶
-        - lane_change           # 基础场景：变道行驶
-        - cut_in                # 交互场景：前车切入
-        - pedestrian_crossing   # 交互场景：行人横穿
-        - intersection_meeting  # 交互场景：路口会车
-        - construction_detour   # 交互场景：施工绕行
-        - rainy                 # 环境场景：雨天
-        - night                 # 环境场景：夜间
-        - foggy                 # 环境场景：雾天
-        - backlight             # 环境场景：强光逆光
-        - emergency_braking     # 极端场景：紧急制动
-        - obstacle_appearance   # 极端场景：障碍物突现
-        - sensor_failure        # 极端场景：传感器失效
-        - multi_vehicle_mixed   # 极端场景：多车混行
-        - custom                # 自定义场景
-        - real_vehicle_replay   # 实车回放（4.5 节实车场景自动提取产物）
+        场景类型（4.2.1 分类体系的叶子场景）。
+        取值为**可扩展受控字典**，单一事实来源见 `contracts/scene-taxonomy.yaml`（scene_types[].value）；
+        新增类型仅需编辑该字典，无需修改本契约固定枚举或后端逻辑即可入库。
+        「分类 → 类型」映射与中文标签见 `x-hunter-scene-types`；入库时由应用层按字典校验，越界拦截。
+      minLength: 1
+      maxLength: 64
+      x-controlled-vocabulary: contracts/scene-taxonomy.yaml
+      x-controlled-vocabulary-field: scene_types[].value
+      example: straight_cruise
 
     SimulationStatus:
       type: string
@@ -922,11 +910,12 @@ components:
       type: object
       description: |
         参与者行为编排（4.2.2 节 actors[].behavior）。
-        ⚠ behavior_type 取值域设计文档未定义（建议：lane_follow / speed_change / cut_in /
-        lane_change / stop）；parameters 为行为参数自由结构；均需人工确认。
+        behavior_type 取值域为**受控字典**（contracts/scene-taxonomy.yaml 的 behavior_types，
+        纵/横/复合/博弈/失效五组，如 lane_follow / cut_in / cross_road / static 等）；
+        parameters 为行为参数自由结构（受控枚举键 rule/edge/coordinate_system/... 出现即校验取值）。
       required: [behavior_type]
       properties:
-        behavior_type: { type: string, minLength: 1, maxLength: 64, example: lane_follow }
+        behavior_type: { type: string, minLength: 1, maxLength: 64, example: lane_follow, x-controlled-vocabulary: contracts/scene-taxonomy.yaml, "x-controlled-vocabulary-field": "behavior_types[].value" }
         parameters:
           type: object
           additionalProperties: true
@@ -961,22 +950,25 @@ components:
       type: object
       description: |
         事件触发条件（4.2.2 节 events[].trigger）。
-        ⚠ 内部结构设计文档未定义：condition 为触发表达式标识（如 OpenSCENARIO 条件名或
-        `ego.position.x > 10`），parameters 为其参数。
+        condition 为触发表达式标识（如 OpenSCENARIO 条件名或 `ego.position.x > 10`）；
+        condition_type 为**受控**触发条件类型（contracts/scene-taxonomy.yaml 的 trigger_condition_types，可选）；
+        parameters 为其参数，受控枚举键（rule/edge/coordinate_system/relative_distance_type/distribution）
+        出现即校验取值，其余自由键不拒绝（兼容 4.5 节实车回放自动提取）。
       required: [condition]
       properties:
         condition: { type: string, minLength: 1, maxLength: 256 }
+        condition_type: { type: string, minLength: 1, maxLength: 64, nullable: true, example: distance, x-controlled-vocabulary: contracts/scene-taxonomy.yaml, "x-controlled-vocabulary-field": "trigger_condition_types[].value" }
         parameters: { type: object, additionalProperties: true }
 
     SceneEventAction:
       type: object
       description: |
         事件触发后的动作（4.2.2 节 events[].action）。
-        ⚠ 内部结构设计文档未定义：action_type 建议取 speed_change / lane_change / stop /
-        emergency_stop / actor_spawn。
+        action_type 取值域为**受控字典**（contracts/scene-taxonomy.yaml 的 action_types，OpenSCENARIO 六组，
+        如 speed_change / lane_change / stop / emergency_stop / degrade_control 等）；parameters 受控枚举键出现即校验取值。
       required: [action_type]
       properties:
-        action_type: { type: string, minLength: 1, maxLength: 64, example: speed_change }
+        action_type: { type: string, minLength: 1, maxLength: 64, example: speed_change, x-controlled-vocabulary: contracts/scene-taxonomy.yaml, "x-controlled-vocabulary-field": "action_types[].value" }
         parameters: { type: object, additionalProperties: true }
 
     SceneEvent:
@@ -1423,42 +1415,75 @@ x-hunter-endpoints:
   ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]
 
 x-hunter-scene-types:
-  source: "设计文档 4.2.1 节（分类体系）+ 4.5 节（实车回放类型）"
-  status: pending_confirmation
-  note: "设计文档未给出编码值；categories[].types 的并集必须等于 SceneType 枚举全集"
+  source: "contracts/scene-taxonomy.yaml（单一事实来源）；设计文档 4.2.1 分类体系 + GB/T 47025—2026 覆盖面"
+  status: confirmed_extensible
+  note: |
+    取值以受控字典为准，可持续扩充：新增类型仅需编辑 scene-taxonomy.yaml，无需改本契约或后端逻辑。
+    categories[].types 的并集必须等于 scene-taxonomy.yaml 的 scene_types 全集（契约测试交叉校验）。
+    叶子类型共 48（basic 12 / interactive 10 / environment 8 / corner_case 16 / custom 1 / real_vehicle 1）。
   categories:
     - value: basic
       label: 基础场景
-      types: [straight_cruise, curve_driving, car_following, lane_change]
+      types: [straight_cruise, curve_driving, car_following, lane_change, overtaking, ramp_merge, ramp_exit, tunnel_driving, roundabout, narrow_road_meeting, uturn, parking]
       type_labels:
         straight_cruise: 直线巡航
         curve_driving: 弯道行驶
         car_following: 跟车行驶
         lane_change: 变道行驶
+        overtaking: 超车借道
+        ramp_merge: 匝道汇入
+        ramp_exit: 匝道汇出
+        tunnel_driving: 隧道通行
+        roundabout: 环岛通行
+        narrow_road_meeting: 窄路会车
+        uturn: 掉头
+        parking: 泊车
     - value: interactive
       label: 交互场景
-      types: [cut_in, pedestrian_crossing, intersection_meeting, construction_detour]
+      types: [cut_in, cut_out, pedestrian_crossing, occluded_pedestrian, intersection_meeting, unprotected_turn, construction_detour, cyclist_interaction, queue_creep, wrong_way_encounter]
       type_labels:
         cut_in: 前车切入
+        cut_out: 前车切出
         pedestrian_crossing: 行人横穿
+        occluded_pedestrian: 鬼探头
         intersection_meeting: 路口会车
+        unprotected_turn: 无信号路口转弯冲突
         construction_detour: 施工绕行
+        cyclist_interaction: 非机动车交互
+        queue_creep: 拥堵蠕行
+        wrong_way_encounter: 逆行借道冲突
     - value: environment
       label: 环境场景
-      types: [rainy, night, foggy, backlight]
+      types: [rainy, night, foggy, backlight, snowy, icy, haze, dusk_dawn]
       type_labels:
         rainy: 雨天
         night: 夜间
         foggy: 雾天
         backlight: 强光逆光
+        snowy: 雪天
+        icy: 结冰路面
+        haze: 霾低能见度
+        dusk_dawn: 黄昏黎明
     - value: corner_case
       label: 极端场景（Corner Case）
-      types: [emergency_braking, obstacle_appearance, sensor_failure, multi_vehicle_mixed]
+      types: [emergency_braking, obstacle_appearance, sensor_failure, multi_vehicle_mixed, stationary_obstacle, debris_spillage, animal_crossing, door_opening, child_chasing_ball, aggressive_cut_in, accident_scene, degraded_localization, comms_failure, actuator_failure, driver_incapacitation, minimal_risk_manoeuvre]
       type_labels:
         emergency_braking: 紧急制动
         obstacle_appearance: 障碍物突现
         sensor_failure: 传感器失效
         multi_vehicle_mixed: 多车混行
+        stationary_obstacle: 静止障碍物
+        debris_spillage: 路面遗撒物
+        animal_crossing: 动物穿行
+        door_opening: 开门杀
+        child_chasing_ball: 儿童追球
+        aggressive_cut_in: 激进加塞博弈
+        accident_scene: 事故现场绕行
+        degraded_localization: 定位丢失地图失配
+        comms_failure: 通信中断
+        actuator_failure: 执行器故障
+        driver_incapacitation: 驾驶员失能
+        minimal_risk_manoeuvre: 最小风险策略
     - value: custom
       label: 自定义场景
       types: [custom]

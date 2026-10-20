@@ -19,11 +19,15 @@ FROM python:3.12-slim
 RUN groupadd -r --gid 10001 appgroup && useradd -u 10001 -r -g appgroup -s /sbin/nologin appuser
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    API_PORT=8081
+    API_PORT=8081 \
+    SCENE_TAXONOMY_FILE=/app/contracts/scene-taxonomy.yaml
 WORKDIR /app
 # pip --prefix=/install 安装路径：/install/lib/python3.12/site-packages → slim 镜像默认 site-packages
 COPY --from=builder /install/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /build/service/app ./app
+# 场景受控字典（单一事实来源）：hunter_common.scene_taxonomy 启动即加载，缺失报错不降级，
+# 故必须随镜像内置（也可由 K8s 以 ConfigMap/bind mount 挂载 contracts/ 覆盖）。
+COPY contracts/scene-taxonomy.yaml ./contracts/scene-taxonomy.yaml
 EXPOSE 8081
 # 容器级健康检查（K8s 环境忽略此指令，由 livenessProbe/readinessProbe 承担）
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \

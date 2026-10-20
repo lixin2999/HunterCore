@@ -1,0 +1,270 @@
+# =====================================================================
+# HunterCore 场景受控字典（单一事实来源 / Single Source of Truth）
+# ---------------------------------------------------------------------
+# 用途：
+#   - 取代原先「SceneType 18 值固定枚举」的硬编码约定，改为**数据驱动受控字典**：
+#     新增场景类型 / 行为 / 动作 / 触发条件只需编辑本文件，无需改动 Python 逻辑即可入库。
+#   - scene-service schemas、批量生成脚本（scripts/batch_add_scenes.py）、前端常量
+#     （由 scripts/gen_scene_taxonomy_ts.py 生成）均以本文件为准。
+#   - OpenAPI 契约 contracts/openapi/scene-service.yaml 的 x-hunter-scene-types 引用本文件。
+# 校验：
+#   - 入库时按本字典对 scene_type / behavior_type / action_type / trigger.condition_type
+#     及 trigger/action.parameters 的键做受控校验；越界值在入库时即被拦下（422/3000）。
+#   - scenes.scene_type 为 TEXT 无 CHECK（见 contracts/database/enums.md），取值域由应用层
+#     本字典把关；新增分类/类型无需 DDL/迁移。
+# 对齐：
+#   - 叶子类型维度对齐 GB/T 47025—2026 智能网联汽车自动驾驶功能仿真试验 48 项覆盖面；
+#   - behavior_type / action_type / trigger 对齐 OpenSCENARIO 分类习惯，避免场景资产被
+#     单一仿真器锁死。
+# 加载：hunter_common.scene_taxonomy（定位顺序：SCENE_TAXONOMY_FILE → 向上查找
+#   contracts/scene-taxonomy.yaml；容器内由 ./contracts 只读挂载或镜像内置提供）。
+# =====================================================================
+version: "1.0"
+source: "场景生成器与场景管理详细设计文档 §4.2.1 分类体系 + GB/T 47025—2026 覆盖面"
+status: confirmed_extensible
+note: "本文件为可扩展受控字典；categories[].types 的并集等于 scene_types 全集"
+
+# ---------- 一级分类（沿用 4.2.1 六大分类，不新增分类、不加 DB 列） ----------
+categories:
+  - { value: basic,        label: 基础场景 }
+  - { value: interactive,  label: 交互场景 }
+  - { value: environment,  label: 环境场景 }
+  - { value: corner_case,  label: 极端场景（Corner Case） }
+  - { value: custom,       label: 自定义场景 }
+  - { value: real_vehicle, label: 实车回放 }
+
+# ---------- 场景类型（叶子，扁平扩充至 48；对齐 GB/T 47025 覆盖面） ----------
+# 模板服务为除 real_vehicle_replay 外的全部类型预置模板（47 个）。
+scene_types:
+  # basic（道路结构 + 基础驾驶任务，12）
+  - { value: straight_cruise,    label: 直线巡航,   category: basic }
+  - { value: curve_driving,      label: 弯道行驶,   category: basic }
+  - { value: car_following,      label: 跟车行驶,   category: basic }
+  - { value: lane_change,        label: 变道行驶,   category: basic }
+  - { value: overtaking,         label: 超车借道,   category: basic }
+  - { value: ramp_merge,         label: 匝道汇入,   category: basic }
+  - { value: ramp_exit,          label: 匝道汇出,   category: basic }
+  - { value: tunnel_driving,     label: 隧道通行,   category: basic }
+  - { value: roundabout,         label: 环岛通行,   category: basic }
+  - { value: narrow_road_meeting, label: 窄路会车,  category: basic }
+  - { value: uturn,              label: 掉头,       category: basic }
+  - { value: parking,            label: 泊车,       category: basic }
+  # interactive（交互与冲突，10）
+  - { value: cut_in,               label: 前车切入,     category: interactive }
+  - { value: cut_out,              label: 前车切出,     category: interactive }
+  - { value: pedestrian_crossing,  label: 行人横穿,     category: interactive }
+  - { value: occluded_pedestrian,  label: 鬼探头,       category: interactive }
+  - { value: intersection_meeting, label: 路口会车,     category: interactive }
+  - { value: unprotected_turn,     label: 无信号路口转弯冲突, category: interactive }
+  - { value: construction_detour,  label: 施工绕行,     category: interactive }
+  - { value: cyclist_interaction,  label: 非机动车交互, category: interactive }
+  - { value: queue_creep,          label: 拥堵蠕行,     category: interactive }
+  - { value: wrong_way_encounter,  label: 逆行借道冲突, category: interactive }
+  # environment（环境/光照，8）
+  - { value: rainy,      label: 雨天,     category: environment }
+  - { value: night,      label: 夜间,     category: environment }
+  - { value: foggy,      label: 雾天,     category: environment }
+  - { value: backlight,  label: 强光逆光, category: environment }
+  - { value: snowy,      label: 雪天,     category: environment }
+  - { value: icy,        label: 结冰路面, category: environment }
+  - { value: haze,       label: 霾低能见度, category: environment }
+  - { value: dusk_dawn,  label: 黄昏黎明, category: environment }
+  # corner_case（极端与失效，16）
+  - { value: emergency_braking,    label: 紧急制动,     category: corner_case }
+  - { value: obstacle_appearance,  label: 障碍物突现,   category: corner_case }
+  - { value: sensor_failure,       label: 传感器失效,   category: corner_case }
+  - { value: multi_vehicle_mixed,  label: 多车混行,     category: corner_case }
+  - { value: stationary_obstacle,  label: 静止障碍物,   category: corner_case }
+  - { value: debris_spillage,      label: 路面遗撒物,   category: corner_case }
+  - { value: animal_crossing,      label: 动物穿行,     category: corner_case }
+  - { value: door_opening,         label: 开门杀,       category: corner_case }
+  - { value: child_chasing_ball,   label: 儿童追球,     category: corner_case }
+  - { value: aggressive_cut_in,    label: 激进加塞博弈, category: corner_case }
+  - { value: accident_scene,       label: 事故现场绕行, category: corner_case }
+  - { value: degraded_localization, label: 定位丢失地图失配, category: corner_case }
+  - { value: comms_failure,        label: 通信中断,     category: corner_case }
+  - { value: actuator_failure,     label: 执行器故障,   category: corner_case }
+  - { value: driver_incapacitation, label: 驾驶员失能,  category: corner_case }
+  - { value: minimal_risk_manoeuvre, label: 最小风险策略, category: corner_case }
+  # custom + real_vehicle（各 1）
+  - { value: custom,             label: 自定义,   category: custom }
+  - { value: real_vehicle_replay, label: 实车回放, category: real_vehicle }
+
+# ---------- 参与者行为类型（behavior_type，纵/横/复合/博弈/失效五组） ----------
+# 说明：取「批量生成器/模板在用值 ∪ OpenSCENARIO 规范新增值」的超集，保证向后兼容。
+behavior_types:
+  # 纵向
+  - { value: constant_velocity,  label: 匀速,       group: longitudinal }
+  - { value: lane_follow,        label: 车道保持,   group: longitudinal }
+  - { value: car_following,      label: 跟驰,       group: longitudinal }
+  - { value: accelerate,         label: 加速,       group: longitudinal }
+  - { value: decelerate,         label: 减速,       group: longitudinal }
+  - { value: emergency_brake,    label: 紧急制动,   group: longitudinal }
+  - { value: stop,               label: 停车,       group: longitudinal }
+  - { value: start_up,           label: 起步,       group: longitudinal }
+  - { value: yield,              label: 让行,       group: longitudinal }
+  - { value: reverse,            label: 倒车,       group: longitudinal }
+  - { value: creep,              label: 蠕行,       group: longitudinal }
+  - { value: forward,            label: 直行通过,   group: longitudinal }
+  - { value: cross_road,         label: 横穿道路,   group: longitudinal }
+  - { value: static,             label: 静止占道,   group: longitudinal }
+  - { value: trajectory_replay,  label: 轨迹回放,   group: longitudinal }
+  # 横向
+  - { value: lane_keep,             label: 车道居,   group: lateral }
+  - { value: lane_change_left,      label: 左变道,   group: lateral }
+  - { value: lane_change_right,     label: 右变道,   group: lateral }
+  - { value: continuous_lane_change, label: 连续变道, group: lateral }
+  - { value: detour,                label: 绕行避障, group: lateral }
+  - { value: borrow_oncoming,       label: 借道,     group: lateral }
+  - { value: uturn,                 label: 掉头,     group: lateral }
+  - { value: turn_left,             label: 左转,     group: lateral }
+  - { value: turn_right,            label: 右转,     group: lateral }
+  - { value: cut_in,                label: 切入,     group: lateral }
+  - { value: cut_out,               label: 切出,     group: lateral }
+  # 复合
+  - { value: lane_change_accelerate, label: 变道加速, group: composite }
+  - { value: decelerate_detour,      label: 减速绕行, group: composite }
+  - { value: turn_yield,             label: 转弯让行, group: composite }
+  # 博弈 / 非理性
+  - { value: aggressive_merge, label: 抢行加塞,   group: adversarial }
+  - { value: hesitation_stop,  label: 犹豫停顿,   group: adversarial }
+  - { value: sudden_cross,     label: 突然横穿,   group: adversarial }
+  - { value: backtrack,        label: 折返,       group: adversarial }
+  - { value: occluded_dash,    label: 遮挡窜出,   group: adversarial }
+  - { value: door_open,        label: 开门,       group: adversarial }
+  - { value: boarding,         label: 上下客,     group: adversarial }
+  - { value: pushing,          label: 推车,       group: adversarial }
+  - { value: child_chase_ball, label: 儿童追球,   group: adversarial }
+  # 失效类
+  - { value: breakdown_stop, label: 抛锚急停,     group: failure }
+  - { value: double_park,    label: 故障双停,     group: failure }
+  - { value: drift_off_lane, label: 漂移出车道,   group: failure }
+
+# ---------- 动作类型（action_type，OpenSCENARIO 六组） ----------
+action_types:
+  # 初始化
+  - { value: teleport,           label: 瞬移定位,     group: initialization }
+  - { value: position,           label: 定位,         group: initialization }
+  - { value: assign_controller,  label: 指定控制器,   group: initialization }
+  # 纵向
+  - { value: speed,                 label: 速度控制,   group: longitudinal }
+  - { value: acceleration,          label: 加速度控制, group: longitudinal }
+  - { value: longitudinal_distance, label: 纵向距离保持, group: longitudinal }
+  - { value: hold_speed,            label: 保持车速,   group: longitudinal }
+  - { value: speed_limit,           label: 限速,       group: longitudinal }
+  - { value: speed_change,          label: 速度变化,   group: longitudinal }
+  - { value: brake,                 label: 制动,       group: longitudinal }
+  - { value: emergency_stop,        label: 紧急停车,   group: longitudinal }
+  - { value: stop,                  label: 停止,       group: longitudinal }
+  # 横向
+  - { value: lane_change,       label: 变道,       group: lateral }
+  - { value: lane_offset,       label: 车道偏移,   group: lateral }
+  - { value: follow_trajectory, label: 轨迹跟随,   group: lateral }
+  # 环境 / 基础设施
+  - { value: environment,     label: 环境变更,   group: environment }
+  - { value: infrastructure,  label: 基础设施变更, group: environment }
+  - { value: weather,         label: 天气变更,   group: environment }
+  - { value: traffic_light,   label: 信号灯切换, group: environment }
+  # 控制 / 逻辑
+  - { value: activate_controller,    label: 激活控制器, group: control }
+  - { value: parameter_assignment,   label: 参数赋值,   group: control }
+  - { value: user_defined,           label: 自定义动作, group: control }
+  - { value: degrade_control,        label: 降级控制,   group: control }
+  - { value: yield,                  label: 让行动作,   group: control }
+  - { value: manual_takeover,        label: 人工接管,   group: control }
+  # 终止 / 可见性
+  - { value: stop_trigger, label: 终止触发,   group: termination }
+  - { value: visibility,   label: 可见性切换, group: termination }
+
+# ---------- 触发器条件类型（trigger.condition_type） ----------
+trigger_condition_types:
+  - { value: distance,                 label: 距离条件 }
+  - { value: relative_distance,        label: 相对距离条件 }
+  - { value: speed,                    label: 速度条件 }
+  - { value: acceleration,             label: 加速度条件 }
+  - { value: standstill,               label: 静止条件 }
+  - { value: reach_position,           label: 到达位置条件 }
+  - { value: collision,                label: 碰撞条件 }
+  - { value: offroad,                  label: 越野条件 }
+  - { value: end_of_road,              label: 道路尽头条件 }
+  - { value: traveled_distance,        label: 已行驶距离条件 }
+  - { value: time_headway,             label: 时距条件 }
+  - { value: time_to_collision,        label: 碰撞时间条件 }
+  - { value: simulation_time,          label: 仿真时间条件 }
+  - { value: storyboard_element_state, label: 故事元素状态条件 }
+  - { value: parameter_value,          label: 参数值条件 }
+  - { value: user_defined_value,       label: 自定义值条件 }
+
+# ---------- trigger.parameters 允许键（白名单，越界拒绝、缺省不报） ----------
+# 覆盖生成器/模板在用的 source 与 OpenSCENARIO 规范键。
+trigger_parameter_keys:
+  - condition_type
+  - entity_ref
+  - value
+  - rule
+  - edge
+  - delay
+  - coordinate_system
+  - relative_distance_type
+  - target_position
+  - parameter_name
+  - distribution
+  - range
+  - random_seed
+  - repeat_count
+  - source
+
+# ---------- 参数键的枚举取值子字典（仅在出现对应键时校验其值；不出现不报） ----------
+# trigger/action parameters 为 4.2.2 自由结构（契约 #3），因此仅对以下**受控枚举键**的
+# 取值做拦截；其余自由键（如 result_id/window_start/extracted_from/event_type 等）不拒绝，
+# 以兼容实车回放自动提取（scene-service consumers/analytics_result）。
+enumerable_parameter_values:
+  rule: [">=", "<=", "==", "!=", ">", "<"]
+  edge: [rising, falling, risingOrFalling, none]
+  coordinate_system: [cartesian, road, lane]
+  relative_distance_type: [longitudinal, lateral, euclidean, sightline]
+  distribution: [uniform, normal, triangular, lognormal]
+
+# ---------- action.parameters 允许键（白名单） ----------
+# 覆盖生成器/模板在用的动力学/几何键与 OpenSCENARIO 规范键。
+action_parameter_keys:
+  - target_speed
+  - target_accel
+  - target_time
+  - target_dist
+  - dynamics_shape
+  - dynamics
+  - target_lane
+  - duration
+  - trajectory
+  - waypoint
+  - road_id
+  - lane_id
+  - s
+  - t
+  - phase
+  - state
+  - rain
+  - fog
+  - wind
+  - cloudiness
+  - wetness
+  - sun_altitude
+  - sun_azimuth
+  - visibility
+  - controller
+  - sensor
+  - fault
+  - fallback
+  - deceleration
+  - complete_in
+  - cut_in_speed
+  - target_ratio
+  - min_safe_distance
+  - object_kind
+  - vehicle_kind
+  - crossing_speed
+  - condition
+  - expression
+  - parameters
+  - source
