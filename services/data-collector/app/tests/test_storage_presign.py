@@ -9,14 +9,19 @@
 """
 from __future__ import annotations
 
+import base64
+import contextlib
+import hashlib
 from typing import Any
 
+import boto3
+from botocore.awsrequest import AWSResponse
 from botocore.exceptions import ParamValidationError
 from botocore.session import get_session
 from botocore.validate import ParamValidator
 
 from app.repositories import storage as storage_module
-from app.repositories.storage import MinioStorage
+from app.repositories.storage import MinioStorage, _inject_content_md5, _register_content_md5
 
 
 class _RecordingClient:
@@ -153,3 +158,58 @@ def test_list_objects_v2_cursor_is_accepted_by_real_sdk_model() -> None:
     assert truncated is True
     assert next_marker == "rosbag/b.bag"  # v2 无 NextMarker → 回退末项 Key
     assert [item["object_key"] for item in items] == ["rosbag/a.bag", "rosbag/b.bag"]
+
+
+# ---------------------------------------------------------------------------
+# DeleteObjects Content-MD5 补算（V1.21.21：MinIO 要求、新版 botocore 不再自动加）
+# ---------------------------------------------------------------------------
+def test_inject_content_md5_sets_base64_md5_of_body() -> None:
+    """纯函数：base64(MD5(body)) 写入 Content-MD5；str 与 bytes 正文同值。"""
+    body = b"<Delete><Object><Key>k</Key></Object></Delete>"
+    params: dict[str, Any] = {"body": body, "headers": {}}
+    _inject_content_md5(params)
+    assert params["headers"]["Content-MD5"] == base64.b64encode(hashlib.md5(body).digest()).decode()
+
+    # 已存在 Content-MD5（任意大小写）不覆盖
+    keep = {"Content-MD5": "preset"}
+    _inject_content_md5({"body": body, "headers": keep})
+    assert keep["Content-MD5"] == "preset"
+
+
+def test_delete_objects_request_carries_content_md5_real_sdk() -> None:
+    """形状门禁（对齐真库）：经 `_register_content_md5` 后，真实 botocore 发出的
+    DeleteObjects 请求必须携带与实际正文一致的 Content-MD5。
+
+    内存替身会掩盖此问题（根本不走签名/序列化）⇒ 必须用真 botocore client，
+    在 before-send 短路（不发网络）捕获最终请求。复现并封堵实机 MissingContentMD5。
+    """
+    client = boto3.client(
+        "s3",
+        endpoint_url="http://127.0.0.1:9",
+        aws_access_key_id="x",
+        aws_secret_access_key="y",
+        region_name="us-east-1",
+    )
+    _register_content_md5(client)
+
+    captured: dict[str, Any] = {}
+
+    class _Captured(Exception):
+        """捕获到最终请求后中断发送（不发网络）。"""
+
+    def _short_circuit(request: Any, **_kwargs: Any) -> AWSResponse:
+        captured["md5"] = dict(request.headers).get("Content-MD5")
+        captured["body"] = request.body
+        raise _Captured
+
+    client.meta.events.register("before-send.s3.DeleteObjects", _short_circuit)
+    with contextlib.suppress(_Captured):
+        client.delete_objects(Bucket="b", Delete={"Objects": [{"Key": "k1"}, {"Key": "k2"}]})
+
+    md5_header = captured.get("md5")
+    body = captured.get("body")
+    assert md5_header is not None, "DeleteObjects 请求必须携带 Content-MD5"
+    md5_str = md5_header.decode() if isinstance(md5_header, bytes) else str(md5_header)
+    body_bytes = body.encode() if isinstance(body, str) else body
+    expect = base64.b64encode(hashlib.md5(body_bytes).digest()).decode()
+    assert md5_str == expect, "Content-MD5 必须与实际请求体一致（否则 MinIO 返 BadDigest）"

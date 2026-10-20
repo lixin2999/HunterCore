@@ -14,6 +14,7 @@ asyncio.to_thread 包装为异步，禁止在事件循环内做阻塞 IO（异�
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 from typing import Any
 
@@ -303,13 +304,40 @@ def _build_sync_client(endpoint_url: str) -> Any:
     """构建 boto3 S3 客户端（同步；构造为纯 CPU 操作，亦在 to_thread 中执行）。"""
     import boto3  # 局部导入：避免模块导入期建立连接
 
-    return boto3.client(
+    client = boto3.client(
         "s3",
         endpoint_url=endpoint_url,
         aws_access_key_id=settings.minio_access_key,
         aws_secret_access_key=settings.minio_secret_key,
         region_name=settings.minio_region,
     )
+    _register_content_md5(client)
+    return client
+
+
+def _register_content_md5(client: Any) -> None:
+    """为 DeleteObjects 补挂 Content-MD5 计算钩子。
+
+    根因（V1.21.21 实机确诊）：MinIO 要求 ``DeleteObjects`` 携带 ``Content-MD5`` 头，
+    但 botocore ≥ 1.36 默认改用 CRC32 灵活校验和、**不再自动为 DeleteObjects 计算 Content-MD5**
+    （旧的 ``conditionally_calculate_md5`` 已 deprecated 且不再注册）⇒ ``delete_objects``
+    报 ``MissingContentMD5``。在 ``before-call`` 阶段按最终请求体补算 base64(MD5)；
+    仅对 DeleteObjects 生效，其余请求无副作用。
+    """
+    client.meta.events.register("before-call.s3.DeleteObjects", _inject_content_md5)
+
+
+def _inject_content_md5(params: dict[str, Any], **_kwargs: Any) -> None:
+    """基于序列化后的请求体设置 ``Content-MD5``（已存在则不覆盖）。"""
+    headers = params.get("headers")
+    if not isinstance(headers, dict) or any(k.lower() == "content-md5" for k in headers):
+        return
+    body = params.get("body")
+    if body is None:
+        return
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    headers["Content-MD5"] = base64.b64encode(hashlib.md5(body).digest()).decode("utf-8")
 
 
 __all__ = ["ROSBAG_RETENTION_TAG_KEY", "MinioStorage", "get_storage"]

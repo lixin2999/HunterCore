@@ -47,19 +47,30 @@ class ObjectStorage(Protocol):
 
 
 class S3ObjectStorage:
-    """基于 aioboto3 的 MinIO（S3 协议）访问实现（客户端惰性创建）。"""
+    """基于 aioboto3 的 MinIO（S3 协议）访问实现（客户端惰性创建）。
+
+    双 client 设计（与 remote-control/data-collector 同构，V1.21.21 补齐）：
+    - ``_client``：内部连接（``minio_endpoint_url``，集群内地址），用于 get/put/list 等服务侧操作。
+    - ``_presign_client``：预签名专用（``minio_public_endpoint_url``，浏览器可达外部地址），
+      保证报告下载 URL 的 host 可被浏览器路由。未配置 MINIO_PUBLIC_ENDPOINT 时回落内部地址。
+      ⚠ 此前本类仅单 client，presign_get 亦走内部 ``minio:9000``，浏览器不可达 →
+        报告能返回链接但下载不可达（V1.21.21 修复）。
+    """
 
     def __init__(self, settings: HunterBaseConfig, bucket: str) -> None:
         self._bucket = bucket
         self._endpoint_url = settings.minio_endpoint_url
+        self._presign_endpoint_url = settings.minio_public_endpoint_url
         self._access_key = settings.minio_access_key
         self._secret_key = settings.minio_secret_key
         self._cm: Any | None = None
         self._client: Any | None = None
+        self._presign_cm: Any | None = None
+        self._presign_client: Any | None = None
         self._lock = asyncio.Lock()
 
-    def _create_client(self) -> Any:
-        """构建 aioboto3 客户端（aioboto3 为可选依赖，缺失时快速失败为 5001）。"""
+    def _create_client(self, endpoint_url: str) -> Any:
+        """构建指定 endpoint 的 aioboto3 客户端（aioboto3 为可选依赖，缺失时快速失败为 5001）。"""
         try:
             import aioboto3  # 延迟导入：避免未安装 minio extra 时阻断服务启动
         except ModuleNotFoundError as exc:  # pragma: no cover - 依赖缺失场景
@@ -67,7 +78,7 @@ class S3ObjectStorage:
         session = aioboto3.Session()
         return session.client(
             "s3",
-            endpoint_url=self._endpoint_url,
+            endpoint_url=endpoint_url,
             aws_access_key_id=self._access_key,
             aws_secret_access_key=self._secret_key,
             region_name="us-east-1",
@@ -77,9 +88,17 @@ class S3ObjectStorage:
         if self._client is None:
             async with self._lock:
                 if self._client is None:
-                    self._cm = self._create_client()
+                    self._cm = self._create_client(self._endpoint_url)
                     self._client = await self._cm.__aenter__()
         return self._client
+
+    async def _ensure_presign_client(self) -> Any:
+        if self._presign_client is None:
+            async with self._lock:
+                if self._presign_client is None:
+                    self._presign_cm = self._create_client(self._presign_endpoint_url)
+                    self._presign_client = await self._presign_cm.__aenter__()
+        return self._presign_client
 
     @staticmethod
     def _is_not_found(exc: Exception) -> bool:
@@ -138,7 +157,8 @@ class S3ObjectStorage:
         return out
 
     async def presign_get(self, key: str, expires_in: int) -> str:
-        client = await self._ensure_client()
+        # 预签名走 public endpoint client：URL host 必须是浏览器可达地址（非集群内 minio:9000）。
+        client = await self._ensure_presign_client()
         try:
             # ⚠ aioboto3 的 generate_presigned_url 是协程（与同步 boto3 不同），必须 await；
             #   漏 await 会把协程对象当字符串返回，下游按 str 校验时抛 ValidationError → 500
@@ -164,3 +184,7 @@ class S3ObjectStorage:
             await self._cm.__aexit__(None, None, None)
             self._cm = None
             self._client = None
+        if self._presign_cm is not None:
+            await self._presign_cm.__aexit__(None, None, None)
+            self._presign_cm = None
+            self._presign_client = None
