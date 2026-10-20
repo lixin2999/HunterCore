@@ -24,13 +24,16 @@ import {
   SCENE_TYPE_LABELS,
 } from '@/constants'
 import { PERMISSIONS } from '@/constants/permissions'
+import { useUserStore } from '@/stores/user'
 import type { Scene, SceneConfig, SceneUpsertRequest } from '@/types/scene'
 import { HunterApiError } from '@/utils/error-code'
 import { downloadByUrl } from '@/utils/hash'
 import { formatBytes, formatDateTimeString } from '@/utils/format'
+import { sceneCreatorLabel } from '@/utils/scene-display'
 
 const route = useRoute()
 const router = useRouter()
+const userStore = useUserStore()
 
 const sceneId = computed<string>(() => String(route.params.scene_id ?? ''))
 const loading = ref(false)
@@ -225,7 +228,9 @@ watch(
       <el-descriptions v-if="scene" :column="3" size="small" border>
         <el-descriptions-item label="场景 ID">{{ scene.scene_id }}</el-descriptions-item>
         <el-descriptions-item label="版本">{{ scene.version }}</el-descriptions-item>
-        <el-descriptions-item label="创建者">{{ scene.creator }}</el-descriptions-item>
+        <el-descriptions-item label="创建者">
+          <span :title="scene.creator">{{ sceneCreatorLabel(scene, userStore.profile?.user_id, userStore.displayName) }}</span>
+        </el-descriptions-item>
         <el-descriptions-item label="创建时间">{{ formatDateTimeString(scene.create_time) }}</el-descriptions-item>
         <el-descriptions-item label="更新时间">{{ formatDateTimeString(scene.update_time) }}</el-descriptions-item>
         <el-descriptions-item label="标签">{{ scene.tags.join(', ') || '-' }}</el-descriptions-item>

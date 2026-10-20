@@ -33,6 +33,7 @@ import {
   SCENE_TYPE_LABELS,
 } from '@/constants'
 import { PERMISSIONS } from '@/constants/permissions'
+import { useUserStore } from '@/stores/user'
 import type {
   Scene,
   SceneExportFormat,
@@ -43,8 +44,10 @@ import type {
 import { HunterApiError } from '@/utils/error-code'
 import { downloadByUrl } from '@/utils/hash'
 import { formatBytes, formatDateTimeString } from '@/utils/format'
+import { sceneCreatorLabel, sceneTypeLabel } from '@/utils/scene-display'
 
 const router = useRouter()
+const userStore = useUserStore()
 
 const loading = ref(false)
 const scenes = ref<Scene[]>([])
@@ -277,8 +280,8 @@ void loadScenes()
       >
         <el-table-column type="selection" width="46" />
         <el-table-column prop="scene_name" label="场景名称" min-width="180" show-overflow-tooltip />
-        <el-table-column label="类型" width="130">
-          <template #default="{ row }">{{ SCENE_TYPE_LABELS[row.scene_type] ?? row.scene_type }}</template>
+        <el-table-column label="类型" width="130" show-overflow-tooltip>
+          <template #default="{ row }">{{ sceneTypeLabel(row.scene_type) }}</template>
         </el-table-column>
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
@@ -291,7 +294,11 @@ void loadScenes()
             <el-tag v-for="tag in row.tags" :key="tag" size="small" effect="plain" class="tag">{{ tag }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="创建者" width="130" prop="creator" />
+        <el-table-column label="创建者" width="130">
+          <template #default="{ row }">
+            <span :title="row.creator">{{ sceneCreatorLabel(row, userStore.profile?.user_id, userStore.displayName) }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="更新时间" width="170">
           <template #default="{ row }">{{ formatDateTimeString(row.update_time) }}</template>
         </el-table-column>

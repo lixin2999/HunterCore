@@ -15,11 +15,11 @@ import { fetchSceneCoverage } from '@/api/analytics'
 import EchartBase from '@/components/charts/EchartBase.vue'
 import DataSourceNotice from '@/components/common/DataSourceNotice.vue'
 import StatCard from '@/components/common/StatCard.vue'
-import { SCENE_TYPE_LABELS } from '@/constants'
 import { useVehicleStore } from '@/stores/vehicle'
 import type { SceneCoverageData, SceneCoverageQuery } from '@/types/analytics'
 import { HunterApiError } from '@/utils/error-code'
 import { formatPercent, formatTime } from '@/utils/format'
+import { sceneTypeLabel } from '@/utils/scene-display'
 
 const vehicleStore = useVehicleStore()
 
@@ -66,7 +66,7 @@ const uncoveredRows = computed(() =>
   (result.value?.uncovered ?? []).map((item) => ({
     kind: item.kind,
     kindLabel: item.kind === 'region' ? '区域' : '场景类型',
-    description: item.kind === 'scene_type' ? (SCENE_TYPE_LABELS[item.description] ?? item.description) : item.description,
+    description: item.kind === 'scene_type' ? sceneTypeLabel(item.description) : item.description,
     reason: item.reason ?? '-',
     sampleCount: item.sample_count ?? null,
   })),
