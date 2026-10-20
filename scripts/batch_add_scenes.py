@@ -1098,6 +1098,17 @@ def main(argv: list[str] | None = None) -> int:
             print("[error] direct 模式 --roles 须包含 admin 或 operator（scene:create 权限）", file=sys.stderr)
             return 2
 
+    # 提交依赖前置检查（dry-run 不需要）：避免生成/校验跑完后才在 submit 深处报 ModuleNotFoundError
+    if not args.dry_run:
+        try:
+            import httpx  # noqa: F401
+        except ImportError:
+            print("[error] 缺少提交依赖 httpx。安装（任选其一）：\n"
+                  "        pip3 install httpx -i https://pypi.tuna.tsinghua.edu.cn/simple\n"
+                  "        sudo apt-get install -y python3-httpx\n"
+                  "        （dry-run 不依赖 httpx，可先 --dry-run 验证生成与校验）", file=sys.stderr)
+            return 2
+
     scenes = generate_scenes(seed=args.seed, ratio=_parse_ratio(args.ratio))
     scenes = _filter_types(scenes, args.only_type)
     if args.start:
