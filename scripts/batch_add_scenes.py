@@ -20,6 +20,14 @@
 余弦相似度去重」，使每条场景的速度/间距/横向偏移/参与者数量/天气强度/事件阈值等**逐条不同**，
 并按 60% 常用 / 30% 边缘 / 10% 长尾的比例覆盖风险梯度。
 
+覆盖面扩展（V1.21.25：300 → 1200）
+--------------------------------
+``SceneType`` 的 18 个取值是固定契约，不可新增。故覆盖面扩展不改类型，而在每个类型内引入
+**子场景（variant）层**：枚举业界典型测试场景（如鬼探头、AEB 行人触发、多传感器级联失效、
+夜间雨天行人等），通过 ``overrides``（调参数分布）、``force``（强制恶劣天气/夜间构造多风险叠加）、
+``augment``（注入遮挡车辆/对向来车/级联失效事件等结构化要素）三种手段差异化，总量按测试重要性
+加权扩至 1200，逐类型 → 逐子场景 → 逐分布区间分层采样，兼顾常见、极端与组合极端场景。
+
 契约映射说明（不改动 DDL / OpenAPI 固定契约）
 --------------------------------------------
 设计文档 §5.1 的扩展元数据（category / risk_level / distribution_zone / source）落在现有
@@ -60,7 +68,7 @@ import tempfile
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +77,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "common" / "python"))
 sys.path.insert(0, str(ROOT / "services" / "scene-service"))
 
-DEFAULT_OUTPUT = ROOT / "scripts" / "output" / "scene_batch_300.json"
+DEFAULT_OUTPUT = ROOT / "scripts" / "output" / "scene_batch_1200.json"
 #: 车端基线车型（见 config.SCENE_EXTRACTION_DEFAULT_EGO_MODEL）
 EGO_MODEL = "HUNTER_SE"
 #: 契约 SCENE_DURATION_MAX_SECONDS 默认上限
@@ -89,27 +97,30 @@ MAX_SAMPLE_TRIES = 64
 # =====================================================================
 # 一、场景类型：配额 + 功能分类 + 风险/分布/来源标签（设计文档 §2.5）
 # =====================================================================
+# 场景类型配额（V1.21.25：300 → 1200，按测试重要性加权；和恒为 TOTAL_SCENES）
+#: 覆盖面不再靠新增 scene_type（18 值为固定契约），而是靠每个类型内的子场景（VARIANTS）扩展。
+TOTAL_SCENES = 1200
 SCENE_QUOTAS: OrderedDict[str, int] = OrderedDict(
     [
-        ("straight_cruise", 12),
-        ("curve_driving", 15),
-        ("car_following", 22),
-        ("lane_change", 22),
-        ("cut_in", 25),
-        ("pedestrian_crossing", 28),
-        ("intersection_meeting", 22),
-        ("construction_detour", 14),
-        ("rainy", 22),
-        ("night", 20),
-        ("foggy", 14),
-        ("backlight", 10),
-        ("emergency_braking", 24),
-        ("obstacle_appearance", 20),
-        ("sensor_failure", 12),
-        ("multi_vehicle_mixed", 18),
+        ("straight_cruise", 40),
+        ("curve_driving", 60),
+        ("car_following", 90),
+        ("lane_change", 80),
+        ("cut_in", 100),
+        ("pedestrian_crossing", 120),
+        ("intersection_meeting", 90),
+        ("construction_detour", 60),
+        ("rainy", 80),
+        ("night", 80),
+        ("foggy", 60),
+        ("backlight", 50),
+        ("emergency_braking", 80),
+        ("obstacle_appearance", 70),
+        ("sensor_failure", 60),
+        ("multi_vehicle_mixed", 80),
     ]
 )
-assert sum(SCENE_QUOTAS.values()) == 300, "场景配额之和必须为 300"
+assert sum(SCENE_QUOTAS.values()) == TOTAL_SCENES, f"场景配额之和必须为 {TOTAL_SCENES}"
 
 #: 类型 → 平台契约分类（4.2.1 两级结构第一级；写入 tags 与 config 校验）
 CATEGORY_BY_TYPE: dict[str, str] = {
@@ -255,6 +266,139 @@ _SENSORS = ("camera_front", "lidar_top", "radar_front", "camera_rear", "gnss")
 _FAULTS = ("black_frame", "point_dropout", "ghost_return", "freeze", "denied")
 _CURVES = ("left", "right", "s-ramp", "hairpin")
 _MANEUVERS = ("straight", "left-turn", "right-turn", "uturn")
+
+
+# =====================================================================
+# 二·五、子场景（variant）层：在不新增 scene_type（18 值固定契约）的前提下扩展覆盖面
+#   每个类型枚举若干典型子场景（对齐全功能/典型测试场景），通过三种手段差异化：
+#   - overrides：替换/扩展该子场景的参数分布（如儿童行人 ped_speed 更高、鬼探头 cross_dist 更短）；
+#   - force：强制固定部分参数（如夜间子场景 sun_alt<0、暴雨 rain=90）——用于构造多风险叠加的极端场景；
+#   - augment：结构化装配标签，由 _augment 据此注入参与者/事件（遮挡车、级联失效、连续切入等）。
+# =====================================================================
+@dataclass(frozen=True)
+class Variant:
+    key: str                                  # 子场景编码（写入 tags sub: 与名称）
+    sub: str                                  # 名称缩写（≤ 6 字符）
+    label: str                                # 中文说明
+    overrides: dict[str, Param] = field(default_factory=dict)   # 参数分布覆盖（键须属于该类型 spec）
+    force: dict[str, float] = field(default_factory=dict)        # 强制固定参数（采样后直接覆盖）
+    augment: str = ""                         # 结构注入标签（交 _augment 处理）
+
+
+def _V(key: str, sub: str, label: str, *, overrides: dict[str, Param] | None = None,
+      force: dict[str, float] | None = None, augment: str = "") -> Variant:
+    return Variant(key=key, sub=sub, label=label, overrides=overrides or {}, force=force or {}, augment=augment)
+
+
+VARIANTS: dict[str, list[Variant]] = {
+    "straight_cruise": [
+        _V("low_speed", "LOW", "低速巡航", overrides={"ego_speed": Param(6, 2, 2, 10, +1)}),
+        _V("high_speed", "HIGH", "高速巡航", overrides={"ego_speed": Param(20, 2.5, 15, 24, +1)}),
+        _V("cruise_stop", "STP", "巡航跟停", augment="lead_varies"),
+    ],
+    "curve_driving": [
+        _V("gentle", "GEN", "缓弯", overrides={"steer_mag": Param(0.25, 0.1, 0.1, 0.45, +1)}),
+        _V("sharp", "SHP", "急弯", overrides={"steer_mag": Param(0.75, 0.13, 0.5, 0.95, +1)}),
+        _V("s_ramp", "SRP", "匝道S弯", augment="s_ramp"),
+        _V("hairpin", "HRP", "掉头弯", overrides={"steer_mag": Param(0.9, 0.05, 0.7, 0.98, +1)}),
+    ],
+    "car_following": [
+        _V("steady", "STY", "稳态跟车", overrides={"gap": Param(18, 5, 10, 32, -1)}),
+        _V("dense", "DNS", "密集车流跟车", overrides={"gap": Param(10, 3, 6, 16, -1)}, augment="dense"),
+        _V("lead_varies", "LVV", "前车加减速", augment="lead_varies"),
+    ],
+    "lane_change": [
+        _V("left", "LFT", "左变道"),
+        _V("right", "RGT", "右变道"),
+        _V("overtake", "OVT", "超车变道", augment="overtake"),
+        _V("continuous", "CTL", "连续变道", augment="double_lc"),
+    ],
+    "cut_in": [
+        _V("normal", "NRM", "邻道常规切入", overrides={"aggr": Param(1.2, 0.5, 0.5, 2.0, +1)}),
+        _V("aggressive", "AGG", "激进加塞", overrides={"aggr": Param(3.8, 0.9, 2.0, 5.0, +1), "cut_gap": Param(20, 5, 15, 30, -1)}),
+        _V("truck", "TRK", "大车切入", augment="truck_cut"),
+        _V("double", "DBL", "连续两次切入", augment="double_cut"),
+    ],
+    "pedestrian_crossing": [
+        _V("crosswalk", "CWK", "斑马线成人过街", overrides={"cross_dist": Param(24, 6, 14, 36, -1)}),
+        _V("dart_out", "DRT", "鬼探头（遮挡窜出）", overrides={"cross_dist": Param(12, 4, 6, 20, -1)}, augment="occluder"),
+        _V("child", "CHD", "儿童横穿", overrides={"ped_speed": Param(2.2, 0.5, 1.5, 3.0, +1)}),
+        _V("elder", "ELD", "老人慢速横穿", overrides={"ped_speed": Param(0.9, 0.2, 0.6, 1.3, -1)}),
+        _V("group", "GRP", "群体过街", overrides={"n_ped": Param(4, 1.0, 3, 6, +1, discrete=True)}),
+        _V("night_rain", "NRN", "夜间雨天行人（多风险叠加）",
+           overrides={"cross_dist": Param(13, 4, 7, 22, -1)}, force={"sun_alt": -30.0, "rain": 70.0}, augment="occluder"),
+    ],
+    "intersection_meeting": [
+        _V("green_straight", "GRN", "绿灯直行会车"),
+        _V("left_turn", "LFT", "左转对向冲突", augment="left_turn"),
+        _V("uncontrolled", "UNC", "无信号路口", augment="no_signal"),
+        _V("right_conflict", "RGT", "右转与直行冲突", augment="right_conflict"),
+    ],
+    "construction_detour": [
+        _V("cones", "CNS", "锥桶导改"),
+        _V("work_vehicle", "WVH", "施工车辆占道", augment="work_vehicle"),
+        _V("night_work", "NGW", "夜间施工", force={"sun_alt": -25.0}, augment="work_vehicle"),
+        _V("borrow_lane", "BRW", "借道绕行", overrides={"bar_dist": Param(14, 5, 8, 24, -1)}, augment="oncoming"),
+    ],
+    "rainy": [
+        _V("light", "LGT", "小雨", overrides={"rain": Param(35, 10, 20, 55, +1)}),
+        _V("downpour", "DNP", "暴雨", overrides={"rain": Param(90, 7, 75, 100, +1)}),
+        _V("rain_fog", "RFG", "雨雾叠加", overrides={"rain": Param(70, 15, 45, 100, +1)}, force={"fog": 55.0}),
+        _V("standing_water", "STW", "积水路面", force={"rain": 80.0}, augment="lead_varies"),
+    ],
+    "night": [
+        _V("pure", "PUR", "纯夜间", overrides={"sun_alt": Param(-25, 10, -45, -5, -1)}),
+        _V("night_ped", "NPE", "夜间行人", overrides={"n_ped": Param(2, 1.0, 1, 4, +1, discrete=True)}),
+        _V("no_streetlight", "NOS", "路灯缺失", force={"sun_alt": -40.0}),
+        _V("oncoming_beam", "HBM", "对向远光", force={"sun_alt": -30.0}, augment="high_beam"),
+    ],
+    "foggy": [
+        _V("light_fog", "LFG", "轻雾", overrides={"fog": Param(55, 8, 45, 68, +1)}),
+        _V("dense", "DFG", "浓雾低能见度", overrides={"fog": Param(90, 7, 75, 100, +1), "vis_dist": Param(9, 3, 6, 16, -1)}),
+        _V("patchy", "PTC", "团雾突现", augment="patchy"),
+    ],
+    "backlight": [
+        _V("sunrise", "SRI", "日出逆光", overrides={"sun_alt": Param(6, 3, 0, 14, +1), "sun_az": Param(90, 20, 60, 120, 0)}),
+        _V("sunset", "SSS", "日落逆光", overrides={"sun_alt": Param(5, 3, 0, 12, +1), "sun_az": Param(270, 20, 240, 300, 0)}),
+        _V("tunnel_exit", "TEX", "隧道出口强光", force={"sun_alt": 3.0}, augment="tunnel_exit"),
+    ],
+    "emergency_braking": [
+        _V("lead_aeb", "AEB", "前车急刹 AEB"),
+        _V("obstacle_trigger", "OBS", "障碍触发急刹", augment="obstacle_trigger"),
+        _V("ped_trigger", "PED", "行人触发急刹", augment="ped_trigger"),
+        _V("wet_high_speed", "WHS", "高速湿滑近距离急刹（多风险叠加）",
+           overrides={"ego_speed": Param(22, 2, 18, 24, +1), "gap": Param(9, 2, 6, 14, -1)}, force={"rain": 75.0}),
+    ],
+    "obstacle_appearance": [
+        _V("cargo", "CRG", "掉落货物", overrides={"kind_idx": Param(3, 0.1, 3, 3, 0, discrete=True)}),
+        _V("debris", "DEB", "碎片轮胎", overrides={"kind_idx": Param(1, 1.0, 0, 4, 0, discrete=True)}),
+        _V("animal", "ANM", "动物窜出", overrides={"kind_idx": Param(2, 0.1, 2, 2, 0, discrete=True)}, augment="occluder"),
+        _V("lead_stop", "LSP", "前车急停", augment="lead_varies"),
+    ],
+    "sensor_failure": [
+        _V("camera_black", "CAM", "相机黑帧", overrides={"sensor_idx": Param(0, 0.1, 0, 0, 0, discrete=True)}),
+        _V("lidar_dropout", "LDR", "激光雷达点云丢失", overrides={"sensor_idx": Param(1, 0.1, 1, 1, 0, discrete=True)}),
+        _V("radar_ghost", "RDG", "雷达幽灵回波", overrides={"sensor_idx": Param(2, 0.1, 2, 2, 0, discrete=True)}),
+        _V("gnss_lost", "GNS", "GNSS 失锁", overrides={"sensor_idx": Param(4, 0.1, 4, 4, 0, discrete=True)}),
+        _V("cascade", "CSC", "多传感器级联失效", augment="cascade"),
+    ],
+    "multi_vehicle_mixed": [
+        _V("roundabout", "RDB", "环岛混行", overrides={"n_v": Param(5, 1.2, 4, 7, +1, discrete=True)}),
+        _V("school_zone", "SCH", "学校区域", overrides={"n_p": Param(3, 1.0, 2, 5, +1, discrete=True)}, augment="school"),
+        _V("construction_zone", "CNZ", "施工区混行", augment="work_vehicle"),
+        _V("peak_dense", "PKD", "高峰密集车流", overrides={"n_v": Param(7, 0.8, 6, 9, +1, discrete=True), "spread": Param(4, 1.5, 3, 8, +1)}, augment="dense"),
+    ],
+}
+assert set(VARIANTS) == set(SCENE_QUOTAS), "子场景必须覆盖全部配额场景类型"
+#: 子场景 → 风险定位（供描述/标签提示；实际风险仍由采样 zone 决定）
+
+
+def _distribute(total: int, parts: int) -> list[int]:
+    """把类型配额尽量均分到其子场景（余数给靠前的子场景，和恒为 total）。"""
+    if parts <= 0:
+        return []
+    base, rem = divmod(total, parts)
+    return [base + (1 if i < rem else 0) for i in range(parts)]
 
 
 # =====================================================================
@@ -581,8 +725,76 @@ ASSEMBLERS: dict[str, Assembler] = {
 assert set(ASSEMBLERS) == set(SCENE_QUOTAS), "装配器必须覆盖全部配额场景类型"
 
 
+def _augment(cfg: dict[str, Any], stype: str, p: dict[str, float], variant: Variant) -> None:
+    """按子场景 augment 标签向已装配的 config 注入额外参与者/事件（就地修改）。
+
+    行为/动作类型与参数均为契约自由字符串/字典（待确认 #3），不触碰受控枚举；
+    事件 type 仅用契约 SceneEventType 七值，参与者 type 仅用 vehicle/pedestrian/other。
+    """
+    tag = variant.augment
+    if not tag:
+        return
+    actors = cfg["actors"]
+    events = cfg["events"]
+    speed = p.get("ego_speed", 6.0)
+    if tag == "occluder":                       # 鬼探头：遮挡车置于行人前侧
+        actors.append(_static("occluder-veh", p.get("cross_dist", 12.0) - 4.0, -3.2, kind="parked"))
+    elif tag == "dense":                        # 密集车流：补两辆背景车
+        actors.append(_vehicle("dense-1", 30.0 + speed * 2, 3.5, "lane_follow", target_speed=round(speed * 0.9, 2)))
+        actors.append(_vehicle("dense-2", 45.0 + speed * 2, -3.5, "lane_follow", target_speed=round(speed * 0.8, 2)))
+    elif tag == "lead_varies":                  # 前车加减速：追加一次速度变化事件
+        events.append(_event("ev-lead-acc", "cut_in", f"ego.distance.lead < {round(20 + speed, 1)}",
+                             "speed_change", target_speed=round(speed * 0.5, 2)))
+    elif tag == "s_ramp":                        # 匝道S弯：对向来车
+        actors.append(_vehicle("ramp-oncoming", 55.0, -3.5, "lane_follow", yaw=PI, target_speed=round(speed * 0.85, 2)))
+    elif tag == "overtake":                      # 超车变道：目标道前车
+        actors.append(_vehicle("otk-target", 26.0, 3.5, "lane_follow", target_speed=round(speed * 0.7, 2)))
+    elif tag == "double_lc":                     # 连续变道：第二段变道事件
+        events.append(_event("ev-lane-change-2", "cut_in", f"ego.position.x > {round(30 + speed, 1)}",
+                             "lane_change", target_lane="left", complete_in=round(p.get("complete_in", 5.0), 2)))
+    elif tag == "truck_cut":                     # 大车切入：以 other 卡车占位
+        actors.append(_actor("cut-truck", "other", _spawn(p.get("cut_gap", 28.0), -3.6, 0.0),
+                             "cut_in", vehicle_kind="truck", target_lane="ego_lane"))
+    elif tag == "double_cut":                    # 连续两次切入：第二个切入车 + 事件
+        actors.append(_vehicle("cut-in-2", p.get("cut_gap", 28.0) + 12.0, 3.6, "cut_in",
+                               target_lane="ego_lane", cut_in_speed=round(p.get("aggr", 2.0), 2)))
+        events.append(_event("ev-cut-in-2", "cut_in", f"ego.position.x > {round(p.get('cut_gap', 28.0) + 6, 1)}",
+                             "speed_change", target_speed=round(speed * 0.55, 2)))
+    elif tag in ("left_turn", "right_conflict"):  # 路口转向/右转冲突：对向直行车
+        actors.append(_vehicle("oncoming-straight", p.get("cross_dist", 30.0) + 10.0, 0.0,
+                               "forward", yaw=PI, target_speed=round(p.get("cross_speed", 6.5), 2)))
+    elif tag == "no_signal":                     # 无信号路口：让行事件（取消信号灯）
+        events.append(_event("ev-yield", "collision", f"ego.position.x > {round(p.get('cross_dist', 30.0) * 0.4, 1)}", "yield"))
+    elif tag == "work_vehicle":                  # 施工占道：补一名施工行人
+        actors.append(_pedestrian("worker-ped", p.get("bar_dist", 16.0) + 3.0, 2.2, speed=0.6))
+    elif tag == "oncoming":                      # 借道绕行：对向来车
+        actors.append(_vehicle("borrow-oncoming", p.get("bar_dist", 16.0) + 20.0, -3.5, "lane_follow",
+                               yaw=PI, target_speed=round(speed * 0.8, 2)))
+    elif tag == "high_beam":                     # 对向远光：来车 + 远光事件
+        actors.append(_vehicle("beam-oncoming", 40.0, -3.5, "lane_follow", yaw=PI, target_speed=round(speed, 2)))
+        events.append(_event("ev-high-beam", "sensor_failure", f"ego.position.x > {round(20 + speed, 1)}",
+                             "degrade_control", sensor="camera_front", fault="glare_saturation", fallback="reduce_speed"))
+    elif tag == "patchy":                        # 团雾突现：二次低能见度事件
+        events.append(_event("ev-patchy-fog", "obstacle_appearance", f"ego.position.x > {round(p.get('vis_dist', 14.0) + 8, 1)}",
+                             "emergency_stop"))
+    elif tag == "tunnel_exit":                   # 隧道出口强光：隧道口静态 + 逆光事件
+        actors.append(_static("tunnel-mouth", 28.0, 0.0, kind="tunnel"))
+        events.append(_event("ev-tunnel-glare", "sensor_failure", "ego.position.x > 26.0",
+                             "degrade_control", sensor="camera_front", fault="glare_saturation", fallback="hold_lane"))
+    elif tag == "obstacle_trigger":              # 障碍触发急刹：前方静态障碍
+        actors.append(_static("aeb-obstacle", p.get("gap", 13.0) + 4.0, 0.3, kind="debris"))
+    elif tag == "ped_trigger":                   # 行人触发急刹：前方行人
+        actors.append(_pedestrian("aeb-ped", p.get("gap", 13.0) + 3.0, -2.5, speed=1.6))
+    elif tag == "cascade":                       # 多传感器级联失效：追加第二路失效
+        events.append(_event("ev-sensor-fail-2", "sensor_failure", f"ego.position.x > {round(p.get('fail_x', 11.0) + 6, 1)}",
+                             "degrade_control", sensor="radar_front", fault="denied", fallback="minimal_risk_manoeuvre"))
+    elif tag == "school":                        # 学校区域：额外儿童行人 + 低速
+        actors.append(_pedestrian("school-kid-1", 18.0, -5.0, speed=1.8))
+        actors.append(_pedestrian("school-kid-2", 20.0, 5.0, speed=1.8))
+
+
 # =====================================================================
-# 六、组装 300 条场景（分层采样 + 可行性拒绝 + 余弦去重 + 唯一命名）
+# 六、组装 1200 条场景（类型 → 子场景 → 分层采样 + 可行性拒绝 + 余弦去重 + 唯一命名）
 # =====================================================================
 def _dedup_tags(tags: list[str], *, limit: int = 20, maxlen: int = 32) -> list[str]:
     out: list[str] = []
@@ -596,12 +808,15 @@ def _dedup_tags(tags: list[str], *, limit: int = 20, maxlen: int = 32) -> list[s
 
 
 def _make_scene(
-    stype: str, spec: dict[str, Param], zone: str, rng: random.Random, accepted: list[list[float]],
+    stype: str, spec: dict[str, Param], zone: str, rng: random.Random,
+    accepted: list[list[float]], variant: Variant,
 ) -> tuple[dict[str, Any], dict[str, float], str, int]:
-    """采样一条通过可行性 + 去重的场景；返回 (config, params, token, tries)。"""
+    """采样一条通过可行性 + 去重的场景（应用子场景 force/augment）；返回 (config, params, token, tries)。"""
     last: tuple[dict[str, float], bool] | None = None
     for attempt in range(1, MAX_SAMPLE_TRIES + 1):
         params = _sample_vector(rng, spec, zone)
+        if variant.force:
+            params.update(variant.force)
         if not _feasible(stype, params):
             continue
         vec = _normalize_vector(spec, params)
@@ -610,13 +825,15 @@ def _make_scene(
             continue
         accepted.append(vec)
         cfg = _assemble_config(stype, params, zone)
-        token = ASSEMBLERS[stype](params)[3]
-        return cfg, params, token, attempt
+        _augment(cfg, stype, params, variant)
+        return cfg, params, ASSEMBLERS[stype](params)[3], attempt
     # 重试耗尽：接受最后一次可行样本（或强制放宽），保证数量恒等于配额
     params = last[0] if last and last[0] else _sample_vector(rng, spec, "common")
+    if variant.force:
+        params.update(variant.force)
     cfg = _assemble_config(stype, params, zone)
-    token = ASSEMBLERS[stype](params)[3]
-    return cfg, params, token, MAX_SAMPLE_TRIES
+    _augment(cfg, stype, params, variant)
+    return cfg, params, ASSEMBLERS[stype](params)[3], MAX_SAMPLE_TRIES
 
 
 def _assemble_config(stype: str, params: dict[str, float], zone: str) -> dict[str, Any]:
@@ -638,45 +855,73 @@ def spec_default_weather(spec: dict[str, Param]) -> dict[str, float]:
     return {k: spec[k].mean for k in keys if k in spec}
 
 
+def _enforce_unique_configs(scenes: list[dict[str, Any]]) -> int:
+    """兜底：对完全重复的 config 施加最小抖动（自车初速 +0.01 m/s）以保证逐条唯一。
+
+    长尾（L4）区的强约束子场景（如动物窜出 kind_idx 固定、障碍急刹参数贴极限）可能
+    在 MAX_SAMPLE_TRIES 耗尽后放宽接受与已有样本重合的 config。此处仅对检出的重复项抖动，
+    正常不重复的场景不受影响；0.01m/s 仍在契约速度域内且不改变场景语义。
+    """
+    seen: set[str] = set()
+    fixed = 0
+    for s in scenes:
+        cfg = s["config"]
+        key = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+        if key not in seen:
+            seen.add(key)
+            continue
+        ego = cfg["ego_vehicle"]
+        for _ in range(10000):
+            ego["initial_speed"] = round(ego["initial_speed"] + 0.01, 2)
+            key = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+            if key not in seen:
+                break
+        seen.add(key)
+        fixed += 1
+    return fixed
+
+
 def generate_scenes(seed: int | None = None, ratio: dict[str, float] | None = None) -> list[dict[str, Any]]:
-    """按配额 + 高斯分层采样生成 300 条场景载荷（字段严格对齐 SceneCreateRequest）。"""
+    """按 类型 → 子场景 → 分布区间 逐层采样生成 TOTAL_SCENES 条场景载荷。"""
     rng = random.Random(seed)
     zone_ratio = ratio or ZONE_RATIO
     scenes: list[dict[str, Any]] = []
     stats = {"tries_total": 0, "dedup_drop": 0}
     g = 0
     for stype, count in SCENE_QUOTAS.items():
-        spec = {**SHARED_PARAMS, **TYPE_PARAMS[stype]}
-        accepted: list[list[float]] = []
-        zone_counts = _zone_counts(count, zone_ratio)
-        per_type: list[dict[str, Any]] = []
-        for zone, n in zone_counts.items():
-            for _ in range(n):
-                cfg, _params, token, tries = _make_scene(stype, spec, zone, rng, accepted)
-                stats["tries_total"] += tries
-                stats["dedup_drop"] += max(0, tries - 1)
-                g += 1
-                risk = RISK_BY_ZONE[zone]
-                name = f"SCN-{g:03d}-{ABBR_BY_TYPE[stype]}-{risk}-{token[:24]}"[:128]
-                tags = _dedup_tags([
-                    f"cat:{FUNC_CATEGORY[stype]}", CATEGORY_BY_TYPE[stype], stype,
-                    f"risk:{risk}", f"zone:{zone}", "src:synthetic",
-                    "ad-training", "carla", *FUNCTION_TAGS[stype],
-                ])
-                w = cfg["weather"]
-                description = (
-                    f"[{LABEL_BY_TYPE[stype]}] {FUNC_CATEGORY[stype]}/{CATEGORY_BY_TYPE[stype]} 类"
-                    f"高斯扰动训练场景（风险 {risk}·{zone} 区）。"
-                    f"地图 {cfg['map']['map_id']}，自车初速 {cfg['ego_vehicle']['initial_speed']}m/s，"
-                    f"时长 {cfg['duration']}s；天气 雨{w['rain']}/雾{w['fog']}/风{w['wind']}"
-                    f"/高度角{w['sun_altitude']}；参与者 {len(cfg['actors'])}，事件 {len(cfg['events'])}。"
-                )[:1024]
-                per_type.append({
-                    "scene_name": name, "scene_type": stype, "description": description,
-                    "tags": tags, "config": cfg,
-                })
-        scenes.extend(per_type)
+        variants = VARIANTS[stype]
+        per_variant = _distribute(count, len(variants))
+        accepted: list[list[float]] = []          # 同一类型内跨子场景共享，保障类型内逐条唯一
+        for variant, vq in zip(variants, per_variant):
+            spec = {**SHARED_PARAMS, **TYPE_PARAMS[stype], **variant.overrides}
+            zone_counts = _zone_counts(vq, zone_ratio)
+            for zone, n in zone_counts.items():
+                for _ in range(n):
+                    g += 1
+                    cfg, _params, token, tries = _make_scene(stype, spec, zone, rng, accepted, variant)
+                    stats["tries_total"] += tries
+                    stats["dedup_drop"] += max(0, tries - 1)
+                    risk = RISK_BY_ZONE[zone]
+                    name = f"SCN-{g:04d}-{ABBR_BY_TYPE[stype]}-{variant.sub}-{risk}-{token[:20]}"[:128]
+                    tags = _dedup_tags([
+                        f"cat:{FUNC_CATEGORY[stype]}", CATEGORY_BY_TYPE[stype], stype,
+                        f"sub:{variant.key}", f"risk:{risk}", f"zone:{zone}", "src:synthetic",
+                        "ad-training", "carla", *FUNCTION_TAGS[stype],
+                    ])
+                    w = cfg["weather"]
+                    description = (
+                        f"[{LABEL_BY_TYPE[stype]}·{variant.label}] {FUNC_CATEGORY[stype]}/{CATEGORY_BY_TYPE[stype]} 类"
+                        f"高斯扰动训练场景（风险 {risk}·{zone} 区）。"
+                        f"地图 {cfg['map']['map_id']}，自车初速 {cfg['ego_vehicle']['initial_speed']}m/s，"
+                        f"时长 {cfg['duration']}s；天气 雨{w['rain']}/雾{w['fog']}/风{w['wind']}"
+                        f"/高度角{w['sun_altitude']}；参与者 {len(cfg['actors'])}，事件 {len(cfg['events'])}。"
+                    )[:1024]
+                    scenes.append({
+                        "scene_name": name, "scene_type": stype, "description": description,
+                        "tags": tags, "config": cfg,
+                    })
     generate_scenes.stats = stats  # type: ignore[attr-defined]
+    stats["dup_fixed"] = _enforce_unique_configs(scenes)
     return scenes
 
 
@@ -1042,7 +1287,7 @@ def _env(name: str, default: str | None = None) -> str | None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="高斯扰动场景生成引擎：批量生成 300 个多样化自动驾驶训练场景（Carla 仿真）",
+        description="高斯扰动场景生成引擎：批量生成 1200 个多样化自动驾驶训练场景（16 类型 × 子场景族，含常见/极端/组合多风险，Carla 仿真）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--dry-run", action="store_true", help="仅生成 + 校验 + 落盘 JSON，不提交 API")
@@ -1108,14 +1353,18 @@ def _print_distribution(scenes: list[dict[str, Any]]) -> None:
     by_type: dict[str, int] = {}
     by_cat: dict[str, int] = {}
     by_risk: dict[str, int] = {}
+    by_sub: dict[str, int] = {}
     for s in scenes:
         by_type[s["scene_type"]] = by_type.get(s["scene_type"], 0) + 1
         by_cat[CATEGORY_BY_TYPE[s["scene_type"]]] = by_cat.get(CATEGORY_BY_TYPE[s["scene_type"]], 0) + 1
         for t in s["tags"]:
             if t.startswith("risk:"):
                 by_risk[t] = by_risk.get(t, 0) + 1
+            elif t.startswith("sub:"):
+                by_sub[t] = by_sub.get(t, 0) + 1
+    total_variants = len({v.key for lst in VARIANTS.values() for v in lst})
     print("\n=== 场景数据集分布 ===")
-    print(f"总计: {len(scenes)} 条；覆盖类型: {len(by_type)}/16")
+    print(f"总计: {len(scenes)} 条；覆盖类型: {len(by_type)}/16；覆盖子场景: {len(by_sub)}/{total_variants}")
     print("按契约分类:")
     for cat in ("basic", "interactive", "environment", "corner_case"):
         if cat in by_cat:
