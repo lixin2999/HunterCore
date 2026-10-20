@@ -6,7 +6,7 @@
  *      展示：台账基本信息 + 接入配置摘要 + 4 步 provisioning 时间线 + 行内动作（下载 bundle / 重发口令 / 重发证书 / 修改台账）
  * 路由参数：vehicle_id（对齐 RESTful 路径段）
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { useRoute } from 'vue-router'
 
@@ -33,19 +33,20 @@ import { HunterApiError } from '@/utils/error-code'
 import { formatDateTimeString, formatRelativeTime } from '@/utils/format'
 
 const route = useRoute()
-const vehicleId = String(route.params.vehicle_id ?? '')
+// 路由参数必须保持响应式：组件实例在参数切换时会被复用（同一 route record + MainLayout keep-alive）
+const vehicleId = computed<string>(() => String(route.params.vehicle_id ?? ''))
 
 const loading = ref(false)
 const detail = ref<VehicleDetail | null>(null)
 
 async function load(): Promise<void> {
-  if (!vehicleId) {
+  if (!vehicleId.value) {
     ElMessage.error('缺少 vehicle_id')
     return
   }
   loading.value = true
   try {
-    detail.value = await getVehicle(vehicleId)
+    detail.value = await getVehicle(vehicleId.value)
   } catch (error) {
     ElMessage.error(error instanceof HunterApiError ? error.message : '车辆详情加载失败')
   } finally {
@@ -53,7 +54,7 @@ async function load(): Promise<void> {
   }
 }
 
-onMounted(load)
+/* 数据加载由文末 watch(vehicleId, …, immediate) 触发 */
 
 /* ------------------------------ 时间线：4 步固定顺序 ------------------------------ */
 interface TimelineItem {
@@ -116,7 +117,7 @@ const kafkaPropertiesPreview = computed(() => {
 async function handleRotate(): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      `将为 ${vehicleId} 生成新的 SCRAM 口令；旧口令立即失效，车端需同步替换 kafka.properties。是否继续？`,
+      `将为 ${vehicleId.value} 生成新的 SCRAM 口令；旧口令立即失效，车端需同步替换 kafka.properties。是否继续？`,
       '重发 SCRAM 口令',
       { type: 'warning', confirmButtonText: '确认重置', cancelButtonText: '取消' },
     )
@@ -124,7 +125,7 @@ async function handleRotate(): Promise<void> {
     return
   }
   try {
-    const result = await rotateScram(vehicleId)
+    const result = await rotateScram(vehicleId.value)
     revealedPassword.value = result.scram_password
     await load()
   } catch (error) {
@@ -142,7 +143,7 @@ const downloading = ref(false)
 async function handleDownload(): Promise<void> {
   downloading.value = true
   try {
-    const { blob, filename } = await downloadBundle(vehicleId)
+    const { blob, filename } = await downloadBundle(vehicleId.value)
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
@@ -171,7 +172,7 @@ async function handleReissueCert(): Promise<void> {
     return
   }
   try {
-    const result = await reissueCert(vehicleId)
+    const result = await reissueCert(vehicleId.value)
     ElMessage.success(`证书已重签（新序列号 ${result.device_cert_sn}）`)
     await load()
   } catch (error) {
@@ -219,7 +220,7 @@ async function submitEdit(): Promise<void> {
   }
   editSubmitting.value = true
   try {
-    await patchVehicle(vehicleId, { ...editForm })
+    await patchVehicle(vehicleId.value, { ...editForm })
     ElMessage.success('台账信息已更新')
     editVisible.value = false
     await load()
@@ -240,6 +241,21 @@ const fenceText = computed(() => {
     return String(v.fence_json)
   }
 })
+
+/**
+ * onMounted 在组件复用时不会重跑（MainLayout keep-alive + 同 route record），
+ * 必须 watch vehicle_id 重新拉取，否则切换车辆时详情停留在上一台车的数据。
+ */
+watch(
+  vehicleId,
+  (id) => {
+    if (!id) return
+    detail.value = null
+    revealedPassword.value = ''
+    void load()
+  },
+  { immediate: true },
+)
 </script>
 
 <template>

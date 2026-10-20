@@ -285,7 +285,7 @@ def _sample_param(rng: random.Random, name: str, p: Param, zone: str, coherent: 
         sign = rng.choice((-1, 1))
     val = _clamp(p.mean + sign * mag * p.std, p.lo, p.hi)
     if p.discrete:
-        val = float(int(round(val)))
+        val = float(round(val))
         val = _clamp(val, p.lo, p.hi)
     return val
 
@@ -327,15 +327,13 @@ def _feasible(stype: str, p: dict[str, float]) -> bool:
         return False
     if stype == "foggy" and p["vis_dist"] < stop_dist:
         return False
-    if stype == "sensor_failure" and p["fail_x"] < stop_dist:
-        return False
-    return True
+    return not (stype == "sensor_failure" and p["fail_x"] < stop_dist)
 
 
 def _zone_counts(total: int, ratio: dict[str, float]) -> OrderedDict[str, int]:
     """按比例把类型配额拆到三个分布区间，舍入余数补给 common（和恒等于 total）。"""
     keys = ("common", "edge", "longtail")
-    counts = {k: int(round(total * ratio.get(k, 0.0))) for k in keys}
+    counts = {k: round(total * ratio.get(k, 0.0)) for k in keys}
     counts["common"] += total - sum(counts.values())   # 舍入余数归常用
     if counts["common"] < 0:                            # 极端舍入致常用为负时回补
         deficit = -counts["common"]
@@ -439,7 +437,7 @@ def _a_straight(p):
 
 def _a_curve(p):
     speed, steer = p["ego_speed"], p["steer_mag"]
-    curve = _CURVES[int(round((steer - 0.1) / 0.85 * 3)) % 4]
+    curve = _CURVES[round((steer - 0.1) / 0.85 * 3) % 4]
     signed = -steer if curve in ("left", "hairpin") else steer
     actors = [_vehicle("oncoming", 50.0 + speed * 3, -3.5, "lane_follow", yaw=PI, target_speed=round(speed * 0.8, 2))]
     events = [_event("ev-curve-limit", "collision", f"ego.lateral.accel > {round(3.0 + steer * 3, 2)}", "speed_limit", target_speed=round(speed, 2))]
@@ -477,7 +475,7 @@ def _a_cut_in(p):
 
 
 def _a_pedestrian(p):
-    speed, n, ps, dist = p["ego_speed"], int(p["n_ped"]), p["ped_speed"], p["cross_dist"]
+    n, ps, dist = int(p["n_ped"]), p["ped_speed"], p["cross_dist"]
     actors = [_pedestrian(f"ped-{k + 1}", dist + k * 1.5, -6.0 - k * 0.6, speed=round(ps + 0.1 * k, 2)) for k in range(n)]
     events = [_event("ev-ped-crossing", "pedestrian_crossing", f"ego.position.x > {round(dist - 5, 1)}", "stop", min_safe_distance=2.0)]
     return actors, events, 0.0, f"{n}ped-{ps:.1f}"
@@ -485,7 +483,7 @@ def _a_pedestrian(p):
 
 def _a_intersection(p):
     speed, cs, dist = p["ego_speed"], p["cross_speed"], p["cross_dist"]
-    maneuver = _MANEUVERS[int(round(speed)) % 4]
+    maneuver = _MANEUVERS[round(speed) % 4]
     actors = [
         _vehicle("cross-vehicle-1", dist, -8.0, "forward", yaw=PI / 2, target_speed=round(cs, 2)),
         _vehicle("cross-vehicle-2", dist, 8.0, "forward", yaw=-PI / 2, target_speed=round(cs * 0.9, 2)),
@@ -496,7 +494,7 @@ def _a_intersection(p):
 
 
 def _a_construction(p):
-    speed, n, dist = p["ego_speed"], int(p["n_bar"]), p["bar_dist"]
+    n, dist = int(p["n_bar"]), p["bar_dist"]
     actors = [_static(f"barrier-{k + 1}", dist + k * 4.0, 1.8, kind="construction") for k in range(n)]
     actors.append(_vehicle("worker-vehicle", dist + n * 4.0 + 8.0, 3.5, "static"))
     events = [_event("ev-detour", "obstacle_appearance", f"ego.position.x > {round(dist - 6, 1)}", "lane_change", target_lane="left", complete_in=6.0)]
@@ -541,7 +539,7 @@ def _a_emergency(p):
 
 
 def _a_obstacle(p):
-    speed, ax = p["ego_speed"], p["appear_x"]
+    ax = p["appear_x"]
     kind = _OBSTACLE_KINDS[int(p["kind_idx"]) % len(_OBSTACLE_KINDS)]
     actors = [_static("sudden-obstacle", ax, 0.4, kind=kind)]
     events = [_event("ev-obstacle", "obstacle_appearance", f"ego.position.x > {round(ax - 4, 1)}", "emergency_stop")]
@@ -654,7 +652,7 @@ def generate_scenes(seed: int | None = None, ratio: dict[str, float] | None = No
         per_type: list[dict[str, Any]] = []
         for zone, n in zone_counts.items():
             for _ in range(n):
-                cfg, params, token, tries = _make_scene(stype, spec, zone, rng, accepted)
+                cfg, _params, token, tries = _make_scene(stype, spec, zone, rng, accepted)
                 stats["tries_total"] += tries
                 stats["dedup_drop"] += max(0, tries - 1)
                 g += 1
@@ -959,6 +957,82 @@ async def submit_scenes(scenes: list[dict[str, Any]], args: argparse.Namespace) 
     return {**stats, "failed_total": len(failures)}
 
 
+async def publish_drafts(args: argparse.Namespace) -> dict[str, int]:
+    """分批修复通道：分页拉取全部 draft 场景并逐一发布（不新建）。
+
+    背景：gateway 模式会话为 Redis ``session:{user_id}`` 单会话全等比较——任何同用户重登录/
+    前端刷新都会覆盖会话使脚本 token 即刻 401/1001（典型时序：创建已全部成功、发布窗口内被覆盖）。
+    重新登录后重跑本通道即可把存量 draft 全部闭环，无需重建场景。"""
+    import httpx
+
+    stats = {"published": 0, "failed": 0}
+    failures: list[str] = []
+    sem = asyncio.Semaphore(max(1, args.concurrency))
+    limiter = _RateLimiter(args.qps)
+    async with httpx.AsyncClient() as client:
+        if args.mode == "gateway":
+            token = await _login_gateway(client, args)
+            headers = _make_header_factory(args, token)
+        else:
+            headers = _make_header_factory(args, None)
+        drafts: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            await limiter.acquire()
+            async with sem:
+                resp = await client.get(f"{args.base_url}/api/v1/scene",
+                                        params={"status": "draft", "page": page, "page_size": 200},
+                                        headers=headers(), timeout=args.timeout)
+            body = _safe_json(resp) or {}
+            if resp.status_code != 200 or body.get("code") != 0:
+                print(f"[error] 拉取 draft 列表失败：HTTP {resp.status_code} "
+                      f"code={body.get('code')} msg={body.get('message')}", file=sys.stderr)
+                return stats
+            data = body.get("data") or {}
+            drafts.extend(data.get("items") or [])
+            if page * 200 >= int(data.get("total") or 0):
+                break
+            page += 1
+        print(f"[publish-drafts] 命中 draft 场景 {len(drafts)} 条，开始发布（qps={args.qps}）")
+
+        async def _pub(item: dict[str, Any]) -> None:
+            scene_id = item.get("scene_id")
+            name = item.get("scene_name") or str(scene_id)
+            if not scene_id:
+                stats["failed"] += 1
+                failures.append(f"{name}: 列表项缺少 scene_id")
+                return
+            for attempt in range(args.max_retries + 1):
+                await limiter.acquire()
+                async with sem:
+                    try:
+                        resp = await client.post(f"{args.base_url}/api/v1/scene/{scene_id}/publish",
+                                                 headers=headers(), timeout=args.timeout)
+                    except Exception:  # noqa: BLE001 - 传输层异常统一重试
+                        await asyncio.sleep(_retry_delay(None, attempt, args))
+                        continue
+                body = _safe_json(resp) or {}
+                if resp.status_code in (200, 201) and body.get("code") == 0:
+                    stats["published"] += 1
+                    return
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(_retry_delay(resp, attempt, args))
+                    continue
+                stats["failed"] += 1
+                failures.append(f"{name}: HTTP {resp.status_code} code={body.get('code')} "
+                                f"msg={body.get('message')}")
+                return
+            stats["failed"] += 1
+            failures.append(f"{name}: 重试耗尽")
+
+        await asyncio.gather(*(_pub(i) for i in drafts))
+    if failures:
+        print("\n[failures]（前 30 条）", file=sys.stderr)
+        for f in failures[:30]:
+            print("  - " + f, file=sys.stderr)
+    return stats
+
+
 # =====================================================================
 # 九、CLI
 # =====================================================================
@@ -985,6 +1059,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--username", default=_env("HUNTER_BATCH_USERNAME", ""), help="gateway 模式登录用户名")
     p.add_argument("--password", default=_env("HUNTER_BATCH_PASSWORD", ""), help="gateway 模式登录密码")
     p.add_argument("--publish", action="store_true", help="创建后立即发布（draft→published，需 execute 权限）")
+    p.add_argument("--publish-drafts", action="store_true",
+                   help="分批修复通道：仅列出并发布全部 draft 场景（不新建）——提交窗口内会话被覆盖"
+                        "（gateway 单会话语义，旧 token 即刻 401/1001）导致部分未发布时重跑本项闭环")
     p.add_argument("--seed", type=int, default=None, help="随机种子（复现任意一批生成结果，设计文档 §九.5）")
     p.add_argument("--ratio", default="", help="分布比例 common:edge:longtail，如 0.6:0.3:0.1（缺省内置）")
     p.add_argument("--concurrency", type=int, default=5, help="并发提交数（配合 --qps 使用）")
@@ -1099,7 +1176,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     # 提交依赖前置检查（dry-run 不需要）：避免生成/校验跑完后才在 submit 深处报 ModuleNotFoundError
-    if not args.dry_run:
+    if not args.dry_run or args.publish_drafts:
         try:
             import httpx  # noqa: F401
         except ImportError:
@@ -1108,6 +1185,12 @@ def main(argv: list[str] | None = None) -> int:
                   "        sudo apt-get install -y python3-httpx\n"
                   "        （dry-run 不依赖 httpx，可先 --dry-run 验证生成与校验）", file=sys.stderr)
             return 2
+
+    # 分批修复通道：不生成/不新建，直接把存量 draft 全部发布
+    if args.publish_drafts:
+        pd = asyncio.run(publish_drafts(args))
+        print(f"\n=== 补发布结果 === 已发布: {pd['published']}  失败: {pd['failed']}")
+        return 1 if pd["failed"] else 0
 
     scenes = generate_scenes(seed=args.seed, ratio=_parse_ratio(args.ratio))
     scenes = _filter_types(scenes, args.only_type)

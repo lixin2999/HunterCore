@@ -10,7 +10,7 @@
  * - POST /api/v1/scene/{scene_id}/run
  * 说明：参数字段与 config_json 结构严格对齐 SceneConfig（字段名不可更改）。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
@@ -164,7 +164,19 @@ async function handleRun(): Promise<void> {
   }
 }
 
-void loadScene()
+/**
+ * 路由参数变化时组件实例会被复用（同一 route record + MainLayout keep-alive），
+ * setup / onMounted 不会重跑——必须 watch scene_id 重新拉取，否则切换场景时详情停留在上一条数据。
+ */
+watch(
+  sceneId,
+  (id) => {
+    if (!id) return
+    scene.value = null
+    void loadScene()
+  },
+  { immediate: true },
+)
 </script>
 
 <template>

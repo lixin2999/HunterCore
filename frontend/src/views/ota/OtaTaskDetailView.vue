@@ -8,7 +8,7 @@
  * - POST .../start|pause|resume|cancel|rollback（见 OtaTasksView 说明）
  * 阈值：任一批次成功率 < 95% 时服务端将 next_action 置为 halt（前端只展示，不自行判定）。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
@@ -154,10 +154,23 @@ async function handleRollback(): Promise<void> {
   }
 }
 
-onMounted(async () => {
-  await vehicleStore.fetchVehicles()
-  await Promise.all([loadTask(), loadRecords()])
+onMounted(() => {
+  void vehicleStore.fetchVehicles()
 })
+
+/**
+ * 路由参数变化时组件实例会被复用（同一 route record + MainLayout keep-alive），
+ * onMounted 不会重跑——必须 watch task_id 重新拉取任务与升级记录。
+ */
+watch(
+  taskId,
+  (id) => {
+    if (!id) return
+    task.value = null
+    void Promise.all([loadTask(), loadRecords()])
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
