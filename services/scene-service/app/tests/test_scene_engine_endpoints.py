@@ -12,7 +12,7 @@ from uuid import uuid4
 from httpx import AsyncClient
 
 from app.scene_engine.catalog import CATALOG, CATALOG_VERSION
-from app.tests.conftest import ADMIN_HEADERS, OPERATOR_HEADERS, VIEWER_HEADERS
+from app.tests.conftest import ADMIN_HEADERS, OPERATOR_HEADERS, REVIEWER_HEADERS, VIEWER_HEADERS
 
 RESPONSE_FIELDS = {"code", "message", "data", "request_id", "timestamp"}
 SCENE_BASE = "/api/v1/scene"
@@ -142,11 +142,11 @@ async def test_dryrun_applies_overrides_and_renders_config(client: AsyncClient) 
     resp = await client.post(
         f"{SCENE_BASE}/logical/LS-INT-001/dryrun",
         headers=ADMIN_HEADERS,
-        json={"values": {"v0": 10.0}},
+        json={"values": {"v0": 0.4}},
     )
     assert resp.status_code == 200
     data = _data(resp)
-    assert data["values"]["v0"] == 10.0
+    assert data["values"]["v0"] == 0.4
     assert data["passed"] is True, data["failures"]
     assert {"map", "ego_vehicle", "actors"} <= set(data["scene_config"])
     assert len(data["gates"]) == 7
@@ -430,7 +430,7 @@ async def test_suite_lock_baseline_and_diff(client: AsyncClient) -> None:
     locked = _data(
         await client.post(
             f"{SCENE_BASE}/suites/{suite_id}/lock",
-            headers=OPERATOR_HEADERS,
+            headers=REVIEWER_HEADERS,
             json={"baseline_name": "baseline-2026-10", "metrics": {"pass_rate": 0.97}},
         )
     )
@@ -454,7 +454,7 @@ async def test_suite_lock_baseline_and_diff(client: AsyncClient) -> None:
     assert diff["added"] == diff["removed"] == diff["changed"] == []
 
     relock = await client.post(
-        f"{SCENE_BASE}/suites/{suite_id}/lock", headers=OPERATOR_HEADERS, json={}
+        f"{SCENE_BASE}/suites/{suite_id}/lock", headers=REVIEWER_HEADERS, json={}
     )
     assert relock.status_code == 409
     _assert_envelope(relock.json(), code=3003)

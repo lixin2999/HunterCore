@@ -11,25 +11,19 @@ from pathlib import Path
 import pytest
 
 from app.models.scene_engine import (
+    SCENE_ENGINE_MODELS,
     Avoidability,
-    BaselineLock,
-    ConcreteScenario,
     ConcreteScenarioStatus,
     CriticalityLevel,
     GenerationProfile,
     GenerationStrategy,
-    GenerationTask,
     GenerationTaskStatus,
-    LogicalScenario,
     LogicalScenarioStatus,
     RarityZone,
     RiskLevel,
-    ScenarioSuite,
-    SuiteItem,
     SuiteItemType,
     SuiteStatus,
 )
-from app.models.scene_engine import TestCase as TestCaseModel
 from app.models.scene_engine import TestCaseStatus as TestCaseStatusEnum
 
 DDL_PATH = (
@@ -47,15 +41,8 @@ CONSTRAINT_HEAD_RE = re.compile(
     r"(PRIMARY KEY|CHECK|CONSTRAINT|FOREIGN|UNIQUE)\b", re.IGNORECASE
 )
 
-ORM_MODELS = [
-    LogicalScenario,
-    ConcreteScenario,
-    TestCaseModel,
-    ScenarioSuite,
-    SuiteItem,
-    BaselineLock,
-    GenerationTask,
-]
+#: 逐表对照清单直接取自 models 导元组，避免新增表时漏更本文件而“假绿”
+ORM_MODELS: list[type] = list(SCENE_ENGINE_MODELS)
 
 #: 枚举列 → StrEnum（TEXT + CHECK 表示，与 StrEnumType(impl=Text) 对齐）
 ENUM_CHECK_MAP: dict[tuple[str, str], type] = {

@@ -1,26 +1,33 @@
 """scene_engine 仓储的内存替身（与 ``app/repositories/engine.py`` 同方法签名）。
 
 只实现服务层实际调用的方法；行为对齐真实 SQL 的关键语义：
-- 逻辑场景按 (logical_id, version) upsert、列表每 ID 取最近更新；
+- 逻辑场景按 (logical_id, version) upsert（status 不参与更新）、列表每 ID 取最近更新；
 - 具体场景按 content_hash 去重；
 - 测试集名称/用例编号唯一冲突抛 3002；
-- 测试集条目按 (suite_id, item_id) upsert。
+- 测试集条目按 (suite_id, item_id) upsert；draft 校验与锁定均为单步原子操作；
+- 生成任务归属/协作取消/启动对账与真实 SQL 同语义。
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import hashlib
+import json
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 from hunter_common.exceptions import ResourceAlreadyExistsError
 
 from app.models.scene_engine import (
+    AuditLog,
     BaselineLock,
     ConcreteScenario,
     GenerationTask,
+    GenerationTaskStatus,
     LogicalScenario,
     ScenarioSuite,
     SuiteItem,
+    SuiteStatus,
     TestCase,
 )
 
@@ -42,6 +49,10 @@ class InMemoryLogicalScenarioRepository:
     async def upsert(self, row: Any) -> None:
         values = dict(row)
         values.setdefault("create_time", _now())
+        existing = self.rows.get((values["logical_id"], values["version"]))
+        if existing is not None:
+            # 与真实 SQL 一致：status 不参与更新（已发布保持 published）
+            values["status"] = existing.status
         values["update_time"] = _now()
         self.rows[(values["logical_id"], values["version"])] = LogicalScenario(**values)
 
@@ -96,8 +107,9 @@ class InMemoryConcreteScenarioRepository:
     def __init__(self) -> None:
         self.rows: dict[UUID, ConcreteScenario] = {}
 
-    async def create_many(self, rows: Any) -> list[ConcreteScenario]:
-        created: list[ConcreteScenario] = []
+    async def create_many(self, rows: Any) -> list[UUID]:
+        """与真实仓储同签名：仅哈希冲突行跳过，返回已入库 scenario_id 列表。"""
+        created: list[UUID] = []
         hashes = {str(row.content_hash).strip() for row in self.rows.values()}
         for payload in rows:
             digest = str(payload["content_hash"]).strip()
@@ -110,8 +122,11 @@ class InMemoryConcreteScenarioRepository:
             values.setdefault("update_time", _now())
             row = ConcreteScenario(**values)
             self.rows[row.scenario_id] = row
-            created.append(row)
+            created.append(row.scenario_id)
         return created
+
+    async def get_many(self, scenario_ids: Any) -> dict[UUID, ConcreteScenario]:
+        return {sid: self.rows[sid] for sid in scenario_ids if sid in self.rows}
 
     async def get(self, scenario_id: UUID) -> ConcreteScenario | None:
         return self.rows.get(scenario_id)
@@ -150,12 +165,21 @@ class InMemoryConcreteScenarioRepository:
             counts[key] = counts.get(key, 0) + 1
         return counts
 
-    async def risk_counts(self) -> dict[str, int]:
+    async def risk_counts(self, *, logical_id: str | None = None) -> dict[str, int]:
         counts: dict[str, int] = {}
         for row in self.rows.values():
+            if logical_id is not None and row.logical_id != logical_id:
+                continue
             key = _value(row.risk_level)
             counts[key] = counts.get(key, 0) + 1
         return counts
+
+    async def zone_counts_by_logical(self) -> dict[tuple[str, str], int]:
+        grouped: dict[tuple[str, str], int] = {}
+        for row in self.rows.values():
+            key = (row.logical_id, _value(row.rarity_zone))
+            grouped[key] = grouped.get(key, 0) + 1
+        return grouped
 
     async def latest(self, logical_id: str) -> ConcreteScenario | None:
         rows = [row for row in self.rows.values() if row.logical_id == logical_id]
@@ -205,6 +229,55 @@ class InMemoryGenerationTaskRepository:
             rows = [row for row in rows if _value(row.status) == status]
         start = (page - 1) * page_size
         return rows[start : start + page_size], len(rows)
+
+    async def claim(self, task_id: UUID, owner_id: str) -> GenerationTask | None:
+        """抢占任务：仅 pending/running 且归属为空或本实例（与真实 SQL 同语义）。"""
+        row = self.rows.get(task_id)
+        if row is None:
+            return None
+        if _value(row.status) not in {
+            GenerationTaskStatus.PENDING.value,
+            GenerationTaskStatus.RUNNING.value,
+        }:
+            return None
+        owner = getattr(row, "owner_id", None)
+        if owner is not None and owner != owner_id:
+            return None
+        row.status = GenerationTaskStatus.RUNNING.value  # type: ignore[assignment]
+        row.owner_id = owner_id
+        row.progress = 0.01
+        row.update_time = _now()
+        return row
+
+    async def request_cancel(self, task_id: UUID) -> GenerationTask | None:
+        row = self.rows.get(task_id)
+        if row is None:
+            return None
+        if _value(row.status) == GenerationTaskStatus.PENDING.value:
+            row.status = GenerationTaskStatus.CANCELED.value  # type: ignore[assignment]
+        elif _value(row.status) == GenerationTaskStatus.RUNNING.value:
+            row.cancel_requested = True
+        row.update_time = _now()
+        return row
+
+    async def is_cancel_requested(self, task_id: UUID) -> bool:
+        row = self.rows.get(task_id)
+        return bool(row is not None and getattr(row, "cancel_requested", False))
+
+    async def reconcile_stale(self, *, stale_seconds: int) -> int:
+        cutoff = _now() - timedelta(seconds=max(int(stale_seconds), 1))
+        count = 0
+        for row in self.rows.values():
+            if _value(row.status) not in {
+                GenerationTaskStatus.PENDING.value,
+                GenerationTaskStatus.RUNNING.value,
+            }:
+                continue
+            if row.update_time < cutoff:
+                row.status = GenerationTaskStatus.FAILED.value  # type: ignore[assignment]
+                row.error_message = "任务失联：实例重启或心跳超时，启动对账已置 failed（可重新提交）"
+                count += 1
+        return count
 
 
 class InMemoryTestCaseRepository:
@@ -328,8 +401,113 @@ class InMemorySuiteRepository:
         rows = [row for row in self.baselines.values() if row.suite_id == suite_id]
         return sorted(rows, key=lambda row: row.create_time, reverse=True)
 
+    async def add_items_if_draft(
+        self, suite_id: UUID, items: Sequence[Mapping[str, Any]]
+    ) -> str:
+        row = self.suites.get(suite_id)
+        if row is None:
+            return "missing"
+        if _value(row.status) != SuiteStatus.DRAFT.value:
+            return "conflict"
+        await self.add_items(suite_id, items)
+        return "ok"
+
+    async def lock_with_baseline(
+        self,
+        suite_id: UUID,
+        *,
+        digest_fn: Callable[[Sequence[Mapping[str, Any]]], str],
+        baseline_name: str | None,
+        metrics: Mapping[str, Any],
+        user_id: str,
+    ) -> tuple[str, str | None, int]:
+        row = self.suites.get(suite_id)
+        if row is None:
+            return "missing", None, 0
+        status = _value(row.status)
+        if status == SuiteStatus.LOCKED.value:
+            digest = str(row.lock_hash).strip() if row.lock_hash else None
+            return "locked", digest, 0
+        if status == SuiteStatus.ARCHIVED.value:
+            return "archived", None, 0
+        items = await self.list_items(suite_id)
+        if not items:
+            return "empty", None, 0
+        fingerprints = [
+            {
+                "item_id": item.item_id,
+                "item_type": _value(item.item_type),
+                "ref_id": item.ref_id,
+                "weight": float(item.weight),
+            }
+            for item in items
+        ]
+        digest = digest_fn(fingerprints)
+        row.status = SuiteStatus.LOCKED.value  # type: ignore[assignment]
+        row.lock_hash = digest
+        row.locked_at = _now()
+        row.locked_by = user_id
+        row.update_time = _now()
+        if baseline_name:
+            await self.create_baseline(
+                suite_id=suite_id,
+                name=baseline_name,
+                suite_hash=digest,
+                metrics={**dict(metrics), "items": fingerprints},
+                locked_by=user_id,
+            )
+        return "ok", digest, len(items)
+
+
+class InMemoryAuditLogRepository:
+    """审计日志内存替身（保留哈希链计算口径供断言）。"""
+
+    def __init__(self) -> None:
+        self.rows: list[AuditLog] = []
+
+    async def append(
+        self,
+        *,
+        action: str,
+        target_type: str,
+        target_id: str,
+        actor: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "action": action,
+                "target_type": target_type,
+                "target_id": target_id,
+                "actor": actor,
+                "payload": dict(payload or {}),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        prev_hash = (
+            str(self.rows[-1].entry_hash).strip() if self.rows else "0" * 64
+        )
+        entry_hash = hashlib.sha256(f"{prev_hash}:{canonical}".encode()).hexdigest()
+        self.rows.append(
+            AuditLog(
+                audit_id=len(self.rows) + 1,
+                action=action,
+                target_type=target_type,
+                target_id=target_id,
+                actor=actor,
+                payload=dict(payload or {}),
+                prev_hash=prev_hash,
+                entry_hash=entry_hash,
+                create_time=_now(),
+            )
+        )
+        return entry_hash
+
 
 __all__ = [
+    "InMemoryAuditLogRepository",
     "InMemoryConcreteScenarioRepository",
     "InMemoryGenerationTaskRepository",
     "InMemoryLogicalScenarioRepository",

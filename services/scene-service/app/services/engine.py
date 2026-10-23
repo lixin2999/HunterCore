@@ -16,6 +16,7 @@ import hashlib
 import json
 import random
 from collections.abc import Mapping, Sequence
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
 from uuid import UUID
 
@@ -39,15 +40,16 @@ from app.models.scene_engine import (
     TestCaseStatus,
 )
 from app.repositories.engine import (
+    AuditLogRepository,
     ConcreteScenarioRepository,
     GenerationTaskRepository,
     LogicalScenarioRepository,
     SuiteRepository,
     TestCaseRepository,
-    utcnow,
 )
 from app.scene_engine.catalog import CATALOG, CATALOG_BY_ID, CATALOG_VERSION
 from app.scene_engine.compiler import compile_scene, default_values
+from app.scene_engine.esmini import EsminiRunner
 from app.scene_engine.generator import (
     PROFILE_QUOTAS,
     GenerationOptions,
@@ -57,6 +59,7 @@ from app.scene_engine.generator import (
 from app.scene_engine.ir import IR_VERSION, SceneIR
 from app.scene_engine.oracles import ORACLE_BY_REF, list_oracles
 from app.scene_engine.validators import ir_content_hash
+from app.scene_engine.vehicle_params import VehicleParams, get_vehicle_params
 from app.schemas.engine import (
     BatchValidateData,
     BatchValidateItem,
@@ -89,6 +92,17 @@ logger = get_logger("app.services.engine")
 SYSTEM_CREATOR = "system"
 #: 生成任务进度回写的最小间隔（百分比）
 PROGRESS_STEP = 0.1
+
+
+class GenerationCanceled(Exception):
+    """协作式取消：工作线程在进度回调中发现 cancel_requested 后中止。"""
+
+
+def _safe_error_message(exc: Exception) -> str:
+    """写回任务的错误摘要（业务错误保留，未知异常不泄露堆栈/SQL）。"""
+    if isinstance(exc, (ValueError, InvalidParameterError, ResourceStateConflictError)):
+        return str(exc)[:300]
+    return f"{type(exc).__name__}: 生成失败（详见服务日志）"
 
 
 def _enum_value(value: Any) -> str:
@@ -124,6 +138,7 @@ class SceneEngineService:
         settings: Settings,
         *,
         generator: SceneGenerator | None = None,
+        audit_repository: AuditLogRepository | None = None,
     ) -> None:
         self._logical = logical_repository
         self._concrete = concrete_repository
@@ -131,10 +146,27 @@ class SceneEngineService:
         self._testcases = testcase_repository
         self._suites = suite_repository
         self._settings = settings
+        self._audit_repository = audit_repository
+        self._owner = settings.task_owner
         allowed_maps = settings.allowed_map_set or None
+        # 车辆物理能力为进程级事实来源：缺失/非法即启动失败，禁止回退硬编码默认值
+        self._vehicle: VehicleParams = get_vehicle_params()
+        self._bounds = settings.map_bounds
+        self._esmini = (
+            EsminiRunner(
+                settings.scene_esmini_bin,
+                timeout_seconds=settings.scene_esmini_timeout_seconds,
+            )
+            if settings.scene_esmini_bin.strip()
+            else None
+        )
         self._generator = generator or SceneGenerator(
             max_duration=settings.scene_duration_max_seconds,
             allowed_maps=allowed_maps,
+            vehicle=self._vehicle,
+            bounds=self._bounds,
+            esmini=self._esmini,
+            esmini_ratio=settings.scene_esmini_sample_ratio,
         )
         self._allowed_maps = allowed_maps
 
@@ -214,7 +246,7 @@ class SceneEngineService:
                     LogicalVersionSummary(
                         version=CATALOG_VERSION,
                         status=LogicalScenarioStatus.PUBLISHED.value,
-                        content_hash=ir_content_hash(ir),
+                        content_hash=ir_content_hash(ir, CATALOG_VERSION),
                         origin="catalog",
                     )
                 )
@@ -230,6 +262,13 @@ class SceneEngineService:
         for ir in CATALOG:
             await self._logical.upsert(self._ir_row(ir, CATALOG_VERSION, created_by=created_by))
             synced.append(ir.logical_id)
+        await self._audit(
+            "sync_catalog",
+            "catalog",
+            CATALOG_VERSION,
+            created_by,
+            {"synced": len(synced)},
+        )
         return {"version": CATALOG_VERSION, "synced": len(synced), "logical_ids": synced}
 
     async def validate(
@@ -244,9 +283,14 @@ class SceneEngineService:
                 values,
                 max_duration=self._settings.scene_duration_max_seconds,
                 allowed_maps=self._allowed_maps,
+                vehicle=self._vehicle,
+                bounds=self._bounds,
+                esmini=self._esmini,
             )
             gates = [
-                GateItem(gate=item.gate, passed=item.passed, message=item.message)
+                GateItem(
+                    gate=item.gate, passed=item.passed, message=item.message, skipped=item.skipped
+                )
                 for item in compilation.report.gates
             ]
             failures = list(compilation.report.failures)
@@ -289,6 +333,9 @@ class SceneEngineService:
                 merged,
                 max_duration=self._settings.scene_duration_max_seconds,
                 allowed_maps=self._allowed_maps,
+                vehicle=self._vehicle,
+                bounds=self._bounds,
+                esmini=self._esmini,
             )
         except ValueError as exc:
             raise InvalidParameterError(str(exc), details={"logical_id": logical_id}) from exc
@@ -299,14 +346,18 @@ class SceneEngineService:
             values=compilation.values,
             scene_config=compilation.config,
             gates=[
-                GateItem(gate=item.gate, passed=item.passed, message=item.message)
+                GateItem(
+                    gate=item.gate, passed=item.passed, message=item.message, skipped=item.skipped
+                )
                 for item in compilation.report.gates
             ],
             failures=list(compilation.report.failures),
         )
 
-    async def publish(self, logical_id: str, version: str | None = None) -> PublishData:
-        """发布逻辑场景（目录项先落库再置 published）。"""
+    async def publish(
+        self, logical_id: str, version: str | None = None, user_id: str = SYSTEM_CREATOR
+    ) -> PublishData:
+        """发布逻辑场景（目录项先落库再置 published；需评审权限 + 审计留痕）。"""
         ir, resolved_version, _, row = await self._load_ir(logical_id, version)
         if row is None:
             await self._logical.upsert(
@@ -323,6 +374,13 @@ class SceneEngineService:
             )
             if not updated:
                 raise ResourceNotFoundError("逻辑场景不存在", details={"logical_id": logical_id})
+        await self._audit(
+            "publish",
+            "logical_scenario",
+            f"{logical_id}@{resolved_version}",
+            user_id,
+            {"content_hash": ir_content_hash(ir, resolved_version)},
+        )
         return PublishData(
             logical_id=logical_id,
             version=resolved_version,
@@ -339,7 +397,7 @@ class SceneEngineService:
         """创建异步生成任务（校验请求早失败，返回 pending 任务）。"""
         ir, resolved_version, _, _ = await self._load_ir(request.logical_id, request.logical_version)
         try:
-            ensure_overrides_shape(request.overrides)
+            ensure_overrides_shape(request.overrides, ir)
         except ValueError as exc:
             raise InvalidParameterError(str(exc), details={"overrides": request.overrides}) from exc
         if request.strategy == GenerationStrategy.REPLAY_MUTATION and not request.overrides.get("base"):
@@ -371,17 +429,38 @@ class SceneEngineService:
         )
 
     async def execute_generation_task(self, task_id: UUID) -> None:
-        """执行生成任务（BackgroundTasks 调用；异常写回 failed 不抛出）。"""
-        task = await self._tasks.get(task_id)
+        """执行生成任务（BackgroundTasks 调用；抢占归属、异常写回、支持协作取消）。"""
+        task = await self._tasks.claim(task_id, self._owner)
         if task is None:
-            logger.warning("generation_task_missing", task_id=str(task_id))
+            logger.info("generation_task_not_claimed", task_id=str(task_id), owner=self._owner)
             return
-        if _enum_value(task.status) not in {
-            GenerationTaskStatus.PENDING.value,
-            GenerationTaskStatus.RUNNING.value,
-        }:
-            return
-        await self._tasks.update(task_id, status=GenerationTaskStatus.RUNNING.value, progress=0.01)
+        progress_state = {"last": 0.0}
+        loop = asyncio.get_running_loop()
+
+        def check_canceled() -> None:
+            """工作线程内的跨线程取消回查（不得在事件循环线程内调用）。"""
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._tasks.is_cancel_requested(task_id), loop
+                )
+                if future.result(timeout=2.0):
+                    raise GenerationCanceled
+            except (RuntimeError, FutureTimeoutError):  # pragma: no cover - 事件循环忙/已关闭
+                pass
+
+        def on_progress(done: int, total: int) -> None:
+            ratio = min(max(done / max(total, 1), 0.0), 0.99)
+            if ratio - progress_state["last"] < PROGRESS_STEP:
+                return
+            progress_state["last"] = ratio
+            check_canceled()
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._tasks.update(task_id, progress=round(ratio, 3)), loop
+                )
+            except RuntimeError:  # pragma: no cover - 事件循环已关闭
+                pass
+
         try:
             ir, resolved_version, _, _ = await self._load_ir(task.logical_id, task.logical_version)
             options = GenerationOptions(
@@ -392,24 +471,16 @@ class SceneEngineService:
                 seed=int(task.seed),
                 overrides=dict(task.overrides or {}),
             )
-            progress_state = {"last": 0.0}
-            loop = asyncio.get_running_loop()
-
-            def on_progress(done: int, total: int) -> None:
-                ratio = min(max(done / max(total, 1), 0.0), 0.99)
-                if ratio - progress_state["last"] < PROGRESS_STEP:
-                    return
-                progress_state["last"] = ratio
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        self._tasks.update(task_id, progress=round(ratio, 3)), loop
-                    )
-                except RuntimeError:  # pragma: no cover - 事件循环已关闭
-                    pass
-
+            # 开跑前回查必须在事件循环内直接 await：从循环线程内 call
+            # ``run_coroutine_threadsafe(...).result()`` 会自阻塞至超时并静默吞掉取消请求
+            if await self._tasks.is_cancel_requested(task_id):
+                raise GenerationCanceled
             outcome = await asyncio.to_thread(
                 self._generator.generate, ir, options, on_progress=on_progress
             )
+            # 取消发生在产物入库前：丢弃本轮结果，避免“已取消但新增场景”
+            if await self._tasks.is_cancel_requested(task_id):
+                raise GenerationCanceled
             rows = [{**row, "task_id": task_id} for row in outcome.rows]
             created = await self._concrete.create_many(rows) if rows else []
             if len(created) != len(rows):
@@ -419,9 +490,14 @@ class SceneEngineService:
                     requested=len(rows),
                     inserted=len(created),
                 )
+            canceled = await self._tasks.is_cancel_requested(task_id)
             await self._tasks.update(
                 task_id,
-                status=GenerationTaskStatus.SUCCEEDED.value,
+                status=(
+                    GenerationTaskStatus.CANCELED.value
+                    if canceled
+                    else GenerationTaskStatus.SUCCEEDED.value
+                ),
                 progress=1.0,
                 produced=len(created),
                 duplicates=outcome.duplicates,
@@ -430,13 +506,32 @@ class SceneEngineService:
                 zone_counts=outcome.zone_counts,
                 error_message=None,
             )
+        except GenerationCanceled:
+            logger.info("generation_task_canceled", task_id=str(task_id))
+            await self._tasks.update(
+                task_id,
+                status=GenerationTaskStatus.CANCELED.value,
+                error_message=None,
+            )
         except Exception as exc:
             logger.exception("generation_task_failed", task_id=str(task_id))
             await self._tasks.update(
                 task_id,
                 status=GenerationTaskStatus.FAILED.value,
-                error_message=str(exc)[:500],
+                error_message=_safe_error_message(exc),
             )
+
+    async def reconcile_generation_tasks(self) -> int:
+        """启动对账：把心跳超时的 pending/running 任务置 failed（多副本不误伤活跃任务）。"""
+        stale_seconds = int(getattr(self._settings, "scene_task_stale_seconds", 900))
+        try:
+            count = await self._tasks.reconcile_stale(stale_seconds=stale_seconds)
+        except (SQLAlchemyError, OSError):  # pragma: no cover - 未初始化 schema 时跳过
+            logger.warning("generation_task_reconcile_skipped")
+            return 0
+        if count:
+            logger.warning("generation_task_reconciled", count=count, owner=self._owner)
+        return count
 
     async def get_task(self, task_id: UUID) -> Any:
         task = await self._tasks.get(task_id)
@@ -450,13 +545,11 @@ class SceneEngineService:
         return await self._tasks.list_page(page=page, page_size=page_size, status=status)
 
     async def cancel_task(self, task_id: UUID) -> Any:
-        """取消任务：仅 pending 可取消；运行中返回 3003（进程内任务无法安全中断）。"""
+        """取消任务：pending 直接 canceled；running 置 cancel_requested（协作式中止）。"""
         task = await self._tasks.get(task_id)
         if task is None:
             raise ResourceNotFoundError("生成任务不存在", details={"task_id": str(task_id)})
         status = _enum_value(task.status)
-        if status == GenerationTaskStatus.PENDING.value:
-            return await self._tasks.update(task_id, status=GenerationTaskStatus.CANCELED.value)
         if status in {
             GenerationTaskStatus.SUCCEEDED.value,
             GenerationTaskStatus.FAILED.value,
@@ -465,9 +558,10 @@ class SceneEngineService:
             raise ResourceStateConflictError(
                 f"任务已结束（{status}），不可取消", details={"task_id": str(task_id)}
             )
-        raise ResourceStateConflictError(
-            "任务执行中不可取消（进程内生成不支持安全中断）", details={"task_id": str(task_id)}
-        )
+        updated = await self._tasks.request_cancel(task_id)
+        if updated is None:  # pragma: no cover - 并发删除的极端情况
+            raise ResourceNotFoundError("生成任务不存在", details={"task_id": str(task_id)})
+        return updated
 
     # =================================================================
     # 三、具体场景
@@ -520,6 +614,9 @@ class SceneEngineService:
             values,
             max_duration=self._settings.scene_duration_max_seconds,
             allowed_maps=self._allowed_maps,
+            vehicle=self._vehicle,
+            bounds=self._bounds,
+            esmini=self._esmini,
         )
         return {
             "scenario_id": row.scenario_id,
@@ -527,41 +624,54 @@ class SceneEngineService:
             "content_hash": str(row.content_hash).strip(),
             "scene_config": compilation.config,
             "gates": [
-                GateItem(gate=item.gate, passed=item.passed, message=item.message)
+                GateItem(
+                    gate=item.gate, passed=item.passed, message=item.message, skipped=item.skipped
+                )
                 for item in compilation.report.gates
             ],
             "passed": compilation.passed,
         }
 
     async def batch_validate(self, scenario_ids: Sequence[UUID]) -> BatchValidateData:
-        """批量复检：逐条重跑 G1-G7，通过写 validated，失败写 quarantined。"""
-        items: list[BatchValidateItem] = []
-        valid_ids: list[UUID] = []
-        invalid_ids: list[UUID] = []
-        for scenario_id in scenario_ids:
-            row = await self._concrete.get(scenario_id)
+        """批量复检：重跑 G1-G7，通过写 validated / 失败写 quarantined。
+
+        两页优化：①一次 `get_many` 取行（避免逐 ID N+1）；②复检含编译与（可选）esmini
+        子进程，属阻塞操作 → 放到线程并以信号量限并发，避免卡住事件循环。
+        """
+        rows_map = await self._concrete.get_many(list(scenario_ids))
+        semaphore = asyncio.Semaphore(max(1, self._settings.scene_validate_concurrency))
+
+        async def one(scenario_id: UUID) -> tuple[BatchValidateItem, bool]:
+            row = rows_map.get(scenario_id)
             if row is None:
-                items.append(
+                return (
                     BatchValidateItem(
                         scenario_id=scenario_id,
                         passed=False,
                         failures=["3001: 具体场景不存在"],
                         status=ConcreteScenarioStatus.QUARANTINED.value,
-                    )
+                    ),
+                    False,
                 )
-                continue
-            passed, failures = await self._validate_concrete_row(row)
+            async with semaphore:
+                passed, failures = await self._validate_concrete_row(row)
             status = (
                 ConcreteScenarioStatus.VALIDATED.value
                 if passed
                 else ConcreteScenarioStatus.QUARANTINED.value
             )
-            items.append(
+            return (
                 BatchValidateItem(
                     scenario_id=scenario_id, passed=passed, failures=failures, status=status
-                )
+                ),
+                passed,
             )
-            (valid_ids if passed else invalid_ids).append(scenario_id)
+
+        # gather 保留输入顺序（响应 items 与请求 scenario_ids 对齐）
+        results = await asyncio.gather(*(one(scenario_id) for scenario_id in scenario_ids))
+        items = [item for item, _ in results]
+        valid_ids = [item.scenario_id for item, passed in results if passed]
+        invalid_ids = [item.scenario_id for item, passed in results if not passed]
         if valid_ids:
             await self._concrete.update_statuses(valid_ids, ConcreteScenarioStatus.VALIDATED.value)
         if invalid_ids:
@@ -571,15 +681,24 @@ class SceneEngineService:
         )
 
     async def _validate_concrete_row(self, row: Any) -> tuple[bool, list[str]]:
+        """复检单条具体场景（重跑 G1-G7）。
+
+        ``compile_scene`` 可能触发 esmini 子进程（同步阻塞），因此放到线程执行，
+        避免批量复检占满事件循环而拖累其他请求。
+        """
         ir = await self._ir_or_none(row.logical_id, row.logical_version)
         if ir is None:
             return False, ["G1: 逻辑场景 IR 不存在，无法复检"]
         try:
-            compilation = compile_scene(
+            compilation = await asyncio.to_thread(
+                compile_scene,
                 ir,
                 dict(row.param_values or {}),
                 max_duration=self._settings.scene_duration_max_seconds,
                 allowed_maps=self._allowed_maps,
+                vehicle=self._vehicle,
+                bounds=self._bounds,
+                esmini=self._esmini,
             )
         except ValueError as exc:
             return False, [f"G1: {exc}"]
@@ -675,13 +794,6 @@ class SceneEngineService:
         self, suite_id: UUID, request: SuiteItemsRequest
     ) -> SuiteDetailData:
         """加条目（仅 draft 可改；引用必须存在，item_id 冲突则覆盖）。"""
-        row = await self._suites.get(suite_id)
-        if row is None:
-            raise ResourceNotFoundError("测试集不存在", details={"suite_id": str(suite_id)})
-        if _enum_value(row.status) != SuiteStatus.DRAFT.value:
-            raise ResourceStateConflictError(
-                "测试集已锁定/归档，条目不可变更", details={"suite_id": str(suite_id)}
-            )
         validated: list[dict[str, Any]] = []
         for item in request.items:
             await self._ensure_item_ref(item)
@@ -693,18 +805,14 @@ class SceneEngineService:
                     "weight": item.weight,
                 }
             )
-        await self._suites.add_items(
-            suite_id,
-            [
-                {
-                    "item_id": item["item_id"],
-                    "item_type": item["item_type"],
-                    "ref_id": item["ref_id"],
-                    "weight": item["weight"],
-                }
-                for item in validated
-            ],
-        )
+        # 引用校验与写入分离；写入在单事务内行锁校验 draft，避免“读时 draft、写时已锁定”
+        outcome = await self._suites.add_items_if_draft(suite_id, validated)
+        if outcome == "missing":
+            raise ResourceNotFoundError("测试集不存在", details={"suite_id": str(suite_id)})
+        if outcome != "ok":
+            raise ResourceStateConflictError(
+                "测试集已锁定/归档，条目不可变更", details={"suite_id": str(suite_id)}
+            )
         return await self.get_suite(suite_id)
 
     async def _ensure_item_ref(self, item: SuiteItemInput) -> None:
@@ -734,48 +842,40 @@ class SceneEngineService:
     async def lock_suite(
         self, suite_id: UUID, *, baseline_name: str | None, metrics: dict[str, Any], user_id: str
     ) -> SuiteLockData:
-        """锁定测试集（写 lock_hash/locked_at），可选创建基线快照。"""
-        row = await self._suites.get(suite_id)
-        if row is None:
+        """锁定测试集（行锁单事务：校验状态 → 读条目 → 写 hash → 可选基线）。"""
+        outcome, digest, item_count = await self._suites.lock_with_baseline(
+            suite_id,
+            digest_fn=suite_hash,
+            baseline_name=baseline_name,
+            metrics=dict(metrics),
+            user_id=user_id,
+        )
+        if outcome == "missing":
             raise ResourceNotFoundError("测试集不存在", details={"suite_id": str(suite_id)})
-        if _enum_value(row.status) == SuiteStatus.LOCKED.value:
+        if outcome == "locked":
             raise ResourceStateConflictError(
                 "测试集已锁定", details={"suite_id": str(suite_id)}
             )
-        items = await self._suites.list_items(suite_id)
-        if not items:
-            raise ResourceStateConflictError("测试集为空，不能锁定", details={"suite_id": str(suite_id)})
-        fingerprints = [
-            {
-                "item_id": item.item_id,
-                "item_type": _enum_value(item.item_type),
-                "ref_id": item.ref_id,
-                "weight": float(item.weight),
-            }
-            for item in items
-        ]
-        digest = suite_hash(fingerprints)
-        locked_at = utcnow()
-        await self._suites.update(
-            suite_id,
-            status=SuiteStatus.LOCKED.value,
-            lock_hash=digest,
-            locked_at=locked_at,
-            locked_by=user_id,
-        )
-        if baseline_name:
-            await self._suites.create_baseline(
-                suite_id=suite_id,
-                name=baseline_name,
-                suite_hash=digest,
-                metrics={**dict(metrics), "items": fingerprints},
-                locked_by=user_id,
+        if outcome == "archived":
+            raise ResourceStateConflictError(
+                "测试集已归档，不能锁定", details={"suite_id": str(suite_id)}
             )
+        if outcome == "empty":
+            raise ResourceStateConflictError(
+                "测试集为空，不能锁定", details={"suite_id": str(suite_id)}
+            )
+        await self._audit(
+            "suite_lock",
+            "scenario_suite",
+            str(suite_id),
+            user_id,
+            {"lock_hash": digest, "item_count": item_count, "baseline": baseline_name},
+        )
         return SuiteLockData(
             suite_id=suite_id,
             status=SuiteStatus.LOCKED.value,
-            lock_hash=digest,
-            item_count=len(fingerprints),
+            lock_hash=digest or "",
+            item_count=item_count,
             baseline_name=baseline_name,
         )
 
@@ -863,7 +963,7 @@ class SceneEngineService:
 
     async def coverage_overview(self, logical_id: str | None = None) -> CoverageOverviewData:
         zone_counts = await self._concrete.zone_counts(logical_id=logical_id)
-        risk_counts = await self._concrete.risk_counts()
+        risk_counts = await self._concrete.risk_counts(logical_id=logical_id)
         total = sum(zone_counts.values())
         ratio = {
             zone: (round(count / total, 4) if total else 0.0)
@@ -883,8 +983,13 @@ class SceneEngineService:
         if ratios is None:
             raise InvalidParameterError(f"未知剖面: {profile}", details={"profile": profile})
         items: list[CoverageGapData] = []
+        grouped = await self._concrete.zone_counts_by_logical()
         for ir in CATALOG:
-            counts = await self._concrete.zone_counts(logical_id=ir.logical_id)
+            counts = {
+                zone: count
+                for (logical_id, zone), count in grouped.items()
+                if logical_id == ir.logical_id
+            }
             total = sum(counts.values())
             base = max(total, 50)
             for zone in ("Z3", "Z4"):
@@ -943,12 +1048,36 @@ class SceneEngineService:
             return None
         return ir
 
+    async def _audit(
+        self,
+        action: str,
+        target_type: str,
+        target_id: str,
+        actor: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> None:
+        """写追加式审计；审计失败不阻断业务，但必须留日志告警。"""
+        if not self._settings.scene_audit_enabled or self._audit_repository is None:
+            return
+        try:
+            await self._audit_repository.append(
+                action=action,
+                target_type=target_type,
+                target_id=target_id,
+                actor=actor,
+                payload=payload,
+            )
+        except (SQLAlchemyError, OSError):  # pragma: no cover - 审计表缺失/盘故障
+            logger.exception(
+                "scene_audit_failed", action=action, target_id=target_id, actor=actor
+            )
+
     def _ir_row(
         self,
         ir: SceneIR,
         version: str,
         *,
-        status: LogicalScenarioStatus = LogicalScenarioStatus.PUBLISHED,
+        status: LogicalScenarioStatus = LogicalScenarioStatus.DRAFT,
         created_by: str = SYSTEM_CREATOR,
     ) -> dict[str, Any]:
         return {
@@ -961,7 +1090,7 @@ class SceneEngineService:
             "ir_version": IR_VERSION,
             "ir_json": ir.model_dump(mode="json"),
             "status": status.value,
-            "content_hash": ir_content_hash(ir),
+            "content_hash": ir_content_hash(ir, version),
             "tags": list(ir.tags),
             "created_by": created_by,
         }
@@ -979,7 +1108,7 @@ class SceneEngineService:
             oracle_ref=ir.oracle_ref,
             parameter_count=len(ir.parameters),
             tags=list(ir.tags),
-            content_hash=ir_content_hash(ir),
+            content_hash=ir_content_hash(ir, CATALOG_VERSION),
             origin="catalog",
         )
 
@@ -996,7 +1125,7 @@ class SceneEngineService:
             oracle_ref=ir.oracle_ref,
             parameter_count=len(ir.parameters),
             tags=list(ir.tags),
-            content_hash=ir_content_hash(ir),
+            content_hash=ir_content_hash(ir, version),
             origin=origin,  # type: ignore[arg-type]
             ir=ir.model_dump(mode="json"),
             parameters=[

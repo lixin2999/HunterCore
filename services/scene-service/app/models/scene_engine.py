@@ -168,7 +168,6 @@ class LogicalScenario(Base):
     __tablename__ = "logical_scenarios"
     __table_args__ = (
         PrimaryKeyConstraint("logical_id", "version", name="pk_logical_scenarios"),
-        UniqueConstraint("content_hash", name="uq_logical_scenarios_hash"),
         CheckConstraint(
             "status IN ('draft', 'validating', 'pending_review', 'published', "
             "'quarantined', 'deprecated', 'archived', 'rejected')",
@@ -181,6 +180,7 @@ class LogicalScenario(Base):
         ),
         Index("idx_logical_scenarios_scene_type", "scene_type", text("version DESC")),
         Index("idx_logical_scenarios_status", "status", text("update_time DESC")),
+        Index("idx_logical_scenarios_hash", "content_hash"),
         {"schema": SCENE_ENGINE_SCHEMA},
     )
 
@@ -193,7 +193,7 @@ class LogicalScenario(Base):
     ir_version: Mapped[str] = mapped_column(Text, nullable=False)
     ir_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     status: Mapped[LogicalScenarioStatus] = mapped_column(
-        StrEnumType(LogicalScenarioStatus), nullable=False, server_default=text("'published'")
+        StrEnumType(LogicalScenarioStatus), nullable=False, server_default=text("'draft'")
     )
     content_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
     tags: Mapped[list[str]] = mapped_column(
@@ -487,12 +487,46 @@ class GenerationTask(Base):
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    owner_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     created_by: Mapped[str] = mapped_column(Text, nullable=False)
     create_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     update_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+# =====================================================================
+# 8. 审计日志（追加式哈希链）
+# =====================================================================
+
+
+class AuditLog(Base):
+    """追加式审计（发布/基线锁定/目录同步；entry_hash 依赖上一条 prev_hash）。"""
+
+    __tablename__ = "audit_logs"
+    __table_args__ = (
+        PrimaryKeyConstraint("audit_id", name="pk_audit_logs"),
+        Index("idx_audit_logs_target", "target_type", "target_id", text("create_time DESC")),
+        {"schema": SCENE_ENGINE_SCHEMA},
+    )
+
+    audit_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    target_type: Mapped[str] = mapped_column(Text, nullable=False)
+    target_id: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    prev_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    entry_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    create_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 
@@ -505,10 +539,12 @@ SCENE_ENGINE_MODELS: tuple[type[Base], ...] = (
     SuiteItem,
     BaselineLock,
     GenerationTask,
+    AuditLog,
 )
 
 __all__ = [
     "SCENE_ENGINE_MODELS",
+    "AuditLog",
     "Avoidability",
     "BaselineLock",
     "ConcreteScenario",

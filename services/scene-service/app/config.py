@@ -8,6 +8,9 @@
 """
 from __future__ import annotations
 
+import os
+import socket
+
 from hunter_common.config import HunterBaseConfig
 
 
@@ -59,13 +62,32 @@ class Settings(HunterBaseConfig):
     scene_generation_max_count: int = 5000
     # 地图白名单（G3；逗号分隔，空 = 不限制，具体部署可按开放区域收紧）
     scene_allowed_maps: str = ""
+    # 地图几何围栏（G3；"xmin,ymin,xmax,ymax"，空 = 不校验）
+    scene_map_bounds: str = ""
+    # 车端车辆参数文件（vehicle_params 导出）；空 = 使用包内 config/vehicle_params.json
+    scene_vehicle_params_path: str = ""
+    # esmini 干跑（G5）：可执行文件/命令前缀；空 = 未部署，G5 标记 skipped（不计失败）
+    scene_esmini_bin: str = ""
+    scene_esmini_timeout_seconds: float = 10.0
+    # 生成时 esmini 抽样比例（0~1；validate/dryrun/复检始终全量干跑）
+    scene_esmini_sample_ratio: float = 0.05
+    # 生成任务归属实例（空 = POD_NAME / hostname）；用于启动对账与取消归属
+    scene_task_owner: str = ""
+    # 任务心跳超时秒数：超过则该 pending/running 任务视为失联，启动时对账置 failed
+    scene_task_stale_seconds: int = 300
+    # 批量复检并发上限（含编译与 esmini 子进程，属阻塞操作 → 线程池限流）
+    scene_validate_concurrency: int = 4
     # 内置 IR 目录版本（与 scene_engine.catalog.CATALOG_VERSION 一致性由测试钉住）
-    scene_catalog_version: str = "1.0.0"
+    scene_catalog_version: str = "1.0.1"
 
     # ---------- RBAC（网关注入 X-Roles；资源域 scene，契约 securitySchemes.bearerAuth） ----------
     scene_read_roles: str = "admin,analyst,operator"
     scene_write_roles: str = "admin,operator"
     scene_execute_roles: str = "admin,operator"
+    # 发布/基线锁定需评审角色（设计 §9.2：reviewer/admin）
+    scene_review_roles: str = "admin,reviewer"
+    # 追加式审计（发布/锁定/目录同步）；哈希链防篡改
+    scene_audit_enabled: bool = True
     # 数据权限隔离（契约：creator 参数「数据权限隔离时由服务端强制注入」）；
     # 默认关闭 = 场景库为团队共享资源，开启后非豁免角色仅可见/可查自有场景
     scene_scope_by_creator: bool = False
@@ -100,6 +122,33 @@ class Settings(HunterBaseConfig):
     def scene_execute_role_set(self) -> frozenset[str]:
         """scene:execute 授权角色集合（发布/下发 Carla 仿真）。"""
         return self._role_set(self.scene_execute_roles)
+
+    @property
+    def scene_review_role_set(self) -> frozenset[str]:
+        """评审授权角色集合（发布/基线锁定）。"""
+        return self._role_set(self.scene_review_roles)
+
+    @property
+    def map_bounds(self) -> tuple[float, float, float, float] | None:
+        """G3 地图几何围栏（xmin, ymin, xmax, ymax）；空/非法 = 不校验。"""
+        parts = [item.strip() for item in self.scene_map_bounds.split(",") if item.strip()]
+        if len(parts) != 4:
+            return None
+        try:
+            xmin, ymin, xmax, ymax = (float(item) for item in parts)
+        except ValueError:
+            return None
+        if xmin >= xmax or ymin >= ymax:
+            return None
+        return xmin, ymin, xmax, ymax
+
+    @property
+    def task_owner(self) -> str:
+        """任务归属实例标识（配置优先，其次 POD_NAME / hostname）。"""
+        configured = self.scene_task_owner.strip()
+        if configured:
+            return configured
+        return os.getenv("POD_NAME") or socket.gethostname()
 
     @property
     def scene_scope_exempt_role_set(self) -> frozenset[str]:

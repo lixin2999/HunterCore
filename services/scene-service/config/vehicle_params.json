@@ -1,0 +1,11 @@
+{
+  "profile": "HUNTER_SE",
+  "wheelbase_m": 0.46,
+  "min_turn_radius_m": 1.9,
+  "max_steer_deg": 22.0,
+  "max_decel_mps2": 1.5,
+  "max_speed_mps": 4.8,
+  "max_lateral_accel_mps2": 4.0,
+  "source": "vehicle_params export (L=0.46m / R_min=1.9m / max inner steer=22deg / brake_decel=1.5mps2 / v_max=4.8mps)",
+  "updated_at": "2026-10-23"
+}

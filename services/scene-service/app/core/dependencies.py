@@ -90,6 +90,21 @@ def require_execute_permission(
     return user_id
 
 
+def require_review_permission(
+    principals: Annotated[tuple[str, frozenset[str]], Depends(_require_forwarded_auth)],
+) -> str:
+    """评审授权（设计 §9.2：发布逻辑场景 / 锁定基线需 reviewer|admin）。
+
+    与 ``scene:execute`` 分离：能生成场景不等于能发布/锁基线，避免写入未经评审的快照。
+    """
+    user_id, roles = principals
+    if not roles & settings.scene_review_role_set:
+        raise PermissionDeniedError(
+            message=f"无权限：发布/基线锁定需要角色 {sorted(settings.scene_review_role_set)}"
+        )
+    return user_id
+
+
 def trace_request_id() -> str:
     """响应体 request_id（复用链路 trace_id，兜底 UUID4）。"""
     return get_trace_id() or str(uuid4())
@@ -131,6 +146,7 @@ __all__ = [
     "require_execute_permission",
     "require_read_permission",
     "require_read_principals",
+    "require_review_permission",
     "require_write_permission",
     "trace_request_id",
 ]

@@ -5,7 +5,8 @@ IR 只描述**可参数化的逻辑场景**，不绑定具体参数值：
 - ``correlations``：高斯 Copula 的相关对（ρ ∈ (-1, 1)）；
 - ``constraints``：线性约束（含单参数边界），生成时拒绝不可行样本（G2）；
 - ``bindings``：参数 → ``SceneConfig`` 字段路径的算术表达式（编译为具体场景）；
-- ``criticality``：临界度计算所需动力学参数（v²、安全距离、最大减速度、轴距/最大转角）。
+- ``criticality``：临界度计算所需参数名与安全余量；物理能力（a_max/轴距/最大转角）
+  来自车端 ``vehicle_params``，不写入 IR。
 
 表达式求值只允许数字、参数名与 ``+ - * / ** () min max abs``（AST 白名单），
 禁止属性访问/函数调用/名称注入。
@@ -139,17 +140,23 @@ class BindingIR(BaseModel):
 
 
 class CriticalityIR(BaseModel):
-    """临界度/运动学校验参数（§2.3、G4）。"""
+    """临界度/运动学校验参数（§2.3、G4）。
+
+    物理能力字段（``max_decel``/``wheelbase``/``max_steer_rad``/``max_lateral_accel``）
+    仅为兼容 V1.23.0 已发布快照保留，**不再参与计算**；运行时一律以车端
+    ``vehicle_params``（``app.scene_engine.vehicle_params``）为准。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     speed_param: str | None = Field(default=None, description="速度参数名（计算 a_req = v²/2(d-d_m)）")
     gap_param: str | None = Field(default=None, description="净距参数名（米）")
-    max_decel: float = Field(default=8.0, gt=0, le=15, description="自车最大减速度 a_max（m/s²）")
     d_margin: float = Field(default=1.0, ge=0, le=5, description="安全余量 d_m（m）")
-    wheelbase: float = Field(default=2.7, gt=0, le=6, description="轴距（m）")
-    max_steer_rad: float = Field(default=0.6, gt=0, le=1.2, description="最大前轮转角（rad）")
-    max_lateral_accel: float = Field(default=4.0, gt=0, le=10, description="横向加速度上限（m/s²）")
+    # ---- 兼容字段：V1.23.0 快照可能带值，运行时忽略，物理参数以 vehicle_params 为准 ----
+    max_decel: float | None = Field(default=None, gt=0, le=15, description="[已废弃] 请用 vehicle_params.max_decel_mps2")
+    wheelbase: float | None = Field(default=None, gt=0, le=6, description="[已废弃] 请用 vehicle_params.wheelbase_m")
+    max_steer_rad: float | None = Field(default=None, gt=0, le=1.2, description="[已废弃] 请用 vehicle_params.max_steer_deg")
+    max_lateral_accel: float | None = Field(default=None, gt=0, le=10, description="[已废弃] 请用 vehicle_params.max_lateral_accel_mps2")
 
 
 class SceneIR(BaseModel):

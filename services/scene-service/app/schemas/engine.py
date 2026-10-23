@@ -97,6 +97,10 @@ class GateItem(BaseModel):
     gate: str = Field(description="G1-G8")
     passed: bool
     message: str
+    skipped: bool = Field(
+        default=False,
+        description="该门未执行（如 esmini 未部署）；skipped 不计入失败，但必须在报告中显式标注",
+    )
 
 
 class ValidationReportData(BaseModel):
@@ -199,6 +203,8 @@ class GenerationTaskData(BaseModel):
     zone_quota: dict[str, int] = Field(default_factory=dict)
     zone_counts: dict[str, int] = Field(default_factory=dict)
     error_message: str | None = None
+    owner_id: str | None = Field(default=None, description="执行该任务的实例标识（多副本归属/对账）")
+    cancel_requested: bool = Field(default=False, description="是否已请求协作式取消")
     created_by: str
     create_time: datetime | None = None
     update_time: datetime | None = None

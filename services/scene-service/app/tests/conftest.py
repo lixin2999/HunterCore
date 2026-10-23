@@ -3,7 +3,7 @@
 - ``scene_env``：把替身仓储/缓存/存储/Carla 客户端装配进 ``app.state``（与 lifespan 结构一致），
   路由经 ``Depends`` 读取，测试可整体替换；
 - ``client``：ASGI 测试客户端（``raise_app_exceptions=False`` 使全局 500 处理器生效）；
-- 认证头：admin（全部动作）、operator（读写执行）、viewer（无 scene 权限 → 1002）。
+- 认证头：admin（读写执行+评审）、reviewer（仅评审）、operator（读写执行）、viewer（无权限 → 1002）。
 """
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from app.tests.fakes import (
     InMemorySceneStorage,
 )
 from app.tests.fakes_engine import (
+    InMemoryAuditLogRepository,
     InMemoryConcreteScenarioRepository,
     InMemoryGenerationTaskRepository,
     InMemoryLogicalScenarioRepository,
@@ -38,6 +39,10 @@ from app.tests.fakes_engine import (
 ADMIN_HEADERS = {
     "X-User-Id": "11111111-1111-4111-8111-111111111111",
     "X-Roles": "admin",
+}
+REVIEWER_HEADERS = {
+    "X-User-Id": "44444444-4444-4444-8444-444444444444",
+    "X-Roles": "reviewer",
 }
 OPERATOR_HEADERS = {
     "X-User-Id": "22222222-2222-4222-8222-222222222222",
@@ -84,6 +89,7 @@ def scene_env() -> Iterator[SimpleNamespace]:
     task_repository = InMemoryGenerationTaskRepository()
     testcase_repository = InMemoryTestCaseRepository()
     suite_repository = InMemorySuiteRepository()
+    audit_repository = InMemoryAuditLogRepository()
     app.state.engine_service = SceneEngineService(
         logical_repository,
         concrete_repository,
@@ -91,6 +97,7 @@ def scene_env() -> Iterator[SimpleNamespace]:
         testcase_repository,
         suite_repository,
         settings,
+        audit_repository=audit_repository,
     )
     app.state.db = SimpleNamespace(check_connection=lambda: asyncio.sleep(0, result=True))
     app.state.redis = SimpleNamespace(ping=lambda: asyncio.sleep(0, result=True))
@@ -106,6 +113,7 @@ def scene_env() -> Iterator[SimpleNamespace]:
         task_repository=task_repository,
         testcase_repository=testcase_repository,
         suite_repository=suite_repository,
+        audit_repository=audit_repository,
     )
     try:
         yield state
@@ -128,6 +136,7 @@ async def client(scene_env: SimpleNamespace) -> AsyncIterator[AsyncClient]:
 __all__ = [
     "ADMIN_HEADERS",
     "OPERATOR_HEADERS",
+    "REVIEWER_HEADERS",
     "VIEWER_HEADERS",
     "client",
     "scene_env",

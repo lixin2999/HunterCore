@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import random
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,7 +26,13 @@ from app.models.scene_engine import (
     GenerationStrategy,
     RarityZone,
 )
-from app.scene_engine.ir import ExpressionError, SceneIR, compile_parameters
+from app.scene_engine.esmini import EsminiRunner
+from app.scene_engine.ir import (
+    ExpressionError,
+    ParameterIR,
+    SceneIR,
+    compile_parameters,
+)
 from app.scene_engine.stats import (
     copula_samples,
     distribution_moments,
@@ -45,6 +51,7 @@ from app.scene_engine.validators import (
     risk_level,
     run_gates,
 )
+from app.scene_engine.vehicle_params import VehicleParams, get_vehicle_params
 
 #: 剖面 → Z1-Z4 配额（§2.9；和为 1）
 PROFILE_QUOTAS: dict[str, dict[str, float]] = {
@@ -170,9 +177,17 @@ class SceneGenerator:
         *,
         max_duration: float,
         allowed_maps: frozenset[str] | None = None,
+        vehicle: VehicleParams | None = None,
+        bounds: tuple[float, float, float, float] | None = None,
+        esmini: EsminiRunner | None = None,
+        esmini_ratio: float = 0.0,
     ) -> None:
         self._max_duration = max_duration
         self._allowed_maps = allowed_maps
+        self._vehicle = vehicle or get_vehicle_params()
+        self._bounds = bounds
+        self._esmini = esmini
+        self._esmini_ratio = min(max(float(esmini_ratio), 0.0), 1.0)
 
     # ---------- 对外入口 ----------
 
@@ -223,6 +238,14 @@ class SceneGenerator:
                 config,
                 max_duration=self._max_duration,
                 allowed_maps=self._allowed_maps,
+                vehicle=self._vehicle,
+                bounds=self._bounds,
+                # 生成阶段按比例抽样干跑；validate/dryrun/复检全量
+                esmini=(
+                    self._esmini
+                    if self._esmini is not None and rng.random() < self._esmini_ratio
+                    else None
+                ),
             )
             if not report.passed:
                 rejected += 1
@@ -230,7 +253,7 @@ class SceneGenerator:
                 continue
 
             p_value, zone, _ = assess_rarity(ir, values)
-            ci = criticality_index(ir, values)
+            ci = criticality_index(ir, values, self._vehicle)
             level = criticality_level(ci)
             risk = risk_level(zone, level)
             label = avoidability_label(ci)
@@ -387,7 +410,7 @@ class SceneGenerator:
                 candidates.append(dict(zip(names, row)))
 
         def score(values: dict[str, float | str]) -> float:
-            return criticality_index(ir, values) + 0.001 * assess_rarity(ir, values)[0]
+            return criticality_index(ir, values, self._vehicle) + 0.001 * assess_rarity(ir, values)[0]
 
         candidates.sort(key=score, reverse=True)
         yield from candidates
@@ -467,12 +490,17 @@ class SceneGenerator:
     ) -> dict[str, Any]:
         numeric_vector = [float(values[parameter.name]) for parameter in ir.numeric_parameters]
         digest = content_hash(ir.logical_id, options.logical_version, values)
-        index = hash(digest) % 10000
+        # 确定性命名（禁止用内置 hash()，其受 PYTHONHASHSEED 影响，跨进程不稳定）
+        index = int(digest[:8], 16) % 10000
         allowed_modes = list(ir.allowed_modes)
+        # VIL 可用判据：模式白名单含 vil + 低风险（L1/L2）+ 高频分区（Z1/Z2）
         vil_safe = "vil" in allowed_modes and risk in {"L1", "L2"} and zone in {
             RarityZone.Z1.value,
             RarityZone.Z2.value,
         }
+        # CI 饱和：净距 <= d_margin 时 a_req 为无穷，DB 列为有限浮点→以 999.0 落库，
+        # 并用 generator.ci_saturated 区分“饱和”与“实测高临界”（下游不得将 999.0 当连续量比较）
+        ci_saturated = ci == float("inf")
         return {
             "logical_id": ir.logical_id,
             "logical_version": options.logical_version,
@@ -481,7 +509,7 @@ class SceneGenerator:
             "param_vec": numeric_vector,
             "rarity_p": round(p_value, 12),
             "rarity_zone": zone,
-            "criticality_ci": round(ci, 6) if ci != float("inf") else 999.0,
+            "criticality_ci": 999.0 if ci_saturated else round(ci, 6),
             "criticality_level": level,
             "risk_level": risk,
             "avoidability": label,
@@ -491,6 +519,9 @@ class SceneGenerator:
                 "profile": options.profile,
                 "seed": options.seed,
                 "catalog": "builtin",
+                "vehicle_profile": self._vehicle.profile,
+                "vehicle_params_hash": self._vehicle.source_hash,
+                "ci_saturated": ci_saturated,
             },
             "allowed_modes": allowed_modes,
             "vil_safe": vil_safe,
@@ -501,24 +532,143 @@ class SceneGenerator:
         }
 
 
-def ensure_overrides_shape(overrides: dict[str, Any]) -> None:
-    """overrides 结构早失败（2001），避免任务异步跑起来才报错。"""
+def _mapping_override(overrides: Mapping[str, Any], key: str) -> dict[str, Any]:
+    value = overrides.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"overrides.{key} 必须是对象")  # noqa: TRY004
+    return {str(name): item for name, item in value.items()}
+
+
+def _hard_bounds(parameter: ParameterIR) -> tuple[float, float] | None:
+    """分布声明的硬边界（low/high 或 min/max）；未声明则不做区间断言。"""
+    params = parameter.distribution.params
+    low, high = params.get("low", params.get("min")), params.get("high", params.get("max"))
+    if low is None or high is None:
+        return None
+    return float(low), float(high)
+
+
+def _ensure_parameter_value(label: str, parameter: ParameterIR, value: Any) -> None:
+    """参数取值合法性（数值落硬界内，分类值在 choices 内）。"""
+    if parameter.distribution.is_numeric:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{label} 必须是数值")
+        bounds = _hard_bounds(parameter)
+        if bounds is not None and not bounds[0] <= float(value) <= bounds[1]:
+            raise ValueError(f"{label} 越界：必须在 {bounds[0]}..{bounds[1]} 之间")
+        return
+    choices = {
+        str(item.get("value")) for item in parameter.distribution.params.get("choices") or []
+    }
+    if str(value) not in choices:
+        raise ValueError(f"{label} 取值非法，可选：{sorted(choices)}")
+
+
+def ensure_overrides_shape(overrides: Mapping[str, Any], ir: SceneIR | None = None) -> None:
+    """overrides 早失败校验（2001）：给定 IR 时同时做语义与取值域校验。
+
+    只查结构时，参数名拼错、fixed 值越界要等到异步任务跑完才表现为“0 条产物”，
+    排查成本高；传入 IR 后在创建任务时即可拒绝（包含 base/candidates 的未知键，
+    早期会被采样环节静默忽略）。
+    """
     unknown = sorted(set(overrides) - ALLOWED_OVERRIDES)
     if unknown:
         raise ValueError(f"overrides 含未支持字段: {unknown}")
-    fixed = overrides.get("fixed")
-    if fixed is not None and not isinstance(fixed, dict):
-        raise ValueError("overrides.fixed 必须是对象")
-    ranges = overrides.get("ranges")
-    if ranges is not None:
-        if not isinstance(ranges, dict):
-            raise ValueError("overrides.ranges 必须是对象")
-        for name, bounds in ranges.items():
-            if not isinstance(bounds, dict) or not {"low", "high"} & set(bounds):
-                raise ValueError(f"overrides.ranges.{name} 必须含 low/high")
+    target_zone = overrides.get("target_zone")
+    if target_zone is not None and target_zone not in {zone.value for zone in RarityZone}:
+        raise ValueError("overrides.target_zone 必须是 Z1/Z2/Z3/Z4")
+    grid_bins = overrides.get("grid_bins")
+    if grid_bins is not None and (
+        isinstance(grid_bins, bool) or not isinstance(grid_bins, int) or not 1 <= grid_bins <= 64
+    ):
+        raise ValueError("overrides.grid_bins 必须是 1..64 的整数")
+    dedup_distance = overrides.get("dedup_distance")
+    if dedup_distance is not None and (
+        isinstance(dedup_distance, bool)
+        or not isinstance(dedup_distance, (int, float))
+        or not 0.0 <= float(dedup_distance) <= 10.0
+    ):
+        raise ValueError("overrides.dedup_distance 必须在 0..10 之间")
+    mutation_scale = overrides.get("mutation_scale")
+    if mutation_scale is not None and (
+        isinstance(mutation_scale, bool)
+        or not isinstance(mutation_scale, (int, float))
+        or not 0.0 < float(mutation_scale) <= 1.0
+    ):
+        raise ValueError("overrides.mutation_scale 必须在 (0, 1] 之间")
+
+    fixed = _mapping_override(overrides, "fixed")
+    ranges = _mapping_override(overrides, "ranges")
+    base = _mapping_override(overrides, "base")
     candidates = overrides.get("candidates")
-    if candidates is not None and not isinstance(candidates, list):
-        raise ValueError("overrides.candidates 必须是数组")
+    if candidates is not None:
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError("overrides.candidates 必须是非空数组")
+        for index, candidate in enumerate(candidates):
+            if not isinstance(candidate, Mapping):
+                raise ValueError(f"overrides.candidates[{index}] 必须是对象")  # noqa: TRY004
+
+    if ir is None:
+        return
+    declared = ir.parameter_map
+    for key, section in (("fixed", fixed), ("base", base)):
+        for name, value in section.items():
+            parameter = declared.get(name)
+            if parameter is None:
+                raise ValueError(f"overrides.{key} 含未声明参数: {name}")
+            _ensure_parameter_value(f"overrides.{key}.{name}", parameter, value)
+    for name, bounds in ranges.items():
+        parameter = declared.get(name)
+        if parameter is None:
+            raise ValueError(f"overrides.ranges 含未声明参数: {name}")
+        if not parameter.distribution.is_numeric:
+            raise ValueError(f"overrides.ranges.{name} 不适用于分类参数")
+        if not bounds:
+            raise ValueError(f"overrides.ranges.{name} 必须含 low/high")
+        hard = _hard_bounds(parameter)
+        low, high = bounds.get("low"), bounds.get("high")
+        for label, value in (("low", low), ("high", high)):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"overrides.ranges.{name}.{label} 必须是数值")  # noqa: TRY004
+            if hard is not None and not hard[0] <= float(value) <= hard[1]:
+                raise ValueError(
+                    f"overrides.ranges.{name}.{label} 越界：必须在 {hard[0]}..{hard[1]} 之间"
+                )
+        if low is not None and high is not None and float(low) >= float(high):
+            raise ValueError(f"overrides.ranges.{name} 要求 low < high")
+    for index, candidate in enumerate(candidates or []):
+        unknown_keys = sorted(set(candidate) - set(declared))
+        if unknown_keys:
+            raise ValueError(f"overrides.candidates[{index}] 含未声明参数: {unknown_keys}")
+        for name, value in candidate.items():
+            _ensure_parameter_value(f"overrides.candidates[{index}].{name}", declared[name], value)
+    # fixed 同时越出线性约束时必然产出 0 条，提前拒绝（仅能全量代入时判定）
+    if fixed:
+        for constraint in ir.constraints:
+            if not set(constraint.terms) <= set(fixed):
+                continue
+            involved = [fixed[name] for name in constraint.terms]
+            if any(
+                isinstance(value, bool) or not isinstance(value, (int, float)) for value in involved
+            ):
+                continue
+            total = sum(
+                float(coefficient) * float(fixed[name])
+                for name, coefficient in constraint.terms.items()
+            )
+            violated = {
+                "<=": total > constraint.value,
+                "<": total >= constraint.value,
+                ">=": total < constraint.value,
+                ">": total <= constraint.value,
+            }[constraint.op]
+            if violated:
+                hint = constraint.message or f"{constraint.op} {constraint.value}"
+                raise ValueError(f"overrides.fixed 违反约束 {constraint.name}（{hint}）")
 
 
 def summarize_failures(failures: Iterable[str]) -> str:

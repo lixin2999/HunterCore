@@ -11,9 +11,11 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
+from app.scene_engine.esmini import EsminiRunner
 from app.scene_engine.ir import SceneIR, compile_parameters
 from app.scene_engine.stats import distribution_quantile, sample_distribution
 from app.scene_engine.validators import ValidationReport, run_gates
+from app.scene_engine.vehicle_params import VehicleParams
 
 
 class GateFailure(ValueError):
@@ -61,10 +63,22 @@ def compile_scene(
     *,
     max_duration: float,
     allowed_maps: frozenset[str] | None = None,
+    vehicle: VehicleParams | None = None,
+    bounds: tuple[float, float, float, float] | None = None,
+    esmini: EsminiRunner | None = None,
 ) -> Compilation:
     """编译并执行 G1-G7；不抛异常，由调用方决定是否拒绝。"""
     config = compile_parameters(ir, values)
-    report = run_gates(ir, values, config, max_duration=max_duration, allowed_maps=allowed_maps)
+    report = run_gates(
+        ir,
+        values,
+        config,
+        max_duration=max_duration,
+        allowed_maps=allowed_maps,
+        vehicle=vehicle,
+        bounds=bounds,
+        esmini=esmini,
+    )
     return Compilation(ir=ir, values=dict(values), config=config, report=report)
 
 
@@ -74,10 +88,19 @@ def render_scene(
     *,
     max_duration: float,
     allowed_maps: frozenset[str] | None = None,
+    vehicle: VehicleParams | None = None,
+    bounds: tuple[float, float, float, float] | None = None,
+    esmini: EsminiRunner | None = None,
 ) -> Compilation:
     """编译并要求全部闸门通过（否则抛 ``GateFailure``）。"""
     compilation = compile_scene(
-        ir, values, max_duration=max_duration, allowed_maps=allowed_maps
+        ir,
+        values,
+        max_duration=max_duration,
+        allowed_maps=allowed_maps,
+        vehicle=vehicle,
+        bounds=bounds,
+        esmini=esmini,
     )
     if not compilation.passed:
         raise GateFailure(compilation.report)

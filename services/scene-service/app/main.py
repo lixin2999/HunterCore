@@ -38,6 +38,7 @@ from app.core.error_handlers import register_exception_handlers
 from app.repositories.cache import SceneDetailCache
 from app.repositories.carla import CarlaManagementClient
 from app.repositories.engine import (
+    AuditLogRepository,
     ConcreteScenarioRepository,
     GenerationTaskRepository,
     LogicalScenarioRepository,
@@ -116,7 +117,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         TestCaseRepository(app.state.db),
         SuiteRepository(app.state.db),
         settings,
+        audit_repository=AuditLogRepository(app.state.db),
     )
+    # 启动对账：K8s 多副本下不强制单实例，失联的 pending/running 任务置 failed（可重新提交）
+    await app.state.engine_service.reconcile_generation_tasks()
 
     consumer_task: asyncio.Task[None] | None = None
     if settings.scene_extraction_consumer_enabled:

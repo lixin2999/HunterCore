@@ -37,6 +37,7 @@ from app.scene_engine.validators import (
     criticality_level,
     risk_level,
 )
+from app.scene_engine.vehicle_params import get_vehicle_params
 
 
 def _uniform_ir() -> SceneIR:
@@ -192,22 +193,57 @@ def test_rarity_zone_boundaries() -> None:
 
 
 def test_criticality_levels_and_avoidability() -> None:
-    assert criticality_level(0.1) == "C0"
-    assert criticality_level(0.4) == "C1"
-    assert criticality_level(0.7) == "C2"
-    assert criticality_level(1.2) == "C3"
-    assert criticality_level(float("inf")) == "C3"
-    assert avoidability_label(0.05) == "trivial_safe"
-    assert avoidability_label(0.5) == "avoidable"
-    assert avoidability_label(0.8) == "marginal"
-    assert avoidability_label(0.99) == "unavoidable"
+    """临界度分档 / 可避免性标签：设表驱动（设计 §2.8.1 口径 0.3 / 0.7 / 1.0，CI>1 不可避免）。"""
+    criticality_cases = [
+        (0.0, "C0"),
+        (0.299, "C0"),
+        (0.3, "C1"),
+        (0.699, "C1"),
+        (0.7, "C2"),
+        (0.999, "C2"),
+        (1.0, "C3"),
+        (5.0, "C3"),
+        (float("inf"), "C3"),
+    ]
+    for ci, expected in criticality_cases:
+        assert criticality_level(ci) == expected, f"CI={ci}"
+
+    avoidability_cases = [
+        (0.0, "trivial_safe"),
+        (0.099, "trivial_safe"),
+        (0.1, "avoidable"),
+        (0.699, "avoidable"),
+        (0.7, "marginal"),
+        (1.0, "marginal"),
+        (1.001, "unavoidable"),
+        (float("inf"), "unavoidable"),
+    ]
+    for ci, expected in avoidability_cases:
+        assert avoidability_label(ci) == expected, f"CI={ci}"
+
+
+def test_risk_matrix_matches_design_table() -> None:
+    """风险矩阵逐格对齐设计 §2.8.1（16 格硬编码断言，防止“单调即可”的弱断言漏掉偏差）。"""
+    expected = {
+        "Z1": {"C0": "L1", "C1": "L1", "C2": "L2", "C3": "L3"},
+        "Z2": {"C0": "L1", "C1": "L2", "C2": "L3", "C3": "L3"},
+        "Z3": {"C0": "L2", "C1": "L3", "C2": "L3", "C3": "L4"},
+        "Z4": {"C0": "L2", "C1": "L3", "C2": "L4", "C3": "L4"},
+    }
+    assert RISK_MATRIX == expected
+    for zone, row in expected.items():
+        for level, risk in row.items():
+            assert risk_level(zone, level) == risk
 
 
 def test_criticality_index_formula() -> None:
+    """CI = a_req / a_max，a_max 取车端 vehicle_params（不再读 IR 内的废弃字段）。"""
     ir = _uniform_ir()
-    # a_req = v^2 / (2*(gap - d_margin)); CI = a_req / max_decel
-    values = {"v0": 10.0, "gap": 5.0}
-    expected = (10.0**2 / (2 * (5.0 - ir.criticality.d_margin))) / ir.criticality.max_decel
+    vehicle = get_vehicle_params()
+    values = {"v0": 1.0, "gap": 5.0}
+    expected = (1.0**2 / (2 * (5.0 - ir.criticality.d_margin))) / vehicle.max_decel
+    assert criticality_index(ir, values, vehicle) == pytest.approx(expected)
+    # 不传时同样回落至 provider（而非 IR 硬编码值）
     assert criticality_index(ir, values) == pytest.approx(expected)
 
 

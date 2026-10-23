@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS scene_engine.logical_scenarios (
     description     TEXT        NULL,
     ir_version      TEXT        NOT NULL,
     ir_json         JSONB       NOT NULL,
-    status          TEXT        NOT NULL DEFAULT 'published',
+    status          TEXT        NOT NULL DEFAULT 'draft',
     content_hash    CHAR(64)    NOT NULL,
     tags            TEXT[]      NOT NULL DEFAULT '{}',
     created_by      TEXT        NULL,
@@ -42,9 +42,15 @@ CREATE TABLE IF NOT EXISTS scene_engine.logical_scenarios (
                    'quarantined', 'deprecated', 'archived', 'rejected')
     ),
     CONSTRAINT ck_logical_scenarios_ir_version CHECK (ir_version = 'hunter.ir/1.2'),
-    CONSTRAINT uq_logical_scenarios_hash UNIQUE (content_hash),
     CONSTRAINT ck_logical_scenarios_tags CHECK (array_length(tags, 1) IS NULL OR array_length(tags, 1) <= 20)
 );
+
+-- V1.23.1：content_hash 不再全局唯一。同一 IR 可随版本号变化（version 参与哈希），
+-- 且目录多版本快照允许哈希重复；幂等键始终是 (logical_id, version)。
+ALTER TABLE scene_engine.logical_scenarios
+    DROP CONSTRAINT IF EXISTS uq_logical_scenarios_hash;
+CREATE INDEX IF NOT EXISTS idx_logical_scenarios_hash
+    ON scene_engine.logical_scenarios (content_hash);
 
 CREATE INDEX IF NOT EXISTS idx_logical_scenarios_scene_type
     ON scene_engine.logical_scenarios (scene_type, version DESC);
@@ -208,6 +214,8 @@ CREATE TABLE IF NOT EXISTS scene_engine.generation_tasks (
     zone_quota        JSONB       NOT NULL DEFAULT '{}',
     zone_counts       JSONB       NOT NULL DEFAULT '{}',
     error_message     TEXT        NULL,
+    owner_id          TEXT        NULL,
+    cancel_requested  BOOLEAN     NOT NULL DEFAULT false,
     created_by        TEXT        NOT NULL,
     create_time       TIMESTAMPTZ NOT NULL DEFAULT now(),
     update_time       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -228,7 +236,30 @@ CREATE INDEX IF NOT EXISTS idx_generation_tasks_status
 CREATE INDEX IF NOT EXISTS idx_generation_tasks_logical
     ON scene_engine.generation_tasks (logical_id, create_time DESC);
 
--- ========== 8. update_time 触发器（复用 00_schemas.sql 公共函数） ==========
+-- V1.23.1：多副本任务归属与协作式取消（存量库幂等升级）
+ALTER TABLE scene_engine.generation_tasks
+    ADD COLUMN IF NOT EXISTS owner_id TEXT NULL;
+ALTER TABLE scene_engine.generation_tasks
+    ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT false;
+
+-- ========== 8. 审计日志（追加式哈希链：发布/锁定/目录同步） ==========
+CREATE TABLE IF NOT EXISTS scene_engine.audit_logs (
+    audit_id    BIGSERIAL   NOT NULL,
+    action      TEXT        NOT NULL,
+    target_type TEXT        NOT NULL,
+    target_id   TEXT        NOT NULL,
+    actor       TEXT        NOT NULL,
+    payload     JSONB       NOT NULL DEFAULT '{}',
+    prev_hash   CHAR(64)    NOT NULL,
+    entry_hash  CHAR(64)    NOT NULL,
+    create_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (audit_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_target
+    ON scene_engine.audit_logs (target_type, target_id, create_time DESC);
+
+-- ========== 9. update_time 触发器（复用 00_schemas.sql 公共函数） ==========
 CREATE OR REPLACE TRIGGER trg_logical_scenarios_update_time
     BEFORE UPDATE ON scene_engine.logical_scenarios
 FOR EACH ROW EXECUTE FUNCTION public.common_set_update_time();

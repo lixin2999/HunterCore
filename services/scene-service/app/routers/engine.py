@@ -18,6 +18,7 @@ from app.core.dependencies import (
     get_engine_service,
     require_execute_permission,
     require_read_permission,
+    require_review_permission,
     require_write_permission,
     trace_request_id,
 )
@@ -108,6 +109,8 @@ def _task_data(task: object) -> GenerationTaskData:
         zone_quota=zone_quota,
         zone_counts=zone_counts,
         error_message=getattr(task, "error_message", None),
+        owner_id=getattr(task, "owner_id", None),
+        cancel_requested=bool(getattr(task, "cancel_requested", False)),
         created_by=str(getattr(task, "created_by", "")),
         create_time=getattr(task, "create_time", None),
         update_time=getattr(task, "update_time", None),
@@ -231,16 +234,16 @@ async def dry_run_logical_scenario(
     "/logical/{logical_id}/publish",
     operation_id="publishLogicalScenario",
     response_model=LogicalPublishResponse,
-    summary="发布逻辑场景（目录项先落库再置 published）",
+    summary="发布逻辑场景（需 reviewer/admin；写审计哈希链）",
     responses={**COMMON_ERRORS},
 )
 async def publish_logical_scenario(
     logical_id: str,
     service: Annotated[SceneEngineService, Depends(get_engine_service)],
-    _user_id: Annotated[str, Depends(require_write_permission)],
+    user_id: Annotated[str, Depends(require_review_permission)],
     version: Annotated[str | None, Query(max_length=16)] = None,
 ) -> LogicalPublishResponse:
-    result: PublishData = await service.publish(logical_id, version)
+    result: PublishData = await service.publish(logical_id, version, user_id=user_id)
     return LogicalPublishResponse(data=result, request_id=trace_request_id())
 
 
@@ -314,7 +317,7 @@ async def get_generation_task(
     "/generate/{task_id}/cancel",
     operation_id="cancelGenerationTask",
     response_model=GenerationTaskResponse,
-    summary="取消生成任务（仅 pending 可取消）",
+    summary="取消生成任务（pending 立即取消；running 置 cancel_requested 协作式中止）",
     responses={**COMMON_ERRORS},
 )
 async def cancel_generation_task(
@@ -569,14 +572,14 @@ async def add_scenario_suite_items(
     "/suites/{suite_id}/lock",
     operation_id="lockScenarioSuite",
     response_model=SuiteLockResponse,
-    summary="锁定测试集（写 lock_hash；可同时创建基线快照）",
+    summary="锁定测试集（需 reviewer/admin；单事务写 lock_hash + 可选基线）",
     responses={**COMMON_ERRORS},
 )
 async def lock_scenario_suite(
     suite_id: UUID,
     request: SuiteLockRequest,
     service: Annotated[SceneEngineService, Depends(get_engine_service)],
-    user_id: Annotated[str, Depends(require_write_permission)],
+    user_id: Annotated[str, Depends(require_review_permission)],
 ) -> SuiteLockResponse:
     data = await service.lock_suite(
         suite_id,
