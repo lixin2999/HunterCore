@@ -55,6 +55,18 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '场景库', icon: 'Files', permission: PERMISSIONS.sceneRead },
       },
       {
+        path: 'scenes/generator',
+        name: 'scene-generator',
+        component: () => import('@/views/scene/SceneGeneratorView.vue'),
+        meta: { title: '场景生成器', icon: 'MagicStick', permission: PERMISSIONS.sceneRead },
+      },
+      {
+        path: 'scenes/testcases',
+        name: 'scene-testcases',
+        component: () => import('@/views/scene/SceneTestCaseView.vue'),
+        meta: { title: '用例与测试集', icon: 'Tickets', permission: PERMISSIONS.sceneRead },
+      },
+      {
         path: 'scenes/:scene_id',
         name: 'scene-detail',
         component: () => import('@/views/scene/SceneDetailView.vue'),

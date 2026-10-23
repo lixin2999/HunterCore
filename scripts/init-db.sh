@@ -231,6 +231,19 @@ main() {
     log_warn "未找到 ${ingest_ddl}：跳过 ingest_platform DDL（部署需含 contracts/，否则 ingest-platform 服务缺表将无法启动）"
   fi
 
+  # ---------- 3c) scene_engine（V1.23.0，scene-service 服务私有 schema） ----------
+  #   单一事实来源：contracts/database/ddl/07_scene_engine.sql（自包含 CREATE SCHEMA + 7 表 + 触发器，全幂等）。
+  #   ⚠ 不计入上方 schema/表校验。逻辑场景目录不在启动时自动 sync（upsert 会覆盖 status，
+  #   重启即把 published 重置为 draft）；首次落库由 POST /api/v1/scene/logical/sync 显式触发
+  #   （前端「场景生成器 → 同步目录」按钮），未同步时列表/详情自动回落内置目录。
+  scene_engine_ddl="${APP_DIR}/contracts/database/ddl/07_scene_engine.sql"
+  if [ -f "$scene_engine_ddl" ]; then
+    log_info "应用 scene_engine 结构：07_scene_engine.sql（服务私有 schema，幂等）"
+    apply_sql "$C_POSTGRES" "$POSTGRES_USER" "$POSTGRES_DB" "$scene_engine_ddl" || return 1
+  else
+    log_warn "未找到 ${scene_engine_ddl}：跳过 scene_engine DDL（场景生成器/场景管理接口将因缺表返回 5000）"
+  fi
+
   # ---------- 4) 初始数据（admin/角色/权限/验证车辆；幂等） ----------
   if [ -n "$ADMIN_PASSWORD_HASH" ]; then
     hash="$ADMIN_PASSWORD_HASH"

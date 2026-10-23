@@ -54,6 +54,14 @@ class Settings(HunterBaseConfig):
     # 版本默认值（契约 SCENE 默认语义化版本 1.0.0）
     scene_default_version: str = "1.0.0"
 
+    # ---------- 场景引擎（逻辑/具体场景、生成任务） ----------
+    # 生成数量上限（DDL generation_tasks.count CHECK 1..5000，二者必须一致）
+    scene_generation_max_count: int = 5000
+    # 地图白名单（G3；逗号分隔，空 = 不限制，具体部署可按开放区域收紧）
+    scene_allowed_maps: str = ""
+    # 内置 IR 目录版本（与 scene_engine.catalog.CATALOG_VERSION 一致性由测试钉住）
+    scene_catalog_version: str = "1.0.0"
+
     # ---------- RBAC（网关注入 X-Roles；资源域 scene，契约 securitySchemes.bearerAuth） ----------
     scene_read_roles: str = "admin,analyst,operator"
     scene_write_roles: str = "admin,operator"
@@ -97,6 +105,11 @@ class Settings(HunterBaseConfig):
     def scene_scope_exempt_role_set(self) -> frozenset[str]:
         """数据权限隔离豁免角色（默认 admin 可见全部场景）。"""
         return self._role_set(self.scene_scope_exempt_roles)
+
+    @property
+    def allowed_map_set(self) -> frozenset[str]:
+        """G3 地图白名单（空集合 = 不限制）。"""
+        return self._path_set(self.scene_allowed_maps)
 
     @property
     def param_override_allowed_set(self) -> frozenset[str]:

@@ -8,6 +8,7 @@
 |------|------|----------|------|
 | api-gateway.yaml | api-gateway | 统一入口（8080） | ✅ 已定义（认证 + 运维探针 + 路由表/限流/WebSocket 扩展字段） |
 | scene-service.yaml | scene-service | `/api/v1/scene` | ✅ 已定义（10 个业务端点 + 4.2.1/4.2.2 数据结构 + 4.4/4.5 流程扩展字段） |
+| scene-engine.yaml | scene-service | `/api/v1/scene` | ✅ 已定义（28 个引擎端点：逻辑场景 / 生成任务 / 具体场景 / 判据与用例 / 测试集与基线 / 覆盖分析；三层抽象 + G1-G8 + 双轴分级） |
 | data-collector.yaml | data-collector | `/api/v1/data` | ✅ 已定义（7 个业务端点 + 5.3.3 遥测结构 + 5.4 预处理 / 5.5 上传流程扩展字段） |
 | data-analytics.yaml | data-analytics | `/api/v1/analytics` | ✅ 已定义（8 个业务端点 + 6.2 实时作业 / 6.3 离线作业 / 6.4 Corner Case / 6.5 报告模板扩展字段） |
 | ota-service.yaml | ota-service | `/api/v1/ota` | ✅ 已定义（15 个业务端点 + 8/9 章 DDL 与 Kafka 对齐 + 版本上传 / 发布校验 / 灰度批次 / 回滚扩展字段；12.5 节原文缺失 → 推导清单） |
@@ -56,6 +57,29 @@
   （消费组 `scene-service-analytics-result`，实车场景自动提取 4.5 节）
 - **⚠ 待核对项**：`scene_type` 编码值（4.2.1 只给两级结构）、~~仿真进度/结果端点缺口~~（已决策 G-20① 交付）、
   `archived` 无归档端点、导出返回形式、`version` 递增策略 —— 全量见契约 `x-hunter-pending-confirmation`（12 项，#2 已决策）
+
+## 场景引擎契约要点（scene-engine.yaml）
+
+- **定位**：设计文档《场景生成器与场景管理详细设计文档》V2.0 的引擎部分（三层场景抽象 + 双轴分级），
+  与 scene-service.yaml（场景库 CRUD / 模板 / 导出 / 仿真）共用前缀但路径不重叠，全部落 `scene_engine` 服务私有 schema
+- **端点**（28 个，`x-hunter-endpoints` 分组登记）：
+  逻辑场景 7（列表 / 目录同步 / 详情 / 版本 / 校验 / 干跑 / 发布）、生成任务 4（创建 202 / 列表 / 详情 / 取消）、
+  具体场景 4（列表 / 批量复检 / 详情 / 渲染）、判据与用例 4（判据目录 / 用例列表 / 创建 201 / 详情）、
+  测试集 7（列表 / 创建 201 / 详情 / 加条目 / 锁定 / 差异 / 基线列表）、覆盖 2（总览 / 盲区）
+- **异步生成**：`POST /generate` 返回 `202 + task_id`，后台执行（CPU 采样在线程池），
+  进度 0.01 步进回写；仅 `pending` 可取消，`running` 取消返回 409/3003
+- **去重与复现**：具体场景 `content_hash`（SHA-256）全局唯一，同种子重放 `produced=0`、`duplicates>0`；
+  实际种子写入任务记录供复现
+- **校验门**：G1-G7 编译期（几何 / 动力学 / 可见性 / 临界度 / 判据存在性 / 时长 / 可渲染），
+  G8 批级去重；批量复检失败进 `quarantined`
+- **双轴分级**：稀有度 Z1-Z4 × 临界度 C0-C3 → 风险 L1-L4；剖面配额 regression 70:25:5:0 /
+  robustness 40:40:20:0 / exploration 10:30:50:10，盲区按配额算缺口
+- **测试用例**：ISO 34505 结构（目标 / 前置 / 步骤 / 平台 / 判据 / 超时），`case_key` 全局唯一；
+  测试集锁定后条目不可变（3003），可同时创建基线快照并 diff
+- **鉴权**：读 `scene:read`；写（同步 / 发布 / 复检 / 用例 / 测试集 / 锁定 / 取消）`scene:create|update|delete`；
+  生成 `scene:execute`
+- **路由顺序**：本组路由必须先于 `/{scene_id}` 注册，否则 `/oracles`、`/testcases`、`/suites`、`/generate`、`/concrete`
+  会被场景详情路由吞掉
 
 ## 数据采集契约要点（data-collector.yaml）
 

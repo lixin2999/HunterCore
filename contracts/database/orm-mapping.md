@@ -189,6 +189,13 @@ tasks = await OtaTaskRepository(session).find_all(
 ⚠ 未列入白名单的 schema（如车辆主数据写入、其他服务业务表）必须通过 REST API 访问
 （例：车辆信息 `/api/v1/vehicle/**`），不得直接使用其 Repository。
 
+**服务私有 schema 的仓储归属**：`scene_engine`（7 表，V1.23.0）与 `ingest_platform` 一样，
+ORM 模型与 Repository 均写在服务内（`services/scene-service/app/{models,repositories}/`），
+**不入**共享包 `hunter_common.database.models.ALL_MODELS` 与 `REPOSITORY_BY_MODEL`，
+因此不占用本节白名单（由 `verify_data_layer.py` 的 `SERVICE_PRIVATE_SCHEMAS` 豁免）；
+scene-service 对共享包的引用仍仅限 `SceneRepository`。服务私有仓储必须自己保证：
+事务边界在调用方、只 `flush` 不 `commit`、约束冲突映射 3002、缺行映射 3001。
+
 ## 4. 服务层 Repository 收敛路径（迁移契约）
 `common/python/hunter_common/database/repositories/` 是**唯一数据访问实现**的最终形态；
 迁移期各服务 `services/*/app/repositories/*.py` 仍存在**同名同表**的过渡实现（构造签名与事务粒度不同：

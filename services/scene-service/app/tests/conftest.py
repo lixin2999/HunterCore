@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.config import settings
 from app.main import app
+from app.services.engine import SceneEngineService
 from app.services.export import SceneExportService
 from app.services.scenes import SceneService
 from app.services.simulation import SceneSimulationService
@@ -25,6 +26,13 @@ from app.tests.fakes import (
     FakeSceneCache,
     InMemorySceneRepository,
     InMemorySceneStorage,
+)
+from app.tests.fakes_engine import (
+    InMemoryConcreteScenarioRepository,
+    InMemoryGenerationTaskRepository,
+    InMemoryLogicalScenarioRepository,
+    InMemorySuiteRepository,
+    InMemoryTestCaseRepository,
 )
 
 ADMIN_HEADERS = {
@@ -47,6 +55,7 @@ STATE_KEYS: tuple[str, ...] = (
     "template_service",
     "export_service",
     "simulation_service",
+    "engine_service",
     "db",
     "redis",
     "storage",
@@ -70,6 +79,19 @@ def scene_env() -> Iterator[SimpleNamespace]:
     app.state.simulation_service = SceneSimulationService(
         scene_service, carla, settings, storage=storage
     )
+    logical_repository = InMemoryLogicalScenarioRepository()
+    concrete_repository = InMemoryConcreteScenarioRepository()
+    task_repository = InMemoryGenerationTaskRepository()
+    testcase_repository = InMemoryTestCaseRepository()
+    suite_repository = InMemorySuiteRepository()
+    app.state.engine_service = SceneEngineService(
+        logical_repository,
+        concrete_repository,
+        task_repository,
+        testcase_repository,
+        suite_repository,
+        settings,
+    )
     app.state.db = SimpleNamespace(check_connection=lambda: asyncio.sleep(0, result=True))
     app.state.redis = SimpleNamespace(ping=lambda: asyncio.sleep(0, result=True))
     state = SimpleNamespace(
@@ -78,6 +100,12 @@ def scene_env() -> Iterator[SimpleNamespace]:
         storage=storage,
         carla=carla,
         service=scene_service,
+        engine=app.state.engine_service,
+        logical_repository=logical_repository,
+        concrete_repository=concrete_repository,
+        task_repository=task_repository,
+        testcase_repository=testcase_repository,
+        suite_repository=suite_repository,
     )
     try:
         yield state

@@ -6,7 +6,9 @@
 - 全链路 trace_id（X-Request-ID）中间件
 - /healthz 存活探针、/readyz 就绪探针（DB/Redis 连通性）
 - /metrics Prometheus 指标端点（供 infra/monitoring 抓取）
-- 业务路由：/api/v1/scene/**（scenes / templates / export / simulation，契约 scene-service.yaml）
+- 业务路由：/api/v1/scene/**（scenes / templates / export / simulation，契约 scene-service.yaml）；
+  场景引擎路由（logical / generate / concrete / testcases / suites / coverage / oracles）
+  复用同一前缀，必须先于 scenes 注册（否则被 /{scene_id} 吞掉）；
 - Kafka：仅消费 analytics_result（组 scene-service-analytics-result，4.5 节实车场景自动提取）；
   契约禁止本服务生产任何 Topic（x-hunter-kafka.produces = []）
 """
@@ -35,10 +37,18 @@ from app.consumers.analytics_result import AnalyticsResultConsumer
 from app.core.error_handlers import register_exception_handlers
 from app.repositories.cache import SceneDetailCache
 from app.repositories.carla import CarlaManagementClient
+from app.repositories.engine import (
+    ConcreteScenarioRepository,
+    GenerationTaskRepository,
+    LogicalScenarioRepository,
+    SuiteRepository,
+    TestCaseRepository,
+)
 from app.repositories.scenes import SceneRepository
 from app.repositories.storage import get_storage
-from app.routers import export, scenes, simulation, templates
+from app.routers import engine, export, scenes, simulation, templates
 from app.routers.health import router as health_router
+from app.services.engine import SceneEngineService
 from app.services.export import SceneExportService
 from app.services.scenes import SceneService
 from app.services.simulation import SceneSimulationService
@@ -97,6 +107,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.simulation_service = SceneSimulationService(
         app.state.scene_service, app.state.carla, settings, storage=app.state.storage
+    )
+    # 场景引擎（服务私有 schema scene_engine；未初始化 DDL 时读取自动回落到内置目录）
+    app.state.engine_service = SceneEngineService(
+        LogicalScenarioRepository(app.state.db),
+        ConcreteScenarioRepository(app.state.db),
+        GenerationTaskRepository(app.state.db),
+        TestCaseRepository(app.state.db),
+        SuiteRepository(app.state.db),
+        settings,
     )
 
     consumer_task: asyncio.Task[None] | None = None
@@ -160,12 +179,13 @@ async def trace_id_middleware(request: Request, call_next) -> Response:
 
 
 app.include_router(health_router)
-# 注意：templates / export / simulation / scenes 共用前缀 /api/v1/scene，
-# 必须先注册具体路径（/templates、/export、/{scene_id}/run），再注册含 {scene_id} 的 scenes 路由，
-# 否则 /api/v1/scene/templates 会被 /{scene_id} 优先匹配。
+# 注意：templates / export / simulation / engine / scenes 共用前缀 /api/v1/scene，
+# 必须先注册具体路径（/templates、/export、/oracles、/testcases、/suites、/generate、/concrete），
+# 再注册含 {scene_id} 的 scenes 路由，否则具体路径会被 /{scene_id} 优先匹配。
 app.include_router(templates.router)
 app.include_router(export.router)
 app.include_router(simulation.router)
+app.include_router(engine.router)
 app.include_router(scenes.router)
 register_metrics(app, settings.service_name, version="0.1.0")
 register_exception_handlers(app)

@@ -9,6 +9,7 @@
 export * from './enums'
 export * from './analysis'
 export * from './data'
+export * from './engine'
 export * from './ota'
 export * from './permissions'
 export * from './remote'
@@ -40,6 +41,8 @@ export const POLL_INTERVALS = {
   telemetry: readNumber(import.meta.env.VITE_POLL_TELEMETRY_MS, 2000),
   /** 远程操控会话状态（GET /api/v1/remote/session/{session_id}） */
   session: readNumber(import.meta.env.VITE_POLL_SESSION_MS, 1000),
+  /** 场景生成任务进度（GET /api/v1/scene/generate/{task_id}，CPU 采样为长任务） */
+  sceneTask: readNumber(import.meta.env.VITE_POLL_SCENE_TASK_MS, 2000),
 } as const
 
 /**

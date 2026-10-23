@@ -17,6 +17,7 @@ from hunter_common.internal_auth import verify_identity_headers
 from hunter_common.logging import get_trace_id
 
 from app.config import settings
+from app.services.engine import SceneEngineService
 from app.services.export import SceneExportService
 from app.services.scenes import SceneService
 from app.services.simulation import SceneSimulationService
@@ -116,7 +117,13 @@ def get_simulation_service(request: Request) -> SceneSimulationService:
     return request.app.state.simulation_service  # type: ignore[no-any-return]
 
 
+def get_engine_service(request: Request) -> SceneEngineService:
+    """场景引擎服务（逻辑/具体场景、生成任务、用例、测试集、覆盖）。"""
+    return request.app.state.engine_service  # type: ignore[no-any-return]
+
+
 __all__ = [
+    "get_engine_service",
     "get_export_service",
     "get_scene_service",
     "get_simulation_service",

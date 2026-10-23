@@ -117,7 +117,7 @@ EXPECTED_TABLES: dict[str, str] = {
 #: 服务私有 schema（独立限界上下文：自带 DDL 文件 + 服务内 ORM 模型 + 自带 Repository，
 #:   不进入共享 hunter_common 元数据）——其表由服务自身契约管理，豁免于共享 13 表 L2 契约的
 #:   DDL↔ORM 逐列对账。新增服务私有 schema 必须在此登记并在 orm-mapping.md §3.5 声明边界。
-SERVICE_PRIVATE_SCHEMAS: frozenset[str] = frozenset({"ingest_platform"})
+SERVICE_PRIVATE_SCHEMAS: frozenset[str] = frozenset({"ingest_platform", "scene_engine"})
 
 #: 契约 schema（ddl/00_schemas.sql 中必须全部创建）
 EXPECTED_SCHEMAS = (

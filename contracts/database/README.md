@@ -19,9 +19,11 @@
 | `ddl/03_ota.sql` | `ota_versions` / `ota_tasks` / `ota_records` | ota_svc |
 | `ddl/04_events.sql` | `events`（19 种事件类型 + 3 级事件等级） | data_collector |
 | `ddl/05_timeseries.sql` | `vehicle_telemetry`、`algorithm_metrics`（hypertable：按天分块 + 90 天保留） | data_collector / data_analytics |
+| `ddl/06_ingest_platform.sql` | ingest-platform 服务私有 schema（events 分区表 + bags / bag_topics / artifacts / derived_assets / tasks / clips / labels / agents / commands / projection_anomaly / datasets / agent_alerts，15 个 CREATE TABLE 含分区子表） | ingest_platform（服务私有） |
+| `ddl/07_scene_engine.sql` | 场景引擎服务私有 schema（logical_scenarios / concrete_scenarios / test_cases / scenario_suites / suite_items / baseline_locks / generation_tasks，7 表） | scene_engine（服务私有） |
 | `er.md` | ER 关系说明、跨 schema 访问例外、字段类型约定、与设计文档的差异清单 | — |
 | `orm-mapping.md` | ORM 关系映射契约（16 条 relationship + lazy 策略白名单）、Repository 契约（13 个 Repository + 专属方法双向校验）、排序 spec 与默认排序、事务/错误码/读取上限/显式加载语义、服务层收敛路径 | — |
-| `enums.md` | 受控词表（车辆状态 / 事件类型与等级 / OTA 状态机 / 权限资源域），与 ORM `StrEnum` 一一对应 | — |
+| `enums.md` | 受控词表（车辆状态 / 事件类型与等级 / OTA 状态机 / 权限资源域 / 场景引擎 12 个枚举），与 ORM `StrEnum` 一一对应 | — |
 | `redis-keys.yaml` | Redis Key 契约：系统约束第 8 条 7 个 Key + `rc:lock:{vehicle_id}` 实现派生键、命名规则、字段结构、TTL、读写方、跨服务引用 | — |
 | `object-storage.yaml` | MinIO 契约：7 个 Bucket（生命周期 / SSE-S3 / 读写方 / 对象键约定）、预签名策略（上传 3600s、下载 900s、Range、分片）、对象键规则 | — |
 
@@ -58,6 +60,10 @@ pytest common/python/tests/test_repositories.py -q
 ## 关键约束（不可更改）
 
 - 各服务独立 schema，禁止跨服务直查（`er.md` 列出唯一例外：时序库只读分析账号）
+- **服务私有 schema**：`ingest_platform` / `scene_engine` 的 DDL 自包含 `CREATE SCHEMA`，
+  模型与 Repository 均在服务内，不入共享包与 `orm-mapping.md` 白名单（`verify_data_layer.py`
+  的 `SERVICE_PRIVATE_SCHEMAS` 豁免）；其 DDL ↔ ORM/枚举一致性由服务侧测试钉住
+  （`test_ingest_ddl*.py` / `test_scene_engine_ddl.py`），变更必须同步服务侧模型与测试
 - `vehicle_telemetry` / `algorithm_metrics`：`chunk_time_interval = 1 day`，保留 90 天
 - 受控词表（车辆状态 8 态、事件类型 19 种、事件等级 3 级、OTA 状态机 9 态、算法模块 3 种）必须与
   `hunter_common/database/enums.py` 完全一致，禁止在业务代码中硬编码字符串

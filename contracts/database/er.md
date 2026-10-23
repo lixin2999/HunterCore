@@ -20,9 +20,22 @@
 | `data_collector` | events | event_id (BIGSERIAL) | data-collector | 否 |
 | `data_collector` | vehicle_telemetry | (time, vehicle_id) | data-collector | 否（90 天保留策略） |
 | `data_analytics` | algorithm_metrics | (time, vehicle_id, module, metric_name) | data-analytics | 否（90 天保留策略） |
+| `scene_engine` | logical_scenarios | (logical_id, version) | scene-service（服务私有） | 否（用 status） |
+| `scene_engine` | concrete_scenarios | scenario_id (UUID) | scene-service（服务私有） | 否（用 status） |
+| `scene_engine` | test_cases | test_case_id (UUID) | scene-service（服务私有） | 否（用 status） |
+| `scene_engine` | scenario_suites | suite_id (UUID) | scene-service（服务私有） | 否（用 status） |
+| `scene_engine` | suite_items | (suite_id, item_id) | scene-service（服务私有） | 否 |
+| `scene_engine` | baseline_locks | baseline_id (UUID) | scene-service（服务私有） | 否 |
+| `scene_engine` | generation_tasks | task_id (UUID) | scene-service（服务私有） | 否 |
 
 预留 schema：`remote_control`（操控会话态在 Redis `rc:session:{vehicle_id}`，录像落 MinIO `hunter-video`）、
 `gateway`（审计走结构化日志 + Loki；后续如需落库再按契约建表）。
+
+> **服务私有 schema**：`scene_engine`（7 表）与 `ingest_platform` 为对应服务的私有 schema——
+> 模型与仓储在服务内（`services/*/app/models|repositories`），**不入**共享包
+> `hunter_common.database.models.ALL_MODELS` 与 `REPOSITORY_BY_MODEL`
+> （`verify_data_layer.py` 的 `SERVICE_PRIVATE_SCHEMAS` 豁免）；DDL ↔ ORM 一致性由服务侧测试钉住
+> （`app/tests/test_scene_engine_ddl.py`）。仅本服务可读写，禁止跨服务直查。
 
 ## 2. 关系（物理外键 = FK，逻辑外键 = LOGICAL）
 
@@ -43,6 +56,13 @@
 | `user_svc.users` | `data_collector.events.acknowledged_by` | 1:N | LOGICAL acknowledged_by |
 | `ota_svc.ota_tasks` | `ota_svc.ota_records` | 1:N | 见上（灰度批次按 task 聚合统计成功率） |
 | `scene_svc.scenes` | MinIO `hunter-scene-assets` | 1:N | 资源文件（地图/模型）经对象地址引用，不入库 |
+| `scene_engine.logical_scenarios` | `scene_engine.concrete_scenarios` | 1:N | LOGICAL (logical_id, version)；内容哈希全局唯一去重 |
+| `scene_engine.logical_scenarios` | `scene_engine.generation_tasks` | 1:N | LOGICAL logical_id（任务账本；实际版本写入 logical_version） |
+| `scene_engine.logical_scenarios` | `scene_engine.test_cases` | 1:N | LOGICAL (logical_id, logical_version)（版本在创建时解析后固化） |
+| `scene_engine.scenario_suites` | `scene_engine.suite_items` | 1:N | LOGICAL suite_id（DDL 未建 FK，服务层级联/校验） |
+| `scene_engine.scenario_suites` | `scene_engine.baseline_locks` | 1:N | LOGICAL suite_id（基线名在集内唯一） |
+| `scene_engine.test_cases` | `scene_engine.suite_items` | 1:N | LOGICAL ref_id = case_key（多态引用，无 FK） |
+| `scene_engine.concrete_scenarios` | `scene_engine.suite_items` | 1:N | LOGICAL ref_id = scenario_id（多态引用，无 FK） |
 
 关联图示（简化）：
 

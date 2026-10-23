@@ -1,0 +1,1630 @@
+# =====================================================================
+# HunterCore 场景引擎契约（OpenAPI 3.0.3）—— 单一事实来源
+# 来源：《场景生成器与场景管理详细设计文档》V2.0
+#   §2 三层场景抽象（功能 / 逻辑 / 具体）+ 双轴分级（稀有度 Z1-Z4 × 临界度 C0-C3 → 风险 L1-L4）
+#   §2.9 五种生成策略；§2.11 产品对象模型（场景 / 测试用例 / 测试集 / 基线）
+#   §4.1 REST 约定（耗时生成 202 + task_id）；ISO 34505 测试用例结构
+# 实现：services/scene-service（FastAPI，端口 8081，schema scene_engine）
+#
+# 范围与边界：
+#   - 网关前缀 /api/v1/scene（不可更改，见 constraints/openapi/api-gateway.yaml 的
+#     x-hunter-gateway-routes）；本契约路径与 scene-service.yaml 不重叠：
+#     /logical、/generate、/concrete、/oracles、/testcases、/suites、/coverage
+#   - 路由注册顺序约束：本组路由必须先于 `/{scene_id}` 注册，否则具体路径被吞
+#   - 存储：scene_engine 为 scene-service **服务私有 schema**（7 表，见
+#     contracts/database/ddl/07_scene_engine.sql），不入共享 ORM 注册表
+#
+# 鉴权（RBAC 资源域 scene）：
+#   读 → scene:read；写（同步/发布/批量复检/用例/测试集/锁定/取消）→ scene:create|update|delete；
+#   生成 → scene:execute。
+# =====================================================================
+openapi: 3.0.3
+
+info:
+  title: HunterCore - scene-engine（场景生成器与场景管理）
+  version: 1.0.0
+  description: |
+    场景引擎契约：三层场景抽象与双轴分级、校验门 G1-G8、生成任务、判据与测试用例、测试集/基线、覆盖分析。
+
+    **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功。
+
+    **异步生成**：`POST /api/v1/scene/generate` 返回 `202 + task_id`，任务在服务端后台执行
+    （CPU 采样在线程池），进度以 0.01 步进回写；客户端轮询 `GET /generate/{task_id}`。
+
+    **校验门**：G1 几何/地图、G2 动力学、G3 可见性/遮挡、G4 临界度、G5 判据存在性、
+    G6 时长、G7 可渲染性（编译期）；G8 批级去重（内容哈希 SHA-256）。
+
+    **去重**：具体场景 `content_hash` 全局唯一，同种子重放返回 `produced=0`、`duplicates>0`。
+
+    **测试集锁定**：lock 后条目不可再改（3003）；锁定可同时创建基线快照，`diff` 对比
+    当前条目与基线/锁定快照的 `added / removed / changed`。
+
+    **判据目录**：`/oracles` 为代码即事实来源的版本化 ref（如 `oracle.safety.min_distance/v1`），
+    只读、不支持在线编辑。
+  license:
+    name: Proprietary - HunterCore
+
+servers:
+  - url: https://hunter-core.example.com
+    description: 生产环境（经网关 /api/v1/scene 转发）
+  - url: http://localhost:8081
+    description: 本地开发（直连服务）
+
+tags:
+  - name: scene-engine-logical
+    description: 逻辑场景（IR / 参数 / 版本 / 校验 / 干跑 / 发布 / 目录同步）
+  - name: scene-engine-generation
+    description: 批量生成任务（202 + task_id、进度、取消）
+  - name: scene-engine-concrete
+    description: 具体场景（参数向量 / 渲染 / 批量复检）
+  - name: scene-engine-oracle
+    description: 判据目录与测试用例（ISO 34505）
+  - name: scene-engine-suite
+    description: 测试集 / 锁定 / 基线 / 差异
+  - name: scene-engine-coverage
+    description: 覆盖总览与盲区
+
+security:
+  - bearerAuth: []
+
+x-hunter-service:
+  name: scene-service
+  prefix: /api/v1/scene
+  schema: scene_engine
+  private_schema: true
+  kafka:
+    produces: []
+    consumes:
+      - topic: analytics_result
+        group: scene-service-analytics-result
+
+x-hunter-endpoints:
+  # 22 个端点（与 services/scene-service/app/routers/engine.py 一一对应）
+  logical: [listLogicalScenarios, syncLogicalScenarioCatalog, getLogicalScenario,
+            listLogicalScenarioVersions, validateLogicalScenario, dryRunLogicalScenario,
+            publishLogicalScenario]
+  generation: [createGenerationTask, listGenerationTasks, getGenerationTask,
+               cancelGenerationTask]
+  concrete: [listConcreteScenarios, batchValidateConcreteScenarios, getConcreteScenario,
+             renderConcreteScenario]
+  oracle: [listOracles, listTestCases, createTestCase, getTestCase]
+  suite: [listScenarioSuites, createScenarioSuite, getScenarioSuite, addScenarioSuiteItems,
+          lockScenarioSuite, diffScenarioSuite, listScenarioSuiteBaselines]
+  coverage: [getCoverageOverview, listCoverageGaps]
+
+paths:
+  # ===================================================================
+  # 一、逻辑场景
+  # ===================================================================
+  /api/v1/scene/logical:
+    get:
+      tags: [scene-engine-logical]
+      summary: 查询逻辑场景（DB 快照 + 内置目录）
+      description: |
+        DB 快照优先，内置目录补齐未同步项；按 `logical_id` 去重（DB 命中则 `origin=database`）。
+        `keyword` 对 `logical_id` / `name` 做不区分大小写的模糊匹配。
+      operationId: listLogicalScenarios
+      parameters:
+        - name: category
+          in: query
+          required: false
+          description: 分类过滤（如 safety / interaction / environment / corner_case）
+          schema: { type: string, maxLength: 32 }
+        - name: keyword
+          in: query
+          required: false
+          description: ID/名称模糊匹配
+          schema: { type: string, minLength: 1, maxLength: 64 }
+        - name: include_catalog
+          in: query
+          required: false
+          description: 是否包含未同步的内置目录项
+          schema: { type: boolean, default: true }
+        - name: limit
+          in: query
+          required: false
+          description: 返回上限（与分页解耦，列表为目录型数据）
+          schema: { type: integer, minimum: 1, maximum: 500, default: 200 }
+      responses:
+        "200":
+          description: 逻辑场景列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LogicalScenarioListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /api/v1/scene/logical/sync:
+    post:
+      tags: [scene-engine-logical]
+      summary: 同步内置逻辑场景目录到数据库（幂等）
+      description: |
+        把内置 17 个逻辑场景按 `(logical_id, version)` upsert 到
+        `scene_engine.logical_scenarios`。upsert 会覆盖 `status`，故**不在服务启动时自动执行**，
+        由本端点（或前端「同步目录」按钮）显式触发。
+      operationId: syncLogicalScenarioCatalog
+      responses:
+        "200":
+          description: 同步结果（synced 为条目数）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogSyncResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /api/v1/scene/logical/{logical_id}:
+    get:
+      tags: [scene-engine-logical]
+      summary: 逻辑场景详情（含 IR / 参数 / 绑定 / 约束）
+      operationId: getLogicalScenario
+      parameters:
+        - $ref: "#/components/parameters/LogicalIdPath"
+        - name: version
+          in: query
+          required: false
+          description: 版本；缺省取最近更新版本
+          schema: { type: string, maxLength: 16 }
+      responses:
+        "200":
+          description: 逻辑场景详情
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LogicalScenarioResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /api/v1/scene/logical/{logical_id}/versions:
+    get:
+      tags: [scene-engine-logical]
+      summary: 逻辑场景版本列表（DB 版本 + 目录当前版本）
+      operationId: listLogicalScenarioVersions
+      parameters:
+        - $ref: "#/components/parameters/LogicalIdPath"
+      responses:
+        "200":
+          description: 版本列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LogicalVersionListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/logical/{logical_id}/validate:
+    post:
+      tags: [scene-engine-logical]
+      summary: 逻辑场景静态校验（缺省参数 + G1-G7 + 判据存在性）
+      operationId: validateLogicalScenario
+      parameters:
+        - $ref: "#/components/parameters/LogicalIdPath"
+        - name: version
+          in: query
+          required: false
+          schema: { type: string, maxLength: 16 }
+      responses:
+        "200":
+          description: 校验报告（passed=false 时 failures 列明门与原因）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LogicalValidationResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/logical/{logical_id}/dryrun:
+    post:
+      tags: [scene-engine-logical]
+      summary: 逻辑场景干跑（返回渲染后的 SceneConfig 预览）
+      description: 合并缺省参数与请求覆盖值后编译；未声明的参数键返回 422/2001。
+      operationId: dryRunLogicalScenario
+      parameters:
+        - $ref: "#/components/parameters/LogicalIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DryRunRequest" }
+      responses:
+        "200":
+          description: 干跑结果（含闸门明细）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LogicalDryRunResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/logical/{logical_id}/publish:
+    post:
+      tags: [scene-engine-logical]
+      summary: 发布逻辑场景（目录项先落库再置 published）
+      operationId: publishLogicalScenario
+      parameters:
+        - $ref: "#/components/parameters/LogicalIdPath"
+        - name: version
+          in: query
+          required: false
+          schema: { type: string, maxLength: 16 }
+      responses:
+        "200":
+          description: 发布结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LogicalPublishResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  # ===================================================================
+  # 二、生成任务
+  # ===================================================================
+  /api/v1/scene/generate:
+    post:
+      tags: [scene-engine-generation]
+      summary: 创建异步批量生成任务（202 + task_id）
+      description: |
+        `strategy=replay_mutation` 必须提供 `overrides.base`；
+        `strategy=ai_generated` 必须提供 `overrides.candidates`；
+        `seed=0` 表示由服务端生成随机种子（实际种子写入任务记录，供复现）。
+      operationId: createGenerationTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GenerateRequest" }
+      responses:
+        "202":
+          description: 任务已受理（后台执行）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationTaskResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+    get:
+      tags: [scene-engine-generation]
+      summary: 查询生成任务列表（按状态过滤、分页）
+      operationId: listGenerationTasks
+      parameters:
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - name: status
+          in: query
+          required: false
+          description: 任务状态过滤
+          schema: { $ref: "#/components/schemas/GenerationTaskStatus" }
+      responses:
+        "200":
+          description: 任务列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationTaskListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/generate/{task_id}:
+    get:
+      tags: [scene-engine-generation]
+      summary: 查询生成任务详情（进度/实产/分区配额）
+      operationId: getGenerationTask
+      parameters:
+        - $ref: "#/components/parameters/TaskIdPath"
+      responses:
+        "200":
+          description: 任务详情
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationTaskResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/generate/{task_id}/cancel:
+    post:
+      tags: [scene-engine-generation]
+      summary: 取消生成任务（仅 pending 可取消）
+      description: running 任务取消返回 409/3003（不支持中断正在执行的采样）。
+      operationId: cancelGenerationTask
+      parameters:
+        - $ref: "#/components/parameters/TaskIdPath"
+      responses:
+        "200":
+          description: 取消后的任务状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GenerationTaskResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/StateConflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ===================================================================
+  # 三、具体场景
+  # ===================================================================
+  /api/v1/scene/concrete:
+    get:
+      tags: [scene-engine-concrete]
+      summary: 查询具体场景（稀有度/风险/状态过滤）
+      operationId: listConcreteScenarios
+      parameters:
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - name: logical_id
+          in: query
+          required: false
+          description: 按逻辑场景过滤
+          schema: { type: string, maxLength: 48 }
+        - name: rarity_zone
+          in: query
+          required: false
+          description: 稀有度分区
+          schema: { $ref: "#/components/schemas/RarityZone" }
+        - name: risk_level
+          in: query
+          required: false
+          description: 风险等级
+          schema: { $ref: "#/components/schemas/RiskLevel" }
+        - name: status
+          in: query
+          required: false
+          description: 具体场景状态
+          schema: { $ref: "#/components/schemas/ConcreteScenarioStatus" }
+      responses:
+        "200":
+          description: 具体场景分页列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConcreteScenarioListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/concrete/batch-validate:
+    post:
+      tags: [scene-engine-concrete]
+      summary: 具体场景批量复检（通过 validated / 失败 quarantined）
+      description: 单次最多 200 条；G1-G7 重跑，失败者置 quarantined 并记录 failures。
+      operationId: batchValidateConcreteScenarios
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BatchValidateRequest" }
+      responses:
+        "200":
+          description: 批量复检结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchValidateResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/concrete/{scenario_id}:
+    get:
+      tags: [scene-engine-concrete]
+      summary: 具体场景详情（参数向量 + 可渲染 config）
+      operationId: getConcreteScenario
+      parameters:
+        - $ref: "#/components/parameters/ScenarioIdPath"
+      responses:
+        "200":
+          description: 具体场景详情
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConcreteScenarioResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/concrete/{scenario_id}/render:
+    post:
+      tags: [scene-engine-concrete]
+      summary: 按需渲染具体场景（返回可直接下发的 SceneConfig）
+      description: 幂等只读操作（POST 仅为携带路径语义），重复渲染结果一致（内容哈希不变）。
+      operationId: renderConcreteScenario
+      parameters:
+        - $ref: "#/components/parameters/ScenarioIdPath"
+      responses:
+        "200":
+          description: 渲染结果（含闸门明细）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConcreteRenderResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ===================================================================
+  # 四、判据 / 测试用例
+  # ===================================================================
+  /api/v1/scene/oracles:
+    get:
+      tags: [scene-engine-oracle]
+      summary: 判据目录（版本化 ref，代码即事实来源）
+      operationId: listOracles
+      responses:
+        "200":
+          description: 判据列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OracleListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/scene/testcases:
+    get:
+      tags: [scene-engine-oracle]
+      summary: 查询测试用例（分页 + 逻辑场景/状态过滤）
+      operationId: listTestCases
+      parameters:
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+        - name: logical_id
+          in: query
+          required: false
+          schema: { type: string, maxLength: 48 }
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/TestCaseStatus" }
+      responses:
+        "200":
+          description: 用例分页列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TestCaseListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    post:
+      tags: [scene-engine-oracle]
+      summary: 创建测试用例（ISO 34505：目标/前置/步骤/平台/判据/超时）
+      description: "`case_key` 全局唯一（重复返回 409/3002）；`oracle_ref` 必须在判据目录中（否则 422/2001）。"
+      operationId: createTestCase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TestCaseCreateRequest" }
+      responses:
+        "201":
+          description: 用例已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TestCaseResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/testcases/{test_case_id}:
+    get:
+      tags: [scene-engine-oracle]
+      summary: 测试用例详情
+      operationId: getTestCase
+      parameters:
+        - $ref: "#/components/parameters/TestCaseIdPath"
+      responses:
+        "200":
+          description: 用例详情
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TestCaseResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ===================================================================
+  # 五、测试集 / 基线
+  # ===================================================================
+  /api/v1/scene/suites:
+    get:
+      tags: [scene-engine-suite]
+      summary: 查询测试集（分页）
+      operationId: listScenarioSuites
+      parameters:
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
+      responses:
+        "200":
+          description: 测试集分页列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SuiteListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    post:
+      tags: [scene-engine-suite]
+      summary: 创建测试集
+      description: 名称唯一（重复返回 409/3002）。
+      operationId: createScenarioSuite
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SuiteCreateRequest" }
+      responses:
+        "201":
+          description: 测试集已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SuiteResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/suites/{suite_id}:
+    get:
+      tags: [scene-engine-suite]
+      summary: 测试集详情（含条目）
+      operationId: getScenarioSuite
+      parameters:
+        - $ref: "#/components/parameters/SuiteIdPath"
+      responses:
+        "200":
+          description: 测试集详情
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SuiteResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/suites/{suite_id}/items:
+    post:
+      tags: [scene-engine-suite]
+      summary: 测试集加条目（item_id 冲突覆盖；锁定后拒绝）
+      description: 引用不存在的用例/具体场景返回 404/3001；已锁定返回 409/3003。
+      operationId: addScenarioSuiteItems
+      parameters:
+        - $ref: "#/components/parameters/SuiteIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SuiteItemsRequest" }
+      responses:
+        "200":
+          description: 更新后的测试集详情
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SuiteResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/StateConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/suites/{suite_id}/lock:
+    post:
+      tags: [scene-engine-suite]
+      summary: 锁定测试集（写 lock_hash；可同时创建基线快照）
+      description: 重复锁定返回 409/3003；`baseline_name` 非空时同事务创建基线。
+      operationId: lockScenarioSuite
+      parameters:
+        - $ref: "#/components/parameters/SuiteIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SuiteLockRequest" }
+      responses:
+        "200":
+          description: 锁定结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SuiteLockResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/StateConflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/suites/{suite_id}/diff:
+    get:
+      tags: [scene-engine-suite]
+      summary: 测试集差异（当前条目 vs 基线/锁定快照）
+      operationId: diffScenarioSuite
+      parameters:
+        - $ref: "#/components/parameters/SuiteIdPath"
+        - name: baseline_id
+          in: query
+          required: false
+          description: 基线 ID；缺省取最新
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: 差异结果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SuiteDiffResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/suites/{suite_id}/baselines:
+    get:
+      tags: [scene-engine-suite]
+      summary: 测试集基线列表（新→旧）
+      operationId: listScenarioSuiteBaselines
+      parameters:
+        - $ref: "#/components/parameters/SuiteIdPath"
+      responses:
+        "200":
+          description: 基线列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BaselineListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ===================================================================
+  # 六、覆盖分析
+  # ===================================================================
+  /api/v1/scene/coverage/overview:
+    get:
+      tags: [scene-engine-coverage]
+      summary: 覆盖总览（Z1-Z4 / L1-L4 计数与占比）
+      operationId: getCoverageOverview
+      parameters:
+        - name: logical_id
+          in: query
+          required: false
+          description: 仅统计指定逻辑场景；缺省全库
+          schema: { type: string, maxLength: 48 }
+      responses:
+        "200":
+          description: 覆盖总览
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CoverageOverviewResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/coverage/gaps:
+    get:
+      tags: [scene-engine-coverage]
+      summary: 覆盖盲区（按剖面配额计算 Z3/Z4 缺口与补采建议）
+      description: 目标配额来自剖面（regression 70:25:5:0 / robustness 40:40:20:0 / exploration 10:30:50:10）。
+      operationId: listCoverageGaps
+      parameters:
+        - name: profile
+          in: query
+          required: false
+          description: 生成剖面（决定 Z1-Z4 目标占比）
+          schema: { $ref: "#/components/schemas/GenerationProfile" }
+      responses:
+        "200":
+          description: 盲区列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CoverageGapListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        网关签发的 JWT Access Token；网关校验后注入 X-User-Id / X-Roles / X-Trace-Id，
+        服务侧按 RBAC 资源域 scene 二次校验（scene:read / write / execute）。
+
+  parameters:
+    PageQuery:
+      name: page
+      in: query
+      required: false
+      description: 页码（从 1 开始）
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSizeQuery:
+      name: page_size
+      in: query
+      required: false
+      description: 每页条数（上限 200）
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+    LogicalIdPath:
+      name: logical_id
+      in: path
+      required: true
+      description: 逻辑场景 ID（如 LS-INT-001）
+      schema:
+        type: string
+        pattern: "^LS-[A-Z0-9-]{3,40}$"
+    TaskIdPath:
+      name: task_id
+      in: path
+      required: true
+      description: 生成任务 ID
+      schema: { type: string, format: uuid }
+    ScenarioIdPath:
+      name: scenario_id
+      in: path
+      required: true
+      description: 具体场景 ID
+      schema: { type: string, format: uuid }
+    TestCaseIdPath:
+      name: test_case_id
+      in: path
+      required: true
+      description: 测试用例 ID
+      schema: { type: string, format: uuid }
+    SuiteIdPath:
+      name: suite_id
+      in: path
+      required: true
+      description: 测试集 ID
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthenticated:
+      description: 1001/1003 未认证（Token 缺失/无效/过期）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 1001
+            message: 未认证
+            data: null
+            request_id: 6f1c2b6e-4d1a-4c6e-9a0c-3b1f7d9e2a44
+            timestamp: "2026-10-23T10:00:00Z"
+    Forbidden:
+      description: 1002 无权限（RBAC 资源域 scene 权限不足）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 1002
+            message: 无权限
+            data: null
+            request_id: 6f1c2b6e-4d1a-4c6e-9a0c-3b1f7d9e2a44
+            timestamp: "2026-10-23T10:00:00Z"
+    NotFound:
+      description: 3001 资源不存在（逻辑场景/具体场景/任务/用例/测试集/基线）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 3001
+            message: 资源不存在
+            data: null
+            request_id: 6f1c2b6e-4d1a-4c6e-9a0c-3b1f7d9e2a44
+            timestamp: "2026-10-23T10:00:00Z"
+    Conflict:
+      description: 3002 唯一约束冲突（case_key / 测试集名称重复）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 3002
+            message: 资源已存在
+            data: null
+            request_id: 6f1c2b6e-4d1a-4c6e-9a0c-3b1f7d9e2a44
+            timestamp: "2026-10-23T10:00:00Z"
+    StateConflict:
+      description: 3003 资源状态冲突（running 任务不可取消 / 测试集已锁定）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 3003
+            message: 资源状态不允许该操作
+            data: null
+            request_id: 6f1c2b6e-4d1a-4c6e-9a0c-3b1f7d9e2a44
+            timestamp: "2026-10-23T10:00:00Z"
+    ValidationFailed:
+      description: 2001 参数错误 / 2002 参数缺失（IR 参数未声明、overrides 非白名单、判据不存在等）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 2001
+            message: 参数错误
+            data: null
+            request_id: 6f1c2b6e-4d1a-4c6e-9a0c-3b1f7d9e2a44
+            timestamp: "2026-10-23T10:00:00Z"
+    InternalError:
+      description: 5000 服务器内部错误（未预期异常）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 5000
+            message: 服务器内部错误
+            data: null
+            request_id: 6f1c2b6e-4d1a-4c6e-9a0c-3b1f7d9e2a44
+            timestamp: "2026-10-23T10:00:00Z"
+    ServiceUnavailable:
+      description: 5001 服务不可用（PostgreSQL 不可达 / scene_engine 未初始化）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiResponse" }
+          example:
+            code: 5001
+            message: 服务暂不可用
+            data: null
+            request_id: 6f1c2b6e-4d1a-4c6e-9a0c-3b1f7d9e2a44
+            timestamp: "2026-10-23T10:00:00Z"
+
+  schemas:
+    # ---------- 统一响应与错误码（不可更改） ----------
+    ErrorCode:
+      type: integer
+      description: |
+        预定义错误码（附录 A，禁止自定义）。本组端点可能返回：
+        `0` 成功 / `1001` 未认证 / `1002` 无权限 / `1003` Token 过期 /
+        `2001` 参数错误 / `2002` 参数缺失 / `3001` 资源不存在 /
+        `3002` 唯一约束冲突 / `3003` 状态冲突 / `5000` 内部错误 / `5001` 服务不可用。
+      enum: [0, 1001, 1002, 1003, 2001, 2002, 3001, 3002, 3003, 5000, 5001]
+    ApiResponse:
+      type: object
+      description: 统一响应格式（所有业务响应/错误响应均为该结构）
+      required: [code, message, data, request_id, timestamp]
+      properties:
+        code: { $ref: "#/components/schemas/ErrorCode" }
+        message: { type: string }
+        data:
+          nullable: true
+          description: 业务载荷（错误时为 null）
+        request_id: { type: string, description: 全链路 trace_id }
+        timestamp: { type: string, format: date-time }
+
+    # ---------- 受控词表（与 app/models/scene_engine.py 逐字一致） ----------
+    LogicalScenarioStatus:
+      type: string
+      enum: [draft, validating, pending_review, published, quarantined, deprecated, archived, rejected]
+    ConcreteScenarioStatus:
+      type: string
+      enum: [generated, validated, published, quarantined, archived]
+    RarityZone:
+      type: string
+      enum: [Z1, Z2, Z3, Z4]
+      description: 稀有度分区（马氏距离 d_M² ~ χ²ₙ 分位，Z1 常见 → Z4 极稀有）
+    CriticalityLevel:
+      type: string
+      enum: [C0, C1, C2, C3]
+      description: 临界度（CI = a_req / a_max，C0 无风险 → C3 极限）
+    RiskLevel:
+      type: string
+      enum: [L1, L2, L3, L4]
+      description: 风险等级（稀有度 × 临界度 双轴矩阵）
+    Avoidability:
+      type: string
+      enum: [avoidable, marginal, unavoidable, trivial_safe]
+      description: 可避免性标签（标注而非剔除）
+    GenerationStrategy:
+      type: string
+      enum: [coverage_driven, distribution, replay_mutation, search_based, ai_generated]
+    GenerationProfile:
+      type: string
+      enum: [regression, robustness, exploration]
+      description: Z1-Z4 分层配额剖面（70:25:5:0 / 40:40:20:0 / 10:30:50:10）
+      default: exploration
+    GenerationTaskStatus:
+      type: string
+      enum: [pending, running, succeeded, failed, canceled]
+    TestCaseStatus:
+      type: string
+      enum: [draft, published, deprecated, archived]
+    SuiteStatus:
+      type: string
+      enum: [draft, locked, archived]
+    SuiteItemType:
+      type: string
+      enum: [test_case, concrete_scenario]
+
+    # ---------- 逻辑场景 ----------
+    GateItem:
+      type: object
+      description: 单道校验门结果（G1 几何 / G2 动力学 / G3 可见性 / G4 临界度 / G5 判据 / G6 时长 / G7 可渲染）
+      required: [gate, passed, message]
+      properties:
+        gate: { type: string, pattern: "^G[1-8]$" }
+        passed: { type: boolean }
+        message: { type: string }
+    LogicalScenarioSummary:
+      type: object
+      required: [logical_id, version, name, category, scene_type]
+      properties:
+        logical_id: { type: string, pattern: "^LS-[A-Z0-9-]{3,40}$" }
+        version: { type: string, example: "1.0.0" }
+        name: { type: string }
+        category: { type: string, example: interaction }
+        scene_type: { type: string, example: cut_in }
+        description: { type: string, default: "" }
+        status:
+          allOf: [{ $ref: "#/components/schemas/LogicalScenarioStatus" }]
+          default: published
+        ir_version: { type: string, default: "hunter.ir/1.2" }
+        oracle_ref: { type: string, example: oracle.safety.min_distance/v1 }
+        parameter_count: { type: integer, minimum: 0 }
+        tags:
+          type: array
+          items: { type: string }
+        content_hash: { type: string, description: SHA-256（IR 规范化后） }
+        origin:
+          type: string
+          enum: [catalog, database]
+          description: database=DB 快照；catalog=内置目录兜底
+        update_time: { type: string, format: date-time, nullable: true }
+    LogicalScenarioDetail:
+      allOf:
+        - $ref: "#/components/schemas/LogicalScenarioSummary"
+        - type: object
+          required: [ir]
+          properties:
+            ir:
+              type: object
+              description: 完整 IR（hunter.ir/1.2；结构以 services/scene-service/app/engine/ir.py 为准）
+            parameters:
+              type: array
+              items: { type: object }
+              description: 参数声明（name/type/distribution/default/unit…）
+            bindings: { type: array, items: { type: object } }
+            constraints: { type: array, items: { type: object } }
+            correlations: { type: array, items: { type: object } }
+            allowed_modes:
+              type: array
+              items: { type: string }
+              description: SIL / VIL / 场地复现等允许模式
+    LogicalVersionSummary:
+      type: object
+      required: [version, status, content_hash, origin]
+      properties:
+        version: { type: string }
+        status: { $ref: "#/components/schemas/LogicalScenarioStatus" }
+        content_hash: { type: string }
+        origin: { type: string, enum: [catalog, database] }
+        update_time: { type: string, format: date-time, nullable: true }
+    ValidationReport:
+      type: object
+      required: [logical_id, version, passed, gates, oracle_ref, oracle_found]
+      properties:
+        logical_id: { type: string }
+        version: { type: string }
+        passed: { type: boolean }
+        gates:
+          type: array
+          items: { $ref: "#/components/schemas/GateItem" }
+        failures:
+          type: array
+          items: { type: string }
+        oracle_ref: { type: string }
+        oracle_found: { type: boolean }
+        parameter_defaults:
+          type: object
+          additionalProperties: { oneOf: [{ type: number }, { type: string }] }
+    DryRunRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        version: { type: string, maxLength: 16, nullable: true }
+        values:
+          type: object
+          description: 参数覆盖（仅允许 IR 已声明的键）
+          additionalProperties: { oneOf: [{ type: number }, { type: string }] }
+    DryRunResult:
+      type: object
+      required: [logical_id, version, passed, values, scene_config, gates]
+      properties:
+        logical_id: { type: string }
+        version: { type: string }
+        passed: { type: boolean }
+        values:
+          type: object
+          additionalProperties: { oneOf: [{ type: number }, { type: string }] }
+        scene_config:
+          type: object
+          description: 渲染后的 SceneConfig（可直接下发）
+        gates:
+          type: array
+          items: { $ref: "#/components/schemas/GateItem" }
+        failures: { type: array, items: { type: string } }
+    PublishResult:
+      type: object
+      required: [logical_id, version, status]
+      properties:
+        logical_id: { type: string }
+        version: { type: string }
+        status: { type: string, example: published }
+    CatalogSyncResult:
+      type: object
+      required: [version, synced, logical_ids]
+      properties:
+        version: { type: string }
+        synced: { type: integer }
+        logical_ids:
+          type: array
+          items: { type: string }
+
+    # ---------- 生成任务 ----------
+    GenerateRequest:
+      type: object
+      additionalProperties: false
+      required: [logical_id]
+      properties:
+        logical_id: { type: string, pattern: "^LS-[A-Z0-9-]{3,40}$" }
+        logical_version: { type: string, maxLength: 16, nullable: true }
+        count:
+          type: integer
+          minimum: 1
+          maximum: 5000
+          default: 100
+          description: 目标生成数量
+        strategy:
+          allOf: [{ $ref: "#/components/schemas/GenerationStrategy" }]
+          default: distribution
+        profile:
+          allOf: [{ $ref: "#/components/schemas/GenerationProfile" }]
+          default: regression
+        seed:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9223372036854775807
+          default: 0
+          description: 随机种子；0 表示由服务端生成
+        overrides:
+          type: object
+          description: |
+            策略覆盖白名单键：`fixed` / `ranges` / `candidates` / `base` / `target_zone`。
+            `replay_mutation` 必填 `base`；`ai_generated` 必填 `candidates`；未知键返回 422。
+    GenerationTask:
+      type: object
+      required: [task_id, logical_id, logical_version, strategy, profile, count, seed, status, progress, produced, duplicates, rejected, created_by]
+      properties:
+        task_id: { type: string, format: uuid }
+        logical_id: { type: string }
+        logical_version: { type: string }
+        strategy: { $ref: "#/components/schemas/GenerationStrategy" }
+        profile: { $ref: "#/components/schemas/GenerationProfile" }
+        count: { type: integer }
+        seed: { type: integer, format: int64 }
+        status: { $ref: "#/components/schemas/GenerationTaskStatus" }
+        progress: { type: number, minimum: 0, maximum: 1 }
+        produced: { type: integer, description: 实际入库数（去重后） }
+        duplicates: { type: integer, description: 内容哈希重复跳过数 }
+        rejected: { type: integer, description: 未过 G1-G7 数 }
+        zone_quota:
+          type: object
+          additionalProperties: { type: integer }
+          description: Z1-Z4 目标配额
+        zone_counts:
+          type: object
+          additionalProperties: { type: integer }
+          description: Z1-Z4 实产分布
+        error_message: { type: string, nullable: true }
+        created_by: { type: string, format: uuid }
+        create_time: { type: string, format: date-time, nullable: true }
+        update_time: { type: string, format: date-time, nullable: true }
+
+    # ---------- 响应包装 ----------
+    LogicalScenarioListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items, total]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/LogicalScenarioSummary" }
+                total: { type: integer }
+    LogicalScenarioResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/LogicalScenarioDetail" }
+    LogicalVersionListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [logical_id, items]
+              properties:
+                logical_id: { type: string }
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/LogicalVersionSummary" }
+    LogicalValidationResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ValidationReport" }
+    LogicalDryRunResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/DryRunResult" }
+    LogicalPublishResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/PublishResult" }
+    CatalogSyncResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/CatalogSyncResult" }
+    GenerationTaskResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/GenerationTask" }
+    GenerationTaskListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items, total]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/GenerationTask" }
+                total: { type: integer }
+
+    # ---------- 具体场景 ----------
+    ConcreteScenarioSummary:
+      type: object
+      required: [scenario_id, logical_id, logical_version, name, rarity_p, rarity_zone, criticality_ci, criticality_level, risk_level, avoidability, vil_safe, status, content_hash, seed]
+      properties:
+        scenario_id: { type: string, format: uuid }
+        logical_id: { type: string }
+        logical_version: { type: string }
+        name: { type: string }
+        rarity_p:
+          type: number
+          description: 稀有度概率 p（越小越稀有）
+        rarity_zone: { $ref: "#/components/schemas/RarityZone" }
+        criticality_ci:
+          type: number
+          description: 临界度 CI = a_req / a_max
+        criticality_level: { $ref: "#/components/schemas/CriticalityLevel" }
+        risk_level: { $ref: "#/components/schemas/RiskLevel" }
+        avoidability: { $ref: "#/components/schemas/Avoidability" }
+        vil_safe:
+          type: boolean
+          description: 是否满足 VIL 安全联锁前置条件
+        status: { $ref: "#/components/schemas/ConcreteScenarioStatus" }
+        content_hash: { type: string, description: SHA-256（全局唯一去重键） }
+        seed: { type: integer, format: int64 }
+        create_time: { type: string, format: date-time, nullable: true }
+    ConcreteScenarioDetail:
+      allOf:
+        - $ref: "#/components/schemas/ConcreteScenarioSummary"
+        - type: object
+          properties:
+            param_values:
+              type: object
+              additionalProperties: true
+            param_vec:
+              type: array
+              items: { type: number }
+              description: 参数向量（数值参数顺序固定，供分布分析）
+            allowed_modes:
+              type: array
+              items: { type: string }
+            generator:
+              type: object
+              description: 生成元数据（strategy/profile/seed/overrides…）
+            validity:
+              type: object
+              description: 校验结果（gates/failures/时间）
+            scene_config: { type: object }
+    RenderResult:
+      type: object
+      required: [scenario_id, logical_id, content_hash, scene_config, gates, passed]
+      properties:
+        scenario_id: { type: string, format: uuid }
+        logical_id: { type: string }
+        content_hash: { type: string }
+        scene_config: { type: object }
+        gates:
+          type: array
+          items: { $ref: "#/components/schemas/GateItem" }
+        passed: { type: boolean }
+    BatchValidateRequest:
+      type: object
+      additionalProperties: false
+      required: [scenario_ids]
+      properties:
+        scenario_ids:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: { type: string, format: uuid }
+    BatchValidateItem:
+      type: object
+      required: [scenario_id, passed, status]
+      properties:
+        scenario_id: { type: string, format: uuid }
+        passed: { type: boolean }
+        failures: { type: array, items: { type: string } }
+        status: { $ref: "#/components/schemas/ConcreteScenarioStatus" }
+    BatchValidateResult:
+      type: object
+      required: [validated, quarantined, items]
+      properties:
+        validated: { type: integer }
+        quarantined: { type: integer }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/BatchValidateItem" }
+
+    # ---------- 判据 / 测试用例 ----------
+    Oracle:
+      type: object
+      required: [oracle_ref, name, kind, description, metric, operator, threshold, platforms, timeout_seconds]
+      properties:
+        oracle_ref: { type: string, example: oracle.safety.min_distance/v1 }
+        name: { type: string }
+        kind: { type: string, example: safety }
+        description: { type: string }
+        metric: { type: string, example: min_distance }
+        operator: { type: string, enum: [">=", "<=", "==", ">", "<"] }
+        threshold: { type: number }
+        unit: { type: string, default: "m" }
+        platforms:
+          type: array
+          items: { type: string, enum: [simulation, replay, sil, vil, hil] }
+        timeout_seconds: { type: integer, default: 120 }
+        extra: { type: object }
+    TestCaseCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [case_key, name, logical_id, objective, oracle_ref]
+      properties:
+        case_key:
+          type: string
+          pattern: "^TC-[A-Z0-9-]{3,48}$"
+          maxLength: 48
+        name: { type: string, minLength: 1, maxLength: 128 }
+        logical_id: { type: string, pattern: "^LS-[A-Z0-9-]{3,40}$" }
+        logical_version: { type: string, maxLength: 16, nullable: true }
+        scenario_id: { type: string, format: uuid, nullable: true }
+        objective: { type: string, minLength: 1, maxLength: 500 }
+        preconditions: { type: object }
+        steps:
+          type: array
+          maxItems: 50
+          items: { type: object }
+        platforms:
+          type: array
+          maxItems: 8
+          items: { type: string, enum: [simulation, replay, sil, vil, hil] }
+          default: [simulation]
+        oracle_ref: { type: string, minLength: 1, maxLength: 64 }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 3600, default: 120 }
+        tags:
+          type: array
+          maxItems: 20
+          items: { type: string }
+    TestCase:
+      allOf:
+        - $ref: "#/components/schemas/TestCaseCreateRequest"
+        - type: object
+          required: [test_case_id, logical_version, status]
+          properties:
+            test_case_id: { type: string, format: uuid }
+            logical_version: { type: string, description: 创建时解析后的具体版本 }
+            status: { $ref: "#/components/schemas/TestCaseStatus" }
+            create_time: { type: string, format: date-time, nullable: true }
+
+    # ---------- 测试集 / 基线 ----------
+    SuiteCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128 }
+        description: { type: string, maxLength: 500, nullable: true }
+    SuiteItemInput:
+      type: object
+      additionalProperties: false
+      required: [item_id, item_type, ref_id]
+      properties:
+        item_id: { type: string, minLength: 1, maxLength: 64, description: 集内唯一条目 ID }
+        item_type: { $ref: "#/components/schemas/SuiteItemType" }
+        ref_id: { type: string, minLength: 1, maxLength: 64, description: case_key 或具体场景 UUID }
+        weight: { type: number, exclusiveMinimum: 0, maximum: 100, default: 1.0 }
+    SuiteItemsRequest:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: { $ref: "#/components/schemas/SuiteItemInput" }
+    SuiteLockRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        baseline_name: { type: string, maxLength: 128, nullable: true }
+        metrics:
+          type: object
+          description: 锁定时的质量度量快照（可空）
+    SuiteItem:
+      type: object
+      required: [item_id, item_type, ref_id, weight]
+      properties:
+        item_id: { type: string }
+        item_type: { $ref: "#/components/schemas/SuiteItemType" }
+        ref_id: { type: string }
+        weight: { type: number }
+    Suite:
+      type: object
+      required: [suite_id, name, status, item_count]
+      properties:
+        suite_id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        status: { $ref: "#/components/schemas/SuiteStatus" }
+        item_count: { type: integer }
+        lock_hash: { type: string, nullable: true }
+        locked_at: { type: string, format: date-time, nullable: true }
+        locked_by: { type: string, format: uuid, nullable: true }
+        create_time: { type: string, format: date-time, nullable: true }
+        update_time: { type: string, format: date-time, nullable: true }
+    SuiteDetail:
+      allOf:
+        - $ref: "#/components/schemas/Suite"
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: "#/components/schemas/SuiteItem" }
+    SuiteLockResult:
+      type: object
+      required: [suite_id, status, lock_hash, item_count]
+      properties:
+        suite_id: { type: string, format: uuid }
+        status: { $ref: "#/components/schemas/SuiteStatus" }
+        lock_hash: { type: string }
+        item_count: { type: integer }
+        baseline_name: { type: string, nullable: true }
+    Baseline:
+      type: object
+      required: [baseline_id, suite_id, name, suite_hash, locked_by]
+      properties:
+        baseline_id: { type: string, format: uuid }
+        suite_id: { type: string, format: uuid }
+        name: { type: string }
+        suite_hash: { type: string }
+        metrics: { type: object }
+        locked_by: { type: string, format: uuid }
+        create_time: { type: string, format: date-time, nullable: true }
+    SuiteDiff:
+      type: object
+      required: [suite_id, current_hash, identical]
+      properties:
+        suite_id: { type: string, format: uuid }
+        current_hash: { type: string }
+        baseline_hash: { type: string, nullable: true }
+        identical: { type: boolean }
+        added: { type: array, items: { type: string } }
+        removed: { type: array, items: { type: string } }
+        changed: { type: array, items: { type: string } }
+
+    # ---------- 覆盖分析 ----------
+    CoverageOverview:
+      type: object
+      required: [total, zone_counts, zone_ratio, risk_counts, risk_matrix_applied]
+      properties:
+        logical_id: { type: string, nullable: true }
+        total: { type: integer }
+        zone_counts:
+          type: object
+          additionalProperties: { type: integer }
+        zone_ratio:
+          type: object
+          additionalProperties: { type: number }
+        risk_counts:
+          type: object
+          additionalProperties: { type: integer }
+        risk_matrix_applied: { type: boolean }
+    CoverageGap:
+      type: object
+      required: [logical_id, name, zone, count, target, deficit, recommendation]
+      properties:
+        logical_id: { type: string }
+        name: { type: string }
+        zone: { $ref: "#/components/schemas/RarityZone" }
+        count: { type: integer }
+        target: { type: integer }
+        deficit: { type: integer }
+        recommendation: { type: string }
+
+    # ---------- 响应包装（具体/用例/测试集/覆盖） ----------
+    ConcreteScenarioListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items, total, page, page_size]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/ConcreteScenarioSummary" }
+                total: { type: integer }
+                page: { type: integer }
+                page_size: { type: integer }
+    ConcreteScenarioResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/ConcreteScenarioDetail" }
+    ConcreteRenderResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/RenderResult" }
+    BatchValidateResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/BatchValidateResult" }
+    OracleListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items, total]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/Oracle" }
+                total: { type: integer }
+    TestCaseListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items, total, page, page_size]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/TestCase" }
+                total: { type: integer }
+                page: { type: integer }
+                page_size: { type: integer }
+    TestCaseResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/TestCase" }
+    SuiteListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items, total, page, page_size]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/Suite" }
+                total: { type: integer }
+                page: { type: integer }
+                page_size: { type: integer }
+    SuiteResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/SuiteDetail" }
+    SuiteLockResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/SuiteLockResult" }
+    BaselineListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/Baseline" }
+    SuiteDiffResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/SuiteDiff" }
+    CoverageOverviewResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/CoverageOverview" }
+    CoverageGapListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [profile, items]
+              properties:
+                profile: { $ref: "#/components/schemas/GenerationProfile" }
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/CoverageGap" }

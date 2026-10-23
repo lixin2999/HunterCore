@@ -20,6 +20,8 @@ REMOTE_CONTROL_SCHEMA = "remote_control"
 GATEWAY_SCHEMA = "gateway"
 #: 数据消费解析与处理（ingest-platform，设计文档 06_ingest_platform.sql）
 INGEST_PLATFORM_SCHEMA = "ingest_platform"
+#: 场景引擎（scene-service 服务私有：逻辑/具体场景、测试用例、测试集、生成任务）
+SCENE_ENGINE_SCHEMA = "scene_engine"
 
 #: 全部 schema（供 Alembic 建/删 schema 使用）
 ALL_SCHEMAS: tuple[str, ...] = (
@@ -32,6 +34,7 @@ ALL_SCHEMAS: tuple[str, ...] = (
     REMOTE_CONTROL_SCHEMA,
     GATEWAY_SCHEMA,
     INGEST_PLATFORM_SCHEMA,
+    SCENE_ENGINE_SCHEMA,
 )
 
 #: 需要 TimescaleDB hypertable 化的表（schema 限定名）
@@ -55,6 +58,7 @@ __all__ = [
     "OTA_SCHEMA",
     "REMOTE_CONTROL_SCHEMA",
     "RETENTION_INTERVAL",
+    "SCENE_ENGINE_SCHEMA",
     "SCENE_SCHEMA",
     "USER_SCHEMA",
     "VEHICLE_SCHEMA",

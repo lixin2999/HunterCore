@@ -5,6 +5,7 @@
 export * from './common'
 export * from './user'
 export * from './scene'
+export * from './engine'
 export * from './data'
 export * from './analytics'
 export * from './ota'

@@ -40,6 +40,10 @@ data:
   SCENE_DUPLICATE_NAME_SUFFIX: "-copy"
   SCENE_DUPLICATE_MAX_ATTEMPTS: "100"
   SCENE_DEFAULT_VERSION: "1.0.0"
+  # 场景引擎（V2.0；生成上限与 DDL generation_tasks.count CHECK 1..5000 同源）
+  SCENE_GENERATION_MAX_COUNT: "5000"
+  SCENE_ALLOWED_MAPS: ""          # 空 = 不限制（G3）；按开放区域收紧时填逗号分隔地图 ID
+  SCENE_CATALOG_VERSION: "1.0.0"   # 与 scene_engine.catalog.CATALOG_VERSION 一致性由测试钉住
   # RBAC（资源域 scene：create/read/update/delete/execute）
   SCENE_READ_ROLES: "admin,analyst,operator"
   SCENE_WRITE_ROLES: "admin,operator"

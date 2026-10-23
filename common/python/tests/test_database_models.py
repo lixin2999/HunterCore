@@ -62,14 +62,14 @@ def ddl_tables() -> dict[str, set[str]]:
     """提取 DDL 中每张表的列名（列定义固定 4 空格缩进，续行缩进更深）。
 
     注：ingest_platform 表的 ORM 模型归属服务侧（services/ingest-platform/app/models），
-    本共享库测试不导入服务包，其表级契约校验见
-    services/ingest-platform/tests/test_ddl_contract.py。
+    scene_engine 同理（services/scene-service/app/models/scene_engine.py），本共享库测试不导入服务包，
+    其表级契约校验见服务侧 test_ddl_contract.py / test_scene_engine_ddl.py。
     """
     tables: dict[str, set[str]] = {}
     for path in sorted(DDL_DIR.glob("*.sql")):
         text = path.read_text(encoding="utf-8")
         for match in CREATE_TABLE_RE.finditer(text):
-            if match.group(1).startswith("ingest_platform."):
+            if match.group(1).startswith(("ingest_platform.", "scene_engine.")):
                 continue
             columns: set[str] = set()
             for line in match.group(2).splitlines():
@@ -107,6 +107,7 @@ def test_contract_files_exist() -> None:
         "04_events.sql",
         "05_timeseries.sql",
         "06_ingest_platform.sql",
+        "07_scene_engine.sql",
     ):
         assert (DDL_DIR / name).is_file(), f"缺失 DDL 契约文件: {name}"
     for name in ("er.md", "enums.md", "README.md"):

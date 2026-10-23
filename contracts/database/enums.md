@@ -145,3 +145,26 @@ GB/T 47025—2026 覆盖面；六大分类 basic / interactive / environment / c
 | `data_collector.vehicle_telemetry.control_mode` | TEXT（遥测示例值 `CAN`） | 完整取值域 |
 | `data_collector.vehicle_telemetry.vehicle_state` | TEXT（遥测示例值 `NORMAL`，与车辆 8 态状态定义不同域） | 完整取值域 |
 
+## 11. 场景引擎词表 `scene_engine`（V1.23.0，服务私有 schema）
+
+单一事实来源：`contracts/database/ddl/07_scene_engine.sql` 的 CHECK 约束，与
+`services/scene-service/app/models/scene_engine.py` 的 `StrEnum` **逐字一致**（禁用 PG 原生枚举，一律 TEXT + CHECK）。
+
+| 枚举 | 取值 | 所在列 |
+|------|------|--------|
+| `LogicalScenarioStatus` | `draft` / `validating` / `pending_review` / `published` / `quarantined` / `deprecated` / `archived` / `rejected` | `logical_scenarios.status` |
+| `ConcreteScenarioStatus` | `generated` / `validated` / `published` / `quarantined` / `archived` | `concrete_scenarios.status` |
+| `RarityZone` | `Z1` / `Z2` / `Z3` / `Z4`（马氏距离 d_M² ~ χ²ₙ 分位，Z1 常见 → Z4 极稀有） | `concrete_scenarios.rarity_zone` |
+| `CriticalityLevel` | `C0` / `C1` / `C2` / `C3`（CI = a_req / a_max） | `concrete_scenarios.criticality_level` |
+| `RiskLevel` | `L1` / `L2` / `L3` / `L4`（稀有度 × 临界度 双轴矩阵） | `concrete_scenarios.risk_level` |
+| `Avoidability` | `avoidable` / `marginal` / `unavoidable` / `trivial_safe`（标注而非剔除） | `concrete_scenarios.avoidability` |
+| `GenerationStrategy` | `coverage_driven` / `distribution` / `replay_mutation` / `search_based` / `ai_generated` | `generation_tasks.strategy` |
+| `GenerationProfile` | `regression`（70:25:5:0）/ `robustness`（40:40:20:0）/ `exploration`（10:30:50:10） | `generation_tasks.profile` |
+| `GenerationTaskStatus` | `pending` / `running` / `succeeded` / `failed` / `canceled` | `generation_tasks.status` |
+| `TestCaseStatus` | `draft` / `published` / `deprecated` / `archived` | `test_cases.status` |
+| `SuiteStatus` | `draft` / `locked` / `archived` | `scenario_suites.status` |
+| `SuiteItemType` | `test_case` / `concrete_scenario` | `suite_items.item_type` |
+
+> 同表内引用约束：`scenario_suites.status=locked` 时 `lock_hash` / `locked_at` / `locked_by` 必须非空；
+> `suite_items.ref_id` 为多态引用（用例 `case_key` 或具体场景 UUID），无物理外键，由服务层校验。
+

@@ -33,6 +33,8 @@ const router = useRouter()
 const MENU: MenuItem[] = [
   { name: 'dashboard', title: '运营看板', icon: 'Monitor', permission: PERMISSIONS.analyticsRead },
   { name: 'scenes', title: '场景库', icon: 'Files', permission: PERMISSIONS.sceneRead },
+  { name: 'scene-generator', title: '场景生成器', icon: 'MagicStick', permission: PERMISSIONS.sceneRead },
+  { name: 'scene-testcases', title: '用例与测试集', icon: 'Tickets', permission: PERMISSIONS.sceneRead },
   { name: 'analytics', title: '数据分析', icon: 'DataAnalysis', permission: PERMISSIONS.analyticsRead },
   {
     name: 'ota-versions',
