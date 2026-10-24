@@ -117,6 +117,7 @@ def scene_env() -> Iterator[SimpleNamespace]:
         storage=storage,
         carla=carla,
         service=scene_service,
+        simulation_service=app.state.simulation_service,
         vil_sessions=vil_sessions,
         topic_provisioner=topic_provisioner,
         engine=app.state.engine_service,

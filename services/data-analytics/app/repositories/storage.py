@@ -29,6 +29,12 @@ class ObjectStorage(Protocol):
         """写入 JSON 对象（覆盖语义）。"""
         ...
 
+    async def put_bytes(
+        self, key: str, payload: bytes, *, content_type: str = "application/octet-stream"
+    ) -> None:
+        """写入二进制对象（覆盖语义；HTML/PDF 等非 JSON 产物）。"""
+        ...
+
     async def list_json(self, prefix: str, *, limit: int | None = None) -> list[tuple[str, dict[str, Any]]]:
         """按前缀列举 JSON 对象（返回 (key, doc) 列表）。"""
         ...
@@ -131,6 +137,21 @@ class S3ObjectStorage:
                 Key=key,
                 Body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 ContentType="application/json",
+            )
+        except Exception as exc:
+            logger.exception("storage_put_failed", key=key)
+            raise ServiceUnavailableError("对象存储写入失败") from exc
+
+    async def put_bytes(
+        self, key: str, payload: bytes, *, content_type: str = "application/octet-stream"
+    ) -> None:
+        client = await self._ensure_client()
+        try:
+            await client.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=payload,
+                ContentType=content_type,
             )
         except Exception as exc:
             logger.exception("storage_put_failed", key=key)

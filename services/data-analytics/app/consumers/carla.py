@@ -112,14 +112,18 @@ class CarlaSimulationConsumer:
         status_doc: dict[str, Any] | None,
     ) -> None:
         events = self._events_cache.get(sim_id) or await self._cached_events(sim_id)
+        status_doc = status_doc or {}
         await self._reports.generate(
             sim_id=sim_id,
-            scene_id=envelope.get("scene_id"),
-            vehicle_id=envelope.get("vehicle_id"),
-            status=(status_doc or {}).get("status"),
+            scene_id=envelope.get("scene_id") or status_doc.get("scene_id"),
+            vehicle_id=envelope.get("vehicle_id") or status_doc.get("vehicle_id"),
+            status=status_doc.get("status"),
             metrics=metrics,
             timestamp=envelope.get("timestamp"),
             events=events,
+            mode=status_doc.get("mode"),
+            started_at=status_doc.get("started_at"),
+            finished_at=status_doc.get("finished_at"),
         )
 
     @staticmethod
@@ -157,6 +161,8 @@ class CarlaSimulationConsumer:
                 continue
             if isinstance(doc, dict):
                 events.append(doc)
+        # Redis List 用 LPUSH 写入（新→旧）；报告按时间正序展示
+        events.reverse()
         return events
 
     async def _get_json(self, key: str) -> dict[str, Any] | None:

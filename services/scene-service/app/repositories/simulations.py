@@ -59,20 +59,33 @@ class VilSessionStore:
         vehicle_id = str(payload.get("vehicle_id") or "")
         if not vehicle_id:
             raise ValueError("VIL 会话缺少 vehicle_id")
+        key = vil_session_key(vehicle_id)
         try:
             created = await self._redis.set(
-                vil_session_key(vehicle_id),
+                key,
                 self._dumps(payload),
                 nx=True,
                 ex=self._ttl,
             )
-            if created:
-                await self._redis.sadd(VIL_ACTIVE, vehicle_id)
         except RedisError as exc:
             raise ServiceUnavailableError(
                 "VIL 会话存储不可用", details={"vehicle_id": vehicle_id}
             ) from exc
-        return bool(created)
+        if not created:
+            return False
+        try:
+            await self._redis.sadd(VIL_ACTIVE, vehicle_id)
+        except RedisError as exc:
+            # SADD 失败必须回滚已占位的会话键，否则该车辆被无主会话阻塞到 TTL 到期
+            # （默认 2 小时），且 vil:active 对账也看不到它（V1.23.4）。
+            try:
+                await self._redis.delete(key)
+            except RedisError:
+                logger.exception("vil_session_acquire_rollback_failed", vehicle_id=vehicle_id)
+            raise ServiceUnavailableError(
+                "VIL 活动集合写入失败", details={"vehicle_id": vehicle_id}
+            ) from exc
+        return True
 
     async def bind_instance(
         self,
@@ -148,21 +161,37 @@ class VilSessionStore:
     async def release(
         self, vehicle_id: str, *, sim_id: str | None = None, sim_instance_id: str | None = None
     ) -> None:
-        """释放 VIL 会话（可选仅当 sim_id 匹配时释放，避免误删新会话）。"""
+        """释放 VIL 会话（可选仅当 sim_id 匹配时释放，避免误删新会话）。
+
+        三个键各自 best effort 清理：任一失败不影响其余键，最终统一抛 5001 供调用方告警。
+        """
         if sim_id is not None:
             current = await self.get(vehicle_id)
             if current is not None and str(current.get("sim_id")) != sim_id:
                 return
+        errors: list[str] = []
         try:
             await self._redis.delete(vil_session_key(vehicle_id))
-            await self._redis.srem(VIL_ACTIVE, vehicle_id)
-            if sim_instance_id:
-                await self._redis.delete(sim_instance_key(sim_instance_id))
         except RedisError as exc:
-            logger.warning("vil_session_release_failed", vehicle_id=vehicle_id, error=str(exc))
+            errors.append(f"session: {exc}")
+        try:
+            await self._redis.srem(VIL_ACTIVE, vehicle_id)
+        except RedisError as exc:
+            errors.append(f"active: {exc}")
+        if sim_instance_id:
+            try:
+                await self._redis.delete(sim_instance_key(sim_instance_id))
+            except RedisError as exc:
+                errors.append(f"instance: {exc}")
+        if errors:
+            logger.warning(
+                "vil_session_release_failed",
+                vehicle_id=vehicle_id,
+                errors=errors,
+            )
             raise ServiceUnavailableError(
                 "VIL 会话释放失败", details={"vehicle_id": vehicle_id}
-            ) from exc
+            )
 
     async def list_active(self) -> list[str]:
         """活动 VIL 车辆列表（启动对账/健康检查用）。"""

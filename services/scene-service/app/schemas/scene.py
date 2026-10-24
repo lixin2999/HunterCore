@@ -555,6 +555,7 @@ class SimulationQuality(StrEnum):
     LOW = "Low"
     MEDIUM = "Medium"
     HIGH = "High"
+    EPIC = "Epic"
 
 
 class VilCalibration(BaseModel):
@@ -577,9 +578,9 @@ class VilConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     calibration: VilCalibration = Field(description="坐标标定（VIL 必填）")
-    target_hz: int = Field(default=10, ge=1, le=30, description="VIL 状态目标频率 Hz")
-    data_timeout_ms: int = Field(default=500, ge=50, le=5000, description="数据超时阈值 ms")
-    extrapolation_ms: int = Field(default=150, ge=0, le=2000, description="丢帧外推上限 ms")
+    target_hz: int = Field(default=10, ge=1, le=50, description="VIL 状态目标频率 Hz")
+    data_timeout_ms: int = Field(default=500, ge=100, le=5000, description="数据超时阈值 ms")
+    extrapolation_ms: int = Field(default=150, ge=0, le=1000, description="丢帧外推上限 ms")
 
 
 class ReplayConfig(BaseModel):

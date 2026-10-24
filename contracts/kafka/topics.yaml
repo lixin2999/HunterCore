@@ -299,13 +299,13 @@ carla_topics:
   - name: "carla.{sim_id}.vil_state"
     direction: platform_to_carla
     dynamic: true
-    partitions: 1
+    partitions: 3
     partition_strategy: hash(sim_id)
     key: sim_id
     acks: "1"                        # 实时可视化：容忍偶发丢帧，换取更低时延
     frequency: "10Hz（latest-wins 降采样）"
-    retention_ms: 3600000            # 1 小时（会话结束即无保留价值；Topic 终态后删除）
-    retention_human: "1 小时"
+    retention_ms: 86400000           # 1 天（会话结束即清理；Topic 终态后删除兜底）
+    retention_human: "1 天"
     producer: vil-forwarder
     consumers: [carla-manager (CARLA vil-mapper)]
     schema: schemas/carla_vil_state.schema.json

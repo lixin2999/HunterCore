@@ -48,7 +48,7 @@ EXPECTED_INGEST_TOPICS: dict[str, tuple[int, int]] = {
 
 #: CARLA 动态 Topic 模板（分区数, acks, key, 保留毫秒）—— topics.yaml#carla_topics
 EXPECTED_CARLA_TOPICS: dict[str, tuple[int, str, str, int]] = {
-    "carla.{sim_id}.vil_state": (1, "1", "sim_id", 3_600_000),
+    "carla.{sim_id}.vil_state": (3, "1", "sim_id", 86_400_000),
     "carla.{sim_id}.sensor_data": (3, "all", "sim_id", 604_800_000),
 }
 

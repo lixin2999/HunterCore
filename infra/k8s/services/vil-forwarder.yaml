@@ -25,6 +25,11 @@ data:
   VIL_FORWARD_TARGET_HZ: "10"
   # 会话 Redis 短缓存：避免每条遥测都打 Redis（会话变更最大延迟 1s）
   VIL_SESSION_CACHE_TTL_MS: "1000"
+  # 源时间戳迟到上限（毫秒）：超时帧丢弃，由 CARLA 侧外推（设计 7.2.2）
+  VIL_MAX_SOURCE_LAG_MS: "500"
+  # 本地车辆状态表上界（空闲 TTL + 最大条数），防止长期运行内存增长
+  VIL_MAX_TRACKED_VEHICLES: "10000"
+  VIL_STATE_IDLE_TTL_SECONDS: "300"
   VIL_CONSUMER_ENABLED: "true"
   # 低时延旁路不落盘缓冲：VIL 允许 latest-wins 丢帧，且只读根文件系统无 /app/data 写权限
   KAFKA_LOCAL_BUFFER_ENABLED: "false"

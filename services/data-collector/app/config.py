@@ -78,6 +78,10 @@ class Settings(HunterBaseConfig):
     carla_sim_cache_ttl_seconds: int = 86400
     # 仿真事件 Redis List 保留条数（防止单会话无限增长）
     carla_sim_events_max: int = 1000
+    # 仿真遥测批量入库（设计 7.3.3：SIM_TELEMETRY_BATCH_SIZE=2000 / FLUSH=500ms；
+    # 500ms 由 Kafka 批次轮询周期近似，批次收尾钩子统一 flush）
+    sim_telemetry_batch_size: int = 2000
+    sim_telemetry_flush_interval_ms: int = 500
 
     # ---------- 车辆维度限流（附录 D：遥测 ≤100 msg/s、文件上传 ≤10 Mbps = 1310720 B/s） ----------
     vehicle_telemetry_max_msg_per_sec: int = 100

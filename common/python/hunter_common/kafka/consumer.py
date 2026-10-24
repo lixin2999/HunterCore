@@ -161,6 +161,8 @@ class KafkaConsumerManager:
             else Consumer(self._build_conf(config, group_id, auto_offset_reset))
         )
         self._running = False
+        #: 上次批次收尾失败导致 offset 未提交；空闲期冲刷成功后需补一次提交
+        self._commit_due = False
 
     # ---------- 配置 ----------
 
@@ -257,14 +259,27 @@ class KafkaConsumerManager:
                     None, self._consumer.consume, self._batch_size, self._poll_timeout
                 )
                 if not messages:
+                    # 空闲周期也执行批次收尾：会话停止发送后，已缓冲数据不能无限期滞留
+                    # （下一次消息可能很久以后；停机 flush 只是兜底）。钩子自身对空缓冲为 no-op。
+                    if await self._run_batch_end_hook():
+                        if self._commit_due:
+                            # 上一批冲刷失败时未提交；本周期补冲刷成功后必须补提交，
+                            # 否则位点停在旧位置，重启会重复回放已入库批次。
+                            self._commit_due = False
+                            await loop.run_in_executor(None, self._commit)
+                    else:
+                        self._commit_due = True
                     continue
                 for message in messages:
                     await self._handle_message(message, handler)
                 # 批次收尾（如遥测累积批量入库）必须在提交 offset **之前**完成：
-                # 钩子失败 → 跳过本次提交，消息重新投递（配合写入侧幂等避免数据丢失）
+                # 钩子失败 → 跳过本次提交，位点不推进（重启/再均衡后重投；写入侧幂等去重）
                 if await self._run_batch_end_hook():
+                    self._commit_due = False
                     # 批次处理完成（含 DLQ 转投）后手动提交 offset（at-least-once 语义）
                     await loop.run_in_executor(None, self._commit)
+                else:
+                    self._commit_due = True
                 await loop.run_in_executor(None, self._refresh_lag)
         finally:
             await loop.run_in_executor(None, self._close)
@@ -278,7 +293,7 @@ class KafkaConsumerManager:
         """执行批次收尾钩子，返回是否允许提交 offset。
 
         钩子失败（如批量入库异常）→ 返回 False 并跳过提交：
-        本批消息在下次 poll 时重新投递，写入侧以唯一约束幂等去重（at-least-once 不丢数据）。
+        未提交的位点在重启/再均衡后重新投递，写入侧以唯一约束幂等去重（at-least-once 不丢数据）。
         未配置钩子时直接放行（返回 True），行为与历史版本一致。
         """
         if self._on_batch_end is None:

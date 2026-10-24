@@ -38,8 +38,9 @@ from app.services.ingest import flatten_to_row, prepare_event
 logger = get_logger("app.consumers.carla")
 
 #: 仿真事件 → 车端 19 类事件（仅语义一致的镜像；其余只留 Redis）
+#: 设计 7.3.2：``collision`` 是实际碰撞，不能镜像为 ``collision_warning``（预警）；
+#: ``lane_invasion`` / ``red_light_run`` / ``scenario_timeout`` 无对应车端枚举，不镜像。
 SIM_EVENT_TYPE_MAP: dict[str, EventType] = {
-    "collision": EventType.COLLISION_WARNING,
     "collision_warning": EventType.COLLISION_WARNING,
     "near_miss": EventType.COLLISION_PRE_WARNING,
     "collision_pre_warning": EventType.COLLISION_PRE_WARNING,
@@ -48,6 +49,7 @@ SIM_EVENT_TYPE_MAP: dict[str, EventType] = {
     "harsh_turning": EventType.HARSH_TURNING,
     "over_speed": EventType.OVER_SPEED,
     "manual_takeover": EventType.MANUAL_TAKEOVER,
+    "emergency_brake": EventType.EMERGENCY_STOP,
     "emergency_stop": EventType.EMERGENCY_STOP,
     "ego_emergency_stop": EventType.EMERGENCY_STOP,
     "sensor_fault": EventType.SENSOR_FAULT,
@@ -126,7 +128,15 @@ class CarlaSensorConsumer(BaseIngestConsumer):
         self._sensor_files = sensor_file_producer or SensorFileProducer()
         self._ttl = max(1, settings.carla_sim_cache_ttl_seconds)
         self._events_max = max(1, settings.carla_sim_events_max)
-        super().__init__(settings)
+        # sim_telemetry 批量缓冲：每批最多 2000 条，批次收尾钩子统一入库（设计 7.3.3）
+        self._pending_rows: list[dict[str, Any]] = []
+        super().__init__(
+            settings,
+            on_batch_end=self._flush_telemetry,
+            batch_size=max(1, settings.sim_telemetry_batch_size),
+            # 轮询超时即批次周期：无新消息时最多等 500ms 就收尾并 flush 缓冲
+            poll_timeout=max(0.05, settings.sim_telemetry_flush_interval_ms / 1000.0),
+        )
 
     @staticmethod
     def idempotency_key(_message: Message, value: Any) -> str:
@@ -170,9 +180,28 @@ class CarlaSensorConsumer(BaseIngestConsumer):
     # ---------- 落库 ----------
 
     async def _store_telemetry(self, envelope: dict[str, Any]) -> None:
-        row = build_sim_telemetry_row(envelope)
-        async with self._telemetry.transaction() as session:
-            await self._telemetry.insert_points(session, [row])
+        # 仅入缓冲；写库由批次收尾钩子在提交 offset 前统一完成。
+        # handler 内直接写库失败会进 DLQ（数据不会自愈），必须走批量钩子重试。
+        self._pending_rows.append(build_sim_telemetry_row(envelope))
+
+    async def _flush_telemetry(self) -> None:
+        """批次收尾：单事务写入本批遥测；失败回填并抛错 → 消费者不提交 offset。"""
+        if not self._pending_rows:
+            return
+        batch = self._pending_rows
+        self._pending_rows = []
+        try:
+            async with self._telemetry.transaction() as session:
+                await self._telemetry.insert_points(session, batch)
+        except Exception:
+            # 回填本批，下一批收尾时重试（避免 offset 未提交但数据丢失）
+            self._pending_rows[:0] = batch
+            logger.exception("sim_telemetry_flush_failed", pending=len(self._pending_rows))
+            raise
+
+    async def flush(self) -> None:
+        """优雅停机：写出未提交的遥测（best effort）。"""
+        await self._flush_telemetry()
 
     async def _store_event(self, envelope: dict[str, Any]) -> None:
         sim_id = str(envelope["sim_id"])

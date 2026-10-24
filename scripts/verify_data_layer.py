@@ -164,7 +164,7 @@ EXPECTED_INGEST_TOPICS: dict[str, tuple[int, int]] = {
 
 #: CARLA 仿真动态 Topic（topics.yaml#carla_topics；不静态创建，按 sim_id 由 scene-service 创建）
 EXPECTED_CARLA_TOPICS: dict[str, tuple[int, int]] = {
-    "carla.{sim_id}.vil_state": (1, 3_600_000),
+    "carla.{sim_id}.vil_state": (3, 86_400_000),
     "carla.{sim_id}.sensor_data": (3, 604_800_000),
 }
 

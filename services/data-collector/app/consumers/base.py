@@ -32,7 +32,14 @@ class BaseIngestConsumer:
     #: 订阅模式（车端 Topic 正则，新车上线无需改配置）
     subscribe_pattern: ClassVar[str] = ""
 
-    def __init__(self, settings: Settings, *, on_batch_end: BatchEndHook | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        on_batch_end: BatchEndHook | None = None,
+        batch_size: int | None = None,
+        poll_timeout: float | None = None,
+    ) -> None:
         self._settings = settings
         self._guard = IdempotencyGuard(
             namespace=self.group_id,
@@ -51,8 +58,12 @@ class BaseIngestConsumer:
             settings,
             group_id=self.group_id,
             topics=[self.subscribe_pattern],
-            batch_size=settings.consumer_batch_size,
-            poll_timeout=settings.consumer_poll_timeout_seconds,
+            batch_size=batch_size or settings.consumer_batch_size,
+            poll_timeout=(
+                poll_timeout
+                if poll_timeout is not None
+                else settings.consumer_poll_timeout_seconds
+            ),
             schema_name=schema_name,
             idempotency=self._guard,
             idempotency_key=self.idempotency_key,

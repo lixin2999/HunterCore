@@ -25,10 +25,12 @@ class SessionRegistry:
         redis_client: Any,
         *,
         cache_ttl_seconds: float = 1.0,
+        max_entries: int = 10000,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._redis = redis_client
         self._ttl = max(0.0, cache_ttl_seconds)
+        self._max_entries = max(1, max_entries)
         self._clock = clock
         self._cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
@@ -55,6 +57,14 @@ class SessionRegistry:
             except (TypeError, json.JSONDecodeError):
                 logger.warning("vil_session_corrupted", vehicle_id=vehicle_id)
         self._cache[vehicle_id] = (now + self._ttl, session)
+        # 缓存上界：车队规模固定时不会触发；异常 vehicle_id 洪泛时按过期优先淘汰，
+        # 防止长期运行内存无界增长（V1.23.4）。
+        if len(self._cache) > self._max_entries:
+            expired = [key for key, (expires, _) in self._cache.items() if expires <= now]
+            for key in expired:
+                self._cache.pop(key, None)
+            while len(self._cache) > self._max_entries:
+                self._cache.pop(next(iter(self._cache)))
         return session
 
     def invalidate(self, vehicle_id: str) -> None:

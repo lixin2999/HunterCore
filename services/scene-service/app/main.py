@@ -149,6 +149,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # 启动对账：K8s 多副本下不强制单实例，失联的 pending/running 任务置 failed（可重新提交）
     await app.state.engine_service.reconcile_generation_tasks()
+    # VIL 会话启动对账（设计 6.4）：清理无实例/已终态会话，避免车辆被 TTL 阻塞 2 小时
+    try:
+        await asyncio.wait_for(
+            app.state.simulation_service.reconcile_sessions(), timeout=15
+        )
+    except TimeoutError:
+        logger.warning("vil_session_reconcile_timeout")
+    except Exception:
+        logger.exception("vil_session_reconcile_failed")
 
     consumer_task: asyncio.Task[None] | None = None
     if settings.scene_extraction_consumer_enabled:

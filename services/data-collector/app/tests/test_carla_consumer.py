@@ -94,6 +94,7 @@ def make_consumer() -> tuple[CarlaSensorConsumer, FakeRedis, FakeRepo, FakeRepo,
     consumer._sensor_files = sensor_files  # type: ignore[attr-defined]
     consumer._ttl = 86400  # type: ignore[attr-defined]
     consumer._events_max = 100  # type: ignore[attr-defined]
+    consumer._pending_rows = []  # type: ignore[attr-defined]
     return consumer, redis, telemetry, events, pipeline, sensor_files
 
 
@@ -158,6 +159,9 @@ async def test_sim_telemetry_is_inserted() -> None:
         ),
         topic="t",
     )
+    # 批量缓冲：批次收尾钩子统一入库（设计 7.3.3）
+    assert telemetry.rows == []
+    await consumer.flush()
     assert len(telemetry.rows) == 1
     assert telemetry.rows[0]["vehicle_id"] == "SIM-sim-001"
 
@@ -190,21 +194,44 @@ async def test_mapped_event_mirrors_to_events_and_event_raw() -> None:
             "sim_event",
             {
                 "event_id": "e-2",
-                "event_type": "collision",
+                "event_type": "emergency_brake",
                 "event_level": "critical",
                 "sim_time": 2.0,
-                "description": "碰撞",
+                "description": "紧急制动",
             },
         ),
         topic="t",
     )
     assert len(events.rows) == 1
     assert events.rows[0]["vehicle_id"] == "SIM-sim-001"
-    assert events.rows[0]["event_type"].value == "collision_warning"
+    assert events.rows[0]["event_type"].value == "emergency_stop"
     assert len(pipeline.events) == 1
     assert pipeline.events[0][1] == "SIM-sim-001"
     assert "carla:sim:sim-001:events" in redis.lists
-    assert SIM_EVENT_TYPE_MAP["collision"].value == "collision_warning"
+    assert SIM_EVENT_TYPE_MAP["emergency_brake"].value == "emergency_stop"
+
+
+@pytest.mark.asyncio
+async def test_collision_is_not_mirrored_to_vehicle_events() -> None:
+    """设计 7.3.2：实际碰撞 ≠ collision_warning（预警），禁止镜像。"""
+    consumer, redis, _telemetry, events, pipeline, _files = make_consumer()
+    await consumer.process(
+        envelope(
+            "sim_event",
+            {
+                "event_id": "e-3",
+                "event_type": "collision",
+                "event_level": "critical",
+                "sim_time": 3.0,
+                "description": "碰撞",
+            },
+        ),
+        topic="t",
+    )
+    assert "collision" not in SIM_EVENT_TYPE_MAP
+    assert events.rows == []
+    assert pipeline.events == []
+    assert "carla:sim:sim-001:events" in redis.lists
 
 
 def test_sim_vehicle_id_prefix() -> None:

@@ -142,6 +142,21 @@ class KafkaProducerManager:
         """
         return self._buffer.stats() if self._buffer is not None else None
 
+    async def healthcheck(self, timeout: float = 1.0) -> bool:
+        """探测 broker 连通性（供 ``/readyz``；不投递消息）。
+
+        ``list_topics`` 会触发一次 metadata 请求；放到线程池避免阻塞事件循环。
+        """
+        if self._closed:
+            return False
+        try:
+            producer = self._producer_for(self._config.kafka_producer_acks)
+            await asyncio.to_thread(producer.list_topics, timeout=timeout)
+            return True
+        except (KafkaException, OSError, RuntimeError):
+            logger.warning("kafka_producer_healthcheck_failed", service=self._service)
+            return False
+
     @staticmethod
     def _build_conf(config: HunterBaseConfig, *, acks: str | None = None) -> dict[str, Any]:
         """构建 confluent-kafka 生产者配置（含 SASL_SSL 支持）。"""

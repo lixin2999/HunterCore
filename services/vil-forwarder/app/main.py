@@ -32,11 +32,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     registry = SessionRegistry(
         app.state.redis.client,
         cache_ttl_seconds=settings.vil_session_cache_ttl_ms / 1000.0,
+        max_entries=settings.vil_max_tracked_vehicles,
     )
     forwarder = VilForwarder(
         KafkaProducerManager.instance(),
         registry,
         target_hz=settings.vil_forward_target_hz,
+        max_source_lag_ms=settings.vil_max_source_lag_ms,
+        max_tracked_vehicles=settings.vil_max_tracked_vehicles,
+        idle_ttl_seconds=settings.vil_state_idle_ttl_seconds,
     )
     app.state.forwarder = forwarder
     app.state.session_registry = registry
@@ -94,9 +98,13 @@ async def healthz() -> dict[str, str]:
 @app.get("/readyz", include_in_schema=False)
 async def readyz() -> dict[str, object]:
     redis_ok = await app.state.redis.ping()
+    try:
+        kafka_ok = await KafkaProducerManager.instance().healthcheck()
+    except RuntimeError:
+        kafka_ok = False
     return {
-        "status": "ok" if redis_ok else "degraded",
-        "checks": {"redis": redis_ok},
+        "status": "ok" if redis_ok and kafka_ok else "degraded",
+        "checks": {"redis": redis_ok, "kafka": kafka_ok},
     }
 
 
@@ -106,5 +114,7 @@ async def status() -> dict[str, object]:
     return {
         "published": forwarder.published_count,
         "skipped": forwarder.skipped_count,
+        "tracked_sessions": forwarder.tracked_sessions,
+        "drop_counts": forwarder.drop_counts,
         "target_hz": settings.vil_forward_target_hz,
     }

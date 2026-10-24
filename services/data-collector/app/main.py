@@ -75,6 +75,8 @@ class _SupervisedConsumer:
         self._factory = factory
         self.group_id = group_id
         self._current: BaseIngestConsumer | None = None
+        # 停机后 run() 的 finally 会清空 _current；保留最后实例供停机 flush 使用
+        self._last: BaseIngestConsumer | None = None
         self._stopping = False
 
     async def run(self) -> None:
@@ -82,6 +84,7 @@ class _SupervisedConsumer:
         while not self._stopping:
             consumer = self._factory()
             self._current = consumer
+            self._last = consumer
             try:
                 await consumer.run()
                 return  # stop() 已置位，底层消费循环正常收尾
@@ -102,6 +105,15 @@ class _SupervisedConsumer:
         self._stopping = True
         if self._current is not None:
             self._current.stop()
+
+    async def flush(self) -> None:
+        """停机前冲刷未提交缓冲（委托最后实例；未实现 flush 的消费者直接跳过）。"""
+        consumer = self._current or self._last
+        if consumer is None:
+            return
+        flush = getattr(consumer, "flush", None)
+        if flush is not None:
+            await flush()
 
 
 def _build_consumers(
@@ -237,6 +249,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             pass
         except Exception:  # 单个消费者停机异常不得阻断其余资源释放
             logger.exception("consumer_stop_failed")
+    # 停机前 flush 批量缓冲（如 sim_telemetry），避免已消费未入库的数据丢失
+    for consumer in consumers:
+        flush = getattr(consumer, "flush", None)
+        if flush is None:
+            continue
+        try:
+            await flush()
+        except Exception:
+            logger.exception("consumer_flush_failed", group_id=consumer.group_id)
     await sweeper.stop()
     await app.state.redis.close()
     await app.state.db.close()

@@ -136,18 +136,28 @@ class KafkaAdmin:
         dlq_retention = int(
             (self.contract.topics_doc.get("naming") or {}).get("dlq_retention_ms", 2_592_000_000)
         )
-        for template, spec in self.contract.carla_topics.items():
-            topic = self.contract.render_carla_topic(template, sim_id)
-            if self.ensure_topic_spec(spec, topic=topic):
-                created.append(topic)
-            if spec.dlq:
-                dlq = self.contract.dlq_topic(topic)
-                if self.ensure_topic(
-                    dlq,
-                    partitions=spec.partitions,
-                    retention_ms=dlq_retention,
-                ):
-                    created.append(dlq)
+        try:
+            for template, spec in self.contract.carla_topics.items():
+                topic = self.contract.render_carla_topic(template, sim_id)
+                if self.ensure_topic_spec(spec, topic=topic):
+                    created.append(topic)
+                if spec.dlq:
+                    dlq = self.contract.dlq_topic(topic)
+                    if self.ensure_topic(
+                        dlq,
+                        partitions=spec.partitions,
+                        retention_ms=dlq_retention,
+                    ):
+                        created.append(dlq)
+        except Exception:
+            # 部分创建失败必须回滚已建 Topic，否则同一 sim_id 重试会残留半套 Topic；
+            # 调用方拿不到 created 列表，无法自行清理（V1.23.4）。
+            for topic in created:
+                try:
+                    self.delete_topic(topic)
+                except Exception:
+                    logger.exception("carla_topic_rollback_failed", topic=topic, sim_id=sim_id)
+            raise
         return created
 
     def delete_carla_session(self, sim_id: str) -> list[str]:

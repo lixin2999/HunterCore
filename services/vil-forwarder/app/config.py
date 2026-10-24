@@ -19,8 +19,13 @@ class Settings(HunterBaseConfig):
     # 把过期位姿推进 CARLA（设计文档 7.2：auto.offset.reset=latest）。
     vil_auto_offset_reset: str = "latest"
 
-    # 10Hz 目标频率（契约 topics.yaml#carla_topics.vil_state.frequency）
+    # 10Hz 目标频率（契约 topics.yaml#carla_topics.vil_state.frequency；会话可覆盖）
     vil_forward_target_hz: int = 10
+    # 源时间戳迟到上限（设计 7.2.2：超过 500ms 丢弃，CARLA 侧进入暂停/外推）
+    vil_max_source_lag_ms: int = 500
+    # 本地车辆状态表上限（空闲 TTL + 最大条数，防止长期运行内存泄漏）
+    vil_max_tracked_vehicles: int = 10000
+    vil_state_idle_ttl_seconds: int = 300
     # Redis 会话本地缓存 TTL（避免每条遥测都打 Redis；会话变更最多延迟该时长）
     vil_session_cache_ttl_ms: int = 1000
     # 消费开关（排障可关闭，不影响 API 健康探针）

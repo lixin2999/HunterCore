@@ -58,7 +58,7 @@ def test_summarize_metrics_extracts_safety_and_grade() -> None:
             "score": 90,
         }
     )
-    assert summary["safety"]["collision_count"] == 0.0
+    assert summary["safety"]["collisions"] == 0.0
     assert summary["safety"]["min_ttc"] == 4.2
     assert summary["grade"] == "A"
     assert summary["score"] == 90.0

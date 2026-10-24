@@ -10,12 +10,14 @@ running）。VIL 唯一会话由 ``vil:session:{vehicle_id}`` 的 SET NX 保证�
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 from hunter_common.exceptions import (
     InvalidParameterError,
+    ResourceNotFoundError,
     ResourceStateConflictError,
     ServiceUnavailableError,
 )
@@ -26,6 +28,7 @@ from app.config import Settings
 from app.repositories.carla import (
     ACTIVE_STATUSES,
     CarlaManagementClient,
+    CarlaSimIdMismatchError,
     SimInstance,
     SimInstanceSnapshot,
 )
@@ -52,6 +55,13 @@ logger = get_logger("app.services.simulation")
 
 #: 可下发状态（契约 x-hunter-lifecycle.deployable_states）
 DEPLOYABLE_STATES = frozenset({"published"})
+
+#: 已占位但未绑定 CARLA 实例的会话宽限期（秒）：覆盖 create_instance + submit_scenario 耗时，
+#: 超过后视为崩溃残留，启动对账时清理（V1.23.4）。
+UNBOUND_SESSION_GRACE_SECONDS = 300
+
+#: 已终态实例的内存去重上限（避免重复调度 Topic 删除；仅本进程生命周期）
+_MAX_FINALIZED_INSTANCES = 4096
 
 
 def _forbidden_match(forbidden: frozenset[str], path: str) -> bool:
@@ -142,6 +152,8 @@ class SceneSimulationService:
             else max(0, topic_delete_delay_seconds)
         )
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        # 终态清理去重：同一实例并发查询 get_progress/get_result/cancel 时只释放/删除一次
+        self._finalized: OrderedDict[str, None] = OrderedDict()
 
     @staticmethod
     def _new_sim_id() -> str:
@@ -263,29 +275,34 @@ class SceneSimulationService:
                         details={"vehicle_id": vehicle_id, "sim_id": sim_id},
                     )
 
-            instance = await self._carla.create_instance(
-                scene_id=str(scene_id),
-                scene_name=model.scene_name,
-                scene_config=merged.model_dump(mode="json"),
-                sim_id=sim_id,
-                mode=mode.value,
-                vehicle_id=vehicle_id,
-                vil=(
-                    request.sim_config.vil.model_dump(mode="json")
-                    if request.sim_config.vil
-                    else None
-                ),
-                replay_config=(
-                    request.replay_config.model_dump(mode="json")
-                    if request.replay_config
-                    else None
-                ),
-                kafka={
-                    "vil_state_topic": vil_state_topic,
-                    "sensor_data_topic": sensor_data_topic,
-                },
-                quality=request.sim_config.quality.value,
-            )
+            try:
+                instance = await self._carla.create_instance(
+                    scene_id=str(scene_id),
+                    scene_name=model.scene_name,
+                    scene_config=merged.model_dump(mode="json"),
+                    sim_id=sim_id,
+                    mode=mode.value,
+                    vehicle_id=vehicle_id,
+                    vil=(
+                        request.sim_config.vil.model_dump(mode="json")
+                        if request.sim_config.vil
+                        else None
+                    ),
+                    replay_config=(
+                        request.replay_config.model_dump(mode="json")
+                        if request.replay_config
+                        else None
+                    ),
+                    kafka={
+                        "vil_state_topic": vil_state_topic,
+                        "sensor_data_topic": sensor_data_topic,
+                    },
+                    quality=request.sim_config.quality.value,
+                )
+            except CarlaSimIdMismatchError as exc:
+                # CARLA 已建实例但 sim_id 不一致：先回收再上抛，避免孤儿实例（V1.23.4）。
+                await self._stop_orphan(exc.instance_id, reason="sim_id_mismatch")
+                raise
             await self._carla.submit_scenario(
                 instance.instance_id,
                 {
@@ -339,12 +356,7 @@ class SceneSimulationService:
             # 失败回滚：停止已创建的实例（避免孤儿）→ 释放会话 → 删除已创建 Topic
             # （均为 best effort；原异常继续上抛）。
             if instance is not None:
-                try:
-                    await self._carla.stop_instance(instance.instance_id)
-                except Exception:
-                    logger.exception(
-                        "carla_instance_rollback_failed", sim_instance_id=instance.instance_id
-                    )
+                await self._stop_orphan(instance.instance_id, reason="run_scene_rollback")
             if session_acquired and vehicle_id and self._sessions is not None:
                 try:
                     await self._sessions.release(vehicle_id, sim_id=sim_id)
@@ -364,6 +376,9 @@ class SceneSimulationService:
                 raise InvalidParameterError("mode=vil 时必须提供 vehicle_id")
             if request.sim_config.vil is None:
                 raise InvalidParameterError("mode=vil 时必须提供 sim_config.vil")
+            if request.sim_config.allow_parallel:
+                # 同一车辆同时仅允许一个 VIL 会话；allow_parallel 与车辆会话唯一性冲突
+                raise InvalidParameterError("mode=vil 不支持 sim_config.allow_parallel=true")
         if request.mode is SimulationMode.REPLAY:
             if not request.vehicle_id:
                 raise InvalidParameterError("mode=replay 时必须提供 vehicle_id")
@@ -377,6 +392,13 @@ class SceneSimulationService:
                         "replay_vehicle_id": request.replay_config.vehicle_id,
                     },
                 )
+        if (
+            request.mode is SimulationMode.SIL
+            and (request.sim_config.vil is not None or request.replay_config is not None)
+        ):
+            raise InvalidParameterError(
+                "mode=sil 时 sim_config.vil 与 replay_config 必须为空"
+            )
 
     @staticmethod
     def _map_id(config: SceneConfig) -> str | None:
@@ -410,6 +432,10 @@ class SceneSimulationService:
         message = self._as_text(snapshot.data, ("message", "detail"))
         if is_paused(snapshot.status) and not message:
             message = "paused"
+        if snapshot_status.value not in ACTIVE_STATUSES:
+            # 终态不一定有人调用 get_result/cancel；进度轮询也必须触发会话/Topic 回收，
+            # 否则 VIL 会话会阻塞该车辆直到 TTL（V1.23.4）。
+            await self._finalize_instance(meta, sim_instance_id)
         return SimulationProgress(
             sim_instance_id=snapshot.instance_id,
             scene_id=self._as_scene_id(snapshot.data),
@@ -524,10 +550,15 @@ class SceneSimulationService:
 
     async def _finalize_instance(
         self, meta: dict[str, Any] | None, sim_instance_id: str
-    ) -> None:
-        """释放 VIL 会话并延迟删除动态 Topic（best effort，不阻断查询/控制响应）。"""
+    ) -> bool:
+        """释放 VIL 会话并延迟删除动态 Topic（best effort，不阻断查询/控制响应）。
+
+        返回 True 表示本次完成了清理；重复清理或释放失败返回 False。
+        """
         if not meta:
-            return
+            return False
+        if not self._mark_finalized(sim_instance_id):
+            return False
         vehicle_id = meta.get("vehicle_id")
         sim_id = meta.get("sim_id")
         if vehicle_id and self._sessions is not None:
@@ -538,9 +569,23 @@ class SceneSimulationService:
                     sim_instance_id=sim_instance_id,
                 )
             except Exception:
+                # 释放失败（如 Redis 短暂不可用）：撤销去重标记，让下一次进度轮询/对账重试；
+                # 否则该车辆会被残留会话阻塞到 TTL（release 本身幂等，重试安全）。
+                self._finalized.pop(sim_instance_id, None)
                 logger.exception("vil_session_release_failed", vehicle_id=str(vehicle_id))
+                return False
         if sim_id and self._topics is not None:
             self._schedule_topic_delete(str(sim_id))
+        return True
+
+    def _mark_finalized(self, sim_instance_id: str) -> bool:
+        """记录实例已清理；返回 False 表示本次是重复清理（并发查询/控制去重）。"""
+        if sim_instance_id in self._finalized:
+            return False
+        self._finalized[sim_instance_id] = None
+        while len(self._finalized) > _MAX_FINALIZED_INSTANCES:
+            self._finalized.popitem(last=False)
+        return True
 
     def _schedule_topic_delete(self, sim_id: str) -> None:
         if self._topic_delete_delay <= 0:
@@ -561,6 +606,119 @@ class SceneSimulationService:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+
+    async def reconcile_sessions(self) -> int:
+        """启动对账：清理无实例、实例已回收或已终态的 VIL 会话（设计 6.4）。
+
+        - ``vil:active`` 中有成员但 ``vil:session`` 已过期 → 移除成员；
+        - 会话已占位但超过宽限期仍未绑定 CARLA 实例（创建中崩溃）→ 释放并删 Topic；
+        - CARLA 返回 404 / 终态 → 释放会话并延迟删除 Topic；
+        - CARLA 暂不可达 → 跳过，留给下次启动或 TTL 兜底。
+
+        返回清理的会话数。单条失败不影响其余会话。
+        """
+        if self._sessions is None:
+            return 0
+        try:
+            active = await self._sessions.list_active()
+        except ServiceUnavailableError:
+            logger.warning("vil_session_reconcile_list_failed")
+            return 0
+        cleaned = 0
+        now = datetime.now(UTC).timestamp()
+        for vehicle_id in active:
+            try:
+                session = await self._sessions.get(vehicle_id)
+            except ServiceUnavailableError:
+                logger.warning("vil_session_reconcile_read_failed", vehicle_id=vehicle_id)
+                continue
+            if session is None:
+                try:
+                    await self._sessions.release(vehicle_id)
+                    cleaned += 1
+                except ServiceUnavailableError:
+                    logger.warning(
+                        "vil_session_reconcile_release_failed", vehicle_id=vehicle_id
+                    )
+                continue
+            sim_id = str(session.get("sim_id") or "") or None
+            sim_instance_id = str(session.get("sim_instance_id") or "") or None
+            if sim_instance_id is None:
+                created_at = self._as_epoch(session.get("created_at"))
+                if created_at is None or now - created_at > UNBOUND_SESSION_GRACE_SECONDS:
+                    try:
+                        await self._sessions.release(vehicle_id, sim_id=sim_id)
+                        if sim_id:
+                            self._schedule_topic_delete(sim_id)
+                        cleaned += 1
+                        logger.warning(
+                            "vil_session_unbound_reconciled",
+                            vehicle_id=vehicle_id,
+                            sim_id=sim_id,
+                        )
+                    except ServiceUnavailableError:
+                        logger.warning(
+                            "vil_session_reconcile_release_failed", vehicle_id=vehicle_id
+                        )
+                continue
+            try:
+                snapshot = await self._carla.get_instance(sim_instance_id)
+            except ResourceNotFoundError:
+                try:
+                    await self._sessions.release(
+                        vehicle_id, sim_id=sim_id, sim_instance_id=sim_instance_id
+                    )
+                    if sim_id:
+                        self._schedule_topic_delete(sim_id)
+                    cleaned += 1
+                    logger.warning(
+                        "vil_session_instance_missing_reconciled",
+                        vehicle_id=vehicle_id,
+                        sim_instance_id=sim_instance_id,
+                    )
+                except ServiceUnavailableError:
+                    logger.warning(
+                        "vil_session_reconcile_release_failed", vehicle_id=vehicle_id
+                    )
+                continue
+            except ServiceUnavailableError:
+                # CARLA 暂不可达：保留会话，避免误删仍在运行的实例
+                logger.warning(
+                    "vil_session_reconcile_carla_unavailable",
+                    vehicle_id=vehicle_id,
+                    sim_instance_id=sim_instance_id,
+                )
+                continue
+            if (
+                to_platform_status(snapshot.status).value not in ACTIVE_STATUSES
+                and await self._finalize_instance(session, sim_instance_id)
+            ):
+                cleaned += 1
+        if cleaned:
+            logger.info("vil_session_reconciled", cleaned=cleaned, active=len(active))
+        return cleaned
+
+    @staticmethod
+    def _as_epoch(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    async def _stop_orphan(self, sim_instance_id: str, *, reason: str) -> None:
+        """尽力停止一个平台不再跟踪的 CARLA 实例（失败仅告警，不掩盖原始异常）。"""
+        try:
+            await self._carla.stop_instance(sim_instance_id)
+            logger.info(
+                "carla_orphan_instance_stopped",
+                sim_instance_id=sim_instance_id,
+                reason=reason,
+            )
+        except Exception:
+            logger.exception(
+                "carla_orphan_instance_stop_failed",
+                sim_instance_id=sim_instance_id,
+                reason=reason,
+            )
 
     async def _delete_topics(self, sim_id: str) -> None:
         if self._topics is None:

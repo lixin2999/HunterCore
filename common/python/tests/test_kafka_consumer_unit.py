@@ -641,6 +641,30 @@ async def test_batch_end_hook_failure_skips_commit(contract: KafkaContract) -> N
     assert fake_consumer.commit_calls == 0
 
 
+async def test_idle_hook_success_commits_pending_offset(contract: KafkaContract) -> None:
+    """失败后空闲期冲刷成功必须补提交：否则位点停在旧位置，重启重复回放。"""
+    calls = {"n": 0}
+
+    async def flaky_hook() -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("batch flush failed")
+
+    # 第二批为空：模拟会话停止发送后的空闲轮询
+    manager, fake_consumer, _ = build_manager(
+        contract, [[telemetry_message(contract)], []], on_batch_end=flaky_hook
+    )
+
+    async def handler(message: FakeMessage, value: Any) -> None:
+        return None
+
+    with pytest.raises(StopConsume):
+        await manager.run(handler)
+
+    assert calls["n"] == 2
+    assert fake_consumer.commit_calls == 1
+
+
 async def test_decode_fallback_without_schema(contract: KafkaContract) -> None:
     """未启用契约校验：非 JSON 消息回退原始 bytes 交给 handler。"""
     raw = FakeMessage(CONSUMED_TOPIC, b"\x00\x01binary")

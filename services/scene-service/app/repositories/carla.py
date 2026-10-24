@@ -46,6 +46,33 @@ class SimInstanceSnapshot:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+class CarlaSimIdMismatchError(ServiceUnavailableError):
+    """CARLA 已创建实例，但回显的 sim_id 与平台下发不一致。
+
+    携带 ``instance_id`` 供调用方先回收实例再上抛，避免「实例已建、平台不知道」的孤儿实例
+    （V1.23.4 修复）。
+    """
+
+    def __init__(
+        self,
+        *,
+        instance_id: str,
+        scene_id: str,
+        platform_sim_id: str,
+        carla_sim_id: str,
+    ) -> None:
+        super().__init__(
+            "Carla 返回的 sim_id 与平台下发不一致",
+            details={
+                "scene_id": scene_id,
+                "platform_sim_id": platform_sim_id,
+                "carla_sim_id": carla_sim_id,
+                "sim_instance_id": instance_id,
+            },
+        )
+        self.instance_id = instance_id
+
+
 class CarlaManagementClient:
     """Carla 管理 API 异步客户端（httpx，连接惰性创建 + 超时/重试 + 统一 5001）。"""
 
@@ -135,7 +162,8 @@ class CarlaManagementClient:
             "quality": quality,
         }
         body.update({key: value for key, value in optional.items() if value is not None})
-        response = await self._request("POST", self._create_path, json_body=body)
+        # 创建实例非幂等：超时重试可能产生第二个实例，禁止自动重试（V1.23.4）。
+        response = await self._request("POST", self._create_path, json_body=body, retry=False)
         payload = self._json_body(response, self._create_path)
         instance_id = self._extract_instance_id(payload)
         if isinstance(payload, dict):
@@ -144,19 +172,19 @@ class CarlaManagementClient:
             if returned_sim_id and sim_id and str(returned_sim_id) != sim_id:
                 # sim_id 是动态 Topic、Kafka key 与 VIL 会话的共同主键；CARLA 回显不一致
                 # 会导致消息写到另一套 Topic（平台永远收不到回传），必须 fail fast。
+                # 但实例已创建，调用方需要 instance_id 先 stop 再上抛，避免孤儿实例。
                 logger.error(
                     "carla_sim_id_mismatch",
                     scene_id=scene_id,
                     platform_sim_id=sim_id,
                     carla_sim_id=str(returned_sim_id),
+                    sim_instance_id=instance_id,
                 )
-                raise ServiceUnavailableError(
-                    "Carla 返回的 sim_id 与平台下发不一致",
-                    details={
-                        "scene_id": scene_id,
-                        "platform_sim_id": sim_id,
-                        "carla_sim_id": str(returned_sim_id),
-                    },
+                raise CarlaSimIdMismatchError(
+                    instance_id=instance_id,
+                    scene_id=scene_id,
+                    platform_sim_id=sim_id,
+                    carla_sim_id=str(returned_sim_id),
                 )
             data = dict(payload)
         else:
@@ -206,7 +234,8 @@ class CarlaManagementClient:
     async def submit_scenario(self, instance_id: str, payload: dict[str, Any]) -> None:
         """③④ 下发场景配置 JSON（Carla 侧加载地图、生成参与者、设置环境）。"""
         path = self._scenario_path.format(sim_instance_id=instance_id)
-        await self._request("POST", path, json_body=payload)
+        # 场景下发非幂等（可能重复加载 world），禁止自动重试（V1.23.4）。
+        await self._request("POST", path, json_body=payload, retry=False)
         logger.info("carla_scenario_submitted", sim_instance_id=instance_id)
 
     async def get_instance(self, instance_id: str) -> SimInstanceSnapshot:
@@ -235,7 +264,8 @@ class CarlaManagementClient:
                 "Carla 管理 API 控制路径未配置", details={"action": action}
             )
         path = path_template.format(sim_instance_id=instance_id)
-        await self._request("POST", path, json_body={})
+        # pause/resume/stop 为幂等控制语义，可安全重试。
+        await self._request("POST", path, json_body={}, retry=True)
         logger.info("carla_instance_control", sim_instance_id=instance_id, action=action)
 
     async def _fetch_snapshot(self, path_template: str, instance_id: str) -> SimInstanceSnapshot:
@@ -266,15 +296,22 @@ class CarlaManagementClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
         allow_not_found: bool = False,
+        retry: bool | None = None,
     ) -> httpx.Response:
-        """发送请求（超时 + 有限重试）；失败统一映射 5001；``allow_not_found`` 时 404 原样返回。"""
+        """发送请求（超时 + 有限重试）；失败统一映射 5001；``allow_not_found`` 时 404 原样返回。
+
+        ``retry``：是否允许自动重试。默认仅 GET/HEAD 重试；创建实例、下发场景等非幂等
+        POST 必须显式 ``retry=False``，避免超时重试造成重复实例（V1.23.4）。
+        """
         if not self._base_url:
             raise ServiceUnavailableError(
                 "Carla 管理 API 未配置", details={"env": "CARLA_MANAGEMENT_ENDPOINT"}
             )
         url = f"{self._base_url}{path}"
         client = await self._get_client()
-        attempts = self._max_retries + 1
+        if retry is None:
+            retry = method.upper() in ("GET", "HEAD")
+        attempts = self._max_retries + 1 if retry else 1
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
@@ -323,4 +360,10 @@ class CarlaManagementClient:
         )
 
 
-__all__ = ["ACTIVE_STATUSES", "CarlaManagementClient", "SimInstance", "SimInstanceSnapshot"]
+__all__ = [
+    "ACTIVE_STATUSES",
+    "CarlaManagementClient",
+    "CarlaSimIdMismatchError",
+    "SimInstance",
+    "SimInstanceSnapshot",
+]
