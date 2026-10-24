@@ -144,7 +144,7 @@ extra_checks() {
     local abnormal=0
     for name in hunter-postgres hunter-redis hunter-kafka hunter-minio hunter-srs hunter-flink-jm \
       hunter-flink-tm hunter-api-gateway hunter-scene hunter-collector hunter-analytics hunter-ota \
-      hunter-remote hunter-web; do
+      hunter-remote hunter-vil-forwarder hunter-web; do
       if ! docker inspect "$name" >/dev/null 2>&1; then
         continue
       fi

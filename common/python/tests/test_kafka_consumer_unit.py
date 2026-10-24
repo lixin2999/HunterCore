@@ -291,6 +291,13 @@ def test_consumer_conf_forbids_auto_topic_creation() -> None:
     conf = KafkaConsumerManager._build_conf(make_config(), GROUP_ID)
     assert conf["allow.auto.create.topics"] is False
     assert conf["topic.metadata.refresh.interval.ms"] == 30_000
+    assert conf["auto.offset.reset"] == "earliest"
+
+
+def test_consumer_conf_allows_latest_override_for_low_latency_bypass() -> None:
+    """VIL 旁路消费者显式 latest：无历史位点时只追当前遥测，不回放历史位姿。"""
+    conf = KafkaConsumerManager._build_conf(make_config(), GROUP_ID, "latest")
+    assert conf["auto.offset.reset"] == "latest"
 
 
 async def test_handler_retry_then_success(contract: KafkaContract) -> None:

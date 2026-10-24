@@ -514,6 +514,85 @@ paths:
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/scene/simulations/{sim_instance_id}/pause:
+    post:
+      tags: [simulation]
+      summary: 暂停仿真实例（CARLA pause）
+      description: |
+        暂停 pending/running 实例：调用 CARLA 管理 API pause 子路径，平台状态仍为 `running`，
+        并以 `message=paused` 保留暂停语义（CARLA 原始状态见 `carla_status`）。
+        终态实例（succeeded/failed/canceled）返回 3003。
+      operationId: pauseSimulation
+      parameters:
+        - $ref: "#/components/parameters/SimInstanceIdPath"
+      responses:
+        "200":
+          description: 暂停成功
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimulationControlResponse" }
+        "404": { $ref: "#/components/responses/SimInstanceNotFound" }
+        "409": { $ref: "#/components/responses/SceneStateConflict" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/simulations/{sim_instance_id}/resume:
+    post:
+      tags: [simulation]
+      summary: 恢复仿真实例（CARLA resume）
+      description: |
+        恢复 pending/running 实例：调用 CARLA 管理 API resume 子路径，清除 `message=paused`。
+        终态实例返回 3003。
+      operationId: resumeSimulation
+      parameters:
+        - $ref: "#/components/parameters/SimInstanceIdPath"
+      responses:
+        "200":
+          description: 恢复成功
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimulationControlResponse" }
+        "404": { $ref: "#/components/responses/SimInstanceNotFound" }
+        "409": { $ref: "#/components/responses/SceneStateConflict" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/simulations/{sim_instance_id}/cancel:
+    post:
+      tags: [simulation]
+      summary: 终止仿真实例并回收 VIL 会话（CARLA stop）
+      description: |
+        调用 CARLA 管理 API stop 子路径；释放 `vil:session:{vehicle_id}` / `vil:active`，
+        并延迟删除动态 Topic（`SIM_TOPIC_DELETE_DELAY_SECONDS`）。终态实例返回 3003。
+      operationId: cancelSimulation
+      parameters:
+        - $ref: "#/components/parameters/SimInstanceIdPath"
+      responses:
+        "200":
+          description: 终止成功（平台状态 canceled）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimulationControlResponse" }
+        "404": { $ref: "#/components/responses/SimInstanceNotFound" }
+        "409": { $ref: "#/components/responses/SceneStateConflict" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /healthz:
     get:
       tags: [ops]
@@ -846,7 +925,75 @@ components:
       description: |
         Carla 仿真实例运行状态（4.4 节"运行中"）。
         ⚠ 设计文档仅给出"运行中"，其余取值由本契约补充，见 `x-hunter-pending-confirmation`。
+        CARLA 状态映射：CREATED/LOADING/READY→pending，RUNNING/PAUSED→running，
+        COMPLETED/SUCCEEDED→succeeded，FAILED→failed，CANCELED/CANCELLED→canceled；
+        未知 CARLA 状态映射为 failed（message=carla_status_unknown），原始值保留在 carla_status。
       enum: [pending, running, succeeded, failed, canceled]
+
+    SimulationMode:
+      type: string
+      description: 仿真模式（数据采集与分析系统 ↔ CARLA 详细设计 6.1.1）
+      enum: [sil, vil, replay]
+
+    SimulationQuality:
+      type: string
+      description: CARLA 渲染/物理质量档位（创建实例参数）
+      enum: [Low, Medium, High]
+
+    VilCalibration:
+      type: object
+      description: VIL 会话坐标标定（平台只做结构校验，坐标语义由 CARLA 校验）
+      additionalProperties: false
+      required: [calibration_id, map_x, map_y, map_heading, odom_x, odom_y, odom_heading]
+      properties:
+        calibration_id: { type: string, minLength: 1, maxLength: 128, description: "标定 ID（追溯用）" }
+        map_x: { type: number, description: "标定参考点地图 X / m" }
+        map_y: { type: number, description: "标定参考点地图 Y / m" }
+        map_heading: { type: number, description: "标定参考点地图航向 rad" }
+        odom_x: { type: number, description: "对应 odom X / m" }
+        odom_y: { type: number, description: "对应 odom Y / m" }
+        odom_heading: { type: number, description: "对应 odom 航向 rad" }
+
+    VilConfig:
+      type: object
+      description: VIL 数据面参数（CARLA vil-mapper 使用）
+      additionalProperties: false
+      required: [calibration]
+      properties:
+        calibration: { $ref: "#/components/schemas/VilCalibration" }
+        target_hz: { type: integer, minimum: 1, maximum: 30, default: 10, description: "VIL 状态目标频率 Hz" }
+        data_timeout_ms: { type: integer, minimum: 50, maximum: 5000, default: 500, description: "数据超时阈值 ms" }
+        extrapolation_ms: { type: integer, minimum: 0, maximum: 2000, default: 150, description: "丢帧外推上限 ms" }
+
+    ReplayConfig:
+      type: object
+      description: 实车数据回放配置（mode=replay）
+      additionalProperties: false
+      required: [vehicle_id, start_time, end_time]
+      properties:
+        vehicle_id:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+          description: "回放数据来源车辆 ID"
+        start_time: { type: number, minimum: 0, description: "回放起始时间 Unix epoch 秒" }
+        end_time: { type: number, minimum: 0, description: "回放结束时间 Unix epoch 秒（必须大于 start_time）" }
+        include_sensors: { type: boolean, default: true, description: "是否回放传感器数据" }
+
+    SceneSimConfig:
+      type: object
+      description: 仿真运行配置（质量档位 + VIL 参数）
+      additionalProperties: false
+      properties:
+        allow_parallel:
+          type: boolean
+          default: false
+          description: "允许同一场景并行运行多个实例（默认 false，避免资源争抢）"
+        quality: { $ref: "#/components/schemas/SimulationQuality" }
+        vil:
+          allOf:
+            - $ref: "#/components/schemas/VilConfig"
+          nullable: true
+          description: "VIL 数据面参数（mode=vil 时必填）"
 
 
     # ---------- 4.2.2 场景配置结构（字段名不可更改） ----------
@@ -1100,8 +1247,15 @@ components:
       required: [sim_instance_id, scene_id, status, started_at]
       properties:
         sim_instance_id: { type: string, description: "Carla 仿真实例 ID（4.4 节第 5 步）" }
+        sim_id: { type: string, nullable: true, description: "平台仿真会话 ID（动态 Topic 前缀；由平台生成后传给 CARLA）" }
         scene_id: { type: string, format: uuid }
+        mode: { $ref: "#/components/schemas/SimulationMode" }
+        vehicle_id: { type: string, nullable: true, description: "VIL/回放关联车辆 ID（SIL 为 null）" }
         status: { $ref: "#/components/schemas/SimulationStatus" }
+        carla_status: { type: string, nullable: true, description: "CARLA 原始状态（排障用）" }
+        vil_state_topic: { type: string, nullable: true, description: "VIL 状态 Topic（mode=vil；carla.{sim_id}.vil_state）" }
+        sensor_data_topic: { type: string, nullable: true, description: "仿真回传 Topic（carla.{sim_id}.sensor_data）" }
+        stream_url: { type: string, format: uri, nullable: true, description: "CARLA 视频流地址（服务端返回时透传）" }
         started_at: { type: string, format: date-time, description: "下发成功时间（UTC）" }
         param_overrides:
           type: object
@@ -1117,11 +1271,22 @@ components:
       properties:
         sim_instance_id: { type: string, description: "Carla 仿真实例 ID" }
         scene_id: { type: string, format: uuid, nullable: true, description: "关联场景 ID（Carla 响应携带时透传）" }
+        mode: { $ref: "#/components/schemas/SimulationMode" }
+        vehicle_id: { type: string, nullable: true, description: "VIL/回放关联车辆 ID" }
         status: { $ref: "#/components/schemas/SimulationStatus" }
+        carla_status: { type: string, nullable: true, description: "CARLA 原始状态（排障用）" }
         progress_percent: { type: number, minimum: 0, maximum: 100, nullable: true, description: "完成百分比（Carla 未提供时 null）" }
         current_time_s: { type: number, minimum: 0, nullable: true, description: "已仿真时长（秒）" }
         total_time_s: { type: number, minimum: 0, nullable: true, description: "场景总时长（秒，对应 SceneConfig.duration）" }
-        message: { type: string, nullable: true, maxLength: 512, description: "状态补充说明（失败原因等）" }
+        actors_count: { type: integer, minimum: 0, nullable: true, description: "参与者数量" }
+        collisions: { type: integer, minimum: 0, nullable: true, description: "碰撞次数" }
+        lane_invasions: { type: integer, minimum: 0, nullable: true, description: "车道入侵次数" }
+        ego_state:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: "VIL 自车位姿/速度/转角（CARLA 透传）"
+        message: { type: string, nullable: true, maxLength: 512, description: "状态补充说明（失败原因 / paused 等）" }
         updated_at: { type: string, format: date-time, nullable: true, description: "Carla 侧最后更新时间（UTC）" }
 
     SimulationArtifact:
@@ -1144,8 +1309,16 @@ components:
       properties:
         sim_instance_id: { type: string }
         scene_id: { type: string, format: uuid, nullable: true }
+        mode: { $ref: "#/components/schemas/SimulationMode" }
+        vehicle_id: { type: string, nullable: true, description: "VIL/回放关联车辆 ID" }
         status: { $ref: "#/components/schemas/SimulationStatus" }
+        carla_status: { type: string, nullable: true, description: "CARLA 原始状态" }
         success: { type: boolean, nullable: true, description: "是否达成 success_criteria（Carla 未判定时 null）" }
+        evaluation:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: "安全/效率/舒适/任务评估（scene_test 报告或 CARLA 评估结果）"
         success_criteria_result:
           type: object
           additionalProperties: true
@@ -1158,6 +1331,16 @@ components:
           description: "产物清单（对象存储产物已换发预签名 URL）"
         started_at: { type: string, format: date-time, nullable: true }
         finished_at: { type: string, format: date-time, nullable: true, description: "仿真结束时间（UTC）" }
+
+    SimulationControlData:
+      type: object
+      description: 仿真控制结果（pause / resume / cancel）
+      required: [sim_instance_id, status]
+      properties:
+        sim_instance_id: { type: string, description: "Carla 仿真实例 ID" }
+        status: { $ref: "#/components/schemas/SimulationStatus" }
+        carla_status: { type: string, nullable: true, description: "控制后的 CARLA 原始状态" }
+        message: { type: string, nullable: true, maxLength: 512, description: "补充说明（如 paused）" }
 
 
     # ---------- 成功响应（data 已定型，便于前端 TS 类型生成） ----------
@@ -1224,6 +1407,14 @@ components:
           required: [data]
           properties:
             data: { $ref: "#/components/schemas/SimulationResult" }
+
+    SimulationControlResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SimulationControlData" }
 
     # ---------- 请求体 ----------
     SceneCreateRequest:
@@ -1313,6 +1504,11 @@ components:
         场景下发请求（可省略请求体）。
         param_overrides 仅允许覆盖 4.2.2 结构中的白名单路径（如 ego_vehicle.initial_speed、
         weather.*、duration），服务端以白名单校验后深合并；禁止覆盖 map.map_id。
+
+        模式约束：
+        - `sil`（默认）：vehicle_id 可为空；
+        - `vil`：vehicle_id + sim_config.vil 必填；同一车辆同时仅允许一个活动 VIL 会话；
+        - `replay`：vehicle_id + replay_config 必填（end_time > start_time）。
       additionalProperties: false
       properties:
         param_overrides:
@@ -1320,14 +1516,20 @@ components:
           additionalProperties: true
           description: "参数化覆盖（白名单路径深合并；键为点分路径）"
         sim_config:
-          type: object
-          description: "仿真运行配置（⚠ 设计文档未定义配置项，见 x-hunter-pending-confirmation）"
-          additionalProperties: false
-          properties:
-            allow_parallel:
-              type: boolean
-              default: false
-              description: "允许同一场景并行运行多个实例（默认 false，避免资源争抢）"
+          allOf:
+            - $ref: "#/components/schemas/SceneSimConfig"
+          description: "仿真运行配置"
+        mode: { $ref: "#/components/schemas/SimulationMode" }
+        vehicle_id:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+          nullable: true
+          description: "VIL/回放关联车辆 ID；SIL 可为空"
+        replay_config:
+          allOf:
+            - $ref: "#/components/schemas/ReplayConfig"
+          nullable: true
+          description: "回放配置（mode=replay 必填）"
 
 
 # =====================================================================
@@ -1345,6 +1547,18 @@ x-hunter-service:
       type: "String(JSON)"
       ttl_seconds: 3600
       usage: "GET /api/v1/scene/{scene_id} 场景详情缓存（写操作后主动失效）"
+    - pattern: "vil:session:{vehicle_id}"
+      type: "String(JSON)"
+      ttl_seconds: 7200
+      usage: "VIL 会话映射（scene-service 写；vil-forwarder 读）"
+    - pattern: "vil:active"
+      type: "Set"
+      ttl_seconds: null
+      usage: "活动 VIL 车辆集合（创建 SADD；终态/取消 SREM）"
+    - pattern: "sim:instance:{sim_instance_id}"
+      type: "String(JSON)"
+      ttl_seconds: 86400
+      usage: "仿真实例元数据（pause/resume/cancel 与 Topic 清理）"
   config_source: "pydantic-settings（环境变量 / K8s ConfigMap scene-service-config + Secret hunter-app-secrets）"
   required_env:
     - SERVICE_NAME
@@ -1412,6 +1626,10 @@ x-hunter-endpoints:
     # 决策 G-20① 新增（设计文档 12.2 节清单未列，4.4 节步骤⑥⑦补齐，待设计文档同步勘误）
     - "GET /api/v1/scene/simulations/{sim_instance_id}"
     - "GET /api/v1/scene/simulations/{sim_instance_id}/result"
+    # CARLA 仿真控制（接入方案 P1：pause/resume/cancel；设计文档 12.2 未列，需同步勘误）
+    - "POST /api/v1/scene/simulations/{sim_instance_id}/pause"
+    - "POST /api/v1/scene/simulations/{sim_instance_id}/resume"
+    - "POST /api/v1/scene/simulations/{sim_instance_id}/cancel"
   ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]
 
 x-hunter-scene-types:

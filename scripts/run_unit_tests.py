@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Monorepo 单元测试聚合运行器（每个测试根目录一个独立 pytest 进程）。
 
-背景（代码审查 R6）：6 个服务共用顶层包名 ``app``，在**同一个** pytest 进程里收集多个服务测试目录会失败：
+背景（代码审查 R6）：多个服务共用顶层包名 ``app``，在**同一个** pytest 进程里收集多个服务测试目录会失败：
 - ≥2 个服务 → ``ModuleNotFoundError: No module named 'app.schemas.events'``（``sys.modules['app']`` 被另一个服务占用）
 - ≥3 个服务 → ``ValueError: Plugin already registered under a different name``（``app.tests.conftest`` 重名）
 
@@ -32,6 +32,7 @@ UNIT_TARGETS: tuple[str, ...] = (
     "services/scene-service",
     "services/data-collector",
     "services/data-analytics",
+    "services/vil-forwarder",
     "services/ota-service",
     "services/remote-control",
     "services/ingest-platform",

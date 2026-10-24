@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -46,6 +47,7 @@ from app.scene_engine.ir import (
 )
 from app.scene_engine.validators import run_gates
 from app.scene_engine.vehicle_params import (
+    DEFAULT_VEHICLE_PARAMS_PATH,
     VehicleParamsError,
     clear_vehicle_params_cache,
     get_vehicle_params,
@@ -216,6 +218,27 @@ def test_get_vehicle_params_follows_configured_path(tmp_path: Path, monkeypatch)
         assert get_vehicle_params() is loaded
     finally:
         clear_vehicle_params_cache()
+
+
+# =====================================================================
+# 一b、内置默认车辆参数必须随镜像构建（V1.23.1 实机回归）
+# =====================================================================
+
+
+def test_packaged_default_vehicle_params_is_loadable() -> None:
+    """源码布局下包内默认文件可加载（回落路径存在，非仅靠挂载）。"""
+    assert DEFAULT_VEHICLE_PARAMS_PATH.is_file()
+    assert load_vehicle_params(DEFAULT_VEHICLE_PARAMS_PATH).profile == "HUNTER_SE"
+
+
+def test_scene_service_dockerfile_ships_vehicle_params_config() -> None:
+    """容器内 DEFAULT 路径解析为 /app/config/vehicle_params.json（__file__=/app/app/... 的 parents[2]），
+    而 app 包不含服务根级 config/——若 Dockerfile 不显式 COPY config 到 /app/config，scene-service 会启动即崩溃。
+    本测试钉住该构建行，防止“测试全绿但镜像缺文件”的实机回归（V1.23.1 实机首发）。"""
+    dockerfile = Path(__file__).resolve().parents[2] / "Dockerfile"
+    text = dockerfile.read_text(encoding="utf-8")
+    assert "WORKDIR /app" in text
+    assert re.search(r"COPY\s+--from=builder\s+/build/service/config\s+\./config", text)
 
 
 # =====================================================================

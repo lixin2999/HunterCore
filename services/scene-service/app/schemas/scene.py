@@ -112,13 +112,21 @@ class SceneTemplateCategory(StrEnum):
 
 
 class SimulationStatus(StrEnum):
-    """Carla 仿真实例运行状态（4.4 节；⚠ 除 running 外取值由契约补充，待确认 #2/#9）。"""
+    """Carla 仿真实例运行状态（4.4 节；平台状态枚举不扩充）。"""
 
     PENDING = "pending"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELED = "canceled"
+
+
+class SimulationMode(StrEnum):
+    """仿真模式（数据采集与分析系统 ↔ CARLA 详细设计 6.1.1）。"""
+
+    SIL = "sil"
+    VIL = "vil"
+    REPLAY = "replay"
 
 
 class MapType(StrEnum):
@@ -402,8 +410,15 @@ class SceneRunData(BaseModel):
     """下发结果数据（POST /api/v1/scene/{scene_id}/run，4.4 节第 5 步）。"""
 
     sim_instance_id: str = Field(description="Carla 仿真实例 ID")
+    sim_id: str | None = Field(default=None, description="平台仿真会话 ID（动态 Topic 前缀）")
     scene_id: UUID = Field(description="场景 ID")
+    mode: SimulationMode = Field(default=SimulationMode.SIL, description="仿真模式")
+    vehicle_id: str | None = Field(default=None, description="VIL/回放关联车辆 ID")
     status: SimulationStatus = Field(description="仿真实例状态")
+    carla_status: str | None = Field(default=None, description="CARLA 原始状态（排障用）")
+    vil_state_topic: str | None = Field(default=None, description="VIL 状态 Topic（mode=vil）")
+    sensor_data_topic: str | None = Field(default=None, description="仿真回传 Topic")
+    stream_url: str | None = Field(default=None, description="CARLA 视频流地址（服务端返回时透传）")
     started_at: datetime = Field(description="下发成功时间（UTC）")
     param_overrides: dict[str, Any] | None = Field(
         default=None, description="实际生效的参数覆盖（回显，便于追溯）"
@@ -418,12 +433,19 @@ class SimulationProgress(BaseModel):
 
     sim_instance_id: str = Field(description="Carla 仿真实例 ID")
     scene_id: UUID | None = Field(default=None, description="关联场景 ID（Carla 携带时透传）")
-    status: SimulationStatus = Field(description="仿真实例状态")
+    mode: SimulationMode | None = Field(default=None, description="仿真模式（会话登记时回填）")
+    vehicle_id: str | None = Field(default=None, description="VIL/回放关联车辆 ID")
+    status: SimulationStatus = Field(description="平台状态")
+    carla_status: str | None = Field(default=None, description="CARLA 原始状态（排障用）")
     progress_percent: float | None = Field(
         default=None, ge=0, le=100, description="完成百分比（Carla 未提供时 null）"
     )
     current_time_s: float | None = Field(default=None, ge=0, description="已仿真时长（秒）")
     total_time_s: float | None = Field(default=None, ge=0, description="场景总时长（秒）")
+    actors_count: int | None = Field(default=None, ge=0, description="参与者数量")
+    collisions: int | None = Field(default=None, ge=0, description="碰撞次数")
+    lane_invasions: int | None = Field(default=None, ge=0, description="车道入侵次数")
+    ego_state: dict[str, Any] | None = Field(default=None, description="VIL 自车位姿/速度/转角")
     message: str | None = Field(default=None, max_length=512, description="状态补充说明（失败原因等）")
     updated_at: datetime | None = Field(default=None, description="Carla 侧最后更新时间（UTC）")
 
@@ -446,15 +468,28 @@ class SimulationResult(BaseModel):
 
     sim_instance_id: str = Field(description="Carla 仿真实例 ID")
     scene_id: UUID | None = Field(default=None, description="关联场景 ID（Carla 携带时透传）")
+    mode: SimulationMode | None = Field(default=None, description="仿真模式")
+    vehicle_id: str | None = Field(default=None, description="VIL/回放关联车辆 ID")
     status: SimulationStatus = Field(description="仿真实例状态（终态）")
+    carla_status: str | None = Field(default=None, description="CARLA 原始状态")
     success: bool | None = Field(default=None, description="是否达成 success_criteria（未判定时 null）")
     success_criteria_result: dict[str, Any] | None = Field(
         default=None, description="成功判据逐项结果（透传，结构待确认 #9）"
     )
+    evaluation: dict[str, Any] | None = Field(default=None, description="安全/效率/舒适/任务评估")
     message: str | None = Field(default=None, max_length=512, description="失败/取消原因等补充说明")
     artifacts: list[SimulationArtifact] = Field(default_factory=list, description="产物清单")
     started_at: datetime | None = Field(default=None)
     finished_at: datetime | None = Field(default=None, description="仿真结束时间（UTC）")
+
+
+class SimulationControlData(BaseModel):
+    """仿真控制结果（pause / resume / cancel）。"""
+
+    sim_instance_id: str = Field(description="Carla 仿真实例 ID")
+    status: SimulationStatus = Field(description="控制后的平台状态")
+    carla_status: str | None = Field(default=None, description="控制后的 CARLA 原始状态")
+    message: str | None = Field(default=None, max_length=512, description="补充说明（如 paused）")
 
 
 # =====================================================================
@@ -514,16 +549,75 @@ class SceneExportRequest(BaseModel):
     format: SceneExportFormat = Field(description="导出格式（4.3 节）")
 
 
+class SimulationQuality(StrEnum):
+    """CARLA 渲染/物理质量档位（CARLA 管理 API 创建参数）。"""
+
+    LOW = "Low"
+    MEDIUM = "Medium"
+    HIGH = "High"
+
+
+class VilCalibration(BaseModel):
+    """VIL 会话坐标标定（平台只做结构校验，坐标语义由 CARLA 校验）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    calibration_id: str = Field(min_length=1, max_length=128, description="标定 ID（追溯用）")
+    map_x: float = Field(description="标定参考点地图 X / m")
+    map_y: float = Field(description="标定参考点地图 Y / m")
+    map_heading: float = Field(description="标定参考点地图航向 rad")
+    odom_x: float = Field(description="对应 odom X / m")
+    odom_y: float = Field(description="对应 odom Y / m")
+    odom_heading: float = Field(description="对应 odom 航向 rad")
+
+
+class VilConfig(BaseModel):
+    """VIL 数据面参数（CARLA vil-mapper 使用）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    calibration: VilCalibration = Field(description="坐标标定（VIL 必填）")
+    target_hz: int = Field(default=10, ge=1, le=30, description="VIL 状态目标频率 Hz")
+    data_timeout_ms: int = Field(default=500, ge=50, le=5000, description="数据超时阈值 ms")
+    extrapolation_ms: int = Field(default=150, ge=0, le=2000, description="丢帧外推上限 ms")
+
+
+class ReplayConfig(BaseModel):
+    """实车数据回放配置（replay 模式）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    vehicle_id: str = Field(
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", description="回放数据来源车辆 ID"
+    )
+    start_time: float = Field(ge=0, description="回放起始时间 Unix epoch 秒")
+    end_time: float = Field(ge=0, description="回放结束时间 Unix epoch 秒")
+    include_sensors: bool = Field(default=True, description="是否回放传感器数据")
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> ReplayConfig:
+        if self.end_time <= self.start_time:
+            raise ValueError("replay_config.end_time 必须大于 start_time")
+        return self
+
+
 class SceneSimConfig(BaseModel):
-    """仿真运行配置（⚠ 设计文档未定义配置项，待确认 #2/#9）。"""
+    """仿真运行配置（CARLA 质量档位 + VIL 参数）。"""
 
     model_config = ConfigDict(extra="forbid")
 
     allow_parallel: bool = Field(default=False, description="允许同一场景并行运行多个实例")
+    quality: SimulationQuality = Field(default=SimulationQuality.MEDIUM, description="渲染/物理质量档位")
+    vil: VilConfig | None = Field(default=None, description="VIL 数据面参数（mode=vil 时必填）")
 
 
 class SceneRunRequest(BaseModel):
-    """场景下发请求（可省略请求体）；param_overrides 仅允许覆盖白名单路径。"""
+    """场景下发请求（可省略请求体）；param_overrides 仅允许覆盖白名单路径。
+
+    - ``mode=sil``：默认，vehicle_id 可为空；
+    - ``mode=vil``：vehicle_id + sim_config.vil 必填，同一车辆同时仅允许一个活动会话；
+    - ``mode=replay``：vehicle_id + replay_config 必填。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -531,6 +625,27 @@ class SceneRunRequest(BaseModel):
         default_factory=dict, description="参数化覆盖（白名单路径深合并；键为点分路径）"
     )
     sim_config: SceneSimConfig = Field(default_factory=SceneSimConfig, description="仿真运行配置")
+    mode: SimulationMode = Field(default=SimulationMode.SIL, description="仿真模式 sil/vil/replay")
+    vehicle_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+        description="VIL/回放关联车辆 ID；SIL 可为空",
+    )
+    replay_config: ReplayConfig | None = Field(default=None, description="回放配置（mode=replay 必填）")
+
+    @model_validator(mode="after")
+    def _validate_mode(self) -> SceneRunRequest:
+        if self.mode is SimulationMode.VIL:
+            if not self.vehicle_id:
+                raise ValueError("mode=vil 时必须提供 vehicle_id")
+            if self.sim_config.vil is None:
+                raise ValueError("mode=vil 时必须提供 sim_config.vil")
+        if self.mode is SimulationMode.REPLAY:
+            if not self.vehicle_id:
+                raise ValueError("mode=replay 时必须提供 vehicle_id")
+            if self.replay_config is None:
+                raise ValueError("mode=replay 时必须提供 replay_config")
+        return self
 
 
 # =====================================================================
@@ -568,6 +683,10 @@ class SimulationResultResponse(ApiResponse[SimulationResult]):
     """仿真结果查询响应（GET …/simulations/{sim_instance_id}/result，G-20①）。"""
 
 
+class SimulationControlResponse(ApiResponse[SimulationControlData]):
+    """仿真控制响应（POST …/simulations/{sim_instance_id}/pause|resume|cancel）。"""
+
+
 __all__ = [
     "EXPORT_EXTENSION_BY_FORMAT",
     "SCENE_CATEGORY_BY_TYPE",
@@ -579,6 +698,7 @@ __all__ = [
     "ActorType",
     "EgoVehicle",
     "MapType",
+    "ReplayConfig",
     "Scene",
     "SceneCategory",
     "SceneConfig",
@@ -613,8 +733,12 @@ __all__ = [
     "SceneType",
     "SceneUpdateRequest",
     "SimulationArtifact",
+    "SimulationControlData",
+    "SimulationControlResponse",
+    "SimulationMode",
     "SimulationProgress",
     "SimulationProgressResponse",
+    "SimulationQuality",
     "SimulationResult",
     "SimulationResultResponse",
     "SimulationStatus",
@@ -622,6 +746,8 @@ __all__ = [
     "SpawnPoint",
     "SuccessCriteria",
     "TagStr",
+    "VilCalibration",
+    "VilConfig",
     "Weather",
     "scene_category_for",
 ]

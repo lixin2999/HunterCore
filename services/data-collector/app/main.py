@@ -18,6 +18,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +35,7 @@ from hunter_common.redis import RedisManager
 
 from app.config import Settings, settings
 from app.consumers.base import BaseIngestConsumer
+from app.consumers.carla import CarlaSensorConsumer
 from app.consumers.events import EventIngestConsumer
 from app.consumers.health import HealthIngestConsumer
 from app.consumers.telemetry import TelemetryIngestConsumer
@@ -108,6 +110,10 @@ def _build_consumers(
     event_repository: EventRepository,
     pipeline_producer: PipelineProducer,
     status_writer: VehicleStatusWriter,
+    *,
+    telemetry_repository: TelemetryRepository,
+    redis_client: Any,
+    sensor_file_producer: SensorFileProducer,
 ) -> list[_SupervisedConsumer]:
     """按配置装配采集消费者监督器（契约 consumer-groups.yaml 的 3 个 data-collector 组）。"""
     supervisors: list[_SupervisedConsumer] = []
@@ -132,6 +138,20 @@ def _build_consumers(
             _SupervisedConsumer(
                 lambda: EventIngestConsumer(config, event_repository, pipeline_producer),
                 EventIngestConsumer.group_id,
+            )
+        )
+    if config.carla_sensor_consumer_enabled:
+        supervisors.append(
+            _SupervisedConsumer(
+                lambda: CarlaSensorConsumer(
+                    config,
+                    redis_client=redis_client,
+                    telemetry_repository=telemetry_repository,
+                    event_repository=event_repository,
+                    pipeline_producer=pipeline_producer,
+                    sensor_file_producer=sensor_file_producer,
+                ),
+                CarlaSensorConsumer.group_id,
             )
         )
     return supervisors
@@ -165,7 +185,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     event_repository = EventRepository(app.state.db)
     app.state.telemetry_service = TelemetryService(telemetry_repository)
     app.state.event_service = EventService(event_repository, storage)
-    app.state.file_service = FileService(storage, SensorFileProducer())
+    sensor_file_producer = SensorFileProducer()
+    app.state.file_service = FileService(storage, sensor_file_producer)
 
     # ---------- 采集链路（审查 R1 补齐）：Kafka 消费者 + 车辆状态守护 ----------
     # 契约 x-hunter-ingest-pipeline：telemetry/event/health 三路消费 + telemetry_raw/clean 投递
@@ -179,7 +200,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.vehicle_ledger_writer = ledger_writer
     app.state.vehicle_status_writer = status_writer
 
-    consumers = _build_consumers(settings, ingest_service, event_repository, pipeline_producer, status_writer)
+    consumers = _build_consumers(
+        settings,
+        ingest_service,
+        event_repository,
+        pipeline_producer,
+        status_writer,
+        telemetry_repository=telemetry_repository,
+        redis_client=app.state.redis.client,
+        sensor_file_producer=sensor_file_producer,
+    )
     app.state.ingest_consumers = consumers
     consumer_tasks = [
         asyncio.create_task(consumer.run(), name=f"consumer-{consumer.group_id}")

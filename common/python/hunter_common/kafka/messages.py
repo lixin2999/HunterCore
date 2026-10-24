@@ -182,21 +182,27 @@ def _enforce_key_contract(
             )
         return None
 
-    if not spec.requires_vehicle_key:
+    key_field = spec.key_field
+    if key_field is None:
         return key_bytes
 
-    payload_vehicle = payload.get("vehicle_id") if isinstance(payload, Mapping) else None
-    if payload_vehicle is None:
+    payload_key = payload.get(key_field) if isinstance(payload, Mapping) else None
+    if payload_key is None:
         raise KafkaMessageSchemaError(
-            f"{topic} 契约要求 key=vehicle_id，但消息体缺少 vehicle_id", details={"topic": topic}
+            f"{topic} 契约要求 key={key_field}，但消息体缺少 {key_field}",
+            details={"topic": topic, "key_field": key_field},
         )
-    expected = vehicle_key(str(payload_vehicle))
+    expected = vehicle_key(str(payload_key))
     if key_bytes is None:
         return expected
     if key_bytes != expected:
         raise KafkaMessageSchemaError(
-            f"{topic} 消息 key 必须等于 vehicle_id（单车辆有序）",
-            details={"topic": topic, "key": key_bytes.decode("utf-8", "replace")},
+            f"{topic} 消息 key 必须等于 {key_field}（同会话/同车辆有序）",
+            details={
+                "topic": topic,
+                "key_field": key_field,
+                "key": key_bytes.decode("utf-8", "replace"),
+            },
         )
     return key_bytes
 

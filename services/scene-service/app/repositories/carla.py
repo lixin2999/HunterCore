@@ -33,6 +33,8 @@ class SimInstance:
 
     instance_id: str
     status: str
+    sim_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +60,9 @@ class CarlaManagementClient:
         max_retries: int,
         get_path: str = "",
         result_path: str = "",
+        pause_path: str = "",
+        resume_path: str = "",
+        stop_path: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._create_path = create_path
@@ -65,6 +70,9 @@ class CarlaManagementClient:
         self._scenario_path = scenario_path
         self._get_path = get_path
         self._result_path = result_path
+        self._pause_path = pause_path
+        self._resume_path = resume_path
+        self._stop_path = stop_path
         self._timeout_seconds = timeout_seconds
         self._max_retries = max(0, max_retries)
         self._client: httpx.AsyncClient | None = None
@@ -94,23 +102,80 @@ class CarlaManagementClient:
     # ---------- 4.4 节流程步骤 ----------
 
     async def create_instance(
-        self, *, scene_id: str, scene_name: str, scene_config: dict[str, Any]
+        self,
+        *,
+        scene_id: str,
+        scene_name: str,
+        scene_config: dict[str, Any],
+        sim_id: str | None = None,
+        mode: str | None = None,
+        vehicle_id: str | None = None,
+        vil: dict[str, Any] | None = None,
+        replay_config: dict[str, Any] | None = None,
+        kafka: dict[str, Any] | None = None,
+        quality: str | None = None,
     ) -> SimInstance:
-        """② 调用 Carla 管理 API 创建仿真实例（返回 sim_instance_id 与初始状态）。"""
-        response = await self._request(
-            "POST",
-            self._create_path,
-            json_body={
-                "scene_id": scene_id,
-                "scene_name": scene_name,
-                "scene_config": scene_config,
-            },
+        """② 调用 Carla 管理 API 创建仿真实例（返回 sim_instance_id 与初始状态）。
+
+        创建请求携带平台生成的 ``sim_id`` 与动态 Topic 名，保证 CARLA 回传 Topic 与会话一致；
+        ``kafka`` 段只传 Topic 名，凭据由 CARLA 运行环境注入（禁止经平台传递）。
+        """
+        body: dict[str, Any] = {
+            "scene_id": scene_id,
+            "scene_name": scene_name,
+            "scene_config": scene_config,
+        }
+        optional = {
+            "sim_id": sim_id,
+            "mode": mode,
+            "vehicle_id": vehicle_id,
+            "vil": vil,
+            "replay_config": replay_config,
+            "kafka": kafka,
+            "quality": quality,
+        }
+        body.update({key: value for key, value in optional.items() if value is not None})
+        response = await self._request("POST", self._create_path, json_body=body)
+        payload = self._json_body(response, self._create_path)
+        instance_id = self._extract_instance_id(payload)
+        if isinstance(payload, dict):
+            status = str(payload.get("status") or "created")
+            returned_sim_id = payload.get("sim_id") or payload.get("simulation_id")
+            if returned_sim_id and sim_id and str(returned_sim_id) != sim_id:
+                # sim_id 是动态 Topic、Kafka key 与 VIL 会话的共同主键；CARLA 回显不一致
+                # 会导致消息写到另一套 Topic（平台永远收不到回传），必须 fail fast。
+                logger.error(
+                    "carla_sim_id_mismatch",
+                    scene_id=scene_id,
+                    platform_sim_id=sim_id,
+                    carla_sim_id=str(returned_sim_id),
+                )
+                raise ServiceUnavailableError(
+                    "Carla 返回的 sim_id 与平台下发不一致",
+                    details={
+                        "scene_id": scene_id,
+                        "platform_sim_id": sim_id,
+                        "carla_sim_id": str(returned_sim_id),
+                    },
+                )
+            data = dict(payload)
+        else:
+            status = "created"
+            returned_sim_id = None
+            data = {}
+        logger.info(
+            "carla_instance_created",
+            scene_id=scene_id,
+            sim_instance_id=instance_id,
+            sim_id=sim_id,
+            mode=mode,
         )
-        body = self._json_body(response, self._create_path)
-        instance_id = self._extract_instance_id(body)
-        status = str(body.get("status") or "running") if isinstance(body, dict) else "running"
-        logger.info("carla_instance_created", scene_id=scene_id, sim_instance_id=instance_id)
-        return SimInstance(instance_id=instance_id, status=status)
+        return SimInstance(
+            instance_id=instance_id,
+            status=status,
+            sim_id=str(returned_sim_id) if returned_sim_id else sim_id,
+            data=data,
+        )
 
     async def find_active_instance(self, scene_id: str) -> SimInstance | None:
         """查询该场景进行中的仿真实例（未找到/响应结构未知返回 None，仅记录告警）。"""
@@ -124,12 +189,18 @@ class CarlaManagementClient:
             if not isinstance(entry, dict):
                 continue
             status = str(entry.get("status") or "")
-            if status not in ACTIVE_STATUSES:
+            if status.strip().lower() not in ACTIVE_STATUSES:
                 continue
             for key in _INSTANCE_ID_KEYS:
                 value = entry.get(key)
                 if value:
-                    return SimInstance(instance_id=str(value), status=status)
+                    sim_id = entry.get("sim_id") or entry.get("simulation_id")
+                    return SimInstance(
+                        instance_id=str(value),
+                        status=status,
+                        sim_id=str(sim_id) if sim_id else None,
+                        data=dict(entry),
+                    )
         return None
 
     async def submit_scenario(self, instance_id: str, payload: dict[str, Any]) -> None:
@@ -146,6 +217,27 @@ class CarlaManagementClient:
         """⑦ 查询仿真实例结果（G-20①；终态判定由服务层完成，此处仅取快照）。"""
         return await self._fetch_snapshot(self._result_path, instance_id)
 
+    async def pause_instance(self, instance_id: str) -> None:
+        """暂停仿真实例（POST /instances/{id}/pause）。"""
+        await self._control_instance(self._pause_path, instance_id, "pause")
+
+    async def resume_instance(self, instance_id: str) -> None:
+        """恢复仿真实例（POST /instances/{id}/resume）。"""
+        await self._control_instance(self._resume_path, instance_id, "resume")
+
+    async def stop_instance(self, instance_id: str) -> None:
+        """停止并回收仿真实例（POST /instances/{id}/stop）。"""
+        await self._control_instance(self._stop_path, instance_id, "stop")
+
+    async def _control_instance(self, path_template: str, instance_id: str, action: str) -> None:
+        if not path_template:
+            raise ServiceUnavailableError(
+                "Carla 管理 API 控制路径未配置", details={"action": action}
+            )
+        path = path_template.format(sim_instance_id=instance_id)
+        await self._request("POST", path, json_body={})
+        logger.info("carla_instance_control", sim_instance_id=instance_id, action=action)
+
     async def _fetch_snapshot(self, path_template: str, instance_id: str) -> SimInstanceSnapshot:
         """GET 实例子资源并解析快照（响应体非对象 → 5001；404 → 3001）。"""
         path = path_template.format(sim_instance_id=instance_id)
@@ -161,7 +253,7 @@ class CarlaManagementClient:
             raise ServiceUnavailableError(
                 "Carla 管理 API 响应非法", details={"path": path}
             )
-        status = str(body.get("status") or "running")
+        status = str(body.get("status") or "created")
         return SimInstanceSnapshot(instance_id=instance_id, status=status, data=body)
 
     # ---------- 内部：请求与解析 ----------

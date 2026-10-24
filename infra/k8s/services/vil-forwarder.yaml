@@ -1,0 +1,165 @@
+# =====================================================================
+# vil-forwarder（VIL 数据面：telemetry_clean → carla.{sim_id}.vil_state）
+# 无状态服务：2 副本（设计文档 7.2.4：消费组 vil-forwarder 分摊车辆；
+#   会话在 Redis 共享，任一副本可处理任一车辆）
+# 资源：⚠ 数值按「10Hz latest-wins + 每副本 max.poll.records=100」负载推导
+# =====================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vil-forwarder-config
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: vil-forwarder
+data:
+  SERVICE_NAME: "vil-forwarder"
+  API_PORT: "8090"
+  # Kafka 声明与 contracts/kafka/consumer-groups.yaml 一一对应（禁止擅自新增 Topic/组）
+  KAFKA_CONSUMER_GROUP: "vil-forwarder"
+  KAFKA_SUBSCRIBE_TOPIC: "telemetry_clean"
+  KAFKA_PRODUCE_TOPICS: "carla.{sim_id}.vil_state"
+  # 新消费组只追当前状态：回放历史遥测会把过期位姿推进 CARLA（设计文档 7.2）
+  VIL_AUTO_OFFSET_RESET: "latest"
+  CONSUMER_BATCH_SIZE: "100"
+  # 10Hz 目标频率（contracts/kafka/topics.yaml#carla_topics.vil_state.frequency）
+  VIL_FORWARD_TARGET_HZ: "10"
+  # 会话 Redis 短缓存：避免每条遥测都打 Redis（会话变更最大延迟 1s）
+  VIL_SESSION_CACHE_TTL_MS: "1000"
+  VIL_CONSUMER_ENABLED: "true"
+  # 低时延旁路不落盘缓冲：VIL 允许 latest-wins 丢帧，且只读根文件系统无 /app/data 写权限
+  KAFKA_LOCAL_BUFFER_ENABLED: "false"
+  # 消费侧契约 Schema 校验（运行时契约目录由 hunter-contracts ConfigMap 挂载）
+  INGEST_SCHEMA_VALIDATION_ENABLED: "true"
+  KAFKA_CONTRACT_DIR: "/app/contracts/kafka"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vil-forwarder
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: vil-forwarder
+    app.kubernetes.io/part-of: hunter-core
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vil-forwarder
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vil-forwarder
+        app.kubernetes.io/part-of: hunter-core
+        app.kubernetes.io/component: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8090"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: vil-forwarder
+      containers:
+        - name: vil-forwarder
+          image: "hunter/vil-forwarder:{version}"   # 版本变量：部署前由 scripts/render_k8s.py 注入
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8090
+          envFrom:
+            - configMapRef:
+                name: hunter-common-config
+            - configMapRef:
+                name: vil-forwarder-config
+            - secretRef:
+                name: hunter-app-secrets
+          volumeMounts:
+            - name: kafka-tls
+              mountPath: /etc/hunter/kafka-tls
+              readOnly: true
+            - name: contracts
+              mountPath: /app/contracts/kafka
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: kafka-tls
+          secret:
+            secretName: hunter-kafka-tls
+        # 运行时 Kafka 契约（消费侧 Schema 校验；由 scripts/generate_contracts_configmap.py 生成）
+        - name: contracts
+          configMap:
+            name: hunter-contracts
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vil-forwarder
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: vil-forwarder
+    app.kubernetes.io/part-of: hunter-core
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vil-forwarder
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http

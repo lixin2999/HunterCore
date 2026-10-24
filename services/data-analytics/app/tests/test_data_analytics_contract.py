@@ -456,7 +456,7 @@ def test_realtime_job_inputs_match_consumer_groups(contract: dict[str, Any]) -> 
     }
     # ℞ V1.19.10：原单组 data-analytics-telemetry（1 组挂 4 作业）已拆为 4 个独立组，
     #   telemetry_clean 侧 -state/-alert/-collision/-algo + 未动的 -raw/-algorithm-metrics/-events/-sensor-file = 8
-    assert len(groups) == 8, f"data-analytics 消费组数量异常: {sorted(groups)}"
+    assert len(groups) == 9, f"data-analytics 消费组数量异常: {sorted(groups)}"
     for entry in realtime["input"]:
         group = groups[entry["consumer_group"]]
         assert group["subscribes"] == [entry["topic"]]
@@ -846,6 +846,10 @@ def test_dashboard_contract_covers_blocks_and_degradation(contract: dict[str, An
         "vehicle:online:set",
         "vehicle:status:{vehicle_id}",
         "analytics:ingest_latency",
+        "carla:sim:{sim_id}:status",
+        "carla:sim:{sim_id}:metrics",
+        "carla:sim:{sim_id}:events",
+        "carla:sim:{sim_id}:artifacts",
     }
 
 
@@ -855,16 +859,23 @@ def test_kafka_participation_matches_contracts(contract: dict[str, Any]) -> None
     platform = {
         entry["name"]: entry for entry in load_yaml(TOPICS_CONTRACT)["platform_topics"]
     }
-    consumed = {entry["topic"] for entry in kafka["consumes"]}
+    consumed = {entry.get("topic") or entry.get("topic_pattern") for entry in kafka["consumes"]}
     assert consumed == {
         "telemetry_clean",
         "telemetry_raw",
         "event_raw",
         "sensor_file",
         "algorithm_metrics",
+        "carla.*.sensor_data",
+    }
+    carla_topics = {
+        entry["name"]: entry for entry in load_yaml(TOPICS_CONTRACT)["carla_topics"]
     }
     for entry in kafka["consumes"]:
-        assert entry["topic"] in platform, entry["topic"]
+        topic = (entry.get("topic") or entry.get("topic_pattern")).replace(
+            "carla.*.sensor_data", "carla.{sim_id}.sensor_data"
+        )
+        assert topic in platform or topic in carla_topics, topic
         assert (ROOT / entry["schema"]).is_file(), entry["schema"]
         # ℞ V1.19.10：拆组后未实现作业的组仍登记但置 enabled=false（占位），
         #   不再断言全部 True；但不启用必须给理由，禁止静默消失。
@@ -889,10 +900,8 @@ def test_kafka_participation_matches_contracts(contract: dict[str, Any]) -> None
 
     groups = {group["group_id"]: group for group in load_yaml(CONSUMER_GROUPS)["groups"]}
     for entry in kafka["consumes"]:
-        assert (
-            groups[entry["group_id"]]["idempotency_key"]
-            == kafka["idempotency_keys"][entry["topic"]]
-        )
+        topic = entry.get("topic") or entry.get("topic_pattern")
+        assert groups[entry["group_id"]]["idempotency_key"] == kafka["idempotency_keys"][topic]
     # enabled 必须与 consumer-groups.yaml 的 status 逐项一致（单一事实来源不得两处各自声明）
     for entry in kafka["consumes"]:
         status = str(groups[entry["group_id"]].get("status", ""))
@@ -1076,10 +1085,16 @@ def test_contract_registers_gaps_without_new_endpoints_or_topics(contract: dict[
     for keyword in ("规划质量评估", "数据质量", "报告删除"):
         assert keyword in joined
     # Kafka：不新增 Topic（消费/生产均取自 contracts/kafka）
-    platform = {
-        entry["name"] for entry in load_yaml(TOPICS_CONTRACT)["platform_topics"]
+    topics = load_yaml(TOPICS_CONTRACT)
+    platform = {entry["name"] for entry in topics["platform_topics"]}
+    carla = {entry["name"] for entry in topics["carla_topics"]}
+    consumed_topics = {
+        (entry.get("topic") or entry.get("topic_pattern")).replace(
+            "carla.*.sensor_data", "carla.{sim_id}.sensor_data"
+        )
+        for entry in contract["x-hunter-kafka"]["consumes"]
     }
-    assert {entry["topic"] for entry in contract["x-hunter-kafka"]["consumes"]} <= platform
+    assert consumed_topics <= platform | carla
     assert {entry["topic"] for entry in contract["x-hunter-kafka"]["produces"]} <= platform
     # DB：不新增表（仅使用既有 algorithm_metrics）
     assert contract["x-hunter-service"]["db_tables"] == ["algorithm_metrics"]

@@ -106,6 +106,12 @@ class Settings(HunterBaseConfig):
     # ---------- 报告生成阈值（x-hunter-rate-limits.heavy_protection） ----------
     report_max_range_days: int = 90
     report_generate_max_concurrent: int = 2
+    # ---------- CARLA 仿真评估报告（接入方案 7.4） ----------
+    carla_sensor_consumer_enabled: bool = True
+    carla_sensor_topic_pattern: str = "carla.*.sensor_data"
+    carla_consumer_group: str = "data-analytics-carla"
+    simulation_report_prefix: str = "scene_test"
+    simulation_eval_pointer_key: str = "eval/simulation/latest.json"
     # 预计就绪提示值（JSON：{"<report_type>": seconds}；未配置的类型返回 null，仅提示用途）
     report_estimated_ready_seconds: str = ""
 
@@ -124,7 +130,8 @@ class Settings(HunterBaseConfig):
     #   与 consumer-groups.yaml 的 status 逐项比对由契约用例强制，**新增作业上线时必须同步本清单**。
     kafka_consumer_groups: str = (
         "data-analytics-telemetry-alert,data-analytics-telemetry-algo,"
-        "data-analytics-telemetry-raw,data-analytics-algorithm-metrics"
+        "data-analytics-telemetry-raw,data-analytics-algorithm-metrics,"
+        "data-analytics-carla"
     )
     dlq_topic: str = "dead_letter_queue"
 

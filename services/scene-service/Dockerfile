@@ -25,6 +25,11 @@ WORKDIR /app
 # pip --prefix=/install 安装路径：/install/lib/python3.12/site-packages → slim 镜像默认 site-packages
 COPY --from=builder /install/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /build/service/app ./app
+# 车辆参数内置默认（V1.23.1：vehicle_params provider 为启动硬依赖，缺文件即启动失败不降级）。
+# DEFAULT_VEHICLE_PARAMS_PATH 在容器内解析为 /app/config/vehicle_params.json（__file__=/app/app/... 的 parents[2]），
+# 而 app 包并不含服务根级 config/，故必须显式内置——否则回落路径不存在会直接 crash 启动。
+# 生产接车端真实参数：挂 bind mount / ConfigMap 后设 SCENE_VEHICLE_PARAMS_PATH 覆盖此默认。
+COPY --from=builder /build/service/config ./config
 # 场景受控字典（单一事实来源）：hunter_common.scene_taxonomy 启动即加载，缺失报错不降级，
 # 故必须随镜像内置（也可由 K8s 以 ConfigMap/bind mount 挂载 contracts/ 覆盖）。
 COPY contracts/scene-taxonomy.yaml ./contracts/scene-taxonomy.yaml

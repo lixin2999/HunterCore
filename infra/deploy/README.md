@@ -1,7 +1,7 @@
 # infra/deploy — 单机 Docker Compose 部署包（→ /opt/hunter-core）
 
 > 目标环境：Ubuntu 22.04 LTS + Docker Engine 24.0+ / Compose v2，单机部署
-> 6 业务服务 + 中间件（PostgreSQL 15 + TimescaleDB 2.13 / Kafka 3.6 / ZooKeeper 3.8 / Redis 7 /
+> 7 业务服务 + 中间件（PostgreSQL 15 + TimescaleDB 2.13 / Kafka 3.6 / ZooKeeper 3.8 / Redis 7 /
 > MinIO / SRS 5.0 / Flink 2.1）+ Vue3 前端（Nginx）。
 > 部署文档：`docs/01-部署概述与环境要求.md` … `docs/07-卸载与灾难恢复.md`。
 
@@ -25,7 +25,7 @@
 | `sql/schema.sql`、`sql/timescaledb.sql` | `contracts/database/ddl/*.sql`（生成，勿手改） |
 | `sql/init-data.sql` 角色/权限编码 | `contracts/openapi/api-gateway.yaml`、`contracts/database/enums.md` §8 |
 | MinIO Bucket 变量、Kafka SASL_SSL | `contracts/database/object-storage.yaml`、`contracts/kafka/topics.yaml` |
-| 端口 8080-8085、路由前缀 | 设计文档模块表 + `contracts/openapi/*.yaml` |
+| 端口 8080-8085 + 8090（vil-forwarder，内部服务）、路由前缀 | 设计文档模块表 + `contracts/openapi/*.yaml` |
 | Kafka 内部 Topic（分区/保留） | `contracts/kafka/topics.yaml`（`infra/docker/kafka/create-topics.sh` 同源） |
 
 ## 重新生成 SQL 部署产物
@@ -46,7 +46,7 @@ cat contracts/database/ddl/05_timeseries.sql > infra/deploy/sql/timescaledb.sql
 | `sql/schema.sql`、`sql/timescaledb.sql`、`sql/init-data.sql` | ✅ 已交付（生成产物） |
 | `.env.example` | ✅ 已交付（133 个变量，口令为 CHANGE_ME_*） |
 | `scripts/*.sh`（12 个：common/install/gen-passwords/gen-kafka-certs/init-db/init-kafka/init-minio/health-check/daily-check/backup/uninstall/collect-logs） | ✅ 已交付（位于仓库根 `scripts/`，部署时映射至 `/opt/hunter-core/scripts/`，见下表） |
-| `docker-compose.yml` | ✅ 已交付（单机生产编排：中间件 + Flink + SRS + 6 业务服务 + web-portal；变量名对齐 pydantic-settings，健康检查用 `/healthz`，distroless 探针用 `python3 -c`；容器名与 `scripts/common.sh` 的 `C_*` 一致） |
+| `docker-compose.yml` | ✅ 已交付（单机生产编排：中间件 + Flink + SRS + 7 业务服务 + web-portal；变量名对齐 pydantic-settings，健康检查用 `/healthz`，distroless 探针用 `python3 -c`；容器名与 `scripts/common.sh` 的 `C_*` 一致） |
 | `docker-compose.override.yml.example` | ✅ 已交付为【模板】（G-03 硬闸）：开发覆盖（源码热重载/降配/端口开放）；生产包不含生效 override，install/health-check 检测到即拦截；联调需手动改名为 `docker-compose.override.yml` 并 `export HUNTER_ALLOW_OVERRIDE=1`（书面豁免） |
 | `config/srs.conf` | ✅ 已交付（SRS 5.0：RTMP 1935 / WebRTC 8000udp / HTTP-API·WHEP 9090；部署前须将 `rtc_server.candidate` 改为真实 SERVER_IP） |
 | `frontend/Dockerfile`、`frontend/.dockerignore` | ✅ 已交付（多阶段：node:20 构建 → nginx:1.25 托管；nginx.conf 由 compose 挂载，不烘焙进镜像） |

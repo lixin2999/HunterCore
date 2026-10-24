@@ -178,6 +178,7 @@ tasks = await OtaTaskRepository(session).find_all(
 | `scene-service` | `SceneRepository` | `scene_svc.scenes`（软删除） |
 | `data-collector` | `EventRepository`、`VehicleTelemetryRepository`、`VehicleRepository` | `data_collector.events` / `vehicle_telemetry`（写路径幂等）；`VehicleRepository` **仅限**回写 `vehicle_svc.vehicles.status` / `last_online_time` 两列（V1.18.11：Redis 读模型 → 台账，「车辆管理」页的唯一数据源；经 `app/repositories/vehicle_ledger.py` 适配层，节流 + 异常隔离）——其余列（含主数据与 `provision_status`）仍归 vehicle-service，禁止扩展 |
 | `data-analytics` | `AlgorithmMetricRepository`、`EventRepository`、`VehicleTelemetryRepository` | 分析读取（时序 + 事件，只读） |
+| `vil-forwarder` | 无（只读 Redis `vil:session:*` / `vil:active`，不访问数据库） | VIL 数据面 `telemetry_clean → carla.{sim_id}.vil_state`；登记本行仅为消除「未登记白名单」，**不得**新增共享 Repository 引用 |
 | `ota-service` | `OtaVersionRepository`、`OtaTaskRepository`、`OtaRecordRepository` | `ota_svc` 三表（灰度成功率统计等） |
 | `api-gateway` | `UserRepository`、`RoleRepository`、`PermissionRepository`、`UserRoleRepository`、`RolePermissionRepository`、`VehicleRepository` | 鉴权链路（`user_svc` RBAC 五表）+ 车辆台账只读 |
 | `remote-control` | `VehicleRepository` | 车辆状态读取（状态写入走 REST 调 vehicle-service） |

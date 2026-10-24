@@ -19,7 +19,8 @@ class Settings(HunterBaseConfig):
     # ---------- Kafka 消费/生产声明（对齐 contracts/kafka/consumer-groups.yaml，禁止擅自新增） ----------
     kafka_consumer_groups: str = (
         "data-collector-telemetry,data-collector-events,"
-        "data-collector-health,data-collector-command-result"
+        "data-collector-health,data-collector-command-result,"
+        "data-collector-carla"
     )
     kafka_subscribe_patterns: str = (
         "hunter.*.telemetry,hunter.*.event,hunter.*.health,hunter.*.command_result"
@@ -37,6 +38,7 @@ class Settings(HunterBaseConfig):
     telemetry_consumer_enabled: bool = True       # data-collector-telemetry
     event_consumer_enabled: bool = True           # data-collector-events
     health_consumer_enabled: bool = True          # data-collector-health
+    carla_sensor_consumer_enabled: bool = True    # data-collector-carla（carla.*.sensor_data）
     # 消费侧契约 Schema 校验（契约先行：默认开启；需 KAFKA_CONTRACT_DIR 可访问，
     # K8s 由 hunter-contracts ConfigMap 挂载）。仅在明确知悉风险时关闭（记录 CRITICAL 告警）。
     ingest_schema_validation_enabled: bool = True
@@ -70,6 +72,12 @@ class Settings(HunterBaseConfig):
 
     # ---------- sensor_file 通知 Topic（契约常量，环境变量可覆盖） ----------
     sensor_file_topic: str = "sensor_file"
+
+    # ---------- CARLA 仿真回传缓存（contracts/database/redis-keys.yaml） ----------
+    # carla:sim:{sim_id}:status/metrics/events/artifacts 的统一 TTL（秒）
+    carla_sim_cache_ttl_seconds: int = 86400
+    # 仿真事件 Redis List 保留条数（防止单会话无限增长）
+    carla_sim_events_max: int = 1000
 
     # ---------- 车辆维度限流（附录 D：遥测 ≤100 msg/s、文件上传 ≤10 Mbps = 1310720 B/s） ----------
     vehicle_telemetry_max_msg_per_sec: int = 100

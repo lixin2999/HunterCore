@@ -46,6 +46,12 @@ EXPECTED_INGEST_TOPICS: dict[str, tuple[int, int]] = {
     "ingest.dlt": (3, 2_592_000_000),
 }
 
+#: CARLA 动态 Topic 模板（分区数, acks, key, 保留毫秒）—— topics.yaml#carla_topics
+EXPECTED_CARLA_TOPICS: dict[str, tuple[int, str, str, int]] = {
+    "carla.{sim_id}.vil_state": (1, "1", "sim_id", 3_600_000),
+    "carla.{sim_id}.sensor_data": (3, "all", "sim_id", 604_800_000),
+}
+
 #: 车端 Topic（分区数, acks, 频率）
 EXPECTED_VEHICLE_TOPICS: dict[str, tuple[int, str, str]] = {
     "hunter.{vehicle_id}.telemetry": (6, "1", "10-50Hz"),
@@ -72,6 +78,8 @@ SCHEMA_FILES = (
     "sensor_file.schema.json",
     "alert_event.schema.json",
     "algorithm_metrics.schema.json",
+    "carla_vil_state.schema.json",
+    "carla_sensor_data.schema.json",
 )
 
 CREATE_TOPIC_CALL_RE = re.compile(r'create_topic\s+"([\w.]+)"\s+(\d+)\s+(\d+)')
@@ -112,6 +120,31 @@ def test_vehicle_topic_contract_values() -> None:
     # 车端消息 key = vehicle_id（单车辆有序）；广播 Topic 例外
     assert vehicle["hunter.{vehicle_id}.telemetry"]["key"] == "vehicle_id"
     assert vehicle["hunter.broadcast.command"]["key"] == "none"
+
+
+def test_carla_dynamic_topic_contract_values() -> None:
+    """CARLA 动态 Topic：模板/分区/acks/key/retention 与 Schema 引用一致。"""
+    topics = load_yaml(KAFKA_DIR / "topics.yaml")
+    carla = {entry["name"]: entry for entry in topics["carla_topics"]}
+    assert set(carla) == set(EXPECTED_CARLA_TOPICS)
+    for name, (partitions, acks, key, retention) in EXPECTED_CARLA_TOPICS.items():
+        entry = carla[name]
+        assert entry["dynamic"] is True
+        assert entry["partitions"] == partitions
+        assert str(entry["acks"]) == acks
+        assert entry["key"] == key
+        assert entry["retention_ms"] == retention
+        assert entry["lifecycle"] == "per_simulation"
+        assert (SCHEMA_DIR / entry["schema"].split("/")[-1]).is_file()
+    assert carla["carla.{sim_id}.sensor_data"]["dlq"] is True
+    assert topics["naming"]["sim_id_topic_pattern"] == "carla.{sim_id}.<type>"
+
+
+def test_carla_topics_are_provisioned_dynamically_not_statically() -> None:
+    """动态 carla.* 不得被静态建 Topic 脚本创建（由 scene-service Admin API 显式创建）。"""
+    for script in (COMPOSE_SCRIPT, K8S_JOB):
+        text = script.read_text(encoding="utf-8")
+        assert "carla." not in text, f"{script.name} 不得静态创建 CARLA 动态 Topic"
 
 
 def test_topic_defaults_follow_security_and_producer_baseline() -> None:
@@ -257,8 +290,14 @@ def test_command_schema_requires_vehicle_or_broadcast_target() -> None:
 
 def test_consumer_groups_only_reference_registered_topics() -> None:
     groups = load_yaml(KAFKA_DIR / "consumer-groups.yaml")["groups"]
-    known = set(EXPECTED_PLATFORM_TOPICS) | set(EXPECTED_VEHICLE_TOPICS) | set(EXPECTED_INGEST_TOPICS)
+    known = (
+        set(EXPECTED_PLATFORM_TOPICS)
+        | set(EXPECTED_VEHICLE_TOPICS)
+        | set(EXPECTED_INGEST_TOPICS)
+        | set(EXPECTED_CARLA_TOPICS)
+    )
     known |= {name.replace("{vehicle_id}", "*") for name in EXPECTED_VEHICLE_TOPICS}
+    known |= {name.replace("{sim_id}", "*") for name in EXPECTED_CARLA_TOPICS}
     known |= {f"{name}.dlq" for name in known}
 
     group_ids = [group["group_id"] for group in groups]
@@ -273,6 +312,44 @@ def test_consumer_groups_only_reference_registered_topics() -> None:
         for topic in group["subscribes"]:
             assert topic in known, f"{gid} 订阅未登记 Topic: {topic}"
 
+
+
+def test_carla_dynamic_topics_render_and_enforce_sim_id_key() -> None:
+    """具体 sim_id 可解析到模板 spec；key 必须等于消息体 sim_id。"""
+    from hunter_common.kafka.contracts import KafkaContract, get_contract
+    from hunter_common.kafka.messages import KafkaMessageSchemaError, build_record
+
+    contract = get_contract(required=True)
+    assert contract is not None
+    spec = contract.topic_spec("carla.sim-20261023-0001.sensor_data")
+    assert spec.name == "carla.{sim_id}.sensor_data"
+    assert spec.schema_name == "carla_sensor_data"
+    assert spec.requires_sim_key is True
+    assert spec.key_field == "sim_id"
+
+    rendered = KafkaContract.render_carla_topic(
+        "carla.{sim_id}.sensor_data", "sim-20261023-0001"
+    )
+    assert rendered == "carla.sim-20261023-0001.sensor_data"
+    assert contract.try_topic_spec("carla.*.vil_state").schema_name == "carla_vil_state"
+
+    example = load_schema("carla_sensor_data.schema.json")["examples"][0]
+    record = build_record(
+        rendered,
+        example,
+        key="sim-20261023-0001",
+        contract=contract,
+        contract_required=True,
+    )
+    assert record.key == b"sim-20261023-0001"
+    with pytest.raises(KafkaMessageSchemaError):
+        build_record(
+            rendered,
+            example,
+            key="HUNTER-001",
+            contract=contract,
+            contract_required=True,
+        )
 
 
 def test_analytics_result_schema_matches_scene_extraction_contract() -> None:

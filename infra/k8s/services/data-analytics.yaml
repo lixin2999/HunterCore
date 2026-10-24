@@ -32,6 +32,17 @@ data:
   # 分析结果与告警输出 Topic（contracts/kafka 契约）
   KAFKA_TOPIC_ANALYTICS_RESULT: "analytics_result"
   KAFKA_TOPIC_ALERT_EVENT: "alert_event"
+  # 消费组清单（看板 LAG 探测，与 contracts/kafka/consumer-groups.yaml 已交付组同源）
+  KAFKA_CONSUMER_GROUPS: "data-analytics-telemetry-alert,data-analytics-telemetry-algo,data-analytics-telemetry-raw,data-analytics-algorithm-metrics,data-analytics-carla"
+  # CARLA 仿真回传（carla.*.sensor_data；终态生成 scene_test 报告）
+  CARLA_SENSOR_CONSUMER_ENABLED: "true"
+  CARLA_SENSOR_TOPIC_PATTERN: "carla.*.sensor_data"
+  CARLA_CONSUMER_GROUP: "data-analytics-carla"
+  SIMULATION_REPORT_PREFIX: "scene_test"
+  SIMULATION_EVAL_POINTER_KEY: "eval/simulation/latest.json"
+  # 运行时契约目录（消费侧 Schema 校验）
+  INGEST_SCHEMA_VALIDATION_ENABLED: "true"
+  KAFKA_CONTRACT_DIR: "/app/contracts/kafka"
   # 报告输出 Bucket（hunter-reports，生命周期永久）与下载预签名时效（15 分钟）
   MINIO_BUCKET_REPORTS: "hunter-reports"
   REPORT_DOWNLOAD_EXPIRES_SECONDS: "900"
@@ -136,6 +147,9 @@ spec:
             - name: kafka-tls
               mountPath: /etc/hunter/kafka-tls
               readOnly: true
+            - name: contracts
+              mountPath: /app/contracts/kafka
+              readOnly: true
             - name: tmp
               mountPath: /tmp
           resources:
@@ -176,6 +190,10 @@ spec:
         - name: kafka-tls
           secret:
             secretName: hunter-kafka-tls
+        # 运行时契约（消费侧 Schema 校验；由 generate_contracts_configmap.py 生成）
+        - name: contracts
+          configMap:
+            name: hunter-contracts
         - name: tmp
           emptyDir: {}
 ---

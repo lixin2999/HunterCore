@@ -8,7 +8,7 @@
 #     副本数回落为 minReplicas，不影响服务可用）
 #
 # ⚠ 与 Deployment 静态副本的关系（人工确认点）：
-#   - scene-service / data-analytics / ota-service：基线 2 副本 → HPA 区间 [2, 5] 一致
+#   - scene-service / data-analytics / ota-service / vil-forwarder：基线 2 副本 → HPA 区间 [2, 5] 一致
 #   - api-gateway / data-collector / remote-control：基线 3 副本（可用性 ≥99.9% 约束）；
 #     HPA 接管后按 minReplicas=2 计算，低负载时可能缩容到 2 副本。
 #     若要求“永不低于 3 副本”，把这 3 个 HPA 的 minReplicas 改为 3（唯一改动点，
@@ -227,6 +227,44 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: remote-control
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+        - { type: Pods, value: 2, periodSeconds: 30 }
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 60 }
+---
+# ---------- VIL 数据面转发（8090，CPU；10Hz latest-wins） ----------
+# 2 副本基线：消费组内分摊车辆；会话在 Redis 共享，扩容无需迁移本地状态。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vil-forwarder
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: vil-forwarder
+    app.kubernetes.io/part-of: hunter-core
+    app.kubernetes.io/component: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vil-forwarder
   minReplicas: 2
   maxReplicas: 5
   metrics:

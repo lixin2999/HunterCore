@@ -165,6 +165,46 @@ data:
         idempotency_key: object_key
         notes: "对上传到 MinIO 的传感器文件做离线分析（感知精度评估 6.3.2 输入）；消息结构 contracts/kafka/schemas/sensor_file.schema.json"
 
+      # =====================================================================
+      # CARLA 仿真链路消费组（VIL 数据面 + 仿真回传面）
+      #   - 动态 Topic 模板 carla.{sim_id}.<type>，key = sim_id；
+      #   - 消费侧订阅写法 carla.*.sensor_data（单层通配，匹配具体 sim_id）；
+      #   - 动态 Topic 由 scene-service 在实例创建前显式创建（见 topics.yaml#carla_topics）。
+      # =====================================================================
+      - group_id: vil-forwarder
+        service: vil-forwarder
+        subscribes: [telemetry_clean]
+        produces: ["carla.{sim_id}.vil_state"]
+        idempotency_key: "(vehicle_id, seq)"
+        notes: "消费清洗后遥测，按 Redis 会话映射（vil:session:{vehicle_id} / vil:active）做 10Hz latest-wins 降采样，发布到会话 Topic；禁止直读 hunter.*.telemetry"
+
+      - group_id: data-collector-carla
+        service: data-collector
+        subscribes: ["carla.*.sensor_data"]
+        subscribe_mode: regex_pattern
+        produces: [sensor_file]
+        writes: [data_collector.vehicle_telemetry, data_collector.events]
+        idempotency_key: "(sim_id, seq)"
+        notes: "仿真状态→Redis；sim_telemetry→vehicle_telemetry（vehicle_id=SIM-{sim_id}）；可映射事件→events；sensor_file 复用现有通知 Topic；不跨 schema 写 data_analytics"
+
+      - group_id: data-analytics-carla
+        service: data-analytics
+        subscribes: ["carla.*.sensor_data"]
+        subscribe_mode: regex_pattern
+        produces: [analytics_result]
+        idempotency_key: "(sim_id, seq)"
+        target_latency: "终态后 60s 内出报告"
+        status: 已交付（services/data-analytics/app/consumers/carla.py；终态生成 scene_test 报告）
+        notes: "消费 sim_metrics / sim_status，生成 scene_test 报告写 hunter-reports（data-analytics 为唯一写方）；报告指针 hunter-reports/eval/simulation/latest.json"
+
+      - group_id: carla-vil
+        service: carla-manager
+        subscribes: ["carla.*.vil_state"]
+        subscribe_mode: regex_pattern
+        produces: []
+        idempotency_key: "(sim_id, seq)"
+        notes: "CARLA 侧 vil-mapper 消费 VIL 实车状态；单会话单消费者，latest-wins"
+
       - group_id: scene-service-analytics-result
         service: scene-service
         subscribes: [analytics_result]
@@ -201,6 +241,62 @@ data:
         produces: []
         idempotency_key: "(vehicle_id, alert_id)"
         notes: "告警聚合、WebSocket 推送前端、对接 Alertmanager"
+
+      # =====================================================================
+      # ingest-platform 消费组（V1.20.4，设计文档 §5.1 消费拓扑）
+      #   ⚠ 命名偏离本文件顶部「<service>-<domain>-<purpose>」中划线约定：ingest 采用点分 g.ingest.<purpose>，
+      #     与车端/平台 Topic 的点分命名一致（config.kafka_consumer_groups 为单一事实来源）；
+      #     verify_data_layer 校验 8 对 g.ingest.* 前缀显式放行。
+      #   幂等：事件仓 append-only ON CONFLICT DO NOTHING（§5.2 层1，idempotency_key= event_id）。
+      # =====================================================================
+      - group_id: g.ingest.manifest
+        service: ingest-platform
+        subscribes: [vehicle.bag.manifest]
+        produces: []
+        idempotency_key: event_id
+        notes: "manifest 上传登记 → 投影与就绪判定（§5.1）"
+      - group_id: g.ingest.projection
+        service: ingest-platform
+        subscribes: [vehicle.bag.task.status]
+        produces: []
+        idempotency_key: event_id
+        notes: "车端任务状态回报（纯投影更新，不触发加工）"
+      - group_id: g.ingest.progress
+        service: ingest-platform
+        subscribes: [vehicle.bag.parse.progress]
+        produces: []
+        idempotency_key: event_id
+        notes: "解析进度落库 bags.progress（最新态写入，历史入 events 仓）"
+      - group_id: g.ingest.artifact
+        service: ingest-platform
+        subscribes: [vehicle.bag.artifact.uploaded]
+        produces: [platform.derived.ready.v1, platform.bag.qc_failed.v1, platform.clip.created.v1, platform.dataset.ready.v1]
+        idempotency_key: event_id
+        notes: "产物上传完成 → 就绪判定；每分区令牌桶限速（§5.4 artifact_ingest_rate_limit）"
+      - group_id: g.ingest.heartbeat
+        service: ingest-platform
+        subscribes: [vehicle.agent.heartbeat]
+        produces: []
+        idempotency_key: event_id
+        notes: "agent 心跳（AgentRepository.upsert_heartbeat）"
+      - group_id: g.ingest.alert
+        service: ingest-platform
+        subscribes: [vehicle.agent.alert]
+        produces: []
+        idempotency_key: event_id
+        notes: "agent 告警；critical/error 级经 Webhook/Alertmanager 外发（§10）"
+      - group_id: g.ingest.cmdack
+        service: ingest-platform
+        subscribes: [vehicle.agent.cmd.ack]
+        produces: [vehicle.agent.cmd]
+        idempotency_key: event_id
+        notes: "下行命令回执（命令闭环 §9.4）；30min 未 ack 自动重发一次"
+      - group_id: g.ingest.dlt-replay
+        service: ingest-platform
+        subscribes: [ingest.dlt]
+        produces: []
+        idempotency_key: "(original_topic, original_partition, original_offset)"
+        notes: "DLT 人工重放工具组（§12.3 dlt_replay.py）；非常驻消费者，按需启动"
   "schemas/alert_event.schema.json": |-
     {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -689,6 +785,461 @@ data:
           }
         }
       }
+    }
+  "schemas/carla_sensor_data.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/carla_sensor_data.schema.json",
+      "title": "HunterCore 仿真回传 carla.{sim_id}.sensor_data",
+      "description": "仿真回传面：CARLA / eval-service 按 sim_id 隔离发布状态、遥测、事件、指标、文件通知与产物。消息 key = sim_id；SIL 模式 vehicle_id 允许为 null，data-collector 落库/转发 sensor_file 时使用 SIM-{sim_id}。消费组：data-collector-carla、data-analytics-carla。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "sim_id", "timestamp", "seq", "type", "payload"],
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0",
+          "description": "契约版本；不兼容变更升主版本"
+        },
+        "sim_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "仿真会话 ID，必须等于 Topic 中的 {sim_id} 与 Kafka key"
+        },
+        "vehicle_id": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "关联实车 ID；SIL 模式为 null"
+        },
+        "scene_id": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "description": "关联场景 ID（UUID 字符串）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "消息产生时间，Unix epoch 秒（含毫秒小数）"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "单 sim_id 内单调递增序号（幂等去重与丢包检测）"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["sim_status", "sim_telemetry", "sim_event", "sim_metrics", "sensor_file", "artifact"],
+          "description": "回传消息类型；payload 结构由 type 决定"
+        },
+        "payload": {
+          "type": "object",
+          "description": "类型相关载荷（见 allOf 条件约束）"
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"type": {"const": "sim_status"}}, "required": ["type"]},
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["status"],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "pattern": "^(CREATED|LOADING|READY|RUNNING|PAUSED|COMPLETED|FAILED|CANCELED|created|loading|ready|running|paused|completed|failed|canceled)$"
+                  },
+                  "progress_percent": {"type": "number", "minimum": 0, "maximum": 100},
+                  "elapsed_time": {"type": "number", "minimum": 0},
+                  "total_time": {"type": "number", "minimum": 0},
+                  "actors_count": {"type": "integer", "minimum": 0},
+                  "collisions": {"type": "integer", "minimum": 0},
+                  "lane_invasions": {"type": "integer", "minimum": 0},
+                  "ego_state": {"type": "object"},
+                  "message": {"type": "string", "maxLength": 512},
+                  "updated_at": {"type": "number"}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "sim_telemetry"}}, "required": ["type"]},
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["pose", "velocity", "steering_angle"],
+                "properties": {
+                  "pose": {
+                    "type": "object",
+                    "required": ["x", "y"],
+                    "properties": {
+                      "x": {"type": "number"},
+                      "y": {"type": "number"},
+                      "z": {"type": "number"},
+                      "yaw": {"type": "number"}
+                    }
+                  },
+                  "twist": {"type": "object"},
+                  "velocity": {"type": "number"},
+                  "steering_angle": {"type": "number"},
+                  "acceleration": {"type": "number"},
+                  "sim_time": {"type": "number", "minimum": 0}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "sim_event"}}, "required": ["type"]},
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["event_id", "event_type", "event_level", "sim_time"],
+                "properties": {
+                  "event_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                  "event_type": {"type": "string", "minLength": 1, "maxLength": 64},
+                  "event_level": {"type": "string", "enum": ["info", "warning", "critical"]},
+                  "sim_time": {"type": "number", "minimum": 0},
+                  "description": {"type": "string", "maxLength": 512},
+                  "data": {"type": "object"}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "sim_metrics"}}, "required": ["type"]},
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "minProperties": 1,
+                "properties": {
+                  "safety": {"type": "object"},
+                  "efficiency": {"type": "object"},
+                  "comfort": {"type": "object"},
+                  "task": {"type": "object"},
+                  "success_criteria_result": {"type": "object"},
+                  "grade": {"type": "string", "maxLength": 16},
+                  "score": {"type": "number"}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "sensor_file"}}, "required": ["type"]},
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["sensor_type", "bucket", "object_key", "format", "size_bytes", "md5", "sha256"],
+                "properties": {
+                  "sensor_type": {"type": "string", "minLength": 1, "maxLength": 64},
+                  "bucket": {
+                    "type": "string",
+                    "enum": ["hunter-raw-data", "hunter-rosbag", "hunter-video"]
+                  },
+                  "object_key": {"type": "string", "minLength": 1, "maxLength": 512},
+                  "format": {"type": "string", "minLength": 1, "maxLength": 32},
+                  "size_bytes": {"type": "integer", "minimum": 0},
+                  "md5": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                  "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "data_type": {"type": "string", "enum": ["point_cloud", "camera_image", "rosbag", "video", "other"]},
+                  "start_time": {"type": "number"},
+                  "end_time": {"type": "number"},
+                  "frame_count": {"type": "integer", "minimum": 0},
+                  "topics": {"type": "array", "items": {"type": "string"}},
+                  "seq": {"type": "integer", "minimum": 0}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"type": {"const": "artifact"}}, "required": ["type"]},
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["name", "bucket", "object_key", "size_bytes", "sha256"],
+                "properties": {
+                  "name": {"type": "string", "minLength": 1, "maxLength": 256},
+                  "bucket": {"type": "string", "minLength": 1, "maxLength": 64},
+                  "object_key": {"type": "string", "minLength": 1, "maxLength": 512},
+                  "size_bytes": {"type": "integer", "minimum": 0},
+                  "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "media_type": {"type": "string", "maxLength": 128}
+                }
+              }
+            }
+          }
+        }
+      ],
+      "examples": [
+        {
+          "schema_version": "1.0.0",
+          "sim_id": "sim-20261023-0001",
+          "vehicle_id": "HUNTER-001",
+          "scene_id": "8f0c2a3e-6c1b-4a7e-9f2d-1b2c3d4e5f60",
+          "timestamp": 1724035200.123,
+          "seq": 42,
+          "type": "sim_status",
+          "payload": {
+            "status": "RUNNING",
+            "progress_percent": 51.7,
+            "elapsed_time": 15.5,
+            "total_time": 30.0,
+            "actors_count": 5,
+            "collisions": 0,
+            "lane_invasions": 0
+          }
+        },
+        {
+          "schema_version": "1.0.0",
+          "sim_id": "sim-20261023-0001",
+          "vehicle_id": null,
+          "scene_id": "8f0c2a3e-6c1b-4a7e-9f2d-1b2c3d4e5f60",
+          "timestamp": 1724035201.0,
+          "seq": 43,
+          "type": "sim_metrics",
+          "payload": {
+            "safety": {"collision_count": 0},
+            "efficiency": {"avg_speed": 1.5},
+            "comfort": {"max_acceleration": 0.8},
+            "task": {"completion": 1.0},
+            "grade": "A",
+            "success_criteria_result": {"collision_free": true}
+          }
+        }
+      ]
+    }
+  "schemas/carla_vil_state.schema.json": |-
+    {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$id": "https://hunter-core.local/contracts/kafka/schemas/carla_vil_state.schema.json",
+      "title": "HunterCore VIL 实车状态 carla.{sim_id}.vil_state",
+      "description": "VIL 数据面：vil-forwarder 消费 telemetry_clean 后按 10Hz latest-wins 降采样，发布到按 sim_id 隔离的 carla.{sim_id}.vil_state。消息 key = sim_id；vehicle_id 必须是实车 ID（SIL 不产生本 Topic）。坐标保持实车 odom 原始坐标，由 CARLA vil-mapper 按会话标定转换。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "sim_id",
+        "vehicle_id",
+        "timestamp",
+        "seq",
+        "pose",
+        "twist",
+        "chassis"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0",
+          "description": "契约版本；不兼容变更升主版本"
+        },
+        "sim_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "仿真会话 ID，必须等于 Topic 中的 {sim_id} 与 Kafka key"
+        },
+        "vehicle_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "实车唯一标识（VIL 模式必填）"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "车端采集时间，Unix epoch 秒（含毫秒小数）；禁止用转发时间替代"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "vil-forwarder 输出序号（单调递增，用于去重/丢帧检测）"
+        },
+        "source_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "原始遥测 seq，便于链路追溯"
+        },
+        "pose": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x", "y", "z", "yaw"],
+          "properties": {
+            "frame": {
+              "type": "string",
+              "enum": ["odom"],
+              "description": "坐标帧固定为 odom（平台不做 odom → map 变换）"
+            },
+            "x": {"type": "number", "description": "odom X / m"},
+            "y": {"type": "number", "description": "odom Y / m"},
+            "z": {"type": "number", "description": "odom Z / m"},
+            "roll": {"type": "number", "description": "横滚角 rad"},
+            "pitch": {"type": "number", "description": "俯仰角 rad"},
+            "yaw": {"type": "number", "description": "航向角 rad"}
+          }
+        },
+        "twist": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["linear", "angular"],
+          "properties": {
+            "linear": {
+              "type": "array",
+              "items": {"type": "number"},
+              "minItems": 3,
+              "maxItems": 3,
+              "description": "[vx, vy, vz] m/s"
+            },
+            "angular": {
+              "type": "array",
+              "items": {"type": "number"},
+              "minItems": 3,
+              "maxItems": 3,
+              "description": "[ωx, ωy, ωz] rad/s"
+            }
+          }
+        },
+        "chassis": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["velocity", "steering_angle"],
+          "properties": {
+            "velocity": {"type": "number", "description": "车速 m/s"},
+            "steering_angle": {"type": "number", "description": "前轮转角 rad"},
+            "battery_voltage": {"type": "number"},
+            "battery_soc": {"type": "integer", "minimum": 0, "maximum": 100},
+            "battery_current": {"type": "number"},
+            "battery_temp": {"type": "number"},
+            "control_mode": {"type": "string"},
+            "vehicle_state": {"type": "string"},
+            "fault_code": {"type": "integer"},
+            "motor_rpm": {"type": "array", "items": {"type": "integer"}},
+            "motor_current": {"type": "array", "items": {"type": "number"}},
+            "motor_temp": {"type": "array", "items": {"type": "integer"}}
+          }
+        },
+        "perception": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "detected_objects": {"type": "integer", "minimum": 0},
+            "fps": {"type": "number", "minimum": 0},
+            "latency_ms": {"type": "number", "minimum": 0},
+            "object_types": {
+              "type": "object",
+              "additionalProperties": {"type": "integer", "minimum": 0}
+            },
+            "objects": {
+              "type": "array",
+              "maxItems": 200,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["object_id", "type", "x", "y"],
+                "properties": {
+                  "object_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                  "type": {"type": "string", "minLength": 1, "maxLength": 32},
+                  "x": {"type": "number"},
+                  "y": {"type": "number"},
+                  "z": {"type": "number"},
+                  "yaw": {"type": "number"},
+                  "length": {"type": "number", "minimum": 0},
+                  "width": {"type": "number", "minimum": 0},
+                  "height": {"type": "number", "minimum": 0},
+                  "vx": {"type": "number"},
+                  "vy": {"type": "number"},
+                  "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+                }
+              }
+            }
+          }
+        },
+        "planning": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "current_behavior": {"type": "string"},
+            "trajectory": {
+              "type": "array",
+              "maxItems": 200,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["x", "y"],
+                "properties": {
+                  "x": {"type": "number"},
+                  "y": {"type": "number"},
+                  "yaw": {"type": "number"},
+                  "v": {"type": "number", "minimum": 0}
+                }
+              }
+            }
+          }
+        },
+        "control": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "target_velocity": {"type": "number"},
+            "target_steer": {"type": "number"},
+            "velocity_error": {"type": "number"},
+            "steer_error": {"type": "number"},
+            "control_latency_ms": {"type": "number", "minimum": 0}
+          }
+        },
+        "calibration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["calibration_id"],
+          "properties": {
+            "calibration_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "map_x": {"type": "number"},
+            "map_y": {"type": "number"},
+            "map_heading": {"type": "number"},
+            "odom_x": {"type": "number"},
+            "odom_y": {"type": "number"},
+            "odom_heading": {"type": "number"}
+          }
+        },
+        "source_timestamp": {
+          "type": "number",
+          "description": "原始遥测时间，用于计算转发延迟"
+        },
+        "forwarded_at": {
+          "type": "number",
+          "description": "vil-forwarder 发出时间"
+        }
+      },
+      "examples": [
+        {
+          "schema_version": "1.0.0",
+          "sim_id": "sim-20261023-0001",
+          "vehicle_id": "HUNTER-001",
+          "timestamp": 1724035200.123,
+          "seq": 12580,
+          "source_seq": 12580,
+          "pose": {"frame": "odom", "x": 125.34, "y": 67.89, "z": 0.32, "roll": 0.01, "pitch": 0.02, "yaw": 1.234},
+          "twist": {"linear": [1.52, 0.01, 0.0], "angular": [0.0, 0.0, 0.05]},
+          "chassis": {
+            "velocity": 1.52,
+            "steering_angle": 0.12,
+            "control_mode": "CAN",
+            "vehicle_state": "NORMAL",
+            "fault_code": 0,
+            "motor_rpm": [1500, 1520, 0],
+            "motor_current": [8.5, 8.7, 2.1],
+            "motor_temp": [45, 46, 42]
+          },
+          "perception": {"detected_objects": 12, "fps": 10.2, "latency_ms": 85, "object_types": {"vehicle": 5, "pedestrian": 3, "other": 4}},
+          "planning": {"current_behavior": "cruise", "trajectory": [{"x": 1.0, "y": 0.0, "yaw": 0.0, "v": 1.5}]},
+          "control": {"target_velocity": 1.6, "target_steer": 0.10, "velocity_error": 0.08, "steer_error": 0.02, "control_latency_ms": 5},
+          "calibration": {"calibration_id": "cal-20261023-0001", "map_x": 100.5, "map_y": 50.2, "map_heading": 1.5708, "odom_x": 0.0, "odom_y": 0.0, "odom_heading": 0.0},
+          "source_timestamp": 1724035200.100,
+          "forwarded_at": 1724035200.135
+        }
+      ]
     }
   "schemas/command.schema.json": |-
     {
@@ -1556,6 +2107,9 @@ data:
       separator: "."
       vehicle_topic_pattern: "hunter.{vehicle_id}.<type>"
       broadcast_topic: "hunter.broadcast.command"
+      # 仿真动态 Topic：按 sim_id（场景仿真实例）隔离；由 scene-service 在实例创建前显式创建，
+      # 终态后延迟删除或依赖 retention 清理（broker 关闭 auto.create.topics.enable）。
+      sim_id_topic_pattern: "carla.{sim_id}.<type>"
       # DLQ 由 hunter_common.kafka.consumer 派生：{original_topic}.dlq（保留 30 天，分区数继承源 Topic）
       dlq_pattern: "{original_topic}.dlq"
       dlq_retention_ms: 2592000000          # 30 天：人工排查与重放窗口（与 event_raw 对齐）
@@ -1821,6 +2375,178 @@ data:
           滚动窗口聚合 telemetry_clean 后投递；data-analytics 常驻消费者再落 data_analytics.algorithm_metrics）；
           实时作业不直连库（G-13），落库经本 Topic 由服务侧消费者完成（写自身 schema，非跨 schema 越界）
         idempotency_key: "(vehicle_id, time, module, metric_name)"
+
+    # =====================================================================
+    # 二a、CARLA 仿真动态 Topic（数据采集与分析系统 ↔ CARLA 仿真系统）
+    #   - 名称模板 carla.{sim_id}.<type>，key = sim_id（同会话有序，与 vehicle_id 命名空间分离）；
+    #   - 动态 Topic 不在 create-topics.sh / kafka-init Job / init-kafka.sh 静态创建，
+    #     由 scene-service 在调用 CARLA 创建实例前通过 Kafka Admin API 显式创建；
+    #   - 实例终态后延迟删除，删除失败由 retention 自然清理；
+    #   - 消费组见 consumer-groups.yaml：vil-forwarder / data-collector-carla / data-analytics-carla / carla-vil。
+    # =====================================================================
+    carla_topics:
+      - name: "carla.{sim_id}.vil_state"
+        direction: platform_to_carla
+        dynamic: true
+        partitions: 1
+        partition_strategy: hash(sim_id)
+        key: sim_id
+        acks: "1"                        # 实时可视化：容忍偶发丢帧，换取更低时延
+        frequency: "10Hz（latest-wins 降采样）"
+        retention_ms: 3600000            # 1 小时（会话结束即无保留价值；Topic 终态后删除）
+        retention_human: "1 小时"
+        producer: vil-forwarder
+        consumers: [carla-manager (CARLA vil-mapper)]
+        schema: schemas/carla_vil_state.schema.json
+        lifecycle: per_simulation
+        description: "VIL 实车状态（平台→CARLA），按 sim_id 隔离；不含控制指令回传"
+
+      - name: "carla.{sim_id}.sensor_data"
+        direction: carla_to_platform
+        dynamic: true
+        dlq: true                        # 派生 carla.{sim_id}.sensor_data.dlq（由 scene-service 一并创建）
+        partitions: 3
+        partition_strategy: hash(sim_id)
+        key: sim_id
+        acks: all
+        frequency: "状态 1Hz / 事件触发 / 指标 10s 或终态"
+        retention_ms: 604800000          # 7 天
+        retention_human: "7 天"
+        producer: carla-manager / eval-service
+        consumers: [data-collector-carla, data-analytics-carla]
+        schema: schemas/carla_sensor_data.schema.json
+        lifecycle: per_simulation
+        description: "仿真回传：状态/事件/指标/传感器文件通知/产物；不传文件本体"
+
+    # =====================================================================
+    # 二b、ingest-platform 数据消费/解析 Topic（服务端数据消费解析与处理详细设计文档 §5.1/§7.5/§9.4/§12.3）
+    #   独立限界上下文（V1.20.4 纳入编排）。与 platform_topics 不同：
+    #     - 死信仅对**被消费**的订阅 Topic 派生 {topic}.dlq（基础设施类失败经 hunter_common 转投），
+    #       数据/字段级失败走自建 DLT `ingest.dlt`；生产 Topic 不派生 .dlq。
+    #     - auto.create.topics.enable=false，本清单由 init-kafka.sh / create-topics.sh / kafka-init Job 三处显式创建。
+    #   消费组见 contracts/kafka/consumer-groups.yaml（g.ingest.*）。组 ID 采用点分命名（与车端/平台 Topic 点分一致）。
+    # =====================================================================
+    ingest_platform_topics:
+      # ---- 订阅（车端/agent 产出、ingest 消费；均派生 {topic}.dlq）----
+      - name: vehicle.bag.manifest
+        direction: vehicle_to_platform
+        partitions: 3
+        retention_ms: 604800000
+        retention_human: "7 天"
+        consumed: true
+        producer: vehicle-agent
+        consumers: [ingest-platform (g.ingest.manifest)]
+        description: "bag manifest 上传登记（§5.1 消费拓扑；触发投影与就绪判定）"
+      - name: vehicle.bag.task.status
+        direction: vehicle_to_platform
+        partitions: 3
+        retention_ms: 604800000
+        retention_human: "7 天"
+        consumed: true
+        producer: vehicle-agent
+        consumers: [ingest-platform (g.ingest.projection)]
+        description: "车端任务状态回报（纯投影更新，不触发加工）"
+      - name: vehicle.bag.parse.progress
+        direction: vehicle_to_platform
+        partitions: 3
+        retention_ms: 604800000
+        retention_human: "7 天"
+        consumed: true
+        producer: vehicle-agent
+        consumers: [ingest-platform (g.ingest.progress)]
+        description: "解析进度（最新态写入 bags.progress，历史入 events 仓）"
+      - name: vehicle.bag.artifact.uploaded
+        direction: vehicle_to_platform
+        partitions: 6
+        retention_ms: 604800000
+        retention_human: "7 天"
+        consumed: true
+        producer: vehicle-agent
+        consumers: [ingest-platform (g.ingest.artifact)]
+        description: "产物上传完成通知（触发就绪判定；每分区令牌桶限速 §5.4）"
+      - name: vehicle.agent.heartbeat
+        direction: vehicle_to_platform
+        partitions: 6
+        retention_ms: 604800000
+        retention_human: "7 天"
+        consumed: true
+        producer: vehicle-agent
+        consumers: [ingest-platform (g.ingest.heartbeat)]
+        description: "agent 心跳（AgentRepository.upsert_heartbeat）"
+      - name: vehicle.agent.alert
+        direction: vehicle_to_platform
+        partitions: 3
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        consumed: true
+        producer: vehicle-agent
+        consumers: [ingest-platform (g.ingest.alert)]
+        description: "agent 告警（critical/error 级经 Webhook/Alertmanager 外发 §10）"
+      - name: vehicle.agent.cmd.ack
+        direction: vehicle_to_platform
+        partitions: 3
+        retention_ms: 604800000
+        retention_human: "7 天"
+        consumed: true
+        producer: vehicle-agent
+        consumers: [ingest-platform (g.ingest.cmdack)]
+        description: "下行命令回执（命令闭环 §9.4；30min 未 ack 自动重发一次）"
+      # ---- 生产（平台侧；不派生 .dlq）----
+      - name: vehicle.agent.cmd
+        direction: platform_to_vehicle
+        partitions: 3
+        retention_ms: 604800000
+        retention_human: "7 天"
+        consumed: false
+        producer: ingest-platform
+        consumers: [vehicle-agent]
+        description: "下行命令（§9.4；ack 经 vehicle.agent.cmd.ack 回报）"
+      - name: platform.derived.ready.v1
+        direction: platform_internal
+        partitions: 3
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        consumed: false
+        producer: ingest-platform
+        consumers: [下游业务]
+        description: "派生产物就绪（§7.5 对齐/切片/QC/富化完成）"
+      - name: platform.bag.qc_failed.v1
+        direction: platform_internal
+        partitions: 3
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        consumed: false
+        producer: ingest-platform
+        consumers: [下游业务]
+        description: "QC 加权分低于阈值告警（§7.4）"
+      - name: platform.clip.created.v1
+        direction: platform_internal
+        partitions: 3
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        consumed: false
+        producer: ingest-platform
+        consumers: [下游业务]
+        description: "切片生成（§7.3 事件驱动/固定窗口/挖掘/手工）"
+      - name: platform.dataset.ready.v1
+        direction: platform_internal
+        partitions: 3
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        consumed: false
+        producer: ingest-platform
+        consumers: [下游业务]
+        description: "训练数据集导出就绪（§8.2 webdataset 分片）"
+      # ---- DLT（解析/字段级无效消息专用死信；replay 工具 g.ingest.dlt-replay 取回源，§12.3）----
+      - name: ingest.dlt
+        direction: platform_internal
+        partitions: 3
+        retention_ms: 2592000000
+        retention_human: "30 天"
+        consumed: false
+        producer: ingest-platform
+        consumers: [ingest-platform (g.ingest.dlt-replay, 人工重放)]
+        description: "ingest 自建死信（数据/字段级无效消息；区别于 hunter_common 的 {topic}.dlq 基础设施死信）"
 
     # =====================================================================
     # 三、Topic 级限流（设计文档附录 D，不可放宽）

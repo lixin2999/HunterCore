@@ -17,6 +17,7 @@ from app.routers.errors import COMMON_ERRORS
 from app.schemas.scene import (
     SceneRunRequest,
     SceneRunResponse,
+    SimulationControlResponse,
     SimulationProgressResponse,
     SimulationResultResponse,
 )
@@ -75,6 +76,57 @@ async def get_simulation_result(
     """仅终态实例可查（非终态 → 3003）；产物落 hunter-scene-assets 时换发预签名 URL。"""
     data = await service.get_result(sim_instance_id)
     return SimulationResultResponse(data=data, request_id=trace_request_id())
+
+
+@router.post(
+    "/simulations/{sim_instance_id}/pause",
+    operation_id="pauseSimulation",
+    response_model=SimulationControlResponse,
+    summary="暂停仿真实例",
+    responses={**COMMON_ERRORS},
+)
+async def pause_simulation(
+    sim_instance_id: Annotated[str, Path(max_length=128, description="Carla 仿真实例 ID")],
+    service: Annotated[SceneSimulationService, Depends(get_simulation_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> SimulationControlResponse:
+    """暂停 pending/running 实例（终态 → 3003）。"""
+    data = await service.pause_instance(sim_instance_id)
+    return SimulationControlResponse(data=data, request_id=trace_request_id())
+
+
+@router.post(
+    "/simulations/{sim_instance_id}/resume",
+    operation_id="resumeSimulation",
+    response_model=SimulationControlResponse,
+    summary="恢复仿真实例",
+    responses={**COMMON_ERRORS},
+)
+async def resume_simulation(
+    sim_instance_id: Annotated[str, Path(max_length=128, description="Carla 仿真实例 ID")],
+    service: Annotated[SceneSimulationService, Depends(get_simulation_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> SimulationControlResponse:
+    """恢复 pending/running 实例（终态 → 3003）。"""
+    data = await service.resume_instance(sim_instance_id)
+    return SimulationControlResponse(data=data, request_id=trace_request_id())
+
+
+@router.post(
+    "/simulations/{sim_instance_id}/cancel",
+    operation_id="cancelSimulation",
+    response_model=SimulationControlResponse,
+    summary="终止仿真实例并回收会话",
+    responses={**COMMON_ERRORS},
+)
+async def cancel_simulation(
+    sim_instance_id: Annotated[str, Path(max_length=128, description="Carla 仿真实例 ID")],
+    service: Annotated[SceneSimulationService, Depends(get_simulation_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> SimulationControlResponse:
+    """终止实例、释放 VIL 会话并延迟删除动态 Topic（终态 → 3003）。"""
+    data = await service.cancel_instance(sim_instance_id)
+    return SimulationControlResponse(data=data, request_id=trace_request_id())
 
 
 __all__ = ["router"]

@@ -43,7 +43,7 @@ USE_JOURNAL=1
 STAGE_DIR=""
 # docker compose 服务名（与 infra/deploy/docker-compose.yml 一致；也可自动探测）
 DEFAULT_SERVICES=(
-  api-gateway scene-service data-collector data-analytics ota-service remote-control
+  api-gateway scene-service data-collector data-analytics ota-service remote-control vil-forwarder
   postgres timescale redis zookeeper kafka minio srs flink-jm flink-tm web-portal
 )
 

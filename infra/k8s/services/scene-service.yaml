@@ -30,8 +30,19 @@ data:
   # G-20① 仿真进度/结果查询子路径（无状态代理，契约 x-hunter-simulation-flow ⑥⑦）
   CARLA_INSTANCE_GET_PATH: "/api/v1/instances/{sim_instance_id}"
   CARLA_INSTANCE_RESULT_PATH: "/api/v1/instances/{sim_instance_id}/result"
+  CARLA_INSTANCE_PAUSE_PATH: "/api/v1/instances/{sim_instance_id}/pause"
+  CARLA_INSTANCE_RESUME_PATH: "/api/v1/instances/{sim_instance_id}/resume"
+  CARLA_INSTANCE_STOP_PATH: "/api/v1/instances/{sim_instance_id}/stop"
   CARLA_REQUEST_TIMEOUT_SECONDS: "5"
   CARLA_REQUEST_MAX_RETRIES: "1"
+  # VIL 会话 / 动态 Topic（接入方案 P1；carla.*.sensor_data + 其 DLQ 由本服务创建）
+  VIL_SESSION_TTL_SECONDS: "7200"
+  SIM_TOPIC_PROVISIONING_ENABLED: "true"
+  SIM_TOPIC_REPLICATION_FACTOR: "3"       # 生产 Kafka replication.factor=3
+  SIM_TOPIC_DELETE_DELAY_SECONDS: "600"
+  SIM_INSTANCE_TTL_SECONDS: "86400"
+  # 运行时契约目录（KafkaAdmin 读取 topics.yaml / consumer-groups.yaml）
+  KAFKA_CONTRACT_DIR: "/app/contracts/kafka"
   # 场景约束与缓存（SCENE_DETAIL_CACHE_TTL_SECONDS 与 Redis Key 契约同源 = 3600）
   SCENE_DURATION_MAX_SECONDS: "600"
   SCENE_PARAM_OVERRIDE_ALLOWED_PATHS: "ego_vehicle,weather,duration,actors,events,success_criteria"
@@ -125,6 +136,9 @@ spec:
             - name: kafka-tls
               mountPath: /etc/hunter/kafka-tls
               readOnly: true
+            - name: contracts
+              mountPath: /app/contracts/kafka
+              readOnly: true
             - name: tmp
               mountPath: /tmp
           resources:
@@ -165,6 +179,10 @@ spec:
         - name: kafka-tls
           secret:
             secretName: hunter-kafka-tls
+        # 运行时契约（KafkaAdmin 动态创建/删除 carla.* Topic；由 generate_contracts_configmap.py 生成）
+        - name: contracts
+          configMap:
+            name: hunter-contracts
         - name: tmp
           emptyDir: {}
 ---

@@ -39,6 +39,20 @@ RC_LOCK = "rc:lock:{vehicle_id}"
 #: 遥测入库延迟车队级 P95 指标 String(JSON)（data-analytics Flink 作业写、看板只读；TTL 300s）
 #: 无占位符的固定键——Flink 写端（ingest_latency_job）与看板读端（IngestLatencyRedisReader）共用本常量。
 ANALYTICS_INGEST_LATENCY = "analytics:ingest_latency"
+#: VIL 会话映射 String(JSON)（scene-service 写；vil-forwarder / scene-service 读；TTL 7200s）
+VIL_SESSION = "vil:session:{vehicle_id}"
+#: 活动 VIL 车辆集合 Set（scene-service 写；vil-forwarder 读；无 TTL，终态 SREM）
+VIL_ACTIVE = "vil:active"
+#: 仿真实例元数据 String(JSON)（scene-service 写读；TTL 86400s）
+SIM_INSTANCE = "sim:instance:{sim_instance_id}"
+#: 仿真状态缓存 String(JSON)（data-collector 写；data-analytics 读；TTL 86400s）
+SIM_STATUS = "carla:sim:{sim_id}:status"
+#: 仿真指标缓存 String(JSON)（data-collector 写；data-analytics 读；TTL 86400s）
+SIM_METRICS = "carla:sim:{sim_id}:metrics"
+#: 仿真事件缓存 List(JSON)（data-collector 写；data-analytics 读；TTL 86400s）
+SIM_EVENTS = "carla:sim:{sim_id}:events"
+#: 仿真产物缓存 Hash（data-collector 写；data-analytics 读；TTL 86400s）
+SIM_ARTIFACTS = "carla:sim:{sim_id}:artifacts"
 
 #: 受控键模式全集（test_storage_contracts.py 据此比对 redis-keys.yaml）。
 CONTROLLED_PATTERNS: frozenset[str] = frozenset(
@@ -52,6 +66,13 @@ CONTROLLED_PATTERNS: frozenset[str] = frozenset(
         CACHE_SCENE,
         RC_LOCK,
         ANALYTICS_INGEST_LATENCY,
+        VIL_SESSION,
+        VIL_ACTIVE,
+        SIM_INSTANCE,
+        SIM_STATUS,
+        SIM_METRICS,
+        SIM_EVENTS,
+        SIM_ARTIFACTS,
     }
 )
 
@@ -96,6 +117,36 @@ def rc_lock_key(vehicle_id: str) -> str:
     return RC_LOCK.format(vehicle_id=vehicle_id)
 
 
+def vil_session_key(vehicle_id: str) -> str:
+    """``vil:session:{vehicle_id}``。"""
+    return VIL_SESSION.format(vehicle_id=vehicle_id)
+
+
+def sim_instance_key(sim_instance_id: str) -> str:
+    """``sim:instance:{sim_instance_id}``。"""
+    return SIM_INSTANCE.format(sim_instance_id=sim_instance_id)
+
+
+def sim_status_key(sim_id: str) -> str:
+    """``carla:sim:{sim_id}:status``。"""
+    return SIM_STATUS.format(sim_id=sim_id)
+
+
+def sim_metrics_key(sim_id: str) -> str:
+    """``carla:sim:{sim_id}:metrics``。"""
+    return SIM_METRICS.format(sim_id=sim_id)
+
+
+def sim_events_key(sim_id: str) -> str:
+    """``carla:sim:{sim_id}:events``。"""
+    return SIM_EVENTS.format(sim_id=sim_id)
+
+
+def sim_artifacts_key(sim_id: str) -> str:
+    """``carla:sim:{sim_id}:artifacts``。"""
+    return SIM_ARTIFACTS.format(sim_id=sim_id)
+
+
 __all__ = [
     "ANALYTICS_INGEST_LATENCY",
     "CACHE_SCENE",
@@ -105,13 +156,26 @@ __all__ = [
     "RC_LOCK",
     "RC_SESSION",
     "SESSION",
+    "SIM_ARTIFACTS",
+    "SIM_EVENTS",
+    "SIM_INSTANCE",
+    "SIM_METRICS",
+    "SIM_STATUS",
     "VEHICLE_ONLINE_SET",
     "VEHICLE_STATUS",
+    "VIL_ACTIVE",
+    "VIL_SESSION",
     "cache_scene_key",
     "ota_progress_key",
     "rate_limit_key",
     "rc_lock_key",
     "rc_session_key",
     "session_key",
+    "sim_artifacts_key",
+    "sim_events_key",
+    "sim_instance_key",
+    "sim_metrics_key",
+    "sim_status_key",
     "vehicle_status_key",
+    "vil_session_key",
 ]

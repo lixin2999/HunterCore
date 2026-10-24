@@ -24,6 +24,8 @@ from app.services.templates import SceneTemplateService
 from app.tests.fakes import (
     FakeCarlaClient,
     FakeSceneCache,
+    FakeTopicProvisioner,
+    FakeVilSessionStore,
     InMemorySceneRepository,
     InMemorySceneStorage,
 )
@@ -75,6 +77,8 @@ def scene_env() -> Iterator[SimpleNamespace]:
     cache = FakeSceneCache()
     storage = InMemorySceneStorage()
     carla = FakeCarlaClient()
+    vil_sessions = FakeVilSessionStore()
+    topic_provisioner = FakeTopicProvisioner()
     scene_service = SceneService(repository, cache, settings)
     app.state.scene_repository = repository
     app.state.scene_service = scene_service
@@ -82,7 +86,13 @@ def scene_env() -> Iterator[SimpleNamespace]:
     app.state.export_service = SceneExportService(scene_service, storage, settings)
     # G-20①：注入 storage 以便产物预签名（与 main.py lifespan 装配一致）
     app.state.simulation_service = SceneSimulationService(
-        scene_service, carla, settings, storage=storage
+        scene_service,
+        carla,
+        settings,
+        storage=storage,
+        sessions=vil_sessions,
+        topics=topic_provisioner,
+        topic_delete_delay_seconds=0,
     )
     logical_repository = InMemoryLogicalScenarioRepository()
     concrete_repository = InMemoryConcreteScenarioRepository()
@@ -107,6 +117,8 @@ def scene_env() -> Iterator[SimpleNamespace]:
         storage=storage,
         carla=carla,
         service=scene_service,
+        vil_sessions=vil_sessions,
+        topic_provisioner=topic_provisioner,
         engine=app.state.engine_service,
         logical_repository=logical_repository,
         concrete_repository=concrete_repository,

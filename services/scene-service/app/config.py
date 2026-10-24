@@ -38,8 +38,23 @@ class Settings(HunterBaseConfig):
     # G-20① 仿真进度/结果查询子路径（无状态代理，契约 x-hunter-simulation-flow ⑥⑦）
     carla_instance_get_path: str = "/api/v1/instances/{sim_instance_id}"
     carla_instance_result_path: str = "/api/v1/instances/{sim_instance_id}/result"
+    # 仿真控制（数据采集与分析系统 ↔ CARLA 详细设计 6.1.2）
+    carla_instance_pause_path: str = "/api/v1/instances/{sim_instance_id}/pause"
+    carla_instance_resume_path: str = "/api/v1/instances/{sim_instance_id}/resume"
+    carla_instance_stop_path: str = "/api/v1/instances/{sim_instance_id}/stop"
     carla_request_timeout_seconds: float = 5.0
     carla_request_max_retries: int = 1
+
+    # ---------- 仿真会话 / 动态 Topic（CARLA 接入方案 P1） ----------
+    # VIL 会话 Redis 契约：vil:session:{vehicle_id}（String JSON，7200s）、vil:active（Set）
+    vil_session_ttl_seconds: int = 7200
+    # 动态 Topic 由 scene-service 在创建实例前显式创建（broker 关闭自动建 Topic）
+    sim_topic_provisioning_enabled: bool = True
+    sim_topic_replication_factor: int = 1
+    # 终态后延迟删除 Topic（秒）；<=0 表示立即删除
+    sim_topic_delete_delay_seconds: int = 600
+    # 实例会话登记（sim:instance:{sim_instance_id}，TTL 86400s）
+    sim_instance_ttl_seconds: int = 86400
 
     # ---------- 场景约束（契约 SceneConfig / SceneExportRequest） ----------
     # ⚠ 时长上限设计文档未定义（待确认项 #9）：默认 600s，超限返回 2001

@@ -30,13 +30,17 @@ from hunter_common.redis import RedisManager
 
 from app.config import settings
 from app.consumers.algorithm_metrics import AlgorithmMetricsConsumer
+from app.consumers.carla import CarlaSimulationConsumer
 from app.core import dependencies
 from app.core.error_handlers import register_exception_handlers
 from app.repositories.algorithm_metrics import AlgorithmMetricsWriter
 from app.repositories.pipeline import MetricsReadOnlyRepository
+from app.repositories.reports import ReportRepository
+from app.repositories.storage import S3ObjectStorage
 from app.routers import corner_cases, coverage, dashboard, evaluation, reports
 from app.routers.health import router as health_router
 from app.services.algorithm_metrics_ingest import AlgorithmMetricsIngest
+from app.services.simulation import SimulationReportService
 
 logger = get_logger("app.main")
 
@@ -53,9 +57,11 @@ class _SupervisedConsumer:
     /healthz 仍健康）。落库缓冲 ``AlgorithmMetricsIngest`` 跨重建复用（未冲刷样本不丢）。
     """
 
-    def __init__(self, factory: Callable[[], AlgorithmMetricsConsumer]) -> None:
+    def __init__(
+        self, factory: Callable[[], Any], group_id: str | None = None
+    ) -> None:
         self._factory = factory
-        self.group_id = AlgorithmMetricsConsumer.group_id
+        self.group_id = group_id or AlgorithmMetricsConsumer.group_id
         self._current: AlgorithmMetricsConsumer | None = None
         self._stopping = False
 
@@ -106,10 +112,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db.init()
     metrics_ingest = AlgorithmMetricsIngest(AlgorithmMetricsWriter(app.state.db), settings)
     app.state.algorithm_metrics_ingest = metrics_ingest
+    simulation_storage = S3ObjectStorage(settings, settings.minio_bucket_reports)
+    app.state.simulation_storage = simulation_storage
+    simulation_reports = SimulationReportService(
+        simulation_storage,
+        ReportRepository(simulation_storage, prefix=settings.report_sidecar_prefix),
+        pointer_key=settings.simulation_eval_pointer_key,
+        object_prefix=settings.simulation_report_prefix,
+    )
+    app.state.simulation_reports = simulation_reports
     supervisors: list[_SupervisedConsumer] = []
     if settings.algorithm_metrics_consumer_enabled:
         supervisors.append(
             _SupervisedConsumer(lambda: AlgorithmMetricsConsumer(settings, metrics_ingest))
+        )
+    if settings.carla_sensor_consumer_enabled:
+        supervisors.append(
+            _SupervisedConsumer(
+                lambda: CarlaSimulationConsumer(
+                    settings,
+                    redis_client=app.state.redis.client,
+                    reports=simulation_reports,
+                ),
+                CarlaSimulationConsumer.group_id,
+            )
         )
     app.state.metrics_consumers = supervisors
     consumer_tasks = [
@@ -144,6 +170,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     storage = getattr(app.state, dependencies.KEY_STORAGE, None)
     if storage is not None:
         await storage.close()
+    await app.state.simulation_storage.close()
     await app.state.redis.close()
     await app.state.db.close()
     await app.state.readonly_metrics.close()

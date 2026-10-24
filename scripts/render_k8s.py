@@ -43,7 +43,7 @@ PLACEHOLDER = "{version}"
 VERSION_PATTERN = re.compile(r"^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
 #: 自有镜像行（`hunter/<service>:<tag>`，可带引号）
 OWN_IMAGE_PATTERN = re.compile(r"(?P<name>hunter/[a-z0-9-]+):(?P<tag>[^\"'\s]+)")
-#: 期望渲染的微服务镜像（与设计文档模块表一致，禁止增减）
+#: 期望渲染的微服务镜像（设计文档模块表 + CARLA 接入方案新增的 vil-forwarder，禁止随意增减）
 EXPECTED_IMAGES: tuple[str, ...] = (
     "hunter/api-gateway",
     "hunter/scene-service",
@@ -51,6 +51,7 @@ EXPECTED_IMAGES: tuple[str, ...] = (
     "hunter/data-analytics",
     "hunter/ota-service",
     "hunter/remote-control",
+    "hunter/vil-forwarder",
 )
 
 

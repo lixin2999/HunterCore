@@ -1,0 +1,225 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hunter-core.local/contracts/kafka/schemas/carla_vil_state.schema.json",
+  "title": "HunterCore VIL 实车状态 carla.{sim_id}.vil_state",
+  "description": "VIL 数据面：vil-forwarder 消费 telemetry_clean 后按 10Hz latest-wins 降采样，发布到按 sim_id 隔离的 carla.{sim_id}.vil_state。消息 key = sim_id；vehicle_id 必须是实车 ID（SIL 不产生本 Topic）。坐标保持实车 odom 原始坐标，由 CARLA vil-mapper 按会话标定转换。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sim_id",
+    "vehicle_id",
+    "timestamp",
+    "seq",
+    "pose",
+    "twist",
+    "chassis"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0",
+      "description": "契约版本；不兼容变更升主版本"
+    },
+    "sim_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "仿真会话 ID，必须等于 Topic 中的 {sim_id} 与 Kafka key"
+    },
+    "vehicle_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+      "description": "实车唯一标识（VIL 模式必填）"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "车端采集时间，Unix epoch 秒（含毫秒小数）；禁止用转发时间替代"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "vil-forwarder 输出序号（单调递增，用于去重/丢帧检测）"
+    },
+    "source_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "原始遥测 seq，便于链路追溯"
+    },
+    "pose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "z", "yaw"],
+      "properties": {
+        "frame": {
+          "type": "string",
+          "enum": ["odom"],
+          "description": "坐标帧固定为 odom（平台不做 odom → map 变换）"
+        },
+        "x": {"type": "number", "description": "odom X / m"},
+        "y": {"type": "number", "description": "odom Y / m"},
+        "z": {"type": "number", "description": "odom Z / m"},
+        "roll": {"type": "number", "description": "横滚角 rad"},
+        "pitch": {"type": "number", "description": "俯仰角 rad"},
+        "yaw": {"type": "number", "description": "航向角 rad"}
+      }
+    },
+    "twist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["linear", "angular"],
+      "properties": {
+        "linear": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 3,
+          "maxItems": 3,
+          "description": "[vx, vy, vz] m/s"
+        },
+        "angular": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 3,
+          "maxItems": 3,
+          "description": "[ωx, ωy, ωz] rad/s"
+        }
+      }
+    },
+    "chassis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["velocity", "steering_angle"],
+      "properties": {
+        "velocity": {"type": "number", "description": "车速 m/s"},
+        "steering_angle": {"type": "number", "description": "前轮转角 rad"},
+        "battery_voltage": {"type": "number"},
+        "battery_soc": {"type": "integer", "minimum": 0, "maximum": 100},
+        "battery_current": {"type": "number"},
+        "battery_temp": {"type": "number"},
+        "control_mode": {"type": "string"},
+        "vehicle_state": {"type": "string"},
+        "fault_code": {"type": "integer"},
+        "motor_rpm": {"type": "array", "items": {"type": "integer"}},
+        "motor_current": {"type": "array", "items": {"type": "number"}},
+        "motor_temp": {"type": "array", "items": {"type": "integer"}}
+      }
+    },
+    "perception": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "detected_objects": {"type": "integer", "minimum": 0},
+        "fps": {"type": "number", "minimum": 0},
+        "latency_ms": {"type": "number", "minimum": 0},
+        "object_types": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "objects": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["object_id", "type", "x", "y"],
+            "properties": {
+              "object_id": {"type": "string", "minLength": 1, "maxLength": 64},
+              "type": {"type": "string", "minLength": 1, "maxLength": 32},
+              "x": {"type": "number"},
+              "y": {"type": "number"},
+              "z": {"type": "number"},
+              "yaw": {"type": "number"},
+              "length": {"type": "number", "minimum": 0},
+              "width": {"type": "number", "minimum": 0},
+              "height": {"type": "number", "minimum": 0},
+              "vx": {"type": "number"},
+              "vy": {"type": "number"},
+              "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+            }
+          }
+        }
+      }
+    },
+    "planning": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "current_behavior": {"type": "string"},
+        "trajectory": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["x", "y"],
+            "properties": {
+              "x": {"type": "number"},
+              "y": {"type": "number"},
+              "yaw": {"type": "number"},
+              "v": {"type": "number", "minimum": 0}
+            }
+          }
+        }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target_velocity": {"type": "number"},
+        "target_steer": {"type": "number"},
+        "velocity_error": {"type": "number"},
+        "steer_error": {"type": "number"},
+        "control_latency_ms": {"type": "number", "minimum": 0}
+      }
+    },
+    "calibration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calibration_id"],
+      "properties": {
+        "calibration_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "map_x": {"type": "number"},
+        "map_y": {"type": "number"},
+        "map_heading": {"type": "number"},
+        "odom_x": {"type": "number"},
+        "odom_y": {"type": "number"},
+        "odom_heading": {"type": "number"}
+      }
+    },
+    "source_timestamp": {
+      "type": "number",
+      "description": "原始遥测时间，用于计算转发延迟"
+    },
+    "forwarded_at": {
+      "type": "number",
+      "description": "vil-forwarder 发出时间"
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "sim_id": "sim-20261023-0001",
+      "vehicle_id": "HUNTER-001",
+      "timestamp": 1724035200.123,
+      "seq": 12580,
+      "source_seq": 12580,
+      "pose": {"frame": "odom", "x": 125.34, "y": 67.89, "z": 0.32, "roll": 0.01, "pitch": 0.02, "yaw": 1.234},
+      "twist": {"linear": [1.52, 0.01, 0.0], "angular": [0.0, 0.0, 0.05]},
+      "chassis": {
+        "velocity": 1.52,
+        "steering_angle": 0.12,
+        "control_mode": "CAN",
+        "vehicle_state": "NORMAL",
+        "fault_code": 0,
+        "motor_rpm": [1500, 1520, 0],
+        "motor_current": [8.5, 8.7, 2.1],
+        "motor_temp": [45, 46, 42]
+      },
+      "perception": {"detected_objects": 12, "fps": 10.2, "latency_ms": 85, "object_types": {"vehicle": 5, "pedestrian": 3, "other": 4}},
+      "planning": {"current_behavior": "cruise", "trajectory": [{"x": 1.0, "y": 0.0, "yaw": 0.0, "v": 1.5}]},
+      "control": {"target_velocity": 1.6, "target_steer": 0.10, "velocity_error": 0.08, "steer_error": 0.02, "control_latency_ms": 5},
+      "calibration": {"calibration_id": "cal-20261023-0001", "map_x": 100.5, "map_y": 50.2, "map_heading": 1.5708, "odom_x": 0.0, "odom_y": 0.0, "odom_heading": 0.0},
+      "source_timestamp": 1724035200.100,
+      "forwarded_at": 1724035200.135
+    }
+  ]
+}

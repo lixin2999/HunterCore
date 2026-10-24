@@ -113,3 +113,6 @@ spec:
           port: 8084
         - protocol: TCP
           port: 8085
+        # vil-forwarder（内部数据面，不经网关；仅放行 Prometheus 抓取）
+        - protocol: TCP
+          port: 8090

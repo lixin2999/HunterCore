@@ -18,6 +18,9 @@ naming:
   separator: "."
   vehicle_topic_pattern: "hunter.{vehicle_id}.<type>"
   broadcast_topic: "hunter.broadcast.command"
+  # 仿真动态 Topic：按 sim_id（场景仿真实例）隔离；由 scene-service 在实例创建前显式创建，
+  # 终态后延迟删除或依赖 retention 清理（broker 关闭 auto.create.topics.enable）。
+  sim_id_topic_pattern: "carla.{sim_id}.<type>"
   # DLQ 由 hunter_common.kafka.consumer 派生：{original_topic}.dlq（保留 30 天，分区数继承源 Topic）
   dlq_pattern: "{original_topic}.dlq"
   dlq_retention_ms: 2592000000          # 30 天：人工排查与重放窗口（与 event_raw 对齐）
@@ -283,6 +286,48 @@ platform_topics:
       滚动窗口聚合 telemetry_clean 后投递；data-analytics 常驻消费者再落 data_analytics.algorithm_metrics）；
       实时作业不直连库（G-13），落库经本 Topic 由服务侧消费者完成（写自身 schema，非跨 schema 越界）
     idempotency_key: "(vehicle_id, time, module, metric_name)"
+
+# =====================================================================
+# 二a、CARLA 仿真动态 Topic（数据采集与分析系统 ↔ CARLA 仿真系统）
+#   - 名称模板 carla.{sim_id}.<type>，key = sim_id（同会话有序，与 vehicle_id 命名空间分离）；
+#   - 动态 Topic 不在 create-topics.sh / kafka-init Job / init-kafka.sh 静态创建，
+#     由 scene-service 在调用 CARLA 创建实例前通过 Kafka Admin API 显式创建；
+#   - 实例终态后延迟删除，删除失败由 retention 自然清理；
+#   - 消费组见 consumer-groups.yaml：vil-forwarder / data-collector-carla / data-analytics-carla / carla-vil。
+# =====================================================================
+carla_topics:
+  - name: "carla.{sim_id}.vil_state"
+    direction: platform_to_carla
+    dynamic: true
+    partitions: 1
+    partition_strategy: hash(sim_id)
+    key: sim_id
+    acks: "1"                        # 实时可视化：容忍偶发丢帧，换取更低时延
+    frequency: "10Hz（latest-wins 降采样）"
+    retention_ms: 3600000            # 1 小时（会话结束即无保留价值；Topic 终态后删除）
+    retention_human: "1 小时"
+    producer: vil-forwarder
+    consumers: [carla-manager (CARLA vil-mapper)]
+    schema: schemas/carla_vil_state.schema.json
+    lifecycle: per_simulation
+    description: "VIL 实车状态（平台→CARLA），按 sim_id 隔离；不含控制指令回传"
+
+  - name: "carla.{sim_id}.sensor_data"
+    direction: carla_to_platform
+    dynamic: true
+    dlq: true                        # 派生 carla.{sim_id}.sensor_data.dlq（由 scene-service 一并创建）
+    partitions: 3
+    partition_strategy: hash(sim_id)
+    key: sim_id
+    acks: all
+    frequency: "状态 1Hz / 事件触发 / 指标 10s 或终态"
+    retention_ms: 604800000          # 7 天
+    retention_human: "7 天"
+    producer: carla-manager / eval-service
+    consumers: [data-collector-carla, data-analytics-carla]
+    schema: schemas/carla_sensor_data.schema.json
+    lifecycle: per_simulation
+    description: "仿真回传：状态/事件/指标/传感器文件通知/产物；不传文件本体"
 
 # =====================================================================
 # 二b、ingest-platform 数据消费/解析 Topic（服务端数据消费解析与处理详细设计文档 §5.1/§7.5/§9.4/§12.3）

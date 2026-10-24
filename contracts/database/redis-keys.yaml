@@ -222,6 +222,110 @@ keys:
       - "contracts/openapi/data-analytics.yaml#x-hunter-dashboard-contract.pipeline.ingest_latency"
       - "contracts/openapi/data-analytics.yaml#x-hunter-realtime-jobs.jobs[data_quality_monitor]"
 
+  # ---------------------------------------------------------------- 10
+  - pattern: "vil:session:{vehicle_id}"
+    type: "String(JSON)"
+    value: "VIL 会话映射（sim_id / scene_id / mode / topics / calibration / created_at / expires_at）"
+    ttl_seconds: 7200
+    ttl_source: "VIL 会话最长 2 小时（CARLA 接入详细设计 6.4）"
+    owner_service: scene-service
+    writers: [scene-service]
+    readers: [scene-service, vil-forwarder]
+    lifecycle: "VIL 实例创建成功后 SET NX EX 7200；实例终态/取消时 DEL；TTL 到期自动清理"
+    sensitive: false
+    ops: ["SET key json NX EX 7200", "GET", "DEL"]
+    refs:
+      - "contracts/openapi/scene-service.yaml#x-hunter-service.redis_keys"
+      - "contracts/kafka/schemas/carla_vil_state.schema.json"
+
+  # ---------------------------------------------------------------- 11
+  - pattern: "vil:active"
+    type: "Set"
+    value: "活动 VIL 车辆集合，成员 = vehicle_id"
+    ttl_seconds: null
+    ttl_source: "无 TTL：必须由终态/取消流程 SREM 清理"
+    owner_service: scene-service
+    writers: [scene-service]
+    readers: [scene-service, vil-forwarder]
+    lifecycle: "VIL 会话创建 SADD；实例终态/取消 SREM；启动对账可清理无会话成员"
+    sensitive: false
+    ops: ["SADD", "SREM", "SMEMBERS", "SISMEMBER"]
+    refs: ["contracts/openapi/scene-service.yaml#x-hunter-service.redis_keys"]
+
+  # ---------------------------------------------------------------- 12
+  - pattern: "sim:instance:{sim_instance_id}"
+    type: "String(JSON)"
+    value: "仿真实例元数据（sim_id / scene_id / vehicle_id / mode / topics）"
+    ttl_seconds: 86400
+    ttl_source: "实例终态后 1 天兜底（scene-service 主动 DEL）"
+    owner_service: scene-service
+    writers: [scene-service]
+    readers: [scene-service]
+    lifecycle: "创建实例成功后 SET EX 86400；终态/取消时 DEL；TTL 兜底"
+    sensitive: false
+    ops: ["SET key json EX 86400", "GET", "DEL"]
+    refs: ["contracts/openapi/scene-service.yaml#x-hunter-service.redis_keys"]
+
+  # ---------------------------------------------------------------- 13
+  - pattern: "carla:sim:{sim_id}:status"
+    type: "String(JSON)"
+    value: "仿真状态缓存（status / progress / counts / ego_state / updated_at）"
+    ttl_seconds: 86400
+    ttl_source: "仿真结束后 1 天（CARLA 接入详细设计 5.4）"
+    owner_service: data-collector
+    writers: [data-collector]
+    readers: [data-collector, data-analytics, scene-service]
+    lifecycle: "消费 sim_status 时 SET EX 86400 覆盖；无主动删除，依赖 TTL"
+    sensitive: false
+    ops: ["SET key json EX 86400", "GET"]
+    refs:
+      - "contracts/openapi/data-collector.yaml#x-hunter-service.redis_keys"
+      - "contracts/kafka/schemas/carla_sensor_data.schema.json"
+
+  # ---------------------------------------------------------------- 14
+  - pattern: "carla:sim:{sim_id}:metrics"
+    type: "String(JSON)"
+    value: "仿真指标缓存（safety / efficiency / comfort / task / success_criteria_result / grade）"
+    ttl_seconds: 86400
+    ttl_source: "仿真结束后 1 天（CARLA 接入详细设计 5.4）"
+    owner_service: data-collector
+    writers: [data-collector]
+    readers: [data-collector, data-analytics]
+    lifecycle: "消费 sim_metrics 时 SET EX 86400 覆盖；无主动删除，依赖 TTL"
+    sensitive: false
+    ops: ["SET key json EX 86400", "GET"]
+    refs:
+      - "contracts/openapi/data-collector.yaml#x-hunter-service.redis_keys"
+      - "contracts/kafka/schemas/carla_sensor_data.schema.json"
+
+  # ---------------------------------------------------------------- 15
+  - pattern: "carla:sim:{sim_id}:events"
+    type: "List(JSON)"
+    value: "仿真事件缓存（无法映射到 19 类车端事件时保留原始事件）"
+    ttl_seconds: 86400
+    ttl_source: "仿真结束后 1 天（event_raw 仅镜像可映射事件）"
+    owner_service: data-collector
+    writers: [data-collector]
+    readers: [data-collector, data-analytics]
+    lifecycle: "每条 sim_event LPUSH + LTRIM 最近 1000 条；EXPIRE 86400；依赖 TTL"
+    sensitive: false
+    ops: ["LPUSH", "LTRIM", "EXPIRE key 86400", "LRANGE"]
+    refs: ["contracts/openapi/data-collector.yaml#x-hunter-service.redis_keys"]
+
+  # ---------------------------------------------------------------- 16
+  - pattern: "carla:sim:{sim_id}:artifacts"
+    type: "Hash"
+    value: "仿真产物缓存（field = object_key，value = JSON 元信息）"
+    ttl_seconds: 86400
+    ttl_source: "仿真结束后 1 天（对象本体在 MinIO）"
+    owner_service: data-collector
+    writers: [data-collector]
+    readers: [data-collector, data-analytics]
+    lifecycle: "HSET artifact 元信息 + EXPIRE 86400；依赖 TTL"
+    sensitive: false
+    ops: ["HSET", "HGETALL", "EXPIRE key 86400"]
+    refs: ["contracts/openapi/data-collector.yaml#x-hunter-service.redis_keys"]
+
 # =====================================================================
 # 交叉校验（scripts/verify_data_layer.py / common/python/tests/test_storage_contracts.py）
 #   1) 各服务 openapi 的 x-hunter-service.redis_keys 声明的键 ∈ 本文件 keys[].pattern

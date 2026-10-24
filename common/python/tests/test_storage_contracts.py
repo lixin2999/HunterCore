@@ -34,6 +34,14 @@ EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
     "cache:scene:{scene_id}": ("String(JSON)", 3600),
     "rc:lock:{vehicle_id}": ("String", 30),
     "analytics:ingest_latency": ("String(JSON)", 300),  # 入库延迟指标缓存（pending #10 结案，redis-keys.yaml pending #9）
+    # CARLA 接入（P1/P2/P3）：VIL 会话 + 仿真实例/状态/指标/事件/产物
+    "vil:session:{vehicle_id}": ("String(JSON)", 7200),
+    "vil:active": ("Set", None),
+    "sim:instance:{sim_instance_id}": ("String(JSON)", 86400),
+    "carla:sim:{sim_id}:status": ("String(JSON)", 86400),
+    "carla:sim:{sim_id}:metrics": ("String(JSON)", 86400),
+    "carla:sim:{sim_id}:events": ("List(JSON)", 86400),
+    "carla:sim:{sim_id}:artifacts": ("Hash", 86400),
 }
 
 #: MinIO Bucket（名称 → 过期天数；None = 永久）——系统关键约束第 7 条（名称不可更改）
@@ -241,8 +249,15 @@ def test_redis_key_builder_module_mirrors_contract() -> None:
     assert redis_keys.cache_scene_key("s1") == "cache:scene:s1"
     assert redis_keys.rc_lock_key("v1") == "rc:lock:v1"
     assert redis_keys.ANALYTICS_INGEST_LATENCY == "analytics:ingest_latency"
+    assert redis_keys.vil_session_key("v1") == "vil:session:v1"
+    assert redis_keys.sim_instance_key("sim-1") == "sim:instance:sim-1"
+    assert redis_keys.sim_status_key("sim-1") == "carla:sim:sim-1:status"
+    assert redis_keys.sim_metrics_key("sim-1") == "carla:sim:sim-1:metrics"
+    assert redis_keys.sim_events_key("sim-1") == "carla:sim:sim-1:events"
+    assert redis_keys.sim_artifacts_key("sim-1") == "carla:sim:sim-1:artifacts"
     # 无占位符固定键：原样等于契约模式
     assert redis_keys.VEHICLE_ONLINE_SET == "vehicle:online:set"
+    assert redis_keys.VIL_ACTIVE == "vil:active"
     # 实际键必须仍命中命名正则（花括号占位符已替换）
     for built in (redis_keys.session_key("u1"), redis_keys.rc_lock_key("v1")):
         assert REDIS_KEY_NAMING_RE.match(built), built

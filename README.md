@@ -32,7 +32,7 @@
             │ REST(统一响应/错误码)       │ 消息(key=vehicle_id)          │ WebRTC/SRTP
 ┌───────────▼────────────────────────────▼───────────────────────────────▼───────────────┐
 │  业务服务层：scene(8081) / data-collector(8082) / data-analytics(8083) /                │
-│              ota-service(8084) / remote-control(8085)                                   │
+│              ota-service(8084) / remote-control(8085) / vil-forwarder(8090，内部数据面)  │
 └───────────┬────────────────────────────┬───────────────────────────────┬───────────────┘
             │                            │                               │
 ┌───────────▼────────────────────────────▼───────────────────────────────▼───────────────┐
@@ -56,6 +56,7 @@ HunterCore/
 │   ├── data-analytics/        # 8083 数据分析
 │   ├── ota-service/           # 8084 OTA 管理
 │   ├── remote-control/        # 8085 远程操控
+│   ├── vil-forwarder/         # 8090 VIL 数据面旁路（telemetry_clean → carla.{sim_id}.vil_state，内部服务）
 │   └── ingest-platform/       # 8089 数据消费解析与处理（V1.20.0 交付、V1.20.1 P0/V1.20.2 P1/V1.20.3 功能遗漏汇总（DLT replay）审查整改，尚未纳入部署编排，见 docs/deployment.md §14）
 ├── common/
 │   ├── python/hunter_common/  # Python 共享库（配置/日志/异常/响应/Kafka/DB/Redis）
@@ -63,7 +64,7 @@ HunterCore/
 ├── frontend/                  # Vue 3 管理后台（Vite + TS + Element Plus + Pinia + ECharts + Three.js）
 │   └── src/                   # api（按模块）/ types（契约类型）/ stores / router / views / utils / components
 ├── infra/
-│   ├── k8s/                   # K8s 清单：6 微服务 Deployment/Service/ConfigMap、中间件 StatefulSet/PVC、初始化 Job、Ingress
+│   ├── k8s/                   # K8s 清单：7 微服务 Deployment/Service/ConfigMap、中间件 StatefulSet/PVC、初始化 Job、Ingress
 │   ├── docker/                # 本地开发：postgres/kafka/minio 初始化脚本
 │   └── monitoring/            # Prometheus 采集与告警 + Alertmanager + Grafana 看板 + exporters + 监控组件清单
 ├── flink-jobs/                # Flink 2.1 实时分析作业（后续层级）
@@ -136,6 +137,7 @@ services/{service-name}/
 | 数据分析 | data-analytics | 8083 | `/api/v1/analytics/**` |
 | OTA 管理 | ota-service | 8084 | `/api/v1/ota/**` |
 | 远程操控 | remote-control | 8085 | `/api/v1/remote/**`、`/ws/remote/**`（WebSocket） |
+| VIL 数据面转发 | vil-forwarder | 8090 | 内部服务（不经网关；消费 `telemetry_clean`，产出 `carla.{sim_id}.vil_state`） |
 | 数据消费解析与处理 | ingest-platform | 8089 | 未入网关路由表（服务未纳入部署编排；REST 供内部查询/导出：`/api/v1/bags|clips|tasks|artifacts|datasets|agents|commands`，V1.20.0；审查 P0/P1 整改见 V1.20.1/V1.20.2，功能遗漏汇总剩余（§12.3 DLT replay）见 V1.20.3） |
 
 ## 快速开始
@@ -189,7 +191,7 @@ cd services/scene-service && pytest -q            # 服务测试（每个服务�
 ruff check tests common/python services           # Lint（CI 同款命令）
 ```
 
-> ⚠ 测试根目录必须逐个运行（6 个服务共用顶层包名 `app`）：CI 与本地统一走
+> ⚠ 测试根目录必须逐服务运行（多个服务共用顶层包名 `app`）：CI 与本地统一走
 > `python scripts/run_unit_tests.py`。
 
 ## 数据采集链路（审查 R1 后已落地）
@@ -226,7 +228,7 @@ ruff check tests common/python services           # Lint（CI 同款命令）
 
 1. `docker compose up -d`：TimescaleDB → Kafka（kafka-init 按契约创建平台内部 Topic）→ Redis → MinIO（minio-init 创建 7 个 Bucket + 生命周期）
 2. 安装共享库 `hunter_common`（editable），并执行数据库迁移：`alembic -c common/python/alembic.ini upgrade head`（建 schema/表/hypertable）
-3. 启动业务微服务（依赖基础设施）：scene-service → data-collector → data-analytics → ota-service → remote-control
+3. 启动业务微服务（依赖基础设施）：scene-service → data-collector → data-analytics → ota-service → remote-control → vil-forwarder（VIL 数据面，需 CARLA 接入时）
 4. 启动 api-gateway（依赖上述服务就绪后统一对外路由，8080）
 5. 前端 dev server：`cd frontend && npm install && npm run dev`（Vite 5173，代理 `/api` → 网关 8080；**`/ws` → remote-control:8085**（V1.21.0：网关不代理 WS，dev 与生产 nginx 路由对齐，`VITE_PROXY_WS_TARGET` 可覆盖）；详见 `frontend/README.md`）
 
@@ -238,7 +240,7 @@ ruff check tests common/python services           # Lint（CI 同款命令）
 ```bash
 # 静态校验（无需集群）：API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约一致性/Kafka CLI 参数齐备（--bootstrap-server + 认证参数）
 # ⚠ 在 Ubuntu 服务器上这些命令要写 `python3 scripts/...`（服务器无 `python` 别名）
-python scripts/render_k8s.py --check    # 镜像 {version} 占位符契约（6 个微服务）
+python scripts/render_k8s.py --check    # 镜像 {version} 占位符契约（7 个微服务）
 python scripts/verify_infra.py
 
 # 版本渲染（{version} 占位符 → 发布版本；清单禁止硬编码版本，产物 build/k8s/）
@@ -251,7 +253,7 @@ kubectl apply -f build/k8s/base/            # 命名空间 + 共享 ConfigMap + 
 # 前置：创建 TLS Secret hunter-kafka-tls / hunter-minio-tls / hunter-core-tls
 kubectl apply -f build/k8s/statefulsets/    # postgres / kafka / redis / minio
 kubectl apply -f build/k8s/jobs/            # Topic 与 Bucket 初始化（契约一致）
-kubectl apply -f build/k8s/services/        # 6 个微服务
+kubectl apply -f build/k8s/services/        # 7 个微服务
 kubectl apply -f build/k8s/ingress.yaml     # 网关路由表 + WebSocket + TLS
 # 网络策略（默认拒绝入向 + 仅网关可达后端；审查 R5 纵深防御）
 kubectl apply -f build/k8s/networkpolicies/
@@ -269,7 +271,7 @@ kubectl apply -f infra/monitoring/exporters/exporters.yaml
 - **探针**：`startupProbe`/`livenessProbe` → `/healthz`，`readinessProbe` → `/readyz`（初始延迟 10s / 周期 5s；就绪端点内部 2s 超时，依赖异常时快速 503 + `code=5001`）
 - **优雅终止**：`terminationGracePeriodSeconds` 基准 30s（api-gateway / scene-service）；消费类与会话类服务 60s（data-collector 提交 offset、ota 任务交接、remote-control 会话收敛，契约 pending 已固化）
 - **滚动更新**：`maxSurge: 1` / `maxUnavailable: 0`（更新期间不降级），配合 PDB 覆盖节点排空场景
-- **自动扩缩容**：HPA 6 个微服务（min=2 / max=5 / CPU 70%），需集群安装 metrics-server；有状态中间件禁止 HPA
+- **自动扩缩容**：HPA 7 个微服务（min=2 / max=5 / CPU 70%），需集群安装 metrics-server；有状态中间件禁止 HPA
 - **指标**：各服务暴露 `GET /metrics`（`common/python/hunter_common/metrics.py`，统一前缀 `hunter_`），Prometheus 通过 Pod 注解自动发现
 - **安全**：`hunter-core` 命名空间 `pod-security=restricted`；密钥/证书仅经 Secret 注入；Kafka `SASL_SSL + SCRAM-SHA-512`；MinIO HTTPS + SSE-S3
 - **告警**：5 组规则（服务健康 / API 性能 / 数据管道 / 中间件 / 业务约束），阈值需与设计文档 15.4.2 节核对
@@ -390,9 +392,9 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 - **数据采集服务**：`data-collector.yaml` 的 7 个业务端点由「附录 D 限流端点 + 5.5 上传流程 + events 表列能力」推导
   （12.2 节未随仓库提供，推导依据在 `x-hunter-endpoints.derivation` 逐条登记）；遥测查询响应与 5.3.3 节消息结构逐字段一致
   （`x-hunter-telemetry-query-contract` 给出扁平列映射）；文件上传 6 步流程 + 命名规范 + 校验失败复用 6001（`x-hunter-file-upload-flow`）；
-  Kafka 消费 4 个车端 Topic（`data-collector-*` 消费组）、生产 4 个内部 Topic（含本次补全的 `sensor_file.schema.json`）
+  Kafka 消费 4 个车端 Topic + `carla.*.sensor_data`（`data-collector-*` 消费组）、生产 4 个内部 Topic（含本次补全的 `sensor_file.schema.json`）
 - **⚠ 待确认**（契约内标 `pending_confirmation`）：~~认证端点路径与载荷~~（**已实现**：网关自持
-  login/refresh/logout/me，MFA 待数据库契约扩展；详见 `docs/api-gateway.md`）、`/api/v1/vehicle|user` 归属服务（模块表仅 6 个微服务，未配置 URL → 503）、
+  login/refresh/logout/me，MFA 待数据库契约扩展；详见 `docs/api-gateway.md`）、`/api/v1/vehicle|user` 归属服务（模块表仅 7 个微服务，未配置 URL → 503）、
   MFA / 限流错误码复用、服务发现机制与配置键名、熔断阈值；场景服务侧见其契约 `x-hunter-pending-confirmation`（12 项）；
   数据采集侧见其契约 `x-hunter-pending-confirmation`（12 项：端点清单来源 / 文件元信息缺表 / sensor_file 字段 / Carla Topic 归属等）；
   数据分析侧见其契约 `x-hunter-pending-confirmation`（12 项：报告元信息缺表 / 报告异步语义 / TTC 等级冲突 /
@@ -457,7 +459,7 @@ cd services/data-analytics && pytest app/tests/test_data_analytics_contract.py -
 
 | 层级 | 位置 | 内容 | 依赖 |
 |------|------|------|------|
-| 集成 | `tests/integration/` | 11.1 遥测链路（Topic 分区/保留契约、字节级往返、落库列覆盖、入库延迟、幂等、hypertable 配置、丢包检测）；API 契约面（统一响应/trace_id/就绪探针/契约外端点拦截，6 服务进程实测） | Docker（Postgres/Kafka/MinIO）+ uvicorn 进程 |
+| 集成 | `tests/integration/` | 11.1 遥测链路（Topic 分区/保留契约、字节级往返、落库列覆盖、入库延迟、幂等、hypertable 配置、丢包检测）；API 契约面（统一响应/trace_id/就绪探针/契约外端点拦截，逐服务进程实测） | Docker（Postgres/Kafka/MinIO）+ uvicorn 进程 |
 | 端到端 | `tests/e2e/` | 11.2 OTA（版本防回滚 6003、SHA-256/RSA 校验顺序、门禁 6003、车端状态机与回滚路径、灰度 5/20/50/100 与 95% 门槛、Kafka 下发/上报往返、Redis 进度 Hash TTL、MinIO 预签名包仓库）；11.3 远程操控（互斥 7001/4001/4002、限幅 2.0 m/s、20Hz 节奏、500ms 超时安全停车、Kafka 20Hz 指令流延迟 ≤100ms、Redis 互斥锁/会话/车辆状态） | 纯逻辑可跑；Kafka/Redis 部分需 Docker |
 | 性能 | `tests/performance/` | API P95 ≤ 200ms（/healthz 全链路）、遥测入库延迟 ≤ 1s、时序写入 ≥ 10000 点/s、Kafka 吞吐回归下限（阈值 `tests/support/thresholds.py`，来源逐条登记，禁止魔法数字） | Docker + api-gateway 进程 |
 

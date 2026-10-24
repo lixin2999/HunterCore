@@ -512,6 +512,11 @@ services:
       MINIO_BUCKET_SCENE_ASSETS: ${MINIO_BUCKET_SCENE_ASSETS:-hunter-scene-assets}
       MINIO_REGION: ${MINIO_REGION:-us-east-1}
       CARLA_MANAGEMENT_ENDPOINT: ${CARLA_MANAGEMENT_ENDPOINT:-}
+      # 仿真动态 Topic / VIL 会话（V1.23.3；默认值见 app/config.py，生产显式覆盖）
+      VIL_SESSION_TTL_SECONDS: ${VIL_SESSION_TTL_SECONDS:-7200}
+      SIM_TOPIC_PROVISIONING_ENABLED: ${SIM_TOPIC_PROVISIONING_ENABLED:-true}
+      SIM_TOPIC_REPLICATION_FACTOR: ${SIM_TOPIC_REPLICATION_FACTOR:-1}
+      SIM_TOPIC_DELETE_DELAY_SECONDS: ${SIM_TOPIC_DELETE_DELAY_SECONDS:-600}
       SCENE_EXTRACTION_CONSUMER_ENABLED: ${SCENE_EXTRACTION_CONSUMER_ENABLED:-true}
       # 场景引擎（逻辑/具体场景生成；ALLOWED_MAPS 空 = 不限制，按开放区域收紧）
       SCENE_GENERATION_MAX_COUNT: ${SCENE_GENERATION_MAX_COUNT:-5000}
@@ -557,6 +562,10 @@ services:
       # 台账回写：车辆管理页「状态/最近在线」的唯一数据源（vehicle-service 不读 Redis）
       VEHICLE_LEDGER_WRITE_ENABLED: ${VEHICLE_LEDGER_WRITE_ENABLED:-true}
       VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS: ${VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS:-30}
+      # CARLA 仿真回传（carla.*.sensor_data；消费组 data-collector-carla，与 K8s ConfigMap 对称）
+      CARLA_SENSOR_CONSUMER_ENABLED: ${CARLA_SENSOR_CONSUMER_ENABLED:-true}
+      CARLA_SIM_CACHE_TTL_SECONDS: ${CARLA_SIM_CACHE_TTL_SECONDS:-86400}
+      CARLA_SIM_EVENTS_MAX: ${CARLA_SIM_EVENTS_MAX:-1000}
     ports:
       - "127.0.0.1:${DATA_COLLECTOR_PORT:-8082}:8082"
     volumes:
@@ -608,6 +617,10 @@ services:
       # 单机默认复用 POSTGRES 超级用户，生产加固：先跑 sql/analytics-roles.sql 建 hunter_analytics_rw，再在 .env 覆盖（见 er.md §3 附注）
       ANALYTICS_RW_DB_USER: ${ANALYTICS_RW_DB_USER:-${POSTGRES_USER}}
       ANALYTICS_RW_DB_PASSWORD: ${ANALYTICS_RW_DB_PASSWORD:-${POSTGRES_PASSWORD}}
+      # CARLA 仿真回传 → scene_test 报告（消费组 data-analytics-carla，与 K8s ConfigMap 对称）
+      CARLA_SENSOR_CONSUMER_ENABLED: ${CARLA_SENSOR_CONSUMER_ENABLED:-true}
+      CARLA_SENSOR_TOPIC_PATTERN: ${CARLA_SENSOR_TOPIC_PATTERN:-carla.*.sensor_data}
+      CARLA_CONSUMER_GROUP: ${CARLA_CONSUMER_GROUP:-data-analytics-carla}
     ports:
       - "127.0.0.1:${DATA_ANALYTICS_PORT:-8083}:8083"
     volumes:
@@ -726,7 +739,51 @@ services:
       resources:
         limits: { cpus: "2", memory: 4G }
 
-  # ---------- 14. vehicle-service（8086；车辆台账与一键接入 provisioning） ----------
+  # ---------- 14. vil-forwarder（8090；VIL 数据面 telemetry_clean → carla.{sim_id}.vil_state） ----------
+  vil-forwarder:
+    image: ${IMAGE_PREFIX:-hunter}/vil-forwarder:${VERSION}
+    build:
+      context: .
+      dockerfile: services/vil-forwarder/Dockerfile
+      args:
+        VERSION: "${VERSION}"
+    container_name: hunter-vil-forwarder
+    environment:
+      <<: *business-env
+      SERVICE_NAME: vil-forwarder
+      API_PORT: "8090"
+      # 契约 consumer-groups.yaml：组 vil-forwarder / telemetry_clean → carla.{sim_id}.vil_state
+      KAFKA_CONSUMER_GROUP: ${VIL_CONSUMER_GROUP:-vil-forwarder}
+      KAFKA_SUBSCRIBE_TOPIC: ${VIL_INPUT_TOPIC:-telemetry_clean}
+      KAFKA_PRODUCE_TOPICS: ${VIL_OUTPUT_TOPIC_TEMPLATE:-carla.{sim_id}.vil_state}
+      # 新组无历史位点时只追当前状态，禁止回放历史遥测到 CARLA
+      VIL_AUTO_OFFSET_RESET: ${VIL_AUTO_OFFSET_RESET:-latest}
+      VIL_FORWARD_TARGET_HZ: ${VIL_TARGET_HZ:-10}
+      VIL_SESSION_CACHE_TTL_MS: ${VIL_SESSION_CACHE_TTL_MS:-1000}
+      VIL_CONSUMER_ENABLED: ${VIL_CONSUMER_ENABLED:-true}
+      # 低时延旁路不落盘缓冲（latest-wins 允许丢帧；避免额外 1GB 磁盘配额）
+      KAFKA_LOCAL_BUFFER_ENABLED: "false"
+    ports:
+      - "127.0.0.1:${VIL_FORWARDER_PORT:-8090}:8090"
+    volumes:
+      - *contracts-vol
+    depends_on:
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [hunter-net]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 1G }
+
+  # ---------- 15. vehicle-service（8086；车辆台账与一键接入 provisioning） ----------
   # 与其它业务服务不同：运行期需 openssl 子进程签发每车客户端证书，镜像基于 python:3.11-slim
   # 预装 openssl（非 distroless）；CA 私钥只读挂载 + setfacl 授权 gid 10001（install.sh 自愈）；
   # 证书写入 /app/data/vehicle-certs（持久卷，vehicle-service 唯一写域）。
@@ -779,7 +836,7 @@ services:
       resources:
         limits: { cpus: "1", memory: 1G }
 
-  # ---------- 15. ingest-platform（8089；数据消费解析与处理：7 Kafka 消费者 + orchestrator 加工 worker + 查询/导出 REST） ----------
+  # ---------- 16. ingest-platform（8089；数据消费解析与处理：7 Kafka 消费者 + orchestrator 加工 worker + 查询/导出 REST） ----------
   # V1.20.4 纳入部署编排（此前仅代码交付、未进 compose，实机验证卡在 `no such service: ingest-platform`）。
   # ⚠ 运行镜像 python:3.12-slim 非 distroless（rosbags/pyarrow/numpy 需原生库），容器 HEALTHCHECK 用 python3 urllib 探 /healthz。
   # ⚠ 端口与同级后端一致只绑 127.0.0.1；对外经 api-gateway 统一前缀 /api/v1/ingest 路由（V1.20.4 已接入网关，见 deployment.md §14）。
@@ -832,7 +889,7 @@ services:
       resources:
         limits: { cpus: "2", memory: 4G }     # 多 worker 加工 + 7 消费者，参照 data-collector 档
 
-  # ---------- 16. web-portal（Nginx + Vue3 dist；对外 80，同源反代 /api、/ws 与 /rtc（V1.21.1 WHEP 信令→srs:9090）） ----------
+  # ---------- 17. web-portal（Nginx + Vue3 dist；对外 80，同源反代 /api、/ws 与 /rtc（V1.21.1 WHEP 信令→srs:9090）） ----------
   web-portal:
     image: ${IMAGE_PREFIX:-hunter}/web-portal:${VERSION}
     build:

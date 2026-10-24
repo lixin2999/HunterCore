@@ -162,6 +162,12 @@ EXPECTED_INGEST_TOPICS: dict[str, tuple[int, int]] = {
     "ingest.dlt": (3, 2_592_000_000),
 }
 
+#: CARLA 仿真动态 Topic（topics.yaml#carla_topics；不静态创建，按 sim_id 由 scene-service 创建）
+EXPECTED_CARLA_TOPICS: dict[str, tuple[int, int]] = {
+    "carla.{sim_id}.vil_state": (1, 3_600_000),
+    "carla.{sim_id}.sensor_data": (3, 604_800_000),
+}
+
 #: 被 ingest 消费的订阅 Topic（派生 {topic}.dlq；分区继承源 Topic、保留取 naming.dlq_retention_ms）
 EXPECTED_INGEST_CONSUMED: tuple[str, ...] = (
     "vehicle.bag.manifest",
@@ -198,6 +204,14 @@ EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
     "cache:scene:{scene_id}": ("String(JSON)", 3600),
     "rc:lock:{vehicle_id}": ("String", 30),
     "analytics:ingest_latency": ("String(JSON)", 300),  # 入库延迟指标缓存（pending #10 结案，redis-keys.yaml pending #9）
+    # CARLA 仿真链路（VIL 数据面 + 回传面）
+    "vil:session:{vehicle_id}": ("String(JSON)", 7200),
+    "vil:active": ("Set", None),
+    "sim:instance:{sim_instance_id}": ("String(JSON)", 86400),
+    "carla:sim:{sim_id}:status": ("String(JSON)", 86400),
+    "carla:sim:{sim_id}:metrics": ("String(JSON)", 86400),
+    "carla:sim:{sim_id}:events": ("List(JSON)", 86400),
+    "carla:sim:{sim_id}:artifacts": ("Hash", 86400),
 }
 
 #: MinIO Bucket 契约（名称 → 过期天数；None = 永久）——来源：系统关键约束第 7 条（名称不可更改）
@@ -249,6 +263,8 @@ EXPECTED_SCHEMAS_FILES = (
     "sensor_file.schema.json",
     "alert_event.schema.json",
     "algorithm_metrics.schema.json",
+    "carla_vil_state.schema.json",
+    "carla_sensor_data.schema.json",
 )
 
 CREATE_TABLE_RE = re.compile(
@@ -959,6 +975,26 @@ def check_kafka_topics() -> dict[str, Any]:
         if name != "hunter.broadcast.command" and entry.get("key") != "vehicle_id":
             fail(f"Topic {name}: 消息 key 必须为 vehicle_id（保证单车辆有序）")
 
+    # CARLA 动态 Topic（topics.yaml#carla_topics；不进入静态脚本四方同步）
+    carla_topics = {entry["name"]: entry for entry in topics.get("carla_topics", [])}
+    if set(carla_topics) != set(EXPECTED_CARLA_TOPICS):
+        fail(
+            f"CARLA Topic 清单不一致: 契约={sorted(carla_topics)} "
+            f"期望={sorted(EXPECTED_CARLA_TOPICS)}"
+        )
+    for name, (partitions, retention) in EXPECTED_CARLA_TOPICS.items():
+        entry = carla_topics.get(name)
+        if entry is None:
+            continue
+        if entry.get("partitions") != partitions:
+            fail(f"CARLA Topic {name}: 分区数 {entry.get('partitions')} != {partitions}")
+        if entry.get("retention_ms") != retention:
+            fail(f"CARLA Topic {name}: 保留时间 {entry.get('retention_ms')} != {retention}")
+        if entry.get("key") != "sim_id":
+            fail(f"CARLA Topic {name}: 消息 key 必须为 sim_id")
+        if entry.get("dynamic") is not True:
+            fail(f"CARLA Topic {name}: 必须标记 dynamic=true（禁止静态创建）")
+
     # ingest-platform Topic（topics.yaml#ingest_platform_topics ↔ EXPECTED_INGEST_TOPICS）
     ingest_topics = {entry["name"]: entry for entry in topics.get("ingest_platform_topics", [])}
     if set(ingest_topics) != set(EXPECTED_INGEST_TOPICS):
@@ -1003,7 +1039,7 @@ def check_kafka_topics() -> dict[str, Any]:
     #   alert_event 由 data-analytics 契约 6.2 节补全）
     tbd_allowed: set[str] = set()
     tbd_actual: set[str] = set()
-    for group in ("vehicle_topics", "platform_topics"):
+    for group in ("vehicle_topics", "platform_topics", "carla_topics"):
         for entry in topics.get(group, []):
             ref = entry.get("schema")
             if ref is None:
@@ -1134,6 +1170,9 @@ def check_consumer_groups() -> None:
     known_topics = set(EXPECTED_PLATFORM_TOPICS) | set(EXPECTED_VEHICLE_TOPICS) | set(EXPECTED_INGEST_TOPICS)
     # 车端 Topic 支持 regex 订阅（新车动态接入无需改配置）：hunter.{vehicle_id}.telemetry → hunter.*.telemetry
     known_topics |= {name.replace("{vehicle_id}", "*") for name in EXPECTED_VEHICLE_TOPICS}
+    # CARLA 动态 Topic：模板、具体实例与 regex 订阅写法均视为已登记
+    known_topics |= set(EXPECTED_CARLA_TOPICS)
+    known_topics |= {name.replace("{sim_id}", "*") for name in EXPECTED_CARLA_TOPICS}
     known_topics |= {f"{name}.dlq" for name in known_topics}
     known_topics |= {f"{name}.dlq" for name in EXPECTED_INGEST_CONSUMED}
 

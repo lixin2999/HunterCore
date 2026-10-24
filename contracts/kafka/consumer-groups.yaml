@@ -140,6 +140,46 @@ groups:
     idempotency_key: object_key
     notes: "对上传到 MinIO 的传感器文件做离线分析（感知精度评估 6.3.2 输入）；消息结构 contracts/kafka/schemas/sensor_file.schema.json"
 
+  # =====================================================================
+  # CARLA 仿真链路消费组（VIL 数据面 + 仿真回传面）
+  #   - 动态 Topic 模板 carla.{sim_id}.<type>，key = sim_id；
+  #   - 消费侧订阅写法 carla.*.sensor_data（单层通配，匹配具体 sim_id）；
+  #   - 动态 Topic 由 scene-service 在实例创建前显式创建（见 topics.yaml#carla_topics）。
+  # =====================================================================
+  - group_id: vil-forwarder
+    service: vil-forwarder
+    subscribes: [telemetry_clean]
+    produces: ["carla.{sim_id}.vil_state"]
+    idempotency_key: "(vehicle_id, seq)"
+    notes: "消费清洗后遥测，按 Redis 会话映射（vil:session:{vehicle_id} / vil:active）做 10Hz latest-wins 降采样，发布到会话 Topic；禁止直读 hunter.*.telemetry"
+
+  - group_id: data-collector-carla
+    service: data-collector
+    subscribes: ["carla.*.sensor_data"]
+    subscribe_mode: regex_pattern
+    produces: [sensor_file]
+    writes: [data_collector.vehicle_telemetry, data_collector.events]
+    idempotency_key: "(sim_id, seq)"
+    notes: "仿真状态→Redis；sim_telemetry→vehicle_telemetry（vehicle_id=SIM-{sim_id}）；可映射事件→events；sensor_file 复用现有通知 Topic；不跨 schema 写 data_analytics"
+
+  - group_id: data-analytics-carla
+    service: data-analytics
+    subscribes: ["carla.*.sensor_data"]
+    subscribe_mode: regex_pattern
+    produces: [analytics_result]
+    idempotency_key: "(sim_id, seq)"
+    target_latency: "终态后 60s 内出报告"
+    status: 已交付（services/data-analytics/app/consumers/carla.py；终态生成 scene_test 报告）
+    notes: "消费 sim_metrics / sim_status，生成 scene_test 报告写 hunter-reports（data-analytics 为唯一写方）；报告指针 hunter-reports/eval/simulation/latest.json"
+
+  - group_id: carla-vil
+    service: carla-manager
+    subscribes: ["carla.*.vil_state"]
+    subscribe_mode: regex_pattern
+    produces: []
+    idempotency_key: "(sim_id, seq)"
+    notes: "CARLA 侧 vil-mapper 消费 VIL 实车状态；单会话单消费者，latest-wins"
+
   - group_id: scene-service-analytics-result
     service: scene-service
     subscribes: [analytics_result]

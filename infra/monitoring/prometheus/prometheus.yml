@@ -25,7 +25,7 @@ alerting:
 
 scrape_configs:
   # ---------- 微服务（Pod 注解自动发现，无需逐个硬编码） ----------
-  # 服务清单：api-gateway/scene-service/data-collector/data-analytics/ota-service/remote-control
+  # 服务清单：api-gateway/scene-service/data-collector/data-analytics/ota-service/remote-control/vil-forwarder
   # 待抓取端点：GET /metrics（hunter_common.metrics 暴露，统一前缀 hunter_）
   - job_name: hunter-services
     kubernetes_sd_configs:

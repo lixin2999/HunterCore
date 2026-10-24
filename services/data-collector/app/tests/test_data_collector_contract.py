@@ -472,15 +472,14 @@ def test_kafka_participation_matches_contracts(contract: dict[str, Any]) -> None
         "data-collector-events",
         "data-collector-health",
         "data-collector-command-result",
+        "data-collector-carla",
     }
     for group_id, entry in consumes.items():
         assert entry["enabled"] is True
         assert entry["subscribe_mode"] == "regex_pattern"
         group = groups[group_id]
         assert group["service"] == "data-collector"
-        assert entry["topic_pattern"].replace("*", "{vehicle_id}") in {
-            topic.replace("*", "{vehicle_id}") for topic in group["subscribes"]
-        }
+        assert entry["topic_pattern"] in group["subscribes"]
         assert entry["produces"] == group["produces"], f"{group_id} 生产清单与消费组契约不一致"
 
     produced = {entry["topic"]: entry for entry in kafka["produces"]}
@@ -491,13 +490,20 @@ def test_kafka_participation_matches_contracts(contract: dict[str, Any]) -> None
         assert (SCHEMA_DIR / Path(entry["schema"]).name).is_file()
     assert produced["sensor_file"]["trigger"].startswith("POST /api/v1/data/files/complete")
 
-    # 其他模块的 Topic（含未登记的 Carla Topic）一律不得出现在本服务的生产清单中
+    # CARLA 回传 Topic 为动态模板：登记在 carla_topics，且消费 Schema 必须存在
+    carla_topics = {entry["name"] for entry in topics["carla_topics"]}
+    assert "carla.{sim_id}.sensor_data" in carla_topics
+    assert "carla.{sim_id}.vil_state" in carla_topics
+    carla = consumes["data-collector-carla"]
+    assert (SCHEMA_DIR / Path(carla["schema"]).name).is_file()
+
+    # 其他模块的 Topic 一律不得出现在本服务的生产/消费清单中
     not_owned = set(kafka["not_owned"]["topics"])
     assert set(produced) & not_owned == set()
     assert {entry["topic_pattern"] for entry in kafka["consumes"]} & not_owned == set()
-    assert "carla.{sim_id}.sensor_data" in not_owned
-    assert "Carla Topic" in kafka["not_owned"]["carla_note"]
-    assert "carla.{sim_id}.vil_state" not in set(platform), "未登记 Carla Topic 不得擅自写入 topics.yaml"
+    assert "carla.{sim_id}.vil_state" in not_owned
+    assert "carla.{sim_id}.sensor_data" not in not_owned
+    assert "sensor_data" in kafka["not_owned"]["carla_note"]
 
 # =====================================================================
 # 四、错误码 / 限流 / Redis / 网关与基础设施三方一致
@@ -594,7 +600,15 @@ def test_rate_limits_match_gateway_and_appendix_d(contract: dict[str, Any]) -> N
 def test_redis_keys_match_redis_contract(contract: dict[str, Any]) -> None:
     """Redis 键必须取自系统 Redis Key 契约，且与健康数据消费职责一致。"""
     patterns = {entry["pattern"] for entry in contract["x-hunter-service"]["redis_keys"]}
-    assert patterns == {"vehicle:status:{vehicle_id}", "vehicle:online:set", "rate_limit:{ip}:{api}"}
+    assert patterns == {
+        "vehicle:status:{vehicle_id}",
+        "vehicle:online:set",
+        "rate_limit:{ip}:{api}",
+        "carla:sim:{sim_id}:status",
+        "carla:sim:{sim_id}:metrics",
+        "carla:sim:{sim_id}:events",
+        "carla:sim:{sim_id}:artifacts",
+    }
     health = next(
         entry for entry in contract["x-hunter-kafka"]["consumes"] if entry["group_id"] == "data-collector-health"
     )

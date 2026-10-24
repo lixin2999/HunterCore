@@ -79,7 +79,7 @@ lint:
 unit:
   stage: unit
   script:
-    # 6 个服务共用顶层包名 app，必须分进程收集（见 scripts/run_unit_tests.py 说明）：
+    # 多个服务共用顶层包名 app，必须分进程收集（见 scripts/run_unit_tests.py 说明）：
     # 同进程收集 services 下多个目录会 ModuleNotFoundError / Plugin already registered
     - python scripts/run_unit_tests.py
   rules:
@@ -149,7 +149,7 @@ build-images:
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - |
       set -e
-      for svc in api-gateway scene-service data-collector data-analytics ota-service remote-control; do
+      for svc in api-gateway scene-service data-collector data-analytics ota-service remote-control vil-forwarder; do
         image="$CI_REGISTRY_IMAGE/$svc:$IMAGE_TAG"
         echo "==> build $image"
         docker build -f "services/$svc/Dockerfile" -t "$image" .

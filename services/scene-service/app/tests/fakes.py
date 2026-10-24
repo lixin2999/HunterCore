@@ -282,6 +282,84 @@ class InMemorySceneStorage:
         return True
 
 
+class FakeVilSessionStore:
+    """VilSessionStore 替身（内存会话 + 实例反查；不依赖 Redis）。"""
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, dict[str, Any]] = {}
+        self.instances: dict[str, dict[str, Any]] = {}
+
+    async def get(self, vehicle_id: str) -> dict[str, Any] | None:
+        return self.sessions.get(vehicle_id)
+
+    async def acquire(self, payload: dict[str, Any]) -> bool:
+        vehicle_id = str(payload.get("vehicle_id") or "")
+        if vehicle_id in self.sessions:
+            return False
+        self.sessions[vehicle_id] = dict(payload)
+        return True
+
+    async def bind_instance(
+        self,
+        *,
+        vehicle_id: str,
+        sim_instance_id: str,
+        sim_id: str,
+        scene_id: str,
+        mode: str,
+        vil_state_topic: str,
+        sensor_data_topic: str,
+        instance_ttl_seconds: int = 86400,
+    ) -> None:
+        meta = {
+            "sim_instance_id": sim_instance_id,
+            "sim_id": sim_id,
+            "scene_id": scene_id,
+            "vehicle_id": vehicle_id,
+            "mode": mode,
+            "vil_state_topic": vil_state_topic,
+            "sensor_data_topic": sensor_data_topic,
+        }
+        self.instances[sim_instance_id] = meta
+        if vehicle_id and vehicle_id in self.sessions:
+            self.sessions[vehicle_id].update(meta)
+
+    async def lookup_instance(self, sim_instance_id: str) -> dict[str, Any] | None:
+        return self.instances.get(sim_instance_id)
+
+    async def release(
+        self, vehicle_id: str, *, sim_id: str | None = None, sim_instance_id: str | None = None
+    ) -> None:
+        current = self.sessions.get(vehicle_id)
+        if sim_id is not None and current is not None and current.get("sim_id") != sim_id:
+            return
+        self.sessions.pop(vehicle_id, None)
+        if sim_instance_id:
+            self.instances.pop(sim_instance_id, None)
+
+    async def list_active(self) -> list[str]:
+        return list(self.sessions)
+
+
+class FakeTopicProvisioner:
+    """SimTopicProvisioner 替身（记录创建/删除，可注入失败）。"""
+
+    def __init__(self) -> None:
+        self.ensured: list[str] = []
+        self.deleted: list[str] = []
+        self.fail_ensure = False
+
+    async def ensure_session(self, sim_id: str) -> list[str]:
+        if self.fail_ensure:
+            raise RuntimeError("topic ensure failed")
+        self.ensured.append(sim_id)
+        return [f"carla.{sim_id}.vil_state", f"carla.{sim_id}.sensor_data"]
+
+    async def delete_session(self, sim_id: str) -> list[str]:
+        self.deleted.append(sim_id)
+        return [f"carla.{sim_id}.vil_state", f"carla.{sim_id}.sensor_data"]
+
+
 class FakeCarlaClient:
     """CarlaManagementClient 替身（记录创建/下发调用；可注入不可用 → 5001、404 → 3001）。"""
 
@@ -290,6 +368,7 @@ class FakeCarlaClient:
         self.status = status
         self.created: list[dict[str, Any]] = []
         self.submitted: list[tuple[str, dict[str, Any]]] = []
+        self.controls: list[tuple[str, str]] = []
         self.active: dict[str, SimInstance] = {}
         self.unavailable = False
         # G-20① 进度/结果查询替身数据：instance_id → 原始响应体（未登记时 404 → 3001）
@@ -297,14 +376,44 @@ class FakeCarlaClient:
         self.results: dict[str, dict[str, Any]] = {}
 
     async def create_instance(
-        self, *, scene_id: str, scene_name: str, scene_config: dict[str, Any]
+        self,
+        *,
+        scene_id: str,
+        scene_name: str,
+        scene_config: dict[str, Any],
+        **kwargs: Any,
     ) -> SimInstance:
         if self.unavailable:
             raise ServiceUnavailableError("Carla 管理 API 不可达", details={"scene_id": scene_id})
         self.created.append(
-            {"scene_id": scene_id, "scene_name": scene_name, "scene_config": scene_config}
+            {
+                "scene_id": scene_id,
+                "scene_name": scene_name,
+                "scene_config": scene_config,
+                **kwargs,
+            }
         )
-        return SimInstance(instance_id=self.instance_id, status=self.status)
+        return SimInstance(
+            instance_id=self.instance_id,
+            status=self.status,
+            sim_id=kwargs.get("sim_id"),
+            data=dict(self.results.get(self.instance_id) or {}),
+        )
+
+    async def pause_instance(self, instance_id: str) -> None:
+        if self.unavailable:
+            raise ServiceUnavailableError("Carla 管理 API 不可达")
+        self.controls.append(("pause", instance_id))
+
+    async def resume_instance(self, instance_id: str) -> None:
+        if self.unavailable:
+            raise ServiceUnavailableError("Carla 管理 API 不可达")
+        self.controls.append(("resume", instance_id))
+
+    async def stop_instance(self, instance_id: str) -> None:
+        if self.unavailable:
+            raise ServiceUnavailableError("Carla 管理 API 不可达")
+        self.controls.append(("stop", instance_id))
 
     async def find_active_instance(self, scene_id: str) -> SimInstance | None:
         if self.unavailable:
@@ -350,6 +459,8 @@ __all__ = [
     "DEFAULT_CREATOR",
     "FakeCarlaClient",
     "FakeSceneCache",
+    "FakeTopicProvisioner",
+    "FakeVilSessionStore",
     "InMemorySceneRepository",
     "InMemorySceneStorage",
     "config_payload",

@@ -100,7 +100,7 @@ HunterCore 单机一键部署脚本
 
 用途：
   在 Ubuntu 22.04 LTS 裸机上按 13 个步骤完成 HunterCore 全栈部署
-  （中间件 + 6 个微服务 + Flink + 前端），每步幂等，失败可指定 --step 续跑。
+  （中间件 + 7 个微服务 + Flink + 前端），每步幂等，失败可指定 --step 续跑。
 
 用法：
   sudo bash scripts/install.sh [选项]
@@ -1659,7 +1659,7 @@ step_10_init_minio() {
 # Step 11：启动业务服务（采集 → 分析/Flink → 业务 → 网关 → 前端）
 # =====================================================================
 step_11_start_services() {
-  local env_file gateway_port scene_port collector_port analytics_port ota_port remote_port web_port
+  local env_file gateway_port scene_port collector_port analytics_port ota_port remote_port vil_port web_port
   env_file="${ENV_FILE_ARG:-${HUNTER_ENV_FILE:-${APP_DIR}/.env}}"
   load_env "$env_file" || return 1
   require_compose_file || return 1
@@ -1671,14 +1671,18 @@ step_11_start_services() {
   analytics_port="${DATA_ANALYTICS_PORT:-8083}"
   ota_port="${OTA_SERVICE_PORT:-8084}"
   remote_port="${REMOTE_CONTROL_PORT:-8085}"
+  vil_port="${VIL_FORWARDER_PORT:-8090}"
   web_port="${WEB_PORT:-80}"
 
   # 11.1 采集与实时分析（消费者先就绪，避免消息积压/丢包窗口）
   hc_run_logged "启动 data-collector" compose up -d data-collector || return 1
   wait_for "service_health_ok ${collector_port}" "data-collector（${collector_port}）" 120 || return 1
-  # 模块表要求 6 个服务全量启动（data-analytics 亦属核心模块，与采集同批次）
+  # 模块表要求 7 个服务全量启动（data-analytics / vil-forwarder 亦属核心模块，与采集同批次）
   hc_run_logged "启动 data-analytics" compose up -d data-analytics || return 1
   wait_for "service_health_ok ${analytics_port}" "data-analytics（${analytics_port}）" 120 || return 1
+  # VIL 数据面旁路（消费 telemetry_clean → carla.{sim_id}.vil_state；会话由 scene-service 写 Redis）
+  hc_run_logged "启动 vil-forwarder" compose up -d vil-forwarder || return 1
+  wait_for "service_health_ok ${vil_port}" "vil-forwarder（${vil_port}）" 120 || return 1
 
   # 11.2 Flink 2.1（镜像 hunter-flink/jobs:2.1.1，含 CPython 3.12 + 作业依赖；JobManager 容器内 8081 → 宿主机 8088）
   hc_run_logged "启动 flink-jm flink-tm" compose up -d flink-jm flink-tm || return 1

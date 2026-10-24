@@ -9,7 +9,7 @@
 #   ⓪ 环境凭据（.env）：口令类变量为空即 FAIL（典型成因：没加 sudo，.env 权限 600）；
 #      ⚠ 本项 FAIL 时，Redis / Kafka / MinIO 的相关结论一律降为「未判定」，不得当服务异常（V1.19.13）
 #   ① 容器运行状态与 Docker healthcheck（缺失/非 healthy/未运行 → FAIL）
-#   ② HTTP 探针：api-gateway/scene/collector/analytics/ota/remote（/healthz）、web-portal、
+#   ② HTTP 探针：api-gateway/scene/collector/analytics/ota/remote/vil（/healthz）、web-portal、
 #      MinIO(/minio/health/live)、SRS(/api/v1/versions)、Flink UI(/overview)
 #   ③ PostgreSQL：pg_isready       ④ TimescaleDB：pg_isready（存在独立实例时）
 #   ⑤ Redis：redis-cli PING（区分 WRONGPASS / NOAUTH / 空口令）  ⑥ Kafka：Topic 数 ≥6
@@ -90,8 +90,8 @@ RESULT_ROWS=()
 EXPECTED_CONTAINERS=(
   "hunter-postgres" "hunter-redis" "hunter-zookeeper" "hunter-kafka" "hunter-minio" "hunter-srs"
   "hunter-flink-jm" "hunter-flink-tm" "hunter-api-gateway" "hunter-scene" "hunter-collector"
-  "hunter-analytics" "hunter-ota" "hunter-remote" "hunter-vehicle-service" "hunter-web"
-  "hunter-ingest-platform"
+  "hunter-analytics" "hunter-ota" "hunter-remote" "hunter-vil-forwarder"
+  "hunter-vehicle-service" "hunter-web" "hunter-ingest-platform"
 )
 OPTIONAL_CONTAINERS=("hunter-timescale")
 
@@ -301,6 +301,7 @@ check_http_endpoints() {
     "data-analytics:${DATA_ANALYTICS_PORT:-8083}:${HEALTH_PATH}"
     "ota-service:${OTA_SERVICE_PORT:-8084}:${HEALTH_PATH}"
     "remote-control:${REMOTE_CONTROL_PORT:-8085}:${HEALTH_PATH}"
+    "vil-forwarder:${VIL_FORWARDER_PORT:-8090}:${HEALTH_PATH}"
     "vehicle-service:${VEHICLE_SERVICE_PORT:-8086}:${HEALTH_PATH}"
     "ingest-platform:${INGEST_PLATFORM_PORT:-8089}:${HEALTH_PATH}"
     "web-portal:${WEB_PORT:-80}:/"
@@ -689,6 +690,7 @@ check_ingest_latency_metric() {
 #   本项走纯宿主侧 stat（不依赖容器存活，崩溃重启中亦可判定），与 ⑮ flink 检查点目录同规格。
 check_business_kafka_buffer() {
   local uid="${HC_BUFFER_UID:-10001}" data_dir="${DATA_DIR:-/data}"
+  # vil-forwarder 不启用本地磁盘缓冲（低时延旁路），故不要求其 kafka-buffer 目录
   local -a svcs=(api-gateway data-collector data-analytics ota-service remote-control scene-service vehicle-service ingest-platform)
   local bad="" missing="" d host own
   for d in "${svcs[@]}"; do
@@ -835,7 +837,7 @@ check_kafka_broker_cert() {
 #     字段级明细见日志 schema_errors，非法消息已转投 DLQ／落盘（不丢），但不会入库（车辆页面会离线）
 check_service_error_logs() {
   local containers=(hunter-api-gateway hunter-scene hunter-collector hunter-analytics \
-    hunter-ota hunter-remote hunter-vehicle-service hunter-ingest-platform)
+    hunter-ota hunter-remote hunter-vil-forwarder hunter-vehicle-service hunter-ingest-platform)
   local window="${ERROR_LOG_WINDOW:-15m}"
   local err_re='\[(error|critical)[[:space:]]*\]|Traceback \(most recent call last\)'
   local sub_re='Subscribed topic not available'

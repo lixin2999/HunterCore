@@ -23,6 +23,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from hunter_common.database import DatabaseSessionManager
+from hunter_common.kafka.admin import KafkaAdmin
+from hunter_common.kafka.contracts import KafkaContractError
 from hunter_common.logging import (
     configure_logging,
     get_logger,
@@ -46,6 +48,7 @@ from app.repositories.engine import (
     TestCaseRepository,
 )
 from app.repositories.scenes import SceneRepository
+from app.repositories.simulations import SimTopicProvisioner, VilSessionStore
 from app.repositories.storage import get_storage
 from app.routers import engine, export, scenes, simulation, templates
 from app.routers.health import router as health_router
@@ -94,7 +97,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_retries=settings.carla_request_max_retries,
         get_path=settings.carla_instance_get_path,
         result_path=settings.carla_instance_result_path,
+        pause_path=settings.carla_instance_pause_path,
+        resume_path=settings.carla_instance_resume_path,
+        stop_path=settings.carla_instance_stop_path,
     )
+    # VIL 会话仓储（scene-service 为唯一写方；vil-forwarder 只读）
+    vil_sessions = VilSessionStore(
+        app.state.redis.client, ttl_seconds=settings.vil_session_ttl_seconds
+    )
+    app.state.vil_sessions = vil_sessions
+    # 动态 Topic 供给（Kafka Admin 同步调用经线程池；契约缺失时启动告警并降级为不创建）
+    topic_provisioner: SimTopicProvisioner | None = None
+    if settings.sim_topic_provisioning_enabled:
+        try:
+            app.state.kafka_admin = KafkaAdmin(
+                settings, replication_factor=settings.sim_topic_replication_factor
+            )
+            topic_provisioner = SimTopicProvisioner(app.state.kafka_admin)
+        except KafkaContractError:
+            logger.exception("sim_topic_provisioning_unavailable")
+    app.state.sim_topic_provisioner = topic_provisioner
     scene_repository = SceneRepository(app.state.db)
     app.state.scene_repository = scene_repository
     app.state.scene_service = SceneService(
@@ -107,7 +129,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.scene_service, app.state.storage, settings
     )
     app.state.simulation_service = SceneSimulationService(
-        app.state.scene_service, app.state.carla, settings, storage=app.state.storage
+        app.state.scene_service,
+        app.state.carla,
+        settings,
+        storage=app.state.storage,
+        sessions=vil_sessions,
+        topics=topic_provisioner,
+        topic_delete_delay_seconds=settings.sim_topic_delete_delay_seconds,
     )
     # 场景引擎（服务私有 schema scene_engine；未初始化 DDL 时读取自动回落到内置目录）
     app.state.engine_service = SceneEngineService(
@@ -138,6 +166,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             raise
         except Exception:
             logger.exception("analytics_result_consumer_stop_failed")
+    await app.state.simulation_service.shutdown()
     await app.state.carla.close()
     await app.state.redis.close()
     await app.state.db.close()

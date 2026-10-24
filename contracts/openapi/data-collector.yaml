@@ -19,8 +19,8 @@
 #   2) 5.5 步骤 6「元信息入库」在 contracts/database 无对应表（data_collector schema 仅
 #      events / vehicle_telemetry）→ 本契约不新增表，按 MinIO 列举 + Kafka sensor_file 通知实现
 #   3) 文件完整性校验失败复用 6001（附录 A 无通用文件校验错误码，6001 原语义为 OTA 包校验失败）
-#   4) Carla Topic（carla.{sim_id}.vil_state / carla.{sim_id}.sensor_data）在 5.3.1 清单出现，
-#      但 contracts/kafka/topics.yaml 未登记 → 本契约只登记缺口，不新增 Topic
+#   4) Carla Topic 已作为 carla_topics 动态模板登记：本服务消费 carla.*.sensor_data
+#      （data-collector-carla），vil_state 为平台→CARLA 方向不消费；动态 Topic 由 scene-service 创建
 #   全量清单见文末 x-hunter-pending-confirmation（12 项）
 # =====================================================================
 openapi: 3.0.3
@@ -1366,6 +1366,22 @@ x-hunter-service:
       type: "String"
       ttl_seconds: 1
       usage: "接口限流计数（窗口 1 秒；与附录 D QPS 阈值配合）"
+    - pattern: "carla:sim:{sim_id}:status"
+      type: "String(JSON)"
+      ttl_seconds: 86400
+      usage: "仿真状态缓存（消费 carla.*.sensor_data 的 sim_status）"
+    - pattern: "carla:sim:{sim_id}:metrics"
+      type: "String(JSON)"
+      ttl_seconds: 86400
+      usage: "仿真指标缓存（消费 sim_metrics；data-analytics 生成报告读取）"
+    - pattern: "carla:sim:{sim_id}:events"
+      type: "List(JSON)"
+      ttl_seconds: 86400
+      usage: "仿真事件缓存（无法映射到 19 类车端事件时保留）"
+    - pattern: "carla:sim:{sim_id}:artifacts"
+      type: "Hash"
+      ttl_seconds: 86400
+      usage: "仿真产物元信息缓存（对象本体在 MinIO）"
   config_source: "pydantic-settings（环境变量 / K8s ConfigMap data-collector-config + Secret hunter-app-secrets）"
   required_env:
     - SERVICE_NAME
@@ -1389,6 +1405,9 @@ x-hunter-service:
     - TELEMETRY_QUERY_MAX_RANGE_HOURS
     - FILE_UPLOAD_MAX_BYTES_PER_SECOND
     - VEHICLE_TELEMETRY_MAX_MSG_PER_SEC
+    - CARLA_SENSOR_CONSUMER_ENABLED
+    - CARLA_SIM_CACHE_TTL_SECONDS
+    - CARLA_SIM_EVENTS_MAX
   env_derived:
     - name: DATABASE_URL
       from: "POSTGRES_HOST / POSTGRES_PORT / POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB（HunterBaseConfig.database_url 派生，K8s 中无需显式配置键）"
@@ -1632,6 +1651,13 @@ x-hunter-kafka:
       produces: []
       enabled: true
       reason: "指令执行结果留痕（审计）；不做业务动作"
+    - topic_pattern: "carla.*.sensor_data"
+      group_id: data-collector-carla
+      subscribe_mode: regex_pattern
+      schema: contracts/kafka/schemas/carla_sensor_data.schema.json
+      produces: [sensor_file]
+      enabled: true
+      reason: "CARLA 仿真回传：sim_telemetry→vehicle_telemetry（vehicle_id=SIM-{sim_id}）；可映射事件→events+event_raw；状态/指标/产物→Redis；sensor_file 复用现有通知 Topic"
   produces:
     - topic: telemetry_raw
       schema: contracts/kafka/schemas/telemetry.schema.json
@@ -1660,8 +1686,7 @@ x-hunter-kafka:
       - "analytics_result"
       - "alert_event"
       - "carla.{sim_id}.vil_state"
-      - "carla.{sim_id}.sensor_data"
-    carla_note: "⚠ Carla Topic 出现在设计文档 5.3.1 清单但未在 contracts/kafka/topics.yaml 登记 → 见 x-hunter-pending-confirmation #9"
+    carla_note: "carla.*.sensor_data 已登记为动态 Topic（contracts/kafka/topics.yaml#carla_topics）并由 data-collector-carla 消费；carla.{sim_id}.vil_state 为平台→CARLA 方向，本服务不消费"
   dlq: "{original_topic}.dlq（hunter_common.kafka.consumer 统一派生，保留原 topic/partition/offset 头）"
   offset_commit: "手动提交（handler 成功后 commit；失败转 DLQ）"
 
@@ -1725,8 +1750,8 @@ x-hunter-pending-confirmation:
       impact: "前端车队视图数据来源；若落本服务需新增端点并回改契约"
     - id: 9
       question: "Carla Topic（carla.{sim_id}.vil_state / carla.{sim_id}.sensor_data）在 5.3.1 清单出现但未登记于 contracts/kafka/topics.yaml"
-      contract_decision: "本契约仅登记缺口（x-hunter-kafka.not_owned.carla_note），不新增 Topic（分区/acks/保留/Schema 未知）"
-      impact: "Carla 仿真数据回传链路归属（scene-service 下发 / data-collector 采集）需明确后再补契约"
+      contract_decision: "已结案：两个 Topic 作为 carla_topics 动态模板登记（分区/acks/保留/Schema 明确），由 scene-service 按 sim_id 显式创建/删除；本服务消费 carla.*.sensor_data（data-collector-carla），不消费 vil_state"
+      impact: "Carla 仿真回传链路已打通；动态 Topic 生命周期由 scene-service 管理，本服务不自动建 Topic"
     - id: 10
       question: "遥测 seq 是否入表（er.md 已标 ⚠）：影响查询返回与幂等键实现"
       contract_decision: "DDL 中保留 vehicle_telemetry.seq（BIGINT），查询响应 seq 可空；若设计文档无该列需同步 DDL/ORM/migration"

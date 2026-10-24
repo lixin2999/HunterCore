@@ -61,6 +61,8 @@ class ReportMeta(BaseModel):
     report_type: ReportType = Field(description="报告模板类型")
     status: ReportStatus = Field(description="报告状态")
     vehicle_id: str | None = Field(default=None, pattern=VEHICLE_ID_PATTERN, description="车辆标识（车辆维度报告）；车队级为 null")
+    scene_id: str | None = Field(default=None, max_length=64, description="关联场景 ID（仿真 scene_test 报告）")
+    sim_id: str | None = Field(default=None, max_length=128, description="关联仿真会话 ID（scene_test 报告）")
     start_time: float | None = Field(default=None, description="报告统计窗口起点（Unix epoch 秒）")
     end_time: float | None = Field(default=None, description="报告统计窗口终点（Unix epoch 秒）")
     formats: list[ReportFormat] = Field(min_length=1, description="请求生成的格式集合")
@@ -96,6 +98,8 @@ class ReportGenerateRequest(BaseModel):
 
     report_type: ReportType = Field(description="报告模板类型（6.5 节 5 类，必填）")
     vehicle_id: str | None = Field(default=None, pattern=VEHICLE_ID_PATTERN, description="目标车辆（vehicle_daily/ota_upgrade 必填）")
+    scene_id: str | None = Field(default=None, max_length=64, description="关联场景 ID（scene_test 可选）")
+    sim_id: str | None = Field(default=None, max_length=128, description="关联仿真会话 ID（scene_test 可选）")
     start_time: float = Field(ge=0, description="报告统计窗口起点（Unix epoch 秒，必填）")
     end_time: float = Field(ge=0, description="报告统计窗口终点（Unix epoch 秒，必填）")
     formats: list[ReportFormat] = Field(min_length=1, description="输出格式（默认 html）")

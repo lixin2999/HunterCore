@@ -59,7 +59,7 @@ Grafana 管理员口令来自 `hunter-app-secrets/GRAFANA_ADMIN_PASSWORD`（见 
 
 | 来源 | 端点 | 关键指标 |
 |------|------|---------|
-| 6 个微服务 | `GET /metrics`（Pod 注解 `prometheus.io/scrape`） | `hunter_http_requests_total`、`hunter_http_request_duration_seconds_bucket`、`hunter_http_requests_in_progress`、`hunter_service_info` |
+| 7 个微服务（含 vil-forwarder） | `GET /metrics`（Pod 注解 `prometheus.io/scrape`） | `hunter_http_requests_total`、`hunter_http_request_duration_seconds_bucket`、`hunter_http_requests_in_progress`、`hunter_service_info` |
 | node-exporter | `:9100/metrics` | `node_filesystem_*`（磁盘告警）、`node_cpu_*`、`node_memory_*` |
 | kube-state-metrics | `:8080/metrics` | `kube_pod_container_status_restarts_total`、`kube_pod_container_status_last_terminated_reason` |
 | postgres-exporter | `:9187/metrics` | `pg_stat_activity_count`、`pg_settings_max_connections` |

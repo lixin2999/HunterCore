@@ -7,7 +7,7 @@
 #   （30s / 60s，见各服务清单）实现优雅终止 → 系统可用性 ≥ 99.9%。
 #
 # 取值规则（minAvailable 必须 < 基线副本数，否则 drain 永久阻塞）：
-#   - 基线 2 副本（scene-service / data-analytics / ota-service）→ minAvailable: 1
+#   - 基线 2 副本（scene-service / data-analytics / ota-service / vil-forwarder）→ minAvailable: 1
 #   - 基线 3 副本（api-gateway / data-collector / remote-control）→ minAvailable: 2
 #   ⚠ 启用 HPA 后副本数会低于/高于基线：HPA 缩容到 2 时 minAvailable: 2 会使
 #     drain 阻塞。若 HPA 与 PDB 同时启用，建议把 3 副本服务改为 maxUnavailable: 1
@@ -113,3 +113,19 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: remote-control
+---
+# ---------- VIL 数据面转发（2 副本基线） ----------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vil-forwarder
+  namespace: hunter-core
+  labels:
+    app.kubernetes.io/name: vil-forwarder
+    app.kubernetes.io/part-of: hunter-core
+    app.kubernetes.io/component: availability
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vil-forwarder

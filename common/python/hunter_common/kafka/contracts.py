@@ -36,15 +36,17 @@ logger = get_logger("hunter_common.kafka.contracts")
 #: 环境变量名（与配置项 kafka_contract_dir 对应）
 CONTRACT_DIR_ENV: Final[str] = "KAFKA_CONTRACT_DIR"
 
-#: 契约中 key 的两种取值
+#: 契约中 key 的取值
 KEY_NONE: Final[str] = "none"
 KEY_VEHICLE_ID: Final[str] = "vehicle_id"
+KEY_SIM_ID: Final[str] = "sim_id"
 
 #: DLQ 后缀（契约 topics.yaml#naming.dlq_pattern）
 _DLQ_SUFFIX: Final[str] = ".dlq"
 
-#: 订阅写法中代表 vehicle_id 的通配记号（``hunter.*.telemetry`` 与模板名 ``hunter.{vehicle_id}.telemetry`` 等价）
-_WILDCARD_TOKENS: Final[tuple[str, ...]] = ("*", "{vehicle_id}")
+#: 订阅写法中代表动态实例的通配记号（``hunter.*.telemetry`` 与模板名等价；
+#: ``carla.*.sensor_data`` 与 ``carla.{sim_id}.sensor_data`` 等价）
+_WILDCARD_TOKENS: Final[tuple[str, ...]] = ("*", "{vehicle_id}", "{sim_id}")
 
 
 class KafkaContractError(HunterBaseException):
@@ -74,6 +76,8 @@ class TopicSpec:
     producer: str | None = None
     consumers: tuple[str, ...] = ()
     frequency: str | None = None
+    dynamic: bool = False
+    dlq: bool = False
 
     @property
     def schema_name(self) -> str | None:
@@ -83,9 +87,21 @@ class TopicSpec:
         return Path(self.schema).name.removesuffix(".schema.json")
 
     @property
+    def key_field(self) -> str | None:
+        """消息 key 必须取自消息体的哪个字段（``vehicle_id`` / ``sim_id``）；广播返回 None。"""
+        if self.key == KEY_NONE:
+            return None
+        return self.key
+
+    @property
     def requires_vehicle_key(self) -> bool:
         """是否强制 ``key = vehicle_id``（契约 defaults.key 与 Topic 级 key）。"""
         return self.key == KEY_VEHICLE_ID
+
+    @property
+    def requires_sim_key(self) -> bool:
+        """是否强制 ``key = sim_id``（CARLA 动态仿真 Topic）。"""
+        return self.key == KEY_SIM_ID
 
     @property
     def is_broadcast(self) -> bool:
@@ -166,6 +182,8 @@ class KafkaContract:
         self._broadcast: dict[str, TopicSpec] = {}
         self._vehicle_by_type: dict[str, TopicSpec] = {}
         self._vehicle_by_template: dict[str, TopicSpec] = {}
+        self._carla_by_type: dict[str, TopicSpec] = {}
+        self._carla_by_template: dict[str, TopicSpec] = {}
         self._groups: dict[str, ConsumerGroupSpec] = {}
         self._schema_cache: dict[str, dict[str, Any]] = {}
         self._validator_cache: dict[str, Draft7Validator] = {}
@@ -218,6 +236,11 @@ class KafkaContract:
         for entry in self._topics_doc.get("platform_topics") or []:
             spec = _topic_spec_of(entry, defaults)
             self._platform[spec.name] = spec
+        for entry in self._topics_doc.get("carla_topics") or []:
+            spec = _topic_spec_of(entry, defaults)
+            topic_type = spec.name.removeprefix("carla.{sim_id}.")
+            self._carla_by_type[topic_type] = spec
+            self._carla_by_template[spec.name] = spec
         for entry in self._groups_doc.get("groups") or []:
             self._groups[str(entry["group_id"])] = _consumer_group_spec_of(
                 entry, self._groups_doc.get("defaults") or {}
@@ -227,6 +250,7 @@ class KafkaContract:
             base_dir=str(self._base_dir),
             platform_topics=len(self._platform),
             vehicle_topics=len(self._vehicle_by_type),
+            carla_topics=len(self._carla_by_type),
             consumer_groups=len(self._groups),
         )
 
@@ -247,24 +271,34 @@ class KafkaContract:
         """广播 Topic：{hunter.broadcast.command: spec}（key 必须为空）。"""
         return dict(self._broadcast)
 
+    @property
+    def carla_topics(self) -> dict[str, TopicSpec]:
+        """CARLA 动态 Topic 模板：{carla.{sim_id}.<type>: spec}。"""
+        return dict(self._carla_by_template)
+
     def try_topic_spec(self, topic: str) -> TopicSpec | None:
         """解析 Topic，未登记返回 None。
 
-        接受四种写法（DLQ 名 ``{topic}.dlq`` 自动剥离后按源 Topic 解析，分区数继承源 Topic）：
-        契约条目名 ``telemetry_raw`` / 模板名 ``hunter.{vehicle_id}.telemetry`` /
-        正则订阅写法 ``hunter.*.telemetry`` / 具体实例 ``hunter.HUNTER-001.telemetry``。
+        接受四类写法（DLQ 名 ``{topic}.dlq`` 自动剥离后按源 Topic 解析，分区数继承源 Topic）：
+        平台名 ``telemetry_raw`` / 车端模板 ``hunter.{vehicle_id}.telemetry`` 或具体实例 /
+        订阅正则 ``hunter.*.telemetry`` / CARLA 动态模板 ``carla.{sim_id}.vil_state`` 或
+        具体实例 ``carla.sim-20261023-0001.vil_state`` / 正则 ``carla.*.sensor_data``。
         """
         base = strip_dlq(topic)
         spec = (
             self._platform.get(base)
             or self._broadcast.get(base)
             or self._vehicle_by_template.get(base)
+            or self._carla_by_template.get(base)
         )
         if spec is not None:
             return spec
         topic_type = _vehicle_type_of(base)
         if topic_type is not None:
             return self._vehicle_by_type.get(topic_type)
+        carla_type = _carla_type_of(base)
+        if carla_type is not None:
+            return self._carla_by_type.get(carla_type)
         return None
 
     def topic_spec(self, topic: str) -> TopicSpec:
@@ -280,9 +314,24 @@ class KafkaContract:
         return self.try_topic_spec(topic) is not None
 
     @staticmethod
-    def render_topic(template: str, vehicle_id: str) -> str:
-        """模板 → 具体 Topic（``hunter.{vehicle_id}.telemetry`` + ``HUNTER-001``）。"""
-        return template.replace("{vehicle_id}", vehicle_id)
+    def render_topic(template: str, value: str, *, field: str = "vehicle_id") -> str:
+        """模板 → 具体 Topic（默认 ``hunter.{vehicle_id}.telemetry`` + ``HUNTER-001``）。
+
+        CARLA 动态 Topic 使用 ``field="sim_id"``：
+        ``render_topic("carla.{sim_id}.sensor_data", "sim-1", field="sim_id")``。
+        """
+        placeholder = "{" + field + "}"
+        if placeholder not in template:
+            raise KafkaContractError(
+                f"Topic 模板缺少占位符 {placeholder}",
+                details={"template": template, "field": field},
+            )
+        return template.replace(placeholder, value)
+
+    @staticmethod
+    def render_carla_topic(template: str, sim_id: str) -> str:
+        """CARLA 动态模板 → 具体 Topic（``carla.{sim_id}.sensor_data`` + ``sim-1``）。"""
+        return KafkaContract.render_topic(template, sim_id, field="sim_id")
 
     @staticmethod
     def dlq_topic(topic: str) -> str:
@@ -472,6 +521,14 @@ def _vehicle_type_of(topic: str) -> str | None:
     return None
 
 
+def _carla_type_of(topic: str) -> str | None:
+    """``carla.<sim_id|*>.sensor_data``（含模板写法）→ ``sensor_data``。"""
+    parts = topic.split(".")
+    if len(parts) == 3 and parts[0] == "carla" and parts[2]:
+        return parts[2]
+    return None
+
+
 def _format_error(error: Any) -> str:
     """JSON Schema 校验错误 → ``字段路径: 说明``（无路径记 ``<root>``）。"""
     path = "/".join(str(part) for part in error.absolute_path) or "<root>"
@@ -491,6 +548,8 @@ def _topic_spec_of(entry: Mapping[str, Any], defaults: Mapping[str, Any]) -> Top
         producer=str(entry["producer"]) if entry.get("producer") else None,
         consumers=tuple(str(item) for item in entry.get("consumers", []) or []),
         frequency=str(entry["frequency"]) if entry.get("frequency") else None,
+        dynamic=bool(entry.get("dynamic", False)),
+        dlq=bool(entry.get("dlq", False)),
     )
 
 

@@ -1,6 +1,6 @@
 # infra/k8s — Kubernetes 部署清单（L1）
 
-> 目标：将 HunterCore 6 个微服务与 4 类有状态中间件以生产可用方式部署到 K8s 1.28。
+> 目标：将 HunterCore 7 个微服务与 4 类有状态中间件以生产可用方式部署到 K8s 1.28。
 > 所有清单使用 `apps/v1` / `v1` / `batch/v1` / `networking.k8s.io/v1` / `rbac.authorization.k8s.io/v1`。
 
 ## 1. 目录结构
@@ -11,13 +11,14 @@ infra/k8s/
 │   ├── 00-namespace.yaml          # 命名空间 hunter-core（pod-security=restricted）
 │   ├── 01-configmap-common.yaml   # 共享非敏感配置（envFrom 注入所有服务）
 │   └── 02-secret.example.yaml     # Secret 模板（禁止提交真实值；复制为 02-secret.yaml 使用）
-├── services/                      # 6 个微服务：ConfigMap + Deployment + Service
+├── services/                      # 7 个微服务：ConfigMap + Deployment + Service
 │   ├── api-gateway.yaml           # 8080，3 副本
 │   ├── scene-service.yaml         # 8081，2 副本
 │   ├── data-collector.yaml        # 8082，3 副本
 │   ├── data-analytics.yaml        # 8083，2 副本
 │   ├── ota-service.yaml           # 8084，2 副本
-│   └── remote-control.yaml        # 8085，3 副本
+│   ├── remote-control.yaml        # 8085，3 副本
+│   └── vil-forwarder.yaml         # 8090，2 副本（VIL 数据面，内部服务）
 │       （以上镜像标签统一为 {version} 占位符，部署前经 scripts/render_k8s.py 渲染）
 ├── statefulsets/                  # 有状态中间件：headless Service + StatefulSet + PVC
 │   ├── postgres.yaml              # PostgreSQL 15 + TimescaleDB 2.13
@@ -28,7 +29,7 @@ infra/k8s/
 │   ├── kafka-init-job.yaml        # 内部 Topic 创建（契约分区数/保留时间）
 │   └── minio-init-job.yaml        # 7 个 Bucket + 生命周期 + SSE-S3
 ├── autoscaling/
-│   └── hpa.yaml                   # HPA：6 微服务，min=2 / max=5 / CPU 70%（缩容稳定窗口 300s）
+│   └── hpa.yaml                   # HPA：7 微服务，min=2 / max=5 / CPU 70%（缩容稳定窗口 300s）
 ├── disruption/
 │   └── poddisruptionbudgets.yaml  # PDB：节点排空/升级时的副本下限（自愿中断保护）
 ├── networkpolicies/
@@ -98,7 +99,7 @@ kubectl apply -f infra/monitoring/exporters/exporters.yaml
 静态校验（无需集群）：
 
 ```bash
-python scripts/render_k8s.py --check   # {version} 占位符 + 6 个微服务镜像齐备
+python scripts/render_k8s.py --check   # {version} 占位符 + 7 个微服务镜像齐备
 python scripts/verify_infra.py         # API 版本/命名空间/探针/资源/HPA/PDB/敏感字段/端口/契约一致性
 ```
 
@@ -166,6 +167,7 @@ broker 首次启动执行 `kafka-storage.sh format --add-scram` 时以
 | data-analytics | 2 | 1 / 2Gi | 4 / 8Gi | 9 | 聚合与 Corner Case 挖掘，内存密集 |
 | ota-service | 2 | 250m / 512Mi | 1 / 1Gi | 3 | 任务调度与灰度编排 |
 | remote-control | 3 | 500m / 1Gi | 2 / 4Gi | 5 | WebRTC 转发，长连接 IO 密集 |
+| vil-forwarder | 2 | 250m / 256Mi | 1 / 1Gi | — | VIL 10Hz latest-wins 转发，无共享 DB |
 | postgres | 1 | 1 / 2Gi | 4 / 8Gi | — | max_connections=300；PVC 200Gi |
 | kafka | 3 | 1 / 4Gi | 4 / 12Gi | — | KRaft，每 broker PVC 500Gi |
 | redis | 1 | 500m / 512Mi | 2 / 2Gi | — | AOF everysec，PVC 20Gi |
@@ -187,6 +189,7 @@ broker 首次启动执行 `kafka-storage.sh format --add-scram` 时以
 | data-analytics | 2 | 2 | 5 | 同上 | 同上 |
 | ota-service | 2 | 2 | 5 | 同上 | 同上 |
 | remote-control | 3 | 2 | 5 | 同上 | 同上 |
+| vil-forwarder | 2 | 2 | 5 | 同上 | 同上 |
 
 - 前置依赖：**metrics-server**（未安装时 `kubectl get hpa` 的 `TARGETS` 显示 `<unknown>`，
   副本数回落 `minReplicas`，不影响服务可用性）。
@@ -205,7 +208,7 @@ broker 首次启动执行 `kafka-storage.sh format --add-scram` 时以
 | 服务 | minAvailable | 基线副本 | 说明 |
 |------|--------------|---------|------|
 | api-gateway / data-collector / remote-control | 2 | 3 | 节点排空时至少保留 2 副本 |
-| scene-service / data-analytics / ota-service | 1 | 2 | 节点排空时至少保留 1 副本 |
+| scene-service / data-analytics / ota-service / vil-forwarder | 1 | 2 | 节点排空时至少保留 1 副本 |
 
 - 与 Deployment 的 `maxUnavailable: 0`（滚动更新不降级）互补：PDB 约束**自愿中断**
   （`kubectl drain` / 集群升级 / 节点自动缩容），配合 `terminationGracePeriodSeconds`

@@ -15,10 +15,10 @@ data:
   API_PORT: "8082"
   DB_POOL_SIZE: "5"          # 单副本可用 CPU(2 核) × 2 + 1
   DB_MAX_OVERFLOW: "5"
-  # 消费者组 / 订阅（对齐 contracts/kafka/consumer-groups.yaml：车端 Topic 正则订阅，
-  # 四个数据域独立 offset，禁止擅自新增 Topic 或消费组）
-  KAFKA_CONSUMER_GROUPS: "data-collector-telemetry,data-collector-events,data-collector-health,data-collector-command-result"
-  KAFKA_SUBSCRIBE_PATTERNS: "hunter.*.telemetry,hunter.*.event,hunter.*.health,hunter.*.command_result"
+  # 消费者组 / 订阅（对齐 contracts/kafka/consumer-groups.yaml：车端 + CARLA 回传正则订阅，
+  # 五个数据域独立 offset，禁止擅自新增 Topic 或消费组）
+  KAFKA_CONSUMER_GROUPS: "data-collector-telemetry,data-collector-events,data-collector-health,data-collector-command-result,data-collector-carla"
+  KAFKA_SUBSCRIBE_PATTERNS: "hunter.*.telemetry,hunter.*.event,hunter.*.health,hunter.*.command_result,carla.*.sensor_data"
   KAFKA_PRODUCE_TOPICS: "telemetry_raw,telemetry_clean,event_raw,sensor_file"
   KAFKA_AUTO_OFFSET_RESET: "earliest"
   # 消费侧契约 Schema 校验（默认开启）：运行时契约目录由 hunter-contracts ConfigMap 挂载
@@ -29,6 +29,10 @@ data:
   TELEMETRY_CONSUMER_ENABLED: "true"
   EVENT_CONSUMER_ENABLED: "true"
   HEALTH_CONSUMER_ENABLED: "true"
+  # CARLA 仿真回传（carla.*.sensor_data；消费组 data-collector-carla）
+  CARLA_SENSOR_CONSUMER_ENABLED: "true"
+  CARLA_SIM_CACHE_TTL_SECONDS: "86400"
+  CARLA_SIM_EVENTS_MAX: "1000"
   CONSUMER_BATCH_SIZE: "100"
   TELEMETRY_PUBLISH_CONCURRENCY: "50"
   # 车辆离线判定与状态守护（系统约束：遥测中断 > 10s → 离线）

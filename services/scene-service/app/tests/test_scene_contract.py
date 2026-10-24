@@ -58,6 +58,9 @@ EXPECTED_ENDPOINTS: set[tuple[str, str]] = {
     ("GET", "/api/v1/scene/templates"),
     ("GET", "/api/v1/scene/simulations/{sim_instance_id}"),
     ("GET", "/api/v1/scene/simulations/{sim_instance_id}/result"),
+    ("POST", "/api/v1/scene/simulations/{sim_instance_id}/pause"),
+    ("POST", "/api/v1/scene/simulations/{sim_instance_id}/resume"),
+    ("POST", "/api/v1/scene/simulations/{sim_instance_id}/cancel"),
 }
 
 #: 运维端点（K8s 探针 / Prometheus 抓取）

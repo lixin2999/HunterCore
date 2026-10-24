@@ -11,7 +11,7 @@
 #     x-hunter-gateway-routes）；网关不剥离前缀，本服务按全路径注册路由
 #   - 本服务是「读模型 + 编排」服务：重计算由 Flink（实时，flink-jobs/）/ Spark（离线，spark-jobs/）
 #     承担，REST 只做查询（读预计算结果/时序聚合）与报告生成编排
-#   - 数据接入主链路为 Kafka（消费 4 个平台内部 Topic），非 REST；
+#   - 数据接入主链路为 Kafka（消费 4 个平台内部 Topic + CARLA 动态回传 carla.*.sensor_data），非 REST；
 #     Kafka 生产/消费清单见 x-hunter-kafka（与 contracts/kafka/{topics,consumer-groups}.yaml 双向一致）
 #   - 跨 schema 只读例外（contracts/database/er.md 第 3 节）：仅允许只读账号 hunter_analytics_ro
 #     SELECT data_collector.vehicle_telemetry / data_analytics.algorithm_metrics；
@@ -1482,7 +1482,7 @@ x-hunter-service:
     hunter-raw-data: "30 天自动删除"
   redis_keys:
     note: "只读键模式以 contracts/database/redis-keys.yaml 为单一事实来源（禁止服务自行新增键模式）；analytics:ingest_latency 为本服务 Flink 作业写入、看板只读的指标缓存键（已在 redis-keys.yaml 登记，pending #10 结案）"
-    read: ["vehicle:online:set", "vehicle:status:{vehicle_id}", "analytics:ingest_latency"]
+    read: ["vehicle:online:set", "vehicle:status:{vehicle_id}", "analytics:ingest_latency", "carla:sim:{sim_id}:status", "carla:sim:{sim_id}:metrics", "carla:sim:{sim_id}:events", "carla:sim:{sim_id}:artifacts"]
   dependencies:
     - service: data-collector
       usage: "REST GET /api/v1/data/events/stats（看板事件精确聚合）；Kafka 平台内部 Topic 由 data-collector 产出"
@@ -1556,6 +1556,13 @@ x-hunter-service:
     - OFFLINE_JOB_CRON_SCENE_COVERAGE
     - OFFLINE_JOB_CRON_CORNER_CASE_MINING
     - OFFLINE_JOB_CRON_MONTHLY_OPERATION
+    - CARLA_SENSOR_CONSUMER_ENABLED
+    - CARLA_SENSOR_TOPIC_PATTERN
+    - CARLA_CONSUMER_GROUP
+    - SIMULATION_REPORT_PREFIX
+    - SIMULATION_EVAL_POINTER_KEY
+    - INGEST_SCHEMA_VALIDATION_ENABLED
+    - KAFKA_CONTRACT_DIR
   env_derived:
     - name: KAFKA_BOOTSTRAP_SERVERS
       source: "hunter-common-config（共享 ConfigMap）"
@@ -2164,6 +2171,13 @@ x-hunter-kafka:
       schema: contracts/kafka/schemas/algorithm_metrics.schema.json
       enabled: true
       reason: "消费 Flink algorithm_performance_monitor 产出的算法指标，经 AlgorithmMetricRepository 写会话落 data_analytics.algorithm_metrics（看板 algorithm 块契约数据源；写自身 schema，非跨库越界）"
+    - topic_pattern: "carla.*.sensor_data"
+      group_id: data-analytics-carla
+      subscribe_mode: regex_pattern
+      schema: contracts/kafka/schemas/carla_sensor_data.schema.json
+      jobs: [simulation_report]
+      enabled: true
+      reason: "消费 sim_status / sim_metrics，终态生成 scene_test 报告写 hunter-reports（data-analytics 为唯一写方）；动态 Topic 由 scene-service 创建"
   produces:
     - topic: analytics_result
       schema: contracts/kafka/schemas/analytics_result.schema.json
@@ -2190,8 +2204,7 @@ x-hunter-kafka:
       - "hunter.{vehicle_id}.remote_control"
       - "hunter.broadcast.command"
       - "carla.{sim_id}.vil_state"
-      - "carla.{sim_id}.sensor_data"
-    carla_note: "⚠ Carla Topic 出现在设计文档 5.3.1 清单但未登记于 contracts/kafka/topics.yaml（data-collector 契约 pending #9）"
+    carla_note: "carla.*.sensor_data 已作为动态 Topic 登记（contracts/kafka/topics.yaml#carla_topics）并由 data-analytics-carla 消费；vil_state 为平台→CARLA 方向，本服务不消费"
   dlq: "{original_topic}.dlq（hunter_common.kafka.consumer 统一派生，保留原 topic/partition/offset 头）"
   offset_commit: "手动提交（handler 成功后 commit；失败转 DLQ）"
   idempotency_keys:
@@ -2200,6 +2213,7 @@ x-hunter-kafka:
     event_raw: "(vehicle_id, event_type, event_time)"
     sensor_file: object_key
     algorithm_metrics: "(vehicle_id, time, module, metric_name)"
+    "carla.*.sensor_data": "(sim_id, seq)"
 
 x-hunter-error-status-map:
   source: "设计文档 附录 A 错误码 + common/python/hunter_common/exceptions.py ErrorCode"

@@ -106,6 +106,7 @@ class KafkaConsumerManager:
         producer_manager: Any | None = None,
         contract: KafkaContract | None = None,
         lag_metrics_enabled: bool | None = None,
+        auto_offset_reset: str | None = None,
         consumer: Consumer | None = None,
     ) -> None:
         """
@@ -121,6 +122,9 @@ class KafkaConsumerManager:
             on_batch_end: 批次收尾钩子（本批 handler 全部完成后、提交 offset 前调用）；
                 典型用途：批量写库前冲刷累积缓冲。钩子抛异常 → 跳过本次提交（消息重投）。
             producer_manager: DLQ 投递用的生产者（默认取全局单例；测试可注入替身）。
+            auto_offset_reset: 无已提交位点时的起始策略（默认 ``earliest``，与
+                consumer-groups.yaml defaults 一致）；低时延旁路消费者（如
+                vil-forwarder）可显式传 ``latest``，避免启动时回放历史遥测。
             consumer: 底层消费者实例（测试注入；默认按配置创建）。
         """
         self._config = config
@@ -152,7 +156,9 @@ class KafkaConsumerManager:
         self._validate_schema_config()
         self._warn_unregistered_group()
         self._consumer = (
-            consumer if consumer is not None else Consumer(self._build_conf(config, group_id))
+            consumer
+            if consumer is not None
+            else Consumer(self._build_conf(config, group_id, auto_offset_reset))
         )
         self._running = False
 
@@ -186,14 +192,16 @@ class KafkaConsumerManager:
             )
 
     @staticmethod
-    def _build_conf(config: HunterBaseConfig, group_id: str) -> dict[str, Any]:
+    def _build_conf(
+        config: HunterBaseConfig, group_id: str, auto_offset_reset: str | None = None
+    ) -> dict[str, Any]:
         """构建 confluent-kafka 消费者配置（含 SASL_SSL 支持）。"""
         conf: dict[str, Any] = {
             "bootstrap.servers": ",".join(config.kafka_bootstrap_servers_list),
             "group.id": group_id,
             "security.protocol": config.kafka_security_protocol,
             "enable.auto.commit": False,  # 手动提交：处理成功后 commit（契约 consumer_defaults）
-            "auto.offset.reset": "earliest",
+            "auto.offset.reset": auto_offset_reset or "earliest",
             # 消费者侧禁止自动建 Topic：契约 Topic 只由 provisioner / init-kafka 按
             # topics.yaml 创建。开启后，写错的订阅名会在 broker 上落一个真实空 Topic，
             # 排障时“Topic 存在”反而误导（与 broker auto.create.topics.enable=false 一致）。

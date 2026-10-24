@@ -8,11 +8,11 @@
   4. 工作负载（Deployment/StatefulSet）resources.requests/limits 与三种探针齐备
   5. 镜像标签禁止 latest / 缺省（必须显式版本或发布日期）
   6. ConfigMap 不得包含敏感字段（密码/密钥/私钥）
-  7. 微服务端口与设计文档端口表一致（8080-8085）
+  7. 微服务端口与设计文档端口表一致（8080-8085 + vil-forwarder 8090）
   8. Kafka Topic 契约一致性（K8s init Job vs docker-compose 脚本：名称/分区/保留）
   9. MinIO Bucket 集合一致性（K8s init Job vs docker-compose 脚本）
  10. 自有微服务镜像必须使用 `{version}` 版本变量占位符（由 scripts/render_k8s.py 注入）
- 11. HPA 契约：6 个微服务齐备，minReplicas=2 / maxReplicas=5 / CPU 目标 70% / 缩容稳定窗口
+ 11. HPA 契约：7 个微服务齐备，minReplicas=2 / maxReplicas=5 / CPU 目标 70% / 缩容稳定窗口
  12. PDB 契约：无状态服务齐备，minAvailable 必须小于 Deployment 基线副本数
  13. Dockerfile 多阶段 / 非 root / 端口 / 容器级健康检查（exec 形式，兼容 distroless）
  14. Kafka 运维命令必带 --bootstrap-server（脚本与文档同一口径；缺它被 usage 刷屏、与集群健康无关）
@@ -67,6 +67,7 @@ SERVICE_PORTS: dict[str, int] = {
     "data-analytics": 8083,
     "ota-service": 8084,
     "remote-control": 8085,
+    "vil-forwarder": 8090,
 }
 
 #: 自有微服务镜像必须使用的版本变量占位符（禁止硬编码版本号；由 scripts/render_k8s.py 注入）
@@ -231,7 +232,7 @@ def check_service_ports(documents: list[tuple[Path, dict[str, Any]]]) -> None:
             api_port = str((doc.get("data") or {}).get("API_PORT", ""))
             if api_port != str(expected):
                 fail(f"{rel(path)}:ConfigMap/{name} API_PORT 应为 {expected}，实际 {api_port!r}")
-    ok("微服务端口一致性校验完成（8080-8085）")
+    ok("微服务端口一致性校验完成（8080-8085 + vil-forwarder 8090）")
 
 
 def check_env_contract(documents: list[tuple[Path, dict[str, Any]]]) -> None:

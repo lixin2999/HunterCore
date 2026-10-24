@@ -458,10 +458,12 @@ C_COLLECTOR="hunter-collector"
 C_ANALYTICS="hunter-analytics"
 C_OTA="hunter-ota"
 C_REMOTE="hunter-remote"
+C_VIL="hunter-vil-forwarder"
 C_WEB="hunter-web"
 C_INGEST="hunter-ingest-platform"
 export C_POSTGRES C_TIMESCALE C_REDIS C_ZOOKEEPER C_KAFKA C_MINIO C_SRS \
-  C_FLINK_JM C_FLINK_TM C_API_GATEWAY C_SCENE C_COLLECTOR C_ANALYTICS C_OTA C_REMOTE C_WEB C_INGEST
+  C_FLINK_JM C_FLINK_TM C_API_GATEWAY C_SCENE C_COLLECTOR C_ANALYTICS C_OTA C_REMOTE C_VIL \
+  C_WEB C_INGEST
 
 # compose <args...>：在 APP_DIR 下执行 docker compose（自动选择生产或部署包编排文件）
 compose() {
