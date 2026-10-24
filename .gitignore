@@ -125,7 +125,6 @@ Icon?
 
 # ===== 本地文档（按开发规则：每次只更新不提交） =====
 docs/
-release.md
 # ===== 单机部署包（infra/deploy）：模板与 SQL 产物入库；真实密钥/证书/数据禁止入库 =====
 infra/deploy/.env
 infra/deploy/.env.bak*
@@ -154,6 +153,5 @@ infra/k8s/**/02-secret.yaml
 ca.crt
 
 
-# ===== 本地文档（开发规则：docs/ 开发文档与 release.md 只更新、不追踪） =====
+# ===== 本地文档（开发规则：docs/ 开发文档只更新、不追踪） =====
 docs/
-release.md
