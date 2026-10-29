@@ -212,6 +212,8 @@ EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
     "carla:sim:{sim_id}:metrics": ("String(JSON)", 86400),
     "carla:sim:{sim_id}:events": ("List(JSON)", 86400),
     "carla:sim:{sim_id}:artifacts": ("Hash", 86400),
+    # 服务令牌会话（V1.23.6）：与 session:{user_id} 隔离，默认 7 天，上限 30 天
+    "session:service:{client_id}": ("String", 604800),
 }
 
 #: MinIO Bucket 契约（名称 → 过期天数；None = 永久）——来源：系统关键约束第 7 条（名称不可更改）

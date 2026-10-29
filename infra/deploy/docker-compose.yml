@@ -472,6 +472,12 @@ services:
       # 重验客户端证书链的 CA（与 Kafka 接入包同源，单文件只读挂载；ca-key 不进网关容器）。
       # 留空/未挂载 → 设备通道 fail-closed（仅控制台 JWT 路线），不影响存量行为
       DEVICE_CA_CERTFILE: ${DEVICE_CA_CERTFILE:-/srv/device-ca/ca-cert.pem}
+      # 服务令牌（契约 x-hunter-service-token，V1.23.6）：脚本/仿真等非交互组件的独立 Bearer
+      # Token，会话键 session:service:{client_id}，与用户单会话 session:{user_id} 隔离
+      SERVICE_TOKEN_TTL_SECONDS: ${SERVICE_TOKEN_TTL_SECONDS:-604800}
+      SERVICE_TOKEN_MAX_TTL_SECONDS: ${SERVICE_TOKEN_MAX_TTL_SECONDS:-2592000}
+      SERVICE_TOKEN_ROLE: ${SERVICE_TOKEN_ROLE:-data-uploader}
+      SERVICE_TOKEN_ISSUE_ROLES: ${SERVICE_TOKEN_ISSUE_ROLES:-admin}
     ports:
       - "${API_GATEWAY_PORT:-8080}:8080"        # 对外唯一业务入口
     volumes:
@@ -569,6 +575,9 @@ services:
       # 仿真遥测批量入库（设计 7.3.3）
       SIM_TELEMETRY_BATCH_SIZE: ${SIM_TELEMETRY_BATCH_SIZE:-2000}
       SIM_TELEMETRY_FLUSH_INTERVAL_MS: ${SIM_TELEMETRY_FLUSH_INTERVAL_MS:-500}
+      # 服务令牌上传角色（契约 x-hunter-service-token，V1.23.6）：需与 api-gateway 的
+      # SERVICE_TOKEN_ROLE 同名同值；仅 presign/complete 认可，不入 data:read/data:execute 白名单
+      UPLOAD_SERVICE_ROLE: ${UPLOAD_SERVICE_ROLE:-data-uploader}
     ports:
       - "127.0.0.1:${DATA_COLLECTOR_PORT:-8082}:8082"
     volumes:

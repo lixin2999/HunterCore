@@ -6501,3 +6501,121 @@ Date：2026-10-24
 9. **Grafana 面板**：`hunter_vil_forward_total` / `hunter_vil_forward_lag_ms` / `hunter_vil_active_sessions` 已暴露，但本轮未在
    `infra/monitoring/grafana/dashboards` 新增面板；排障期用 `/metrics` 与 `/status`（见《运维操作手册》§3.12）。
 
+## V1.23.5（文档补录 / 环境工具链：`kubectl apply` 报 `failed to download openapi`（404）——**已定性：本机单机部署、无集群无 kubeconfig，无代码改动**）
+
+Date：2026-10-26
+变更类型：文档（`docs/故障排查指南.md` 新增场景 19）；**不改任何代码、清单、契约、DDL、OpenAPI、环境变量**
+
+### 1. 现场
+
+实机（`/opt/HunterCore`，root）执行 K8s 清单形态的部署步骤时：
+
+```bash
+root@hunter-core-server:/opt/HunterCore# python3 scripts/generate_contracts_configmap.py
+[OK] 已生成 infra/k8s/base/03-configmap-contracts.yaml（106781 字节）
+root@hunter-core-server:/opt/HunterCore# kubectl apply -f infra/k8s/base/03-configmap-contracts.yaml
+error: error validating "infra/k8s/base/03-configmap-contracts.yaml": error validating data:
+failed to download openapi: the server could not find the requested resource;
+if you choose to ignore these errors, turn validation off with --validate=false
+```
+
+随后 `kubectl -n hunter-core get cm hunter-contracts -o jsonpath=…` 连刷 5 行
+`E1026 … memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: the server could not find the requested resource"`，
+末行 `Error from server (NotFound)`；同一条管道接 `python3 -c 'json.load…'` 抛 `JSONDecodeError`（stdout 为空所致）。
+
+### 2. 判定
+
+- **根因**：`kubectl apply` 提交前会先拉 apiserver 的 `/openapi/v2|v3` 做客户端字段校验，拉不到即整体中止——与清单内容无关（同一台机 `00-namespace.yaml` 报同一句）。
+- **本次属「A 情形」（连接目标不是可用 apiserver）**：`kubectl get ns` 的 discovery 请求同样 404，说明目标地址上有 HTTP 服务在应答，但它不是/不再代理到 kube-apiserver。该情形下 `--validate=false` 与 `--server-side` **全部无效**（它只跳过校验，请求仍到不了 apiserver）。
+- **实机终定根因（2026-10-26）**：`kubectl config view --minify` 报 `error: current-context must exist in order to minify`（**无可用 kubeconfig**），`systemctl list-units --type=service | grep -iE 'kube|k3s|microk8s'` 为空（**无任何集群**）⇒ kubectl 兜底使用默认地址 `http://localhost:8080`，而该端口正是本项目 **api-gateway 的宿主发布端口**（compose `${API_GATEWAY_PORT:-8080}:8080`）⇒ discovery 拿回一个普通 404，因此报错是 “could not find the requested resource” 而**不是** “connection refused”。（若 `API_GATEWAY_PORT` 改过、8080 无人监听，文案会退化成 `The connection to the server localhost:8080 was refused`）
+- **定性：环境 / 工具链问题，不涉及本仓库代码**。`hunter-contracts` 这份清单本身合规：16 个键、106781 字节，远低于 ConfigMap 1 MiB 上限，`generate_contracts_configmap.py --check` PASS。
+- **单机形态下该 ConfigMap 用不到**：本项目主力交付是 Docker Compose 单机部署，`contracts/kafka` 为 bind mount，`KAFKA_CONTRACT_DIR` 直接指向挂载目录，消费侧 Schema 校验不经 K8s。
+
+### 3. 本次改动（仅文档）
+
+`docs/故障排查指南.md`：
+
+- §0 新增一条速查项（`failed to download openapi` 的定性与分流口径）；
+- 新增 **场景 19（§20）**：分流判据表（`kubectl get ns` / `get --raw /openapi/v2` / `get apiservice` / `config view` 的 server 地址 / 代理变量 / `curl /api` 状态码）→ A 情形成因表（本机无集群、kubeconfig 残留或来自别处、指向业务反代、k3s/microk8s 未起或用错客户端、Rancher 路径前缀失效）→ B 情形绕过（`--server-side` 首选；`--validate=false` 会让 `last-applied` 注解体积翻倍到约 213 KB 且需手工移除）→ 应用后验证；
+- 章节顺延：`20. 紧急恢复预案` → `21`（其子节残留编号 `19.1–19.4` 一并改为 `21.1–21.4`），`21. 获取帮助` → `22`；原「场景 18（§19）」引用不受影响。
+
+### 4. 结论与待办（**未修复 / 不需要修**，如实登记）
+
+1. **已定性（2026-10-26 实机）：本机为单机部署，无集群、无 kubeconfig** —— 本条**不是缺陷，也不涉及仓库代码**；`generate_contracts_configmap.py` 与清单本身均合规。单机 compose 形态下 `hunter-contracts` 用不到（`contracts/kafka` 是 bind mount），**正确处置是去掉实机流程里的 `kubectl apply` 这一步**，不重建镜像、不改配置。
+2. **K8s 形态是否交付未定**：`infra/k8s/**` 与 compose 单机形态并列、不混跑；待真正交付 K8s 时，才需要准备 kubeconfig 与集群，并按场景 19 §20.3 验证。
+3. **契约 ConfigMap 尚未在真实集群生效过**：即使将来连上可用集群，`hunter-contracts` 仍未被成功创建过，`schema_name="auto"` 的集群内路径（Pod 内 `/app/contracts/kafka`）**未做过实机验证**。
+
+### 5. 验证
+
+- 无代码改动，不涉及单测/静态门禁；实机只确认了报错现象与生成物（106781 字节 / 16 个键：`consumer-groups.yaml`、`topics.yaml` 与 14 个 `schemas/*.schema.json`）。
+- 实机证据（四条，已回填至故障排查指南场景 19）：① 生成成功；② `kubectl apply` 报本条 404（换个清单同样报）；③ `kubectl get cm` 连刷 5 行 discovery 报错 + `Error from server (NotFound)`；④ `kubectl config view --minify` 报 `current-context must exist in order to minify`、`systemctl list-units … | grep -iE 'kube|k3s|microk8s'` 为空。
+- 文档为 Markdown，无构建产物；`release.md` 与 `docs/` 按仓库规则「只更新、不入库」，无需分发。
+
+### 6. 兼容与风险
+
+- **无向后兼容影响**：未改代码/清单/契约/DDL/环境变量，compose 形态行为零变化。
+- 风险：本条极易与「清单写错」混淆——A 情形下反复用 `--validate=false` 重试只会得到同样的 404。排障入口统一按场景 19 第 1 条判据（`kubectl get ns`）分流，不要从 YAML 侧找原因。
+
+## V1.23.6（新增：服务令牌——为非交互组件（HunterSim/脚本）签发独立于用户单会话的 Bearer Token，与 Web 前端登录互不干扰）
+
+Date：2026-10-29
+变更类型：新增（契约 + 共享库 + 网关端点 + data-collector 主体白名单 + 部署编排）+ 文档
+
+**背景**：`session:{user_id}` 为**单值会话**（登录写 / 刷新覆盖 / 登出 DEL，校验「存储值 == 当前 Token」），同一账号再次登录必然覆盖旧值 ⇒ 旧 Token 立即失效。因此 HunterSim 用 admin 登录取到的 `HUNTER_CORE_JWT_TOKEN`，只要管理员再登录一次 Web 前端就立刻失效，仿真运行期间**不能**再登前端、两个模块无法并行。
+
+**方案取舍**：不改用户单会话语义（不引入黑名单、不扩成 `session:{user_id}:{device}`），而是为自动化组件签发 `typ=service` 的 Token，会话落**独立键** `session:service:{client_id}`，与 `session:{user_id}` 零交集：
+
+| 项 | 用户 Access Token | 服务令牌（V1.23.6） |
+|---|---|---|
+| `typ` / `sub` | `access` / 用户 UUID | `service` / `service:{client_id}` |
+| 会话键 | `session:{user_id}`（7200s） | `session:service:{client_id}`（默认 604800s，上限 2592000s） |
+| 角色 | RBAC 展开 | 单一 `SERVICE_TOKEN_ROLE`（默认 `data-uploader`） |
+| 失效路径 | 再登录覆盖 / 登出 / 到期 | 重复签发轮换 / `DELETE` 撤销 / 到期 |
+
+### 1. 契约层（单一事实来源，纳入既有校验器）
+
+1. `contracts/database/redis-keys.yaml` 新增第 17 条受控键 `session:service:{client_id}`（String，TTL 604800s，writers/readers = api-gateway），`cross_check` 注释同步为 17 个受控键。
+2. `contracts/openapi/api-gateway.yaml` 新增 `POST /api/v1/user/service-token`（operationId `issueServiceToken`）与 `DELETE /api/v1/user/service-token/{client_id}`（`revokeServiceToken`）+ `ServiceTokenRequest`/`ServiceToken`/`ApiResponseServiceToken` 三个 schema。
+3. 同一文件新增机器可读段 `x-hunter-service-token`：`claims.typ=service`、`session_key`、**`never_touches: ["session:{user_id}"]`**、TTL 上下限、`allowed_backends.data-collector.paths`（仅 presign/complete）。
+4. `contracts/openapi/data-collector.yaml` 的 presign 端点说明补充第三类上传主体（服务令牌，`data-uploader` 角色）。
+
+### 2. api-gateway
+
+1. `core/security.py`：新增 `create_service_token()`（`typ=service` + `client_id` claim）；抽出 `decode_bearer_token()` 接受 `{access, service}`，**`decode_access_token()` 仍只认 `typ=access`**（控制台端点天然拒绝服务令牌）。
+2. `core/auth.py`：`get_current_user` → `_authenticate(allow_service=False)`；catch-all 代理用 `authenticate_request` → `_authenticate(allow_service=True)`，服务令牌额外校验「`client_id` 与 `sub=service:{client_id}` 自洽」+「`session:service:{client_id}` 存储值 == 当前 Token」；新增 `service_session_key()` / `load_service_session_token()`（后端异常 503+5001）。
+3. `services/auth_service.py`：`issue_service_token()`（TTL = `min(请求值 or 默认, 上限)`，写独立会话；写失败 503；审计日志不落令牌明文）、`revoke_service_token()`（DEL，幂等）、`_require_service_token_issuer()`（非管理员 403+1002）。
+4. `routers/auth.py` + `schemas/auth.py`：落地上述两端点与模型（`client_id` pattern `^[a-z0-9][a-z0-9._-]{2,63}$`，`ttl_seconds` 300–2592000 可空）。
+5. 配置 4 项：`SERVICE_TOKEN_TTL_SECONDS`(604800) / `SERVICE_TOKEN_MAX_TTL_SECONDS`(2592000) / `SERVICE_TOKEN_ROLE`(data-uploader) / `SERVICE_TOKEN_ISSUE_ROLES`(admin)。
+
+### 3. data-collector
+
+1. `core/dependencies.py#require_uploader_identity` 增加**第三类上传主体**：`roles` 命中 `UPLOAD_SERVICE_ROLE` ⇒ 放行 presign/complete（`device_vehicle_id=None`，不做 vehicle_id==CN 强校验——该约束仍只对设备主体生效）。
+2. 新增配置 `UPLOAD_SERVICE_ROLE`（默认 `data-uploader`，与本服务角色同名同值）；服务角色不在 `DATA_READ_ROLES`/`DATA_EXECUTE_ROLES` 白名单，其余端点仍 403+1002（能力面收窄）。
+3. 1002 提示文案补充服务令牌角色分支，便于现场定位主体类型。
+
+### 4. 部署与运维
+
+1. `infra/k8s/services/api-gateway.yaml` ConfigMap 新增 4 个 `SERVICE_TOKEN_*` 键；`infra/k8s/services/data-collector.yaml` 新增 `UPLOAD_SERVICE_ROLE`。
+2. `infra/deploy/docker-compose.yml`：api-gateway 注入 4 项、data-collector 注入 1 项；根 `.env.example` 与 `infra/deploy/.env.example` 同步登记（含「与用户会话隔离」说明）。
+3. 文档：`services/api-gateway/README.md` 增「服务令牌（V1.23.6）」章节（对比表 + curl 签发/撤销）、`services/data-collector/README.md` 增「上传主体（presign/complete）」三类主体表、`docs/api-gateway.md` 增认证章节与待确认项 3 更新、`docs/运维操作手册.md` 的「登录失效」条目补服务令牌用法（含「HunterSim 不要再用 admin 登录取 Token」口径）。
+
+### 5. 验证
+
+| 验证项 | 结果 |
+|---|---|
+| `pytest services/api-gateway -q` | **97 passed**（31 契约 + 22 auth + 13 设备认证 + 9 转发 + 7 限流 + 4 health + 11 服务令牌） |
+| `pytest services/data-collector -q` | **192 passed**（含 3 条服务令牌主体回归） |
+| `pytest common/python -q` | **338 passed**（含 Redis 键契约 17 个受控键比对） |
+| `scripts/verify_data_layer.py` | **通过 34 项，失败 0** |
+| `scripts/verify_infra.py` | **全部校验通过**（96 个 K8s 文档） |
+| `ruff check`（api-gateway / data-collector） | **All checks passed**（common 侧 5 项 UP046/UP047 为既有问题，非本次文件） |
+
+关键用例（`test_service_token.py`）：签发写**独立**会话且 TTL 生效；**再次用户登录后服务令牌仍可用**（本轮核心诉求）；代理转发注入 `X-User-Id=service:hunter-sim` + `X-Roles=data-uploader`；`DELETE` 撤销即时失效且幂等；同 `client_id` 重复签发即轮换；服务令牌访问 `/me`、`/logout`、再签发一律 401+1001；非管理员签发/撤销 403+1002。
+
+### 6. 兼容与风险
+
+- **无破坏性变更**：用户登录/刷新/登出/改密行为零变化，`session:{user_id}` 不被新逻辑触碰（契约 `never_touches` + 单测双重护栏）。既有 admin Token 继续可用，仅「脚本共享用户会话」的用法建议迁移到服务令牌。
+- **能力面收窄是设计而非缺陷**：服务令牌只放行 presign/complete；若脚本还需查询类接口，应按需新签角色/端点白名单，不要复用管理员账号。
+- 服务令牌 **长 TTL（默认 7 天，上限 30 天）**：泄露窗口比 Access Token 大，撤销入口（`DELETE …/service-token/{client_id}`）是唯一止血手段，务必登记 `client_id` 台账。
+- 服务令牌**不能**用于 WebSocket 与前端控制台：`typ=service` 被 `decode_access_token` 拒绝是预期（防令牌越权复用到用户面）。
+

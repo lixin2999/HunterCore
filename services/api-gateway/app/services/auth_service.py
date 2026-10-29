@@ -9,6 +9,10 @@
 - MFA(TOTP)：G-23 已在数据库契约增 `users.mfa_enabled` / `users.totp_secret` 字段，
   但 TOTP 签发/校验流程（含密钥加密存储）尚未实现，当前仍按契约
   「账号未启用 MFA 时忽略」处理；启用前需同步实现校验逻辑与前端绑定流程
+- 服务令牌（V1.23.6，契约 x-hunter-service-token）：管理员签发/撤销*非交互组件*专用
+  Bearer Token，会话键 ``session:service:{client_id}``（redis-keys.yaml 第 17 条）。
+  与用户单会话完全隔离：本模块的 login/refresh/logout **只读写** ``session:{user_id}``，
+  因此脚本/仿真持有的服务令牌不会因管理员再次登录而失效
 """
 from __future__ import annotations
 
@@ -19,17 +23,19 @@ from hunter_common.database.enums import UserStatus
 from hunter_common.exceptions import (
     AuthenticationError,
     InvalidParameterError,
+    PermissionDeniedError,
     ServiceUnavailableError,
     TokenExpiredError,
 )
 from hunter_common.logging import get_logger
 
 from app.config import Settings, settings
-from app.core.auth import load_session_token, session_key
+from app.core.auth import load_session_token, service_session_key, session_key
 from app.core.rate_limit import RateLimiter, RateLimitExceeded, rate_limit_key
 from app.core.security import (
     create_access_token,
     create_refresh_token,
+    create_service_token,
     decode_access_token_ignoring_expiry,
     decode_refresh_token,
     hash_password,
@@ -40,6 +46,8 @@ from app.schemas.auth import (
     ChangePasswordRequest,
     LoginRequest,
     RefreshTokenRequest,
+    ServiceToken,
+    ServiceTokenRequest,
     TokenPair,
     UserProfile,
 )
@@ -49,7 +57,10 @@ logger = get_logger("app.services.auth_service")
 LOGIN_SCOPE: Final[str] = "login"              # rate_limit:{ip}:login（登录频率限制）
 LOGIN_FAILURE_SCOPE: Final[str] = "login-fail"  # rate_limit:{ip}:login-fail（失败锁定）
 
-__all__ = ["LOGIN_FAILURE_SCOPE", "LOGIN_SCOPE", "AuthService"]
+#: 服务令牌携带的权限声明（与角色同一能力面收窄策略：仅文件上传，不含 data:read）
+SERVICE_TOKEN_PERMISSIONS: Final[tuple[str, ...]] = ("data:upload",)
+
+__all__ = ["LOGIN_FAILURE_SCOPE", "LOGIN_SCOPE", "SERVICE_TOKEN_PERMISSIONS", "AuthService"]
 
 
 class AuthService:
@@ -221,6 +232,67 @@ class AuthService:
         logger.info("auth_password_changed", user_id=user_id)
 
     # =================================================================
+    # 服务令牌（POST /api/v1/user/service-token；DELETE .../{client_id}；V1.23.6）
+    # =================================================================
+    async def issue_service_token(
+        self, claims: dict[str, Any], payload: ServiceTokenRequest
+    ) -> ServiceToken:
+        """签发服务令牌（契约 x-hunter-service-token；仅控制台授权角色可调用）。
+
+        同一 ``client_id`` 重复签发覆盖旧令牌（等效轮换）：旧令牌因会话值不等而即刻失效。
+        会话写失败 → 503（强依赖，不发半截令牌）。
+        """
+        self._require_service_token_issuer(claims)
+        cfg = self._settings
+        ttl_seconds = min(
+            payload.ttl_seconds or cfg.service_token_ttl_seconds,
+            cfg.service_token_max_ttl_seconds,
+        )
+        roles = [cfg.service_token_role]
+        token, _ = create_service_token(
+            client_id=payload.client_id,
+            roles=roles,
+            permissions=list(SERVICE_TOKEN_PERMISSIONS),
+            ttl_seconds=ttl_seconds,
+            settings=cfg,
+        )
+        try:
+            await self._redis.set(
+                service_session_key(payload.client_id), token, expire_seconds=ttl_seconds
+            )
+        except Exception as exc:
+            logger.error("service_session_write_failed", client_id=payload.client_id)
+            raise ServiceUnavailableError("服务不可用") from exc
+        # 审计：记录签发人与有效期，**不落令牌明文**（令牌会落入日志采集系统）
+        logger.info(
+            "service_token_issued",
+            client_id=payload.client_id,
+            issued_by=str(claims.get("sub")),
+            ttl_seconds=ttl_seconds,
+        )
+        return ServiceToken(
+            access_token=token,
+            expires_in=ttl_seconds,
+            client_id=payload.client_id,
+            roles=roles,
+        )
+
+    async def revoke_service_token(self, claims: dict[str, Any], client_id: str) -> None:
+        """撤销服务令牌：DEL ``session:service:{client_id}``（幂等，令牌即刻失效）。
+
+        仅作用于服务令牌会话，不影响任何用户会话（``session:{user_id}``）。
+        """
+        self._require_service_token_issuer(claims)
+        try:
+            await self._redis.delete(service_session_key(client_id))
+        except Exception as exc:
+            logger.error("service_session_delete_failed", client_id=client_id)
+            raise ServiceUnavailableError("服务不可用") from exc
+        logger.info(
+            "service_token_revoked", client_id=client_id, revoked_by=str(claims.get("sub"))
+        )
+
+    # =================================================================
     # 内部方法
     # =================================================================
     @staticmethod
@@ -339,3 +411,17 @@ class AuthService:
         except Exception as exc:
             logger.error("auth_db_unavailable", user_id=str(user_id))
             raise ServiceUnavailableError("服务不可用") from exc
+
+    def _require_service_token_issuer(self, claims: dict[str, Any]) -> None:
+        """签发/撤销授权：角色须命中 ``SERVICE_TOKEN_ISSUE_ROLES``（默认 admin），否则 403 + 1002。"""
+        roles = {str(role) for role in (claims.get("roles") or [])}
+        allowed = self._settings.service_token_issue_role_set
+        if not allowed or not roles & allowed:
+            logger.warning(
+                "service_token_denied",
+                user_id=str(claims.get("sub")),
+                roles=sorted(roles),
+            )
+            raise PermissionDeniedError(
+                message=f"无权限：服务令牌管理需要角色 {sorted(allowed)}"
+            )

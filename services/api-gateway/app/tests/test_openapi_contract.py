@@ -55,13 +55,15 @@ EXPECTED_ENDPOINT_LIMITS: dict[tuple[str, str], int] = {
     ("GET", "/api/v1/data/telemetry"): 20,
 }
 
-#: 网关自持端点（认证 5 个 + 运维探针 3 个）；探针端点已在 app/routers/health.py 实现
+#: 网关自持端点（认证 7 个 + 运维探针 3 个）；探针端点已在 app/routers/health.py 实现
 EXPECTED_PATHS: set[str] = {
     "/api/v1/user/login",
     "/api/v1/user/refresh",
     "/api/v1/user/logout",
     "/api/v1/user/me",
     "/api/v1/user/change-password",
+    "/api/v1/user/service-token",            # V1.23.6：签发服务令牌
+    "/api/v1/user/service-token/{client_id}",  # V1.23.6：撤销服务令牌
     "/healthz",
     "/readyz",
     "/metrics",
@@ -284,6 +286,30 @@ def test_device_ingress_contract_matches_implementation(contract: dict[str, Any]
     assert ingress["identity"]["claims"]["roles"] == ["device"]
     assert "X-Device-Vehicle-Id" in ingress["identity"]["injected_headers"]
     assert [c["key"] for c in ingress["config"]] == ["DEVICE_CA_CERTFILE"]
+
+
+def test_service_token_contract_matches_implementation(contract: dict[str, Any]) -> None:
+    """服务令牌面（x-hunter-service-token）契约↔实现一致性护栏（V1.23.6）。
+
+    会话键模式取共享库常量（redis-keys.yaml 第 17 条镜像），与契约逐字比对；
+    TTL / 角色 / 允许后端任一项漂移即红灯（防「先实现后补契约」）。
+    """
+    from hunter_common.redis_keys import SERVICE_SESSION
+
+    from app.config import settings
+
+    section = contract["x-hunter-service-token"]
+    assert section["session_key"] == SERVICE_SESSION
+    assert section["never_touches"] == ["session:{user_id}"]
+    assert section["claims"]["typ"] == "service"
+    assert settings.service_token_role in section["claims"]["roles"]
+    assert section["ttl"]["default_seconds"] == settings.service_token_ttl_seconds
+    assert section["ttl"]["max_seconds"] == settings.service_token_max_ttl_seconds
+    # 能力面收窄：仅数据采集上传两端点（data-collector 段为 paths + note 映射）
+    assert set(section["allowed_backends"]["data-collector"]["paths"]) == {
+        "POST /api/v1/data/files/presign",
+        "POST /api/v1/data/files/complete",
+    }
 
 
 def test_proxy_routes_target_correct_service_ports(contract: dict[str, Any]) -> None:

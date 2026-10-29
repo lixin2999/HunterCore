@@ -35,7 +35,7 @@ common_rules:
   - "禁止在任何键值中写入明文密码/私钥/证书；session:{user_id} 值为 JWT，必须受日志脱敏规则保护（不落日志/审计/异常响应）"
   - "计数类键必须使用 INCR + EXPIRE(NX) 原子组合（hunter_common.redis.RedisManager.incr_with_expire），禁止先读后写导致窗口语义漂移"
   - "每个键必须显式声明失效路径（主动 DEL 或 TTL），禁止出现无失效路径的键"
-  - "强依赖键（session / rc:session / rc:lock）不可用时返回 HTTP 503 + code=5001，禁止降级为无会话或无锁模式"
+  - "强依赖键（session / session:service / rc:session / rc:lock）不可用时返回 HTTP 503 + code=5001，禁止降级为无会话或无锁模式"
   - "只读键（如 data-analytics / ota-service / remote-control 读 vehicle:status:*）禁止由读取方写入，写方以本契约 writers 为准"
 
 keys:
@@ -326,14 +326,33 @@ keys:
     ops: ["HSET", "HGETALL", "EXPIRE key 86400"]
     refs: ["contracts/openapi/data-collector.yaml#x-hunter-service.redis_keys"]
 
+  # ---------------------------------------------------------------- 17
+  - pattern: "session:service:{client_id}"
+    type: "String"
+    value: "JWT 服务令牌字符串（原样存储；typ=service，sub=service:{client_id}）"
+    ttl_seconds: 604800
+    ttl_source: "V1.23.6：服务令牌默认 7 天（SERVICE_TOKEN_TTL_SECONDS 可调，签发请求可缩短），上限 30 天（SERVICE_TOKEN_MAX_TTL_SECONDS）"
+    owner_service: api-gateway
+    writers: [api-gateway]
+    readers: [api-gateway]
+    lifecycle: |
+      管理员经 POST /api/v1/user/service-token 签发时 SET key value EX <ttl>（同一 client_id 重复签发即覆盖轮换）；
+      DELETE /api/v1/user/service-token/{client_id} 主动 DEL（即时撤销）；到期自然过期。
+      **用户登录/刷新/登出只操作 session:{user_id}，永不读写本键**——单会话语义仅作用于用户账号
+    sensitive: true
+    ops: ["SET key value EX 604800", "GET", "EXISTS", "DEL", "TTL"]
+    refs:
+      - "contracts/openapi/api-gateway.yaml（POST /api/v1/user/service-token、DELETE /api/v1/user/service-token/{client_id}）"
+      - "contracts/openapi/api-gateway.yaml#x-hunter-service-token（服务令牌语义与上传端点白名单）"
+
 # =====================================================================
 # 交叉校验（scripts/verify_data_layer.py / common/python/tests/test_storage_contracts.py）
 #   1) 各服务 openapi 的 x-hunter-service.redis_keys 声明的键 ∈ 本文件 keys[].pattern
 #   2) 声明中的 type / ttl_seconds 与本文件一致
 #   3) 声明键的服务 ∈ 本文件 writers ∪ readers
-#   4) 9 个受控键的 TTL 与声明一致：session 1800（G-04① 收紧，原第 8 条 7200）/ rate_limit 60 /
+#   4) 17 个受控键的 TTL 与声明一致：session 1800（G-04① 收紧，原第 8 条 7200）/ rate_limit 1 /
 #      ota:progress 86400 / cache:scene 3600 / analytics:ingest_latency 300（指标缓存，pending #10 结案）/
-#      vehicle:* 与 rc:session 不过期（null）
+#      session:service 604800（V1.23.6 服务令牌默认 7 天）/ vehicle:* 与 rc:session 不过期（null）
 # =====================================================================
 cross_check:
   contracts:

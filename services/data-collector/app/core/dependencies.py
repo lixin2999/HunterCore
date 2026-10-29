@@ -10,6 +10,9 @@
 - 设备主体（车端 REST，契约 x-hunter-device-ingress / pending #6 决议）：网关重验证书链后
   注入 X-Device-Vehicle-Id（纳入 HMAC 第 5 段）；仅 presign/complete 认可设备主体，且请求体
   vehicle_id 必须等于证书 CN（不符 1002）；设备不进入 data:read 白名单，访问其余端点 → 1002。
+- 服务令牌主体（契约 x-hunter-service-token，V1.23.6）：脚本/仿真等非交互组件由网关签发
+  ``typ=service`` 令牌（角色默认 data-uploader，独立会话键不与用户登录互斥）；
+  **仅 presign/complete 认可**，同样不入 data:read/data:execute 白名单，其余端点 → 1002。
 """
 from __future__ import annotations
 
@@ -96,6 +99,8 @@ def require_uploader_identity(
 
     - 设备主体：角色必须恰为 {device} 且携带 X-Device-Vehicle-Id（两者同源注入，HMAC 第 5 段
       覆盖设备头，集群内无法单独伪造）；调用方须再校验请求体 vehicle_id == CN；
+    - 服务令牌主体：角色命中 UPLOAD_SERVICE_ROLE（默认 data-uploader）即可上传，
+      与用户登录会话隔离（契约 x-hunter-service-token）；
     - 控制台主体：沿用 data:read 白名单（代传路线保留，vehicle_id 一致性校验为存量待办）。
     """
     user_id, roles = credentials
@@ -105,9 +110,14 @@ def require_uploader_identity(
                 message="无权限：设备主体仅可以为证书 CN 指定车辆上传（角色/车辆 ID 头不完整或越界）"
             )
         return UploaderPrincipal(user_id=user_id, device_vehicle_id=x_device_vehicle_id)
+    if settings.upload_service_role and settings.upload_service_role in roles:
+        return UploaderPrincipal(user_id=user_id, device_vehicle_id=None)
     if not roles & settings.data_read_role_set:
         raise PermissionDeniedError(
-            message=f"无权限：上传需设备主体（证书 CN）或角色 {sorted(settings.data_read_role_set)}"
+            message=(
+                "无权限：上传需设备主体（证书 CN）、服务令牌角色 "
+                f"{settings.upload_service_role} 或角色 {sorted(settings.data_read_role_set)}"
+            )
         )
     return UploaderPrincipal(user_id=user_id, device_vehicle_id=None)
 

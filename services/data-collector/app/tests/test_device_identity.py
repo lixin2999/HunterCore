@@ -1,8 +1,9 @@
-"""设备主体身份测试（契约 x-hunter-device-ingress / pending #6 决议，V1.21.13）。
+"""设备主体 / 服务令牌主体身份测试（契约 x-hunter-device-ingress / x-hunter-service-token）。
 
 覆盖：
 - require_uploader_identity 双主体判定（设备主体角色/车辆头成对出现、混合角色拒绝、
   控制台代传路线保持、无权限角色 1002）；
+- 服务令牌主体（V1.23.6：roles=[data-uploader]）仅上传端点可用，不获得 data:read 能力；
 - FileService 层 vehicle_id == 证书 CN 强校验（presign/complete，越权 1002）。
 """
 from __future__ import annotations
@@ -65,6 +66,30 @@ def test_device_principal_without_read_whitelist_membership() -> None:
     对设备主体天然 1002；此处校验白名单配置本身不含 device。"""
     assert "device" not in settings.data_read_role_set
     assert "device" not in settings.data_execute_role_set
+
+
+# ---------------------------------------------------------------------------
+# 服务令牌主体（契约 x-hunter-service-token，V1.23.6）
+# ---------------------------------------------------------------------------
+
+
+def test_upload_service_role_allowed_for_upload() -> None:
+    """服务令牌角色（默认 data-uploader）可上传（无 device 车辆头约束）。"""
+    p = _principal({settings.upload_service_role}, None)
+    assert p.user_id == USER_ID
+    assert p.device_vehicle_id is None
+
+
+def test_upload_service_role_not_in_read_whitelist() -> None:
+    """能力面收窄：服务令牌角色不入 data:read/data:execute 白名单（其余端点天然 1002）。"""
+    assert settings.upload_service_role not in settings.data_read_role_set
+    assert settings.upload_service_role not in settings.data_execute_role_set
+
+
+def test_service_role_with_device_header_rejected() -> None:
+    """服务令牌角色不得携带设备车辆头（设备通道需纯 {device} 角色）。"""
+    with pytest.raises(PermissionDeniedError):
+        _principal({settings.upload_service_role}, VEHICLE_ID)
 
 
 # ---------------------------------------------------------------------------

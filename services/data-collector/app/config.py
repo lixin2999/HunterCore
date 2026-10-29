@@ -98,6 +98,9 @@ class Settings(HunterBaseConfig):
     # 且强制 body.vehicle_id == CN；故意**不**加入 data_read/data_execute 白名单——
     # 设备访问其余端点经 RBAC 自然 403/1002）
     device_role: str = "device"
+    # 服务令牌角色（契约 x-hunter-service-token：脚本/仿真等非交互组件，由 api-gateway 签发；
+    # 仅 presign/complete 认可，同样**不**入 data_read/data_execute 白名单）
+    upload_service_role: str = "data-uploader"
 
     @property
     def data_read_role_set(self) -> frozenset[str]:

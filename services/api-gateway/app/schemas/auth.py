@@ -13,12 +13,15 @@ from pydantic import BaseModel, Field, field_validator
 
 __all__ = [
     "ApiResponseEmpty",
+    "ApiResponseServiceToken",
     "ApiResponseTokenPair",
     "ApiResponseUserProfile",
     "ChangePasswordRequest",
     "LoginRequest",
     "LogoutRequest",
     "RefreshTokenRequest",
+    "ServiceToken",
+    "ServiceTokenRequest",
     "TokenPair",
     "UserProfile",
 ]
@@ -90,6 +93,27 @@ class ChangePasswordRequest(BaseModel):
         return value
 
 
+class ServiceTokenRequest(BaseModel):
+    """POST /api/v1/user/service-token 请求体（契约 ServiceTokenRequest；V1.23.6）。
+
+    同一 ``client_id`` 重复签发会覆盖旧令牌（等效轮换），旧令牌即刻失效。
+    """
+
+    client_id: str = Field(
+        min_length=3,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9._-]{2,63}$",
+        description="调用方标识（如 hunter-sim）；写入 JWT sub=service:{client_id} 与 Redis 会话键",
+    )
+    ttl_seconds: int | None = Field(
+        default=None,
+        ge=300,
+        le=2592000,
+        description=("有效期（秒）；缺省取 SERVICE_TOKEN_TTL_SECONDS（默认 604800 = 7 天），"
+                     "上限 30 天"),
+    )
+
+
 # =====================================================================
 # 数据模型（契约 UserProfile / TokenPair）
 # =====================================================================
@@ -121,6 +145,20 @@ class TokenPair(BaseModel):
     user: UserProfile = Field(description="登录用户信息")
 
 
+class ServiceToken(BaseModel):
+    """服务令牌（契约 ServiceToken；V1.23.6）。
+
+    ``typ=service``，会话键 ``session:service:{client_id}``；仅上传端点（presign/complete）
+    认可其角色，控制台端点（/me、/logout、/refresh、/change-password）一律拒绝。
+    """
+
+    access_token: str = Field(description="JWT 服务令牌（会话键 session:service:{client_id}）")
+    token_type: Literal["Bearer"] = "Bearer"
+    expires_in: int = Field(description="服务令牌有效期（秒）")
+    client_id: str = Field(description="服务令牌调用方标识（JWT `sub` = service:{client_id}）")
+    roles: list[str] = Field(description="服务角色（默认 data-uploader，不在 data:read 白名单）")
+
+
 # =====================================================================
 # 统一响应封装（契约 ApiResponseTokenPair / ApiResponseUserProfile / ApiResponseEmpty）
 # =====================================================================
@@ -133,4 +171,8 @@ class ApiResponseUserProfile(ApiResponse[UserProfile]):
 
 
 class ApiResponseEmpty(ApiResponse[None]):
-    """注销成功响应（data 恒为 null，契约 ApiResponseEmpty）。"""
+    """注销 / 撤销服务令牌成功响应（data 恒为 null，契约 ApiResponseEmpty）。"""
+
+
+class ApiResponseServiceToken(ApiResponse[ServiceToken]):
+    """服务令牌签发响应（data=ServiceToken）。"""

@@ -44,6 +44,13 @@ data:
   LOGIN_LOCK_WINDOW_SECONDS: "900"
   JWT_ISSUER: "hunter-platform"
   TRUST_FORWARDED_FOR: "true"   # Ingress 覆盖 X-Forwarded-For；直连部署改 false
+  # ---------- 服务令牌（契约 x-hunter-service-token，V1.23.6） ----------
+  # 脚本/仿真等非交互组件的独立 Bearer Token：会话键 session:service:{client_id}，
+  # 与用户单会话 session:{user_id} 隔离（管理员重新登录不会使其失效）
+  SERVICE_TOKEN_TTL_SECONDS: "604800"      # 默认 7 天
+  SERVICE_TOKEN_MAX_TTL_SECONDS: "2592000"  # 签发请求 ttl_seconds 上限（30 天）
+  SERVICE_TOKEN_ROLE: "data-uploader"       # 仅 presign/complete 认可（不入 data:read 白名单）
+  SERVICE_TOKEN_ISSUE_ROLES: "admin"        # 允许签发/撤销的控制台角色
 ---
 apiVersion: apps/v1
 kind: Deployment

@@ -1,17 +1,19 @@
-"""统一认证路由（契约 paths：/api/v1/user/login|refresh|logout|me|change-password）。
+"""统一认证路由（契约 paths：/api/v1/user/login|refresh|logout|me|change-password|service-token）。
 
 - operationId 与契约一致（userLogin / userRefreshToken / userLogout / getCurrentUser /
-  userChangePassword）
+  userChangePassword / issueServiceToken / revokeServiceToken）
 - response_model 为契约响应 schema（ApiResponseTokenPair / ApiResponseUserProfile /
-  ApiResponseEmpty；统一五字段）
-- 错误映射遵循 x-hunter-error-status-map：1001→401、1003→401、2001→422、
+  ApiResponseEmpty / ApiResponseServiceToken；统一五字段）
+- 错误映射遵循 x-hunter-error-status-map：1001→401、1002→403、1003→401、2001→422、
   429（code 复用 5001）+ Retry-After
+- 服务令牌（V1.23.6）：管理员签发/撤销非交互组件令牌；令牌本体归属 ``session:service:{client_id}``，
+  与用户单会话隔离（契约 x-hunter-service-token）
 """
 from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, Path, Request
 from hunter_common.responses import success_response
 
 from app.core.auth import get_current_user, get_logout_principal
@@ -20,12 +22,14 @@ from app.core.http import get_client_ip, too_many_requests_response
 from app.core.rate_limit import RateLimitExceeded
 from app.schemas.auth import (
     ApiResponseEmpty,
+    ApiResponseServiceToken,
     ApiResponseTokenPair,
     ApiResponseUserProfile,
     ChangePasswordRequest,
     LoginRequest,
     LogoutRequest,
     RefreshTokenRequest,
+    ServiceTokenRequest,
 )
 from app.services.auth_service import AuthService
 
@@ -149,4 +153,61 @@ async def user_change_password(
     口令明文仅经 TLS 传输，不落日志（字段 writeOnly）；成功后复位标志。
     """
     await service.change_password(claims, payload)
+    return success_response(data=None)
+
+
+@router.post(
+    "/service-token",
+    operation_id="issueServiceToken",
+    summary="签发服务令牌（脚本/仿真等非交互组件的独立 Bearer Token）",
+    response_model=ApiResponseServiceToken,
+    responses={
+        401: {"description": "1001/1003 控制台 Token 缺失或无效（服务令牌不得签发服务令牌）"},
+        403: {"description": "1002 角色不足（需 SERVICE_TOKEN_ISSUE_ROLES，默认 admin）"},
+        422: {"description": "2001 参数错误（client_id 格式 / ttl_seconds 越界）"},
+        500: {"description": "5000 服务器内部错误"},
+        503: {"description": "5001 服务不可用（Redis 会话强依赖不可用）"},
+    },
+)
+async def issue_service_token(
+    payload: ServiceTokenRequest,
+    claims: Annotated[dict[str, Any], Depends(get_current_user)],
+    service: Annotated[AuthService, Depends(get_auth_service)],
+) -> ApiResponseServiceToken:
+    """签发服务令牌（V1.23.6；令牌不落日志，同一 client_id 重复签发即轮换）。
+
+    ``get_current_user`` 仅接受 Access Token，故服务令牌无法自签发（避免权限升级链）。
+    """
+    token = await service.issue_service_token(claims, payload)
+    return success_response(data=token)
+
+
+@router.delete(
+    "/service-token/{client_id}",
+    operation_id="revokeServiceToken",
+    summary="撤销服务令牌（注销即失效）",
+    response_model=ApiResponseEmpty,
+    responses={
+        401: {"description": "1001/1003 控制台 Token 缺失或无效"},
+        403: {"description": "1002 角色不足（需 SERVICE_TOKEN_ISSUE_ROLES）"},
+        422: {"description": "2001 参数错误（client_id 格式不符）"},
+        500: {"description": "5000 服务器内部错误"},
+        503: {"description": "5001 服务不可用（Redis 会话强依赖不可用）"},
+    },
+)
+async def revoke_service_token(
+    client_id: Annotated[
+        str,
+        Path(
+            min_length=3,
+            max_length=64,
+            pattern=r"^[a-z0-9][a-z0-9._-]{2,63}$",
+            description="服务令牌调用方标识（契约 ServiceClientId）",
+        ),
+    ],
+    claims: Annotated[dict[str, Any], Depends(get_current_user)],
+    service: Annotated[AuthService, Depends(get_auth_service)],
+) -> ApiResponseEmpty:
+    """撤销服务令牌（幂等：DEL session:service:{client_id}；用户会话不受影响）。"""
+    await service.revoke_service_token(claims, client_id)
     return success_response(data=None)

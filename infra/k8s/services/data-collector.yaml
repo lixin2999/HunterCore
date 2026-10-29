@@ -60,6 +60,9 @@ data:
   # 预签名 URL（上传 1h / 下载 15min，支持 Range 分片）
   PRESIGNED_UPLOAD_EXPIRE_SECONDS: "3600"
   PRESIGNED_DOWNLOAD_EXPIRE_SECONDS: "900"
+  # 服务令牌上传角色（契约 x-hunter-service-token，V1.23.6）：与 api-gateway 的
+  # SERVICE_TOKEN_ROLE 同名同值；仅 presign/complete 认可，不入 DATA_READ_ROLES / DATA_EXECUTE_ROLES 白名单
+  UPLOAD_SERVICE_ROLE: "data-uploader"
 ---
 apiVersion: apps/v1
 kind: Deployment

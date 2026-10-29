@@ -53,6 +53,9 @@ SIM_METRICS = "carla:sim:{sim_id}:metrics"
 SIM_EVENTS = "carla:sim:{sim_id}:events"
 #: 仿真产物缓存 Hash（data-collector 写；data-analytics 读；TTL 86400s）
 SIM_ARTIFACTS = "carla:sim:{sim_id}:artifacts"
+#: 服务令牌会话 String（api-gateway 写读；默认 TTL 604800s）——与用户会话 SESSION 完全隔离，
+#: 用户登录/刷新/登出永不触碰本键（V1.23.6）。
+SERVICE_SESSION = "session:service:{client_id}"
 
 #: 受控键模式全集（test_storage_contracts.py 据此比对 redis-keys.yaml）。
 CONTROLLED_PATTERNS: frozenset[str] = frozenset(
@@ -73,6 +76,7 @@ CONTROLLED_PATTERNS: frozenset[str] = frozenset(
         SIM_METRICS,
         SIM_EVENTS,
         SIM_ARTIFACTS,
+        SERVICE_SESSION,
     }
 )
 
@@ -147,6 +151,11 @@ def sim_artifacts_key(sim_id: str) -> str:
     return SIM_ARTIFACTS.format(sim_id=sim_id)
 
 
+def service_session_key(client_id: str) -> str:
+    """``session:service:{client_id}``（服务令牌会话，与 ``session:{user_id}`` 隔离）。"""
+    return SERVICE_SESSION.format(client_id=client_id)
+
+
 __all__ = [
     "ANALYTICS_INGEST_LATENCY",
     "CACHE_SCENE",
@@ -155,6 +164,7 @@ __all__ = [
     "RATE_LIMIT",
     "RC_LOCK",
     "RC_SESSION",
+    "SERVICE_SESSION",
     "SESSION",
     "SIM_ARTIFACTS",
     "SIM_EVENTS",
@@ -170,6 +180,7 @@ __all__ = [
     "rate_limit_key",
     "rc_lock_key",
     "rc_session_key",
+    "service_session_key",
     "session_key",
     "sim_artifacts_key",
     "sim_events_key",

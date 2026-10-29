@@ -397,6 +397,10 @@ paths:
         - `vehicle_id` 必须等于设备主体认证的车辆（车端证书 CN → 网关注入 `X-Device-Vehicle-Id`，
           服务端强校验 body.vehicle_id == 该头，不匹配 1002）；控制台用户仅可为其有权限的车辆申请（代传路线保留）
         - 设备主体（roles=[device]）仅可访问本端点与 complete；访问其余端点→ 1002（不入 data:read 角色白名单）
+        - 服务令牌主体（roles=[data-uploader]，V1.23.6 脚本/仿真等非交互组件，契约见 api-gateway.yaml
+          `x-hunter-service-token`）同样**仅**可访问本端点与 complete；其角色不入 data:read/data:execute
+          白名单，访问其余端点 → 1002。服务令牌使用独立会话（`session:service:{client_id}`），
+          与用户登录互不影响（管理员重新登录不会使其失效）
         - `part_count > 1` 时返回分片上传：`upload_id` + `parts[].upload_url`（大文件 ROS Bag 分片上传）
         - 车辆维度带宽 ≤ 10 Mbps、单车辆限流见 `x-hunter-rate-limits`；超限返回 429/5001
       operationId: presignFileUpload

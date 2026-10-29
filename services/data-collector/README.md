@@ -25,6 +25,22 @@
 关键阈值（不可放宽）：遥测入库延迟 ≤1s、时序写入 ≥10000 点/秒、单车遥测 ≤100 msg/s、
 文件上传 ≤10 Mbps、`GET /api/v1/data/telemetry` 单用户 20 QPS、上传预签名 1h / 下载预签名 15min。
 
+## 上传主体（presign / complete）
+
+`POST /api/v1/data/files/presign|complete` 认可三类主体（`core/dependencies.require_uploader_identity`）：
+
+| 主体 | 网关注入头 | 约束 |
+|------|------------|------|
+| 控制台用户 | `X-User-Id` + `X-Roles`（命中 `DATA_READ_ROLES`） | 代传路线保留（车辆一致性校验为存量待办） |
+| 车辆设备 | `X-Roles=device` + `X-Device-Vehicle-Id`（mTLS 证书 CN） | 角色必须恰为 `{device}` 且请求体 `vehicle_id` == CN |
+| 服务令牌 | `X-User-Id=service:{client_id}` + `X-Roles=data-uploader` | V1.23.6：脚本/仿真等非交互组件，**仅上传端点** |
+
+- 服务令牌由 api-gateway 签发（`POST /api/v1/user/service-token`，契约 `x-hunter-service-token`），
+  会话键 `session:service:{client_id}` 与用户登录会话隔离 → 管理员重新登录 Web 前端不会使其失效
+- 服务角色（`UPLOAD_SERVICE_ROLE`，默认 `data-uploader`）**不**入 `DATA_READ_ROLES` / `DATA_EXECUTE_ROLES`：
+  查询/确认等其它端点对服务令牌一律 403 + 1002（能力面收窄）
+- 两服务的角色名必须同名同值：api-gateway `SERVICE_TOKEN_ROLE` ↔ data-collector `UPLOAD_SERVICE_ROLE`
+
 ## 本地运行
 
 ```bash

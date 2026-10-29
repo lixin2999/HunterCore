@@ -63,5 +63,20 @@ class Settings(HunterBaseConfig):
     device_ca_certfile: str | None = None
     device_role: str = "device"            # 设备主体角色（后端仅上传端点认可，不入 data:read 白名单）
 
+    # ---------- 服务令牌（契约 x-hunter-service-token；V1.23.6） ----------
+    # 非交互组件（脚本/仿真等 bag 上传）使用独立 Bearer Token，会话键 session:service:{client_id}，
+    # 与用户单会话 session:{user_id} 完全隔离：用户登录/刷新/登出不会使服务令牌失效
+    service_token_ttl_seconds: int = 604800       # 默认 7 天（与 Refresh Token 同档）
+    service_token_max_ttl_seconds: int = 2592000  # 签发请求 ttl_seconds 上限（30 天）
+    service_token_role: str = "data-uploader"     # 服务角色（仅上传端点认可，不入 data:read/data:execute 白名单）
+    service_token_issue_roles: str = "admin"      # 允许签发/撤销服务令牌的控制台角色
+
+    @property
+    def service_token_issue_role_set(self) -> frozenset[str]:
+        """允许签发/撤销服务令牌的角色集合（空集合时禁止一切签发）。"""
+        return frozenset(
+            role.strip() for role in self.service_token_issue_roles.split(",") if role.strip()
+        )
+
 
 settings = Settings()

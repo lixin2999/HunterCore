@@ -241,6 +241,92 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /api/v1/user/service-token:
+    post:
+      operationId: issueServiceToken
+      tags: [auth]
+      summary: 签发服务令牌（脚本/仿真等非交互组件的独立 Bearer Token）
+      description: |
+        V1.23.6：为外部自动化组件（如 HunterSim 等 bag 上传工具）签发**与用户登录并行、互不干扰**
+        的服务令牌。背景：`session:{user_id}` 为单值会话模型，同一账号再次登录会覆盖旧值，
+        导致脚本持有的 Token 立即失效。
+
+        - 令牌载荷：`typ=service` / `sub=service:{client_id}` / `roles=[服务角色]`（默认 data-uploader）
+        - 会话键为 `session:service:{client_id}`（redis-keys.yaml 第 17 条）；
+          **不写** `session:{user_id}`，用户登录/刷新/登出永不触碰该键
+        - 调用方须携带有效控制台 Bearer Token 且角色属于 `SERVICE_TOKEN_ISSUE_ROLES`（默认 admin），
+        否则 403 + 1002
+        - 同一 `client_id` 重复签发覆盖旧令牌（旧令牌即刻失效，等效轮换）；
+          有效期默认 7 天（`SERVICE_TOKEN_TTL_SECONDS`），`ttl_seconds` 可缩短，上限 30 天
+        - 服务令牌能力面收窄：仅数据采集上传端点（presign/complete）认可该角色，
+          其余端点因不在 data:read / data:execute 白名单而返回 403 + 1002
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TraceRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServiceTokenRequest'
+      responses:
+        '200':
+          description: 签发成功（返回服务令牌；服务端不落令牌明文日志）
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseServiceToken'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidParameter'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/user/service-token/{client_id}:
+    delete:
+      operationId: revokeServiceToken
+      tags: [auth]
+      summary: 撤销服务令牌（注销即失效）
+      description: |
+        删除 `session:service:{client_id}`（服务令牌会话）——该令牌立即失效，用户会话不受影响。
+
+        - 权限：同签发（`SERVICE_TOKEN_ISSUE_ROLES`，默认 admin），否则 403 + 1002
+        - 幂等：键不存在时仍返回 code=0（不泄露令牌存在性）
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TraceRequestId'
+        - $ref: '#/components/parameters/ServiceClientId'
+      responses:
+        '200':
+          description: 撤销成功（data 为 null）
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseEmpty'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidParameter'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
   # ------------------------------------------------------------------
   # 运维端点（非 /api/v1 前缀；K8s probe 与 Prometheus 抓取使用，不经网关路由表）
   # ------------------------------------------------------------------
@@ -379,6 +465,16 @@ components:
       schema:
         type: string
         format: uuid
+    ServiceClientId:
+      name: client_id
+      in: path
+      required: true
+      description: 服务令牌调用方标识（JWT `sub=service:{client_id}` 与 Redis `session:service:{client_id}` 同源）
+      schema:
+        type: string
+        minLength: 3
+        maxLength: 64
+        pattern: '^[a-z0-9][a-z0-9._-]{2,63}$'
 
   responses:
     Unauthenticated:
@@ -591,6 +687,14 @@ components:
             data:
               $ref: '#/components/schemas/UserProfile'
 
+    ApiResponseServiceToken:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/ServiceToken'
+
     ApiResponseHealth:
       allOf:
         - $ref: '#/components/schemas/ApiResponse'
@@ -721,6 +825,50 @@ components:
           description: |
             G-06 首登强制改密标志（user_svc.users.must_change_password）；
             true 时前端应引导跳转改密页，调用 /api/v1/user/change-password 后复位
+
+    # ---------- 服务令牌（V1.23.6：与用户单会话语义隔离） ----------
+    ServiceTokenRequest:
+      type: object
+      required: [client_id]
+      properties:
+        client_id:
+          type: string
+          minLength: 3
+          maxLength: 64
+          pattern: '^[a-z0-9][a-z0-9._-]{2,63}$'
+          description: |
+            调用方标识（如 hunter-sim）；写入 JWT `sub=service:{client_id}` 与 Redis `session:service:{client_id}`，
+            同一标识重复签发覆盖旧令牌
+        ttl_seconds:
+          type: integer
+          minimum: 300
+          maximum: 2592000
+          nullable: true
+          description: 有效期（秒）；缺省取 SERVICE_TOKEN_TTL_SECONDS（默认 604800 = 7 天），上限 30 天
+
+    ServiceToken:
+      type: object
+      required: [access_token, token_type, expires_in, client_id, roles]
+      properties:
+        access_token:
+          type: string
+          description: JWT 服务令牌（`typ=service`；仅数据采集上传端点认可其角色）
+        token_type:
+          type: string
+          enum: [Bearer]
+          default: Bearer
+        expires_in:
+          type: integer
+          example: 604800
+          description: 服务令牌有效期（秒）
+        client_id:
+          type: string
+          description: 服务令牌调用方标识
+        roles:
+          type: array
+          items:
+            type: string
+          description: 服务角色（默认 data-uploader；不在 data:read / data:execute 白名单内）
 
     # ---------- 运维探测 ----------
     HealthStatus:
@@ -903,6 +1051,33 @@ x-hunter-kafka:
     因此 contracts/kafka/ 下无网关 Topic 与消费者组。
     ⚠ 若将 alert_event 的 WebSocket 推送落在网关，须先更新 contracts/kafka/consumer-groups.yaml
     （现为 platform-alert-event 落位待定），不得先实现后补契约。
+
+# ---------- 服务令牌（V1.23.6：非交互组件与用户登录并行） ----------
+x-hunter-service-token:
+  source: "V1.23.6：脚本/仿真等自动化组件需要独立于用户单会话的 Bearer Token（否则管理员再登录即会覆盖会话使脚本 Token 失效）"
+  endpoints:
+    issue: "POST /api/v1/user/service-token"
+    revoke: "DELETE /api/v1/user/service-token/{client_id}"
+  claims:
+    typ: service
+    sub: "service:{client_id}"
+    roles: "[SERVICE_TOKEN_ROLE]（默认 data-uploader）"
+    note: "与 Access Token（typ=access）区分；/api/v1/user/me、/logout、/refresh、/change-password 一律不认可服务令牌"
+  session_key: "session:service:{client_id}"        # redis-keys.yaml 第 17 条（与 session:{user_id} 完全隔离）
+  never_touches: ["session:{user_id}"]
+  ttl:
+    default_env: SERVICE_TOKEN_TTL_SECONDS
+    default_seconds: 604800
+    max_env: SERVICE_TOKEN_MAX_TTL_SECONDS
+    max_seconds: 2592000
+  issue_roles_env: SERVICE_TOKEN_ISSUE_ROLES
+  role_env: SERVICE_TOKEN_ROLE
+  allowed_backends:
+    data-collector:
+      paths:
+        - POST /api/v1/data/files/presign
+        - POST /api/v1/data/files/complete
+      note: "其余业务端点因服务角色不在 data:read / data:execute 白名单而返回 403 + 1002（能力面收窄）"
 
 # ---------- 错误码 → HTTP 状态映射（与各服务 error_handlers 实现保持一致） ----------
 x-hunter-error-status-map:
