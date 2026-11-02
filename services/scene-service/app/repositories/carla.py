@@ -3,8 +3,13 @@
 ⚠ 契约待确认项 #2/#9：Carla 管理 API 地址（``CARLA_MANAGEMENT_ENDPOINT``）与各步骤子路径
 设计文档未定义 —— 本实现全部经环境变量注入（禁止硬编码），默认子路径见 app/config.py，
 人工确认后仅需调整配置，无需改代码。
-错误语义：未配置连接地址 / 连接失败 / 超时 / 非 2xx / 响应结构非法 → 5001 服务不可用
-（契约 4.4 节第 2 步「Carla 管理 API 不可达/超时返回 5001」）；
+错误语义（全部 5001 服务不可用，但**文案按成因分流**，见 V1.23.7）：
+- 未配置连接地址 → 「Carla 管理 API 未配置」；
+- 地址形态非法（缺 scheme / 非 http(s) / 无主机名 / 携带子路径）→ 「Carla 管理 API 地址非法」，
+  **在发出任何请求前**判定（契约 4.4 节第 2 步；动机见 validate_management_endpoint）；
+- 子路径模板缺 `{sim_instance_id}` 占位符 → 「Carla 管理 API 子路径配置非法」（不得伪装成 5000）；
+- 连接失败 / 超时 → 「Carla 管理 API 不可达」/「Carla 管理 API 连接超时」；
+- 非 2xx / 响应结构非法 → 「Carla 管理 API 返回 <code>」/「Carla 管理 API 响应非法」；
 进度/结果查询（G-20①）中 Carla 返回 404 → 3001 资源不存在（实例不存在或已回收）。
 """
 from __future__ import annotations
@@ -12,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from hunter_common.exceptions import ResourceNotFoundError, ServiceUnavailableError
@@ -25,6 +31,44 @@ _RETRY_BACKOFF_SECONDS = 0.2
 ACTIVE_STATUSES = frozenset({"pending", "running"})
 #: 响应体中实例 ID 的可接受键名（⚠ Carla API 未定义，待确认 #9）
 _INSTANCE_ID_KEYS = ("sim_instance_id", "instance_id", "id")
+#: 管理 API 基址允许的 scheme（本客户端不携带任何认证/证书，故不接受其它协议猜测）
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+
+def validate_management_endpoint(base_url: str) -> str | None:
+    """校验管理 API 基址形态；返回 ``None`` 表示合法，否则返回缺陷描述。
+
+    动机（V1.23.7 实机）：``.env`` 中 ``KEY=   # 例：http://…`` 这一形状的行尾注释会被
+    docker compose 当成**值**下发 —— 值非空 ⇒ 绕过「未配置」判定，httpx 随即抛
+    ``UnsupportedProtocol``，被兜底文案伪装成「Carla 管理 API 不可达」，现场按网络故障
+    多绕一轮。故在构造期判定形态，把「配置本身非法」与「网络不通」彻底分开。
+
+    空值不算形态缺陷（返回 ``None``）：那是「未配置」分支的语义，两者文案必须区分。
+    """
+    if not base_url.strip():
+        return None
+    try:
+        parts = urlsplit(base_url)
+    except ValueError:
+        return "URL 无法解析"
+    if not parts.scheme:
+        return "缺少 scheme（正确形态：http://<host>[:<port>]，子路径另由 CARLA_INSTANCE_*_PATH 配置）"
+    if parts.scheme.lower() not in _ALLOWED_SCHEMES:
+        return f"scheme 非法：{parts.scheme}（仅支持 http/https）"
+    if not parts.hostname:
+        return "缺少主机名"
+    if parts.path.rstrip("/"):
+        return f"基址不得携带子路径：{parts.path}（子路径由 CARLA_INSTANCE_*_PATH 配置）"
+    return None
+
+
+def _transport_failure_message(exc: BaseException | None) -> str:
+    """按传输异常类型分流文案：超时 / 协议非法 / 不可达三类不再共用一条。"""
+    if isinstance(exc, httpx.TimeoutException):
+        return "Carla 管理 API 连接超时"
+    if isinstance(exc, httpx.UnsupportedProtocol):
+        return "Carla 管理 API 地址协议非法（需 http/https）"
+    return "Carla 管理 API 不可达"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +136,15 @@ class CarlaManagementClient:
         stop_path: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        # 地址形态门禁（构造期判定，不阻塞启动：场景库 CRUD 不应被 CARLA 配置缺陷带下）
+        self._endpoint_problem = validate_management_endpoint(self._base_url)
+        if self._endpoint_problem:
+            # 不回显原始值（可能含 userinfo/口令），只回显成因
+            logger.error(
+                "carla_endpoint_invalid",
+                env="CARLA_MANAGEMENT_ENDPOINT",
+                problem=self._endpoint_problem,
+            )
         self._create_path = create_path
         self._query_path = query_path
         self._scenario_path = scenario_path
@@ -107,8 +160,16 @@ class CarlaManagementClient:
 
     @property
     def configured(self) -> bool:
-        """是否已配置 Carla 管理 API 地址（未配置时任何调用返回 5001）。"""
+        """是否已配置 Carla 管理 API 地址（未配置时任何调用返回 5001）。
+
+        注意：“非空”不等于“可用”；地址形态非法时 ``endpoint_problem`` 携带缺陷描述。
+        """
         return bool(self._base_url)
+
+    @property
+    def endpoint_problem(self) -> str | None:
+        """地址形态缺陷描述（``None`` = 合法或未配置）。"""
+        return self._endpoint_problem
 
     async def _get_client(self) -> httpx.AsyncClient:
         """惰性创建 httpx 客户端（并发安全）。"""
@@ -233,44 +294,60 @@ class CarlaManagementClient:
 
     async def submit_scenario(self, instance_id: str, payload: dict[str, Any]) -> None:
         """③④ 下发场景配置 JSON（Carla 侧加载地图、生成参与者、设置环境）。"""
-        path = self._scenario_path.format(sim_instance_id=instance_id)
+        path = self._render_path(
+            "CARLA_SCENARIO_SUBMIT_PATH", self._scenario_path, instance_id=instance_id
+        )
         # 场景下发非幂等（可能重复加载 world），禁止自动重试（V1.23.4）。
         await self._request("POST", path, json_body=payload, retry=False)
         logger.info("carla_scenario_submitted", sim_instance_id=instance_id)
 
     async def get_instance(self, instance_id: str) -> SimInstanceSnapshot:
         """⑥ 查询仿真实例进度快照（G-20①；Carla 404 → 3001，其余失败 → 5001）。"""
-        return await self._fetch_snapshot(self._get_path, instance_id)
+        return await self._fetch_snapshot(
+            "CARLA_INSTANCE_GET_PATH", self._get_path, instance_id
+        )
 
     async def get_result(self, instance_id: str) -> SimInstanceSnapshot:
         """⑦ 查询仿真实例结果（G-20①；终态判定由服务层完成，此处仅取快照）。"""
-        return await self._fetch_snapshot(self._result_path, instance_id)
+        return await self._fetch_snapshot(
+            "CARLA_INSTANCE_RESULT_PATH", self._result_path, instance_id
+        )
 
     async def pause_instance(self, instance_id: str) -> None:
         """暂停仿真实例（POST /instances/{id}/pause）。"""
-        await self._control_instance(self._pause_path, instance_id, "pause")
+        await self._control_instance(
+            "CARLA_INSTANCE_PAUSE_PATH", self._pause_path, instance_id, "pause"
+        )
 
     async def resume_instance(self, instance_id: str) -> None:
         """恢复仿真实例（POST /instances/{id}/resume）。"""
-        await self._control_instance(self._resume_path, instance_id, "resume")
+        await self._control_instance(
+            "CARLA_INSTANCE_RESUME_PATH", self._resume_path, instance_id, "resume"
+        )
 
     async def stop_instance(self, instance_id: str) -> None:
         """停止并回收仿真实例（POST /instances/{id}/stop）。"""
-        await self._control_instance(self._stop_path, instance_id, "stop")
+        await self._control_instance(
+            "CARLA_INSTANCE_STOP_PATH", self._stop_path, instance_id, "stop"
+        )
 
-    async def _control_instance(self, path_template: str, instance_id: str, action: str) -> None:
+    async def _control_instance(
+        self, env_name: str, path_template: str, instance_id: str, action: str
+    ) -> None:
         if not path_template:
             raise ServiceUnavailableError(
-                "Carla 管理 API 控制路径未配置", details={"action": action}
+                "Carla 管理 API 控制路径未配置", details={"action": action, "env": env_name}
             )
-        path = path_template.format(sim_instance_id=instance_id)
+        path = self._render_path(env_name, path_template, instance_id=instance_id)
         # pause/resume/stop 为幂等控制语义，可安全重试。
         await self._request("POST", path, json_body={}, retry=True)
         logger.info("carla_instance_control", sim_instance_id=instance_id, action=action)
 
-    async def _fetch_snapshot(self, path_template: str, instance_id: str) -> SimInstanceSnapshot:
+    async def _fetch_snapshot(
+        self, env_name: str, path_template: str, instance_id: str
+    ) -> SimInstanceSnapshot:
         """GET 实例子资源并解析快照（响应体非对象 → 5001；404 → 3001）。"""
-        path = path_template.format(sim_instance_id=instance_id)
+        path = self._render_path(env_name, path_template, instance_id=instance_id)
         response = await self._request("GET", path, allow_not_found=True)
         if response.status_code == 404:
             raise ResourceNotFoundError(
@@ -287,6 +364,24 @@ class CarlaManagementClient:
         return SimInstanceSnapshot(instance_id=instance_id, status=status, data=body)
 
     # ---------- 内部：请求与解析 ----------
+
+    @staticmethod
+    def _render_path(env_name: str, template: str, *, instance_id: str | None = None) -> str:
+        """渲染子路径（V1.23.7）：占位符缺失/非法一律 5001「子路径配置非法」。
+
+        不得让 ``str.format`` 的 ``KeyError``/``IndexError`` 泄到请求层变成 5000，
+        否则现场会把“配置写错”当成“服务异常”查。
+        """
+        if instance_id is None:
+            return template
+        try:
+            return template.format(sim_instance_id=instance_id)
+        except (IndexError, KeyError) as exc:
+            logger.error("carla_path_template_invalid", env=env_name, template=template)
+            raise ServiceUnavailableError(
+                "Carla 管理 API 子路径配置非法",
+                details={"env": env_name, "template": template, "error": type(exc).__name__},
+            ) from exc
 
     async def _request(
         self,
@@ -306,6 +401,15 @@ class CarlaManagementClient:
         if not self._base_url:
             raise ServiceUnavailableError(
                 "Carla 管理 API 未配置", details={"env": "CARLA_MANAGEMENT_ENDPOINT"}
+            )
+        if self._endpoint_problem:
+            raise ServiceUnavailableError(
+                "Carla 管理 API 地址非法",
+                details={
+                    "env": "CARLA_MANAGEMENT_ENDPOINT",
+                    "problem": self._endpoint_problem,
+                    "path": path,
+                },
             )
         url = f"{self._base_url}{path}"
         client = await self._get_client()
@@ -333,7 +437,12 @@ class CarlaManagementClient:
                 )
             return response
         raise ServiceUnavailableError(
-            "Carla 管理 API 不可达", details={"path": path, "attempts": attempts}
+            _transport_failure_message(last_exc),
+            details={
+                "path": path,
+                "attempts": attempts,
+                "error": type(last_exc).__name__ if last_exc else None,
+            },
         ) from last_exc
 
     @staticmethod
@@ -366,4 +475,5 @@ __all__ = [
     "CarlaSimIdMismatchError",
     "SimInstance",
     "SimInstanceSnapshot",
+    "validate_management_endpoint",
 ]

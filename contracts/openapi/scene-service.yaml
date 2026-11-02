@@ -1775,6 +1775,20 @@ x-hunter-simulation-flow:
     - "⑦ 结果落库（Carla → hunter-scene-assets 产物转存）由 Carla 侧完成，平台仅代理查询（产物 key 约定待确认 #9）"
   entrypoint_env: CARLA_MANAGEMENT_ENDPOINT   # ⚠ 键名待确认
   timeout_policy: "连接/读超时与重试次数需环境变量化（禁止硬编码）"
+  # ---------- V1.23.7：地址与子路径的配置语义（错误码不变，仅细化可定位性） ----------
+  endpoint_address_contract:
+    format: "scheme://host[:port]；scheme 仅允许 http/https；禁止携带子路径（子路径走 *_PATH 键）"
+    validation: "客户端构造期校验；形态非法不阻塞启动，但任何调用在**发出请求前**返回 5001"
+    rationale: "实机：.env 中 `KEY=   # 注释` 的行尾注释被 docker compose 当成值下发，值非空 ⇒ 绕过「未配置」判定 ⇒ httpx UnsupportedProtocol 被兜底文案误报为「不可达」"
+    subpath_defaults: "CARLA_INSTANCE_*_PATH 为空串/纯空白时回落服务默认值（compose 以 ${VAR:-} 透传，避开插值默认值含 `{` 时的截断）；模板缺 {sim_instance_id} 占位符 → 5001「子路径配置非法」，不得泄为 5000"
+    injection_parity: "compose（infra/deploy/docker-compose.yml）与 K8s ConfigMap（infra/k8s/services/scene-service.yaml）自 V1.23.7 起对称注入 8 个子路径 + 超时/重试"
+  failure_message_taxonomy:
+    - {message: "Carla 管理 API 未配置", cause: "CARLA_MANAGEMENT_ENDPOINT 为空", retryable_by_config: "填地址并 force-recreate"}
+    - {message: "Carla 管理 API 地址非法", cause: "值形态不符 endpoint_address_contract（含行尾注释污染）", retryable_by_config: "改值；不发请求，无副作用"}
+    - {message: "Carla 管理 API 子路径配置非法", cause: "模板缺 {sim_instance_id} 或含非法占位符", retryable_by_config: "改 *_PATH 键"}
+    - {message: "Carla 管理 API 连接超时", cause: "CARLA_REQUEST_TIMEOUT_SECONDS 内未响应（对端同步阻塞/防火墙丢包）", retryable_by_config: "调大超时或修对端异步返回"}
+    - {message: "Carla 管理 API 不可达", cause: "传输层错误（DNS 不可解析 / 连接被拒）", retryable_by_config: "修地址与网络"}
+    - {message: "Carla 管理 API 返回 <code>", cause: "连得通但路由/权限不对", retryable_by_config: "核对子路径（待确认 #9）"}
 
 x-hunter-real-vehicle-extraction:
   source: "设计文档 4.5 节"
@@ -1880,7 +1894,7 @@ x-hunter-pending-confirmation:
       impact: "网关/服务错误处理"
     - id: 9
       question: "Carla 管理 API 地址与配置键名、仿真并发上限、场景时长上限"
-      contract_decision: "键名暂定 CARLA_MANAGEMENT_ENDPOINT，值域与上限均需环境变量化；实现侧以 CARLA_INSTANCE_CREATE_PATH / CARLA_INSTANCE_QUERY_PATH（默认 /api/v1/instances）与 CARLA_SCENARIO_SUBMIT_PATH（默认 /api/v1/instances/{sim_instance_id}/scenario）及 SCENE_DURATION_MAX_SECONDS（默认 600s）落地；G-20① 追加 CARLA_INSTANCE_GET_PATH / CARLA_INSTANCE_RESULT_PATH（默认 /api/v1/instances/{sim_instance_id} 与 …/result），人工确认后仅调整配置不改代码"
+      contract_decision: "键名暂定 CARLA_MANAGEMENT_ENDPOINT，值域与上限均需环境变量化；实现侧以 CARLA_INSTANCE_CREATE_PATH / CARLA_INSTANCE_QUERY_PATH（默认 /api/v1/instances）与 CARLA_SCENARIO_SUBMIT_PATH（默认 /api/v1/instances/{sim_instance_id}/scenario）及 SCENE_DURATION_MAX_SECONDS（默认 600s）落地；G-20① 追加 CARLA_INSTANCE_GET_PATH / CARLA_INSTANCE_RESULT_PATH（默认 /api/v1/instances/{sim_instance_id} 与 …/result），人工确认后仅调整配置不改代码；V1.23.7 补：地址形态门禁与 5001 文案分流见 x-hunter-simulation-flow.endpoint_address_contract / failure_message_taxonomy"
       impact: "Step 3 服务层实现与 K8s ConfigMap"
     - id: 10
       question: "实车场景提取触发源：analytics_result 还是 event_raw"

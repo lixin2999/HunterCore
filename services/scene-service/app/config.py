@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import os
 import socket
+from typing import ClassVar
 
 from hunter_common.config import HunterBaseConfig
+from pydantic import model_validator
 
 
 class Settings(HunterBaseConfig):
@@ -120,6 +122,35 @@ class Settings(HunterBaseConfig):
     # 提取场景的成功判据默认值（analytics_result 未携带 success_criteria）
     scene_extraction_min_safe_distance: float = 1.0
     scene_extraction_max_speed_deviation: float = 1.0
+
+    # ---------- Carla 子路径归一（V1.23.7） ----------
+
+    #: 允许“空串回落默认”的 Carla 子路径键（V1.23.7）。
+    #
+    #: compose 侧统一用 ``${CARLA_*_PATH:-}`` 透传：① 避开 docker compose 变量插值在默认值
+    #: 含 ``{...}`` 时的截断风险；② “未设置”与“设为空”在容器内同为空串，必须由应用侧归一。
+    CARLA_PATH_FIELDS: ClassVar[tuple[str, ...]] = (
+        "carla_instance_create_path",
+        "carla_instance_query_path",
+        "carla_scenario_submit_path",
+        "carla_instance_get_path",
+        "carla_instance_result_path",
+        "carla_instance_pause_path",
+        "carla_instance_resume_path",
+        "carla_instance_stop_path",
+    )
+
+    @model_validator(mode="after")
+    def _blank_carla_paths_fallback(self) -> Settings:
+        """子路径留空/纯空白 → 回落字段默认值（与 K8s ConfigMap 默认一致）。"""
+        fields = type(self).model_fields
+        for name in self.CARLA_PATH_FIELDS:
+            value = getattr(self, name)
+            if not value.strip():
+                setattr(self, name, fields[name].default)
+            elif value != value.strip():
+                setattr(self, name, value.strip())
+        return self
 
     # ---------- 派生集合 ----------
 

@@ -6568,7 +6568,7 @@ Date：2026-10-29
 | 项 | 用户 Access Token | 服务令牌（V1.23.6） |
 |---|---|---|
 | `typ` / `sub` | `access` / 用户 UUID | `service` / `service:{client_id}` |
-| 会话键 | `session:{user_id}`（7200s） | `session:service:{client_id}`（默认 604800s，上限 2592000s） |
+| 会话键 | `session:{user_id}`（1800s，G-04①） | `session:service:{client_id}`（默认 604800s，上限 2592000s） |
 | 角色 | RBAC 展开 | 单一 `SERVICE_TOKEN_ROLE`（默认 `data-uploader`） |
 | 失效路径 | 再登录覆盖 / 登出 / 到期 | 重复签发轮换 / `DELETE` 撤销 / 到期 |
 
@@ -6612,10 +6612,286 @@ Date：2026-10-29
 
 关键用例（`test_service_token.py`）：签发写**独立**会话且 TTL 生效；**再次用户登录后服务令牌仍可用**（本轮核心诉求）；代理转发注入 `X-User-Id=service:hunter-sim` + `X-Roles=data-uploader`；`DELETE` 撤销即时失效且幂等；同 `client_id` 重复签发即轮换；服务令牌访问 `/me`、`/logout`、再签发一律 401+1001；非管理员签发/撤销 403+1002。
 
-### 6. 兼容与风险
+### 6. 实机部署与验证步骤（单机 compose 形态，必须按序；**2026-10-29 已按本节实机执行，结果见 §7**）
+
+> 部署根以 `/opt/HunterCore` 为例，全程 root（`.env` 为 600）。**`restart` 无效**：本次改动含共享库 `hunter_common`（镜像内置），必须 `--build` 重建；compose **必须带 `--project-directory .`**，否则读不到部署根 `.env`（`${VERSION}` 解析失败会导致镜像 tag 非法）。
+
+```bash
+sudo -i && cd /opt/HunterCore && git pull
+# 运维封装（下文 dcompose 同此；必须同时带 -f/--project-directory/--env-file）
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+
+# 1) 契约：compose 形态 contracts/ 为 bind mount，git pull 即生效，无需重建镜像
+grep -n 'session:service' contracts/database/redis-keys.yaml
+grep -n 'x-hunter-service-token' contracts/openapi/api-gateway.yaml
+
+# 2) 环境变量：均有默认值（不填也能启动），显式登记可避免两侧角色名漂移；幂等追加
+#    注：UPLOAD_SERVICE_ROLE 必须与 SERVICE_TOKEN_ROLE 同名同值；.env 内行尾注释易被当成值，故单独成行
+grep -q '^SERVICE_TOKEN_TTL_SECONDS=' .env || cat >> .env <<'EOF'
+# --- V1.23.6 服务令牌（与用户会话隔离）---
+SERVICE_TOKEN_TTL_SECONDS=604800
+SERVICE_TOKEN_MAX_TTL_SECONDS=2592000
+SERVICE_TOKEN_ROLE=data-uploader
+SERVICE_TOKEN_ISSUE_ROLES=admin
+UPLOAD_SERVICE_ROLE=data-uploader
+EOF
+
+# 3) 渲染校验：确认 5 项已进对应容器（期望 api-gateway 4 项 + data-collector 1 项，无 <no value>）
+dcompose config | grep -E 'SERVICE_TOKEN_|UPLOAD_SERVICE_ROLE'
+
+# 4) 重建镜像并强制重建容器（不改镜像只 restart 会继续跑旧代码；输出 `up 9/9` 含被顺带拉起的依赖 redis/postgres/minio/kafka，属正常）
+dcompose build api-gateway data-collector
+dcompose up -d --force-recreate api-gateway data-collector
+
+# 5) 探针
+docker ps --format '{{.Names}}\t{{.Status}}' | grep -E 'hunter-api-gateway|hunter-collector'
+# 期望两者 healthy；启动即退/持续 unhealthy 先看 docker logs hunter-api-gateway（契约 YAML 或 import 错误）
+```
+
+**6.1 功能验证（一条链路跑完，含「与前端登录并行」这条核心判据）**
+
+```bash
+BASE=http://127.0.0.1:8080
+# ① 管理员登录（取一次即可，第 ③ 步会被覆盖）
+ADMIN=$(curl -s -X POST $BASE/api/v1/user/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<ADMIN_PASSWORD>"}' | jq -r .data.access_token)
+
+# ② 签发服务令牌（同 client_id 重复签发即轮换）；结果写入 HunterSim 的 HUNTER_CORE_JWT_TOKEN
+SIM=$(curl -s -X POST $BASE/api/v1/user/service-token \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"client_id":"hunter-sim"}' | jq -r .data.access_token)
+echo "$SIM"
+
+# ③ 模拟管理员再登录 Web 前端（旧 ADMIN 必然失效——单会话语义未变，属预期）
+ADMIN2=$(curl -s -X POST $BASE/api/v1/user/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<ADMIN_PASSWORD>"}' | jq -r .data.access_token)
+curl -s -o /dev/null -w 'old_admin=%{http_code}\n' $BASE/api/v1/user/me -H "Authorization: Bearer $ADMIN"
+# 期望 401
+
+# ④ 核心判据：再登录后服务令牌仍可用（presign 经网关转发至 data-collector）
+curl -s -X POST $BASE/api/v1/data/files/presign \
+  -H "Authorization: Bearer $SIM" -H 'Content-Type: application/json' \
+  -d '{"vehicle_id":"SIM-001","bucket":"hunter-rosbag","data_type":"rosbag","file_name":"run.bag","file_size":1048576}' \
+  | jq '{code, message}'
+# 期望 code=0 且 data.method=put / data.upload_url 非空；URL host 必须是 MINIO_PUBLIC_ENDPOINT（车端/仿真端可达地址），不是 minio:9000
+```
+
+**6.2 隔离与收窄验证（均为设计行为，非缺陷；变量沿用 6.1 的 `BASE`/`SIM`/`ADMIN2`，同一 shell 会话内执行）**
+
+```bash
+# 服务令牌访问控制台端点 → 401 + 1001；再签发同样 401（typ=service 不被 decode_access_token 接受）
+curl -s -o /dev/null -w 'me=%{http_code}\n' $BASE/api/v1/user/me -H "Authorization: Bearer $SIM"
+curl -s -X POST $BASE/api/v1/user/service-token -H "Authorization: Bearer $SIM" \
+  -H 'Content-Type: application/json' -d '{"client_id":"x-sim"}'
+
+# 服务令牌访问非上传端点 → 403 + 1002（角色不在 DATA_READ_ROLES 白名单）
+curl -s -o /dev/null -w 'files_list=%{http_code}\n' $BASE/api/v1/data/files -H "Authorization: Bearer $SIM"
+
+# Redis：两套会话并存，且 TTL 为 7 天（按运维手册口径用 SCAN，禁用 KEYS *）
+set -a; . /opt/HunterCore/.env; set +a
+rcli() { docker exec hunter-redis redis-cli --no-auth-warning -a "${REDIS_PASSWORD}" "$@"; }
+rcli --scan --pattern 'session:*'
+rcli TTL 'session:service:hunter-sim'
+# 期望 session:<admin uuid> 与 session:service:hunter-sim 同时存在；ttl ≈ 604800
+
+# 审计日志：有事名、无令牌明文（有 eyJ 命中即脱敏缺口，需核查）
+docker logs --since 10m hunter-api-gateway 2>&1 | grep -E 'service_token_issued|service_token_revoked'
+docker logs --since 10m hunter-api-gateway 2>&1 | grep -c 'eyJ'
+
+# 撤销：即刻失效 + 幂等
+curl -s -X DELETE $BASE/api/v1/user/service-token/hunter-sim -H "Authorization: Bearer $ADMIN2"
+curl -s -X DELETE $BASE/api/v1/user/service-token/hunter-sim -H "Authorization: Bearer $ADMIN2"   # 幂等仍 code=0
+curl -s -o /dev/null -w 'after_revoke=%{http_code}\n' -X POST $BASE/api/v1/data/files/presign \
+  -H "Authorization: Bearer $SIM" -H 'Content-Type: application/json' \
+  -d '{"vehicle_id":"SIM-001","bucket":"hunter-rosbag","data_type":"rosbag","file_name":"run.bag","file_size":1024}'
+# 期望 401
+```
+
+**6.3 K8s 形态（本轮未实机验证，如实标注）**
+
+ConfigMap 已登记 `SERVICE_TOKEN_TTL_SECONDS` / `SERVICE_TOKEN_MAX_TTL_SECONDS` / `SERVICE_TOKEN_ROLE` / `SERVICE_TOKEN_ISSUE_ROLES`（api-gateway）与 `UPLOAD_SERVICE_ROLE`（data-collector）：`kubectl apply -f infra/k8s/services/api-gateway.yaml -f infra/k8s/services/data-collector.yaml` → `kubectl -n hunter-core rollout restart deployment/api-gateway deployment/data-collector`。`verify_infra.py` 只证明清单与共享 ConfigMap 契约一致，ConfigMap 热更新与真实集群行为需连上可用集群后按 6.1/6.2 复跑。
+
+**6.4 回滚**
+
+- 回滚两服务到上一镜像即可：新增配置项均有默认值，缺失不阻塞启动；`session:{user_id}` 结构与既有键未变，**用户登录不受影响**。
+- **已签发的服务令牌在旧镜像下不可用**（旧认证链不认 `typ=service`，一律 401）：回滚后 HunterSim 须改回 admin 登录取 Token，即回到「仿真期间不要登前端」的旧约束。
+- Redis 残留的 `session:service:{client_id}` 键无副作用（旧代码不读），到期自然清理，也可手工 `DEL`。
+
+### 7. 实机验证记录（2026-10-29，`/opt/HunterCore`，root）
+
+> 按 §6 逐条执行，**13 项判据全 PASS**；未改任何步骤即跑通。镜像：`hunter/api-gateway:0.1.0`、`hunter/data-collector:0.1.0`（`VERSION` 未变，如需按版本归档需显式改）。
+
+| # | 判据 | 实机结果 |
+|---|---|---|
+| 1 | 契约随 `git pull` 生效 | PASS：`redis-keys.yaml:330` 命中 `session:service:{client_id}`、`api-gateway.yaml:1056` 命中 `x-hunter-service-token` |
+| 2 | `.env` 5 项注入两编排 | PASS：`dcompose config` 渲染出 api-gateway 4 项 + data-collector 1 项，无 `<no value>` |
+| 3 | 重建镜像 + 容器健康 | PASS：两镜像重建 468.4s；`hunter-api-gateway` / `hunter-collector` 均 `Up (healthy)` |
+| 4 | 管理员登录取 Token | PASS |
+| 5 | 签发服务令牌 | PASS：令牌载荷 `sub=service:hunter-sim`、`client_id=hunter-sim`、`roles=[data-uploader]`、`permissions=[data:upload]`、`typ=service`、`exp-iat=604800` |
+| 6 | **再登录踢旧 Token（单会话语义未变）** | PASS：`old_admin=401` |
+| 7 | **服务令牌在再登录后仍可用（本轮核心需求）** | PASS：`POST /api/v1/data/files/presign` → `{"code":0,"message":"success"}` |
+| 8 | 服务令牌被控制台端点拒绝 | PASS：`/user/me`=401；再用服务令牌签发=`401` + `code=1001` |
+| 9 | 能力面收窄 | PASS：`GET /api/v1/data/files`=403 |
+| 10 | 两套会话并存 + TTL | PASS：`--scan 'session:*'` 同时命中 `session:service:hunter-sim` 与 `session:cd34f8d8-c434-4dba-9450-1934cbc09b13`（admin）；后者被第二次登录覆盖，前者不受影响；`TTL session:service:hunter-sim`=**604518s** |
+| 11 | 审计日志无令牌明文 | PASS：`service_token_issued client_id=hunter-sim issued_by=cd34f8d8-… ttl_seconds=604800`；`grep -c 'eyJ'`=**0** |
+| 12 | 撤销幂等 | PASS：两次 `DELETE …/service-token/hunter-sim` 均 `code=0` |
+| 13 | 撤销即时失效 | PASS：撤销后同一服务令牌调 presign=`401` |
+
+**关键证据（会话隔离在真实 Redis 数据上成立）**：
+
+- 管理员两次登录后，Redis 仅有一个 `session:{admin_uuid}`（单值被覆盖），而 `session:service:hunter-sim` **独立存活** ⇒ HunterSim 与 Web 前端可并行，不再互踢；
+- 日志 `issued_by=cd34f8d8-c434-4dba-9450-1934cbc09b13` 与 Redis 中 admin 会话键后缀一致，审计可追溯；
+- TTL 604518s = 604800 − 282（签发后经 282s 自然衰减），TTL 生效且未被用户登录/登出重置。
+
+**本轮未覆盖（如实标注，不代表已验收）**：
+
+1. **未打印 `data.upload_url`**：仅验证 presign 返回 `code=0`，`MINIO_PUBLIC_ENDPOINT` 对仿真端的可达性仍待在 HunterSim 侧确认；建议补一次「真传 1 MiB bag → `complete`」闭环（含 MD5/SHA-256 回填）。
+2. **K8s 形态未执行**（本机单机部署、无集群，同 V1.23.5 已定性的 `kubectl` 情形），见 §6.3。
+3. **HunterSim 客户端未改代码**：本次仅用 curl 模拟；客户端需把 `HUNTER_CORE_JWT_TOKEN` 换成服务令牌，并登记 `client_id` 台账（默认 7 天到期，`DELETE` 为唯一止血手段）。
+
+### 8. 兼容与风险
 
 - **无破坏性变更**：用户登录/刷新/登出/改密行为零变化，`session:{user_id}` 不被新逻辑触碰（契约 `never_touches` + 单测双重护栏）。既有 admin Token 继续可用，仅「脚本共享用户会话」的用法建议迁移到服务令牌。
 - **能力面收窄是设计而非缺陷**：服务令牌只放行 presign/complete；若脚本还需查询类接口，应按需新签角色/端点白名单，不要复用管理员账号。
 - 服务令牌 **长 TTL（默认 7 天，上限 30 天）**：泄露窗口比 Access Token 大，撤销入口（`DELETE …/service-token/{client_id}`）是唯一止血手段，务必登记 `client_id` 台账。
 - 服务令牌**不能**用于 WebSocket 与前端控制台：`typ=service` 被 `decode_access_token` 拒绝是预期（防令牌越权复用到用户面）。
+
+### 9. 分发与文档同步
+
+- 受跟踪文件：`contracts/database/redis-keys.yaml`、`contracts/openapi/{api-gateway,data-collector}.yaml`、`common/python/hunter_common/redis_keys.py`、`services/api-gateway/{app/**,README.md}`、`services/data-collector/{app/config.py,app/core/dependencies.py,app/tests/test_device_identity.py,README.md}`、`infra/deploy/{docker-compose.yml,.env.example}`、`infra/k8s/services/{api-gateway,data-collector}.yaml`、根 `.env.example`。
+- 按仓库规则「只更新、不入库」（`.gitignore` 含 `docs/`）：`docs/api-gateway.md`（服务令牌章节 + Redis 键一致性 + 待确认项 3）、`docs/运维操作手册.md`（「登录失效」条目补服务令牌用法与「HunterSim 不要再用 admin 登录取 Token」口径）、`docs/deployment.md`（§8 安全基线新增「服务令牌」行、§10 验证清单新增 #25 并行验证）、`release.md`（本条目）需单独同步到服务器。
+- `docs/故障排查指南.md` 与 `docs/01-部署概述与环境要求.md` 本轮**未新增场景/条目**：本特性为新增能力，未改变既有故障形态（服务令牌相关的 401/403 判据已写入运维手册与 deployment §10 #25）；若现场出现「HunterSim 突然 401」，先排除“令牌被 `DELETE` 撤销/旧镜像不认 `typ=service`/客户端误用了 admin Token”三种情况。
+
+## V1.23.7（修复：场景下发仿真报「Carla 管理 API 不可达」——真实成因是 `.env` 行尾注释被 docker compose 当成**值**下发；地址形态门禁 + 5001 文案按成因分流 + compose 配置面与 K8s 恢复对称）
+
+Date：2026-11-02
+变更类型：修复（scene-service 客户端 + 配置归一）+ 部署编排补齐 + 契约文档化 + 测试 + 文档
+
+**报告现象**：运营管理后台「场景库」对已发布场景（`SCN-2461-MRM-STD-L2-v3.0` 等 4 条，均 `published`）点「下发仿真」，顶部红色弹窗 **`Carla 管理 API 不可达`**（HTTP 503 + `code=5001`）。
+调用链定位：前端 `runScene` 传 `{}` ⇒ `mode` 默认 `sil` ⇒ 第一个 CARLA 调用是 `find_active_instance`（`GET /api/v1/instances`，**发生在建 Topic / 建实例之前**），所以「连 Topic 都没建就报错」是本链路的正常形状，不是 Kafka 故障。
+
+### 1. 现场取证（部署机 `/opt/HunterCore`，单机 compose，`hunter-net` 17 容器）
+
+| # | 取证点 | 结果 | 结论 |
+|---|---|---|---|
+| A | `.env` 第 86–91 行 | `CARLA_MANAGEMENT_ENDPOINT=                 # 例：http://carla-manager.hunter-core:2000`，其下 5 行为子路径/超时/重试 | 值写空、示例以**行尾注释**形式同行 |
+| B | `docker exec hunter-scene env` | `CARLA_MANAGEMENT_ENDPOINT=# 例：http://carla-manager.hunter-core:2000` | **决定性证据**：行尾注释被 compose 当成值下发进容器，值**非空** |
+| C | 容器/宿主监听 | 无任何 carla 容器；宿主仅 `127.0.0.1:8090`（dockerd 代管 `vil-forwarder`） | `carla-manager` 确实未部署 |
+| D | `hunter-net` 容器清单 | 17 个平台容器，无 `carla-manager` | 同上 |
+| E | 容器内 `/healthz` 直连脚本 | 无有效输出（heredoc 中 `{{}}`/引号被本机终端吞掉） | **不作为证据**，改由 F 取证 |
+| F | `docker logs hunter-scene` | `carla_request_failed error=UnsupportedProtocol path=/api/v1/instances attempt=1/2`（两次间隔 202ms = 退避 `0.2×1`），对外 `code=5001` 出现在 `/api/v1/scene/{id}/run` | 失败在**传输层协议判定**，根本没走到网络握手 |
+
+### 2. 根因（三段链，缺一不成立）
+
+1. **compose env-file 解析**：`KEY=    # 注释` 中，只要 `=` 右侧有非空内容，`#…` 就被当作**值**的一部分（不是注释）⇒ 容器生效值为 `# 例：http://…`；
+2. **`configured` 判定过宽**：`CarlaManagementClient.configured` 只判 `bool(base_url)` ⇒ 非空即「已配置」，绕过「未配置」分支；
+3. **兜底文案吞掉成因**：`UnsupportedProtocol` 属 `httpx.HTTPError`，落入 `except httpx.HTTPError` 的统一出口 ⇒ 输出「不可达」。
+⇒ **配置本身非法 / 网络不通 / 对端超时** 三类成因共用一条文案，把现场引向「查 CARLA 监听与防火墙」的错误方向（本轮实际多绕一轮）。
+
+**同轮发现并一并修的次生缺陷**：
+
+- compose 的 `scene-service` **只透传了 `CARLA_MANAGEMENT_ENDPOINT`**，`.env:87-91` 那 5 个键（8 路径中的部分 + 超时/重试）**完全无效**，与 `infra/k8s/services/scene-service.yaml` ConfigMap 不对称；而 `docs/carla-integration.md` §6.1 自 V1.23.3 起就写着「compose 与 K8s ConfigMap 已对称注入」——**文档与实现不符**，本轮一并更正。
+- 子路径模板缺 `{sim_instance_id}` 时 `str.format` 抛 `KeyError` 泄到请求层 ⇒ 变成 5000「服务器内部错误」，把「配置写错」伪装成「服务异常」。
+
+### 3. 修复内容
+
+**① `app/repositories/carla.py`：地址形态门禁 + 5001 文案按成因分流**
+
+- 新增模块级 `validate_management_endpoint(base_url) -> str | None`：仅接受 `http(s)://host[:port]`，拒绝「缺 scheme / 非 http(s) / 无主机名 / 基址携带子路径 / 无法解析」；**空值返回 `None`**（空属「未配置」分支，两者文案必须区分）。
+- `__init__` 构造期判定并存 `_endpoint_problem`，命中即 `logger.error("carla_endpoint_invalid", env=…, problem=…)`；**不阻塞启动**（场景库 CRUD 不应被 CARLA 配置缺陷带下），**不回显原始值**（可能含 userinfo/口令，只回显成因）；新增 `endpoint_problem` property。
+- `_request` 双前置守卫：先「未配置」、再「地址非法」，**在发出任何请求前**返回 5001（`details={env, problem, path}`），因而不产生实例/Topic/VIL 会话副作用；尾部按异常类型分流 `TimeoutException` / `UnsupportedProtocol` / 其它（`details.error` 带异常类名，便于现场直接判成因）。
+- 新增 `_render_path(env_name, template, instance_id=…)`：捕获 `KeyError/IndexError` → 5001「Carla 管理 API 子路径配置非法」并记 `carla_path_template_invalid`，不再泄成 5000；`_control_instance`/`_fetch_snapshot` 签名增加 `env_name`，submit/get/result/pause/resume/stop 6 个调用点同步。
+- 模块 docstring 改为**六类文案**清单；`__all__` 导出 `validate_management_endpoint`（供运维在容器内自检，不必发请求）。
+
+| 前端文案（均 HTTP 503 + `code=5001`） | 触发条件 | 对应日志事件 |
+|---|---|---|
+| Carla 管理 API 未配置 | 值为空 | —（不发请求） |
+| **Carla 管理 API 地址非法** | 值形态不合规（含本轮行尾注释污染） | `carla_endpoint_invalid` |
+| **Carla 管理 API 子路径配置非法** | `*_PATH` 缺 `{sim_instance_id}` | `carla_path_template_invalid` |
+| **Carla 管理 API 连接超时** | `ConnectTimeout`/`ReadTimeout` | `carla_request_failed` |
+| Carla 管理 API 不可达 | `ConnectError` 等真连不上 | `carla_request_failed` |
+| Carla 管理 API 返回 `<code>` / 响应非法 | 连得通但非 2xx / 非 JSON | `carla_error_response` / `carla_response_not_json` |
+
+**② compose 与 K8s 配置面恢复对称**
+
+- `infra/deploy/docker-compose.yml` 的 `scene-service.environment` 新增 **10 个键**：8 个 `CARLA_INSTANCE_*_PATH`/`CARLA_SCENARIO_SUBMIT_PATH` + `CARLA_REQUEST_TIMEOUT_SECONDS` + `CARLA_REQUEST_MAX_RETRIES`。
+- **子路径的插值默认值一律写空**（`${VAR:-}`）：docker compose 变量插值的 default 组按 `[^}]*` 匹配，遇到 `{sim_instance_id}` 里的第一个 `}` 就**截断**，因此不能把真实默认值写进 `${…:-…}`；超时/重试为纯数字，安全地写成 `:-5` / `:-1`。
+- `app/config.py` 配套新增 `CARLA_PATH_FIELDS`（8 项）+ `model_validator` `_blank_carla_paths_fallback`：空串/纯空白 → 回落 `model_fields[name].default`（与 K8s ConfigMap 默认一致），非空则 `strip()`。惯用法与既有 `kafka_contract_dir`（blank→None）、remote-control 的 URL 归一保持一致。
+
+**③ 契约与运维纪律**
+
+- `contracts/openapi/scene-service.yaml` 的 `x-hunter-simulation-flow` 新增机器可读段 `endpoint_address_contract`（format / validation / rationale / subpath_defaults / injection_parity）与 `failure_message_taxonomy`（六条 message→cause→可否改配置恢复）；pending #9 `contract_decision` 追加 V1.23.7 说明。
+- `infra/deploy/.env.example` 9a 小节头：标注「V1.23.7 起 compose 真正透传」+ **行尾注释纪律**（含复核命令 `docker exec hunter-scene env | grep -E '^[A-Z0-9_]+=.*#'`）；`CARLA_MANAGEMENT_ENDPOINT` 行上方加「禁止在本行末尾追加注释」；子路径注释加「留空即回落默认」。
+
+### 4. 验证
+
+| 验证项 | 结果 |
+|---|---|
+| `pytest services/scene-service/app/tests/test_carla_endpoint_guard.py` + `test_carla_hardening.py` | **29 passed**（新增 20 项：污染值/裸 host:port/带子路径/9 组形态参数化/模板非法不泄 5000/4 组传输异常文案分流/空值回落与显式覆盖） |
+| `pytest services/scene-service -q` | **325 passed** |
+| `ruff check services/scene-service` | **All checks passed**（本轮修掉 UP035：`Awaitable/Callable` 改从 `collections.abc` 导入） |
+| `ruff format --check` | 报 3 文件需重排，含**本轮未改动**的历史行 ⇒ 判定仓库不以 ruff format 为准，**未执行格式化** |
+| 全仓 `pytest` | **2 failed / 409 passed / 27 skipped**；两个失败为存量，与本轮无关（见 §8 待办 2） |
+| compose↔K8s 键对称校验（临时脚本，已删除） | compose `scene-service` 现 **11 个 `CARLA_` 键**（ENDPOINT + 8 路径 + 超时 + 重试），K8s ConfigMap **10 个**；去掉 `CARLA_MANAGEMENT_ENDPOINT`（按纪律不进 ConfigMap）后**两侧集合完全一致** |
+| 三个被改 YAML 解析 | `dcompose`/K8s/契约文件 `yaml.safe_load_all` 全部通过 |
+| **实机回验** | **未执行**——本机无 Docker；`dcompose config` 渲染、容器生效值、止血后的实际文案均待在部署机复跑（§5） |
+
+关键新用例（`test_carla_endpoint_guard.py`）：用 `POLLUTED_ENDPOINT = "# 例：http://carla-manager.hunter-core:2000"` 复刻现场值，断言 ① `client.configured` 仍为 `True`（证明旧 bool 判定确实区分不出来）、② 文案为「地址非法」且 `details.problem` 含 `scheme`、③ `client._client is None`（**请求前拦截、零副作用**）。
+
+### 5. 实机执行步骤（**待在部署机回验**；本轮只完成代码/编排/文档落地）
+
+```bash
+sudo -i && cd /opt/HunterCore && git pull
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+
+# 1) 止血：把行尾注释剥掉（值改干净，注释单独成行写在上方）
+#    ⚠ 该命令会把该行清成 `CARLA_MANAGEMENT_ENDPOINT=`（本轮现场值本就是空的）；已有真实地址时请手工编辑该行
+sed -i -E 's|^(CARLA_MANAGEMENT_ENDPOINT=).*#.*$|\1|' .env
+grep -n -B2 '^CARLA_MANAGEMENT_ENDPOINT=' .env
+# 1b) 同类体检：任何键的值里出现 # 都是同一形状污染（本轮实证只需这一条）
+dcompose config | grep -nE '^ +[A-Z0-9_]+: .*#' || echo '渲染值无 # 污染'
+
+# 2) 重建镜像（改了 app/config.py 与 repositories/carla.py，**必须 --build**；只 restart 会继续跑旧代码）
+dcompose build scene-service
+dcompose up -d --force-recreate scene-service   # 改 .env 后必须 force-recreate：restart 不重读 .env
+
+# 3) 生效值与形态自检（不发请求）
+docker exec hunter-scene env | grep -E '^CARLA_'
+docker exec hunter-scene env | grep -E '^[A-Z0-9_]+=.*#' || echo '无行尾注释污染'
+docker exec hunter-scene python3 -c 'from app.repositories.carla import validate_management_endpoint as v; import os; e=os.environ["CARLA_MANAGEMENT_ENDPOINT"]; print(repr(e)); print(v(e) or "OK")'
+docker exec hunter-scene python3 -c 'from app.config import Settings; s=Settings(); print(s.carla_instance_create_path, s.carla_scenario_submit_path)'  # 期望非空默认值
+
+# 4) 再点一次「下发仿真」，按文案分流
+#    「未配置」/「不可达」⇒ 本轮配置缺陷已消除，剩余是**真未部署 carla-manager**（设计预期，deployment §11 #14）
+#    「地址非法」⇒ 值仍写错，按 details.problem 改
+```
+
+### 6. 兼容与风险
+
+- **无 API/DDL/Kafka 契约变更**：错误码仍是 5001（HTTP 503），只细化 `message` 与 `details`；**前端弹窗文案会变**（「不可达」→「地址非法」等），属预期改进，无接口破坏。
+- **不阻塞启动**：形态非法仅在构造期记 `logger.error`，服务照起，场景库 CRUD 不受影响。
+- ⚠ **编排与镜像必须同批上线**：新 compose 以 `${VAR:-}` 注入空串，依赖新镜像里的 `_blank_carla_paths_fallback` 回落默认。**只更新 compose 而 scene-service 仍是旧镜像**时，旧代码无回落逻辑 ⇒ 子路径变成空串 ⇒ 请求打到 `base_url` 本身，属新增回归面。回滚须**同时**回滚镜像与 compose。
+- 子路径/超时/重试从此**在单机环境真正可改**（此前改 `.env` 无效）；若现场曾在 `.env` 里写过这些键并默认「不生效」，上线后会突然生效——需检查是否有历史遗留值。
+- 脱敏：`地址非法` 的 `details` 只含 `env`/`problem`/`path`，不回显原始 URL（可能带 userinfo）。
+- 止血后仍会返回 5001：`carla-manager` 未交付（取证 C/D，仓库无 `tools/carla-manager/`），**这是外部依赖未满足，不是平台缺陷**（deployment §11 待确认项 #14）。
+
+### 7. 分发与文档同步
+
+- 受跟踪文件：`services/scene-service/app/repositories/carla.py`、`services/scene-service/app/config.py`、`services/scene-service/app/tests/test_carla_endpoint_guard.py`（新增）、`infra/deploy/{docker-compose.yml,.env.example}`、`contracts/openapi/scene-service.yaml`。
+- 运维四件套（按仓库规则「只更新、不入库」，需单独同步到服务器）：
+  - `docs/故障排查指南.md`：§19.1 事件表由 4 行扩到 9 行（新增 `carla_endpoint_invalid`/`carla_path_template_invalid`，并把 `carla_request_failed` 按三类文案拆开、补上 `carla_error_response`），新增 **§19.1.1「不可达」≠「网络不通」：先取证容器生效值**（含 sed 止血命令与 `env | grep -E '^[A-Z0-9_]+=.*#'` 体检）；
+  - `docs/运维操作手册.md`：§3.12 ② 段由「读 `.env` 文本」改为**读容器生效值** + 形态自检 + 六类文案分流口径 + 「改 `.env` 必须 `--force-recreate`」；
+  - `docs/deployment.md`：§11 待确认项 #14 补「配置写错与网络不通已分流」；§17.4 配置表三行改写 + 新增「注入对称面」注记（含插值截断与空值回落两条设计要点）；§17.5 步骤 2 补行尾注释禁令；§8 CARLA 段补 V1.23.7 形态约束；
+  - `docs/01-部署概述与环境要求.md`：CARLA 说明块新增 V1.23.7 配置面补充段；§5 环境变量表 `CARLA_MANAGEMENT_ENDPOINT` 行补形态与注释禁令。
+- 另两处同步更正（非四件套，但属同一事实错误）：`docs/carla-integration.md` §6.1「现状核对」重写（明确 V1.23.3～V1.23.6 的「已对称注入」表述不实）；`docs/仿真端接入平台系统方案.md` §9.5 配置注入现状注记（并标注 `SIM_PROVIDER`/`SIM_MANAGEMENT_ENDPOINT` 等通用化别名**尚未实现**）。
+
+### 8. 结论与待办（**未修复 / 不在本轮范围**，如实登记）
+
+1. **同形状插值风险残留**：`infra/deploy/docker-compose.yml:783` `KAFKA_PRODUCE_TOPICS: ${VIL_OUTPUT_TOPIC_TEMPLATE:-carla.{sim_id}.vil_state}` 的插值默认值同样含 `{…}`，属本轮规避掉的同一截断形状；当前只因 `.env` 显式赋了值才未暴露。建议下一轮改为 `${VAR:-}` + `vil-forwarder` 配置侧回落，并补对称性测试。
+2. **两个存量测试失败**（均与本轮改动无关：本轮未新增路由、未触碰 ota-service）：
+   - `tests/integration/test_api_contract_surface.py::test_readyz_reports_dependency_state[ota-service]`——`/readyz` 响应多出 `minio` 键，与契约断言不符（需定性：契约补键 还是 实现去键）；
+   - 同文件 `::test_implemented_routes_subset_of_contract[scene-service]`——25 个 `/api/v1/scene/{logical,generate,concrete,testcases,suites,coverage,oracles}` 端点未登记进 `contracts/openapi/scene-service.yaml` 的 `paths`（引擎侧端点长期未回填契约）。
+   本轮未试图掩盖或跳过这两项；因沙箱拒绝 `git stash push -u`（`cannot create standard input pipe for update-index: Permission denied`），**未能用「回到干净工作树复跑」的方式证明其为存量**，判定依据是「失败断言与本轮改动面不相交」。
+3. **实机未回验**：本机无 Docker，§5 全部步骤待在部署机执行并回填本条目（尤其 ① `dcompose config` 渲染无 `#` 污染；② 容器内 `CARLA_INSTANCE_*_PATH` 空值确实回落默认；③ 下发仿真文案从「不可达」变为「未配置」或明确的网络类错误）。
+4. **`carla-manager` 仍未交付**（取证 C/D）：本轮只把「为什么报不可达」讲清楚，**没有**、也不可能在平台侧让仿真跑通。
 
