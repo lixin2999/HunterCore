@@ -44,6 +44,11 @@ EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
     "carla:sim:{sim_id}:artifacts": ("Hash", 86400),
     # 服务令牌会话（V1.23.6）：与 session:{user_id} 隔离（用户登录/刷新/登出不触碰）
     "session:service:{client_id}": ("String", 604800),
+    # 仿真节点动态地址直推（V1.24.0）：TTL 均为默认值（SIM_NODE_LEASE / SIM_INSTANCE_TTL）
+    "sim:node:{node_id}": ("String(JSON)", 90),
+    "sim:node:seen": ("ZSet", None),
+    "sim:instance:active": ("ZSet", None),
+    "sim:runtime:{sim_instance_id}": ("String(JSON)", 86400),
 }
 
 #: MinIO Bucket（名称 → 过期天数；None = 永久）——系统关键约束第 7 条（名称不可更改）
@@ -168,7 +173,7 @@ def expected_expiry_rules() -> dict[str, list[tuple[int, str | None]]]:
     ]
     return rules
 def test_redis_contract_keys_and_ttls_match_constraints() -> None:
-    """9 个受控键：键模式 / 类型 / TTL 与系统关键约束第 8 条逐项一致。"""
+    """受控键全集：键模式 / 类型 / TTL 与系统关键约束第 8 条（含实现期登记的扩展键）逐项一致。"""
     keys = contract_keys()
     assert set(keys) == set(EXPECTED_REDIS_KEYS)
     for pattern, (expected_type, expected_ttl) in EXPECTED_REDIS_KEYS.items():
@@ -188,7 +193,10 @@ def test_redis_contract_keys_declare_failure_path_and_ownership() -> None:
         assert entry.get("readers"), f"{pattern} 缺少 readers"
         if entry.get("ttl_seconds") is None:
             ops = " ".join(str(op) for op in entry.get("ops") or [])
-            assert "DEL" in ops or "SREM" in ops, f"{pattern} 无 TTL 时必须主动清理"
+            # Set 用 SREM、ZSet 用 ZREM、Hash 用 HDEL：形式不拘，但必须有主动清理路径
+            assert any(op in ops for op in ("DEL", "SREM", "ZREM", "HDEL")), (
+                f"{pattern} 无 TTL 时必须主动清理"
+            )
         owner = entry.get("owner_service")
         if owner is not None:
             assert owner in set(entry["writers"]) | set(entry["readers"]), pattern

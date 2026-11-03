@@ -41,6 +41,20 @@ data:
   SIM_TOPIC_REPLICATION_FACTOR: "3"       # 生产 Kafka replication.factor=3
   SIM_TOPIC_DELETE_DELAY_SECONDS: "600"
   SIM_INSTANCE_TTL_SECONDS: "86400"
+  # 仿真下发链路模式（V1.24.0，契约 x-hunter-simulation-flow.node_dispatch）
+  #   direct：固定地址（CARLA_MANAGEMENT_ENDPOINT 由环境 overlay 注入）——集群内默认值
+  #   node  ：按注册/心跳自学习到的 ip:manager_port 直推节点 CARLA 管理 API；
+  #           ⚠ 仅适用于 Pod 可直接路由到节点网段的部署（hostNetwork / 同二层），否则表现为 5001；
+  #           ⚠ 地址不在配置里硬编：实例只绑 node_id，每次调用重新解析 ⇒ 节点 IP 漂移由心跳自愈
+  SIM_DISPATCH_MODE: "direct"
+  SIM_NODE_LEASE_SECONDS: "90"
+  SIM_NODE_DEFAULT_CAPACITY: "1"
+  SIM_NODE_ROLES: "data-uploader,admin"    # 空 = 无任何角色可注册节点，禁止置空
+  SIM_NODE_MANAGER_DEFAULT_PORT: "8090"
+  SIM_NODE_MANAGER_SCHEME: "http"
+  SIM_NODE_TRUST_FORWARDED_FOR: "true"     # 经由 api-gateway/Ingress 转发的部署保持 true
+  SIM_NODE_ALLOWED_NETWORKS: ""            # 逗号分隔 CIDR；收紧为仅办公网段时填写（空 = 不限制）
+  SIM_NODE_CLIENT_CACHE_MAX: "32"
   # 运行时契约目录（KafkaAdmin 读取 topics.yaml / consumer-groups.yaml）
   KAFKA_CONTRACT_DIR: "/app/contracts/kafka"
   # 场景约束与缓存（SCENE_DETAIL_CACHE_TTL_SECONDS 与 Redis Key 契约同源 = 3600）

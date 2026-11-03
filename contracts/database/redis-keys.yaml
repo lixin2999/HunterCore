@@ -345,14 +345,87 @@ keys:
       - "contracts/openapi/api-gateway.yaml（POST /api/v1/user/service-token、DELETE /api/v1/user/service-token/{client_id}）"
       - "contracts/openapi/api-gateway.yaml#x-hunter-service-token（服务令牌语义与上传端点白名单）"
 
+  # ---------------------------------------------------------------- 18
+  #  仿真节点动态地址直推（V1.24.0，契约 scene-service.yaml#x-hunter-simulation-flow.node_dispatch）
+  #  设计原理：节点出向注册/心跳时平台从入站头学习来源 IP 并覆盖登记；
+  #  下发时按 node_id 解析当前地址、直推节点 CARLA 管理 API。
+  #  IP 变化在下一次心跳刷新 ⇒ 自动愈合，无需人工处置。
+  - pattern: "sim:node:{node_id}"
+    type: "String(JSON)"
+    value: "节点注册信息 + 自学习地址（owner / carla_version / maps / capacity / running / endpoint_ip / manager_port / protocol / endpoint_source / learned_at）"
+    ttl_seconds: 90
+    ttl_source: "V1.24.0：在线租约 SIM_NODE_LEASE_SECONDS 默认 90s，每次注册/心跳 SET EX 续租"
+    owner_service: scene-service
+    writers: [scene-service]
+    readers: [scene-service]
+    lifecycle: |
+      节点 PUT /api/v1/scene/sim-nodes/{node_id} 注册与 POST .../heartbeat 均 SET key json EX 90（覆盖式续租，含刷新的 IP）；
+      掉线即键自然过期、无需主动 DEL；listNodes 以 sim:node:seen 分数判在线并顺手 ZREM 过期成员。
+      ⚠ endpoint_ip = 平台自学习结果（X-Real-IP 优先、XFF 降级、TCP 对端保底），每次注册/心跳刷新。
+    sensitive: false
+    ops: ["SET key json EX 90", "GET", "TTL", "DEL"]
+    refs:
+      - "contracts/openapi/scene-service.yaml#x-hunter-simulation-flow.node_dispatch"
+
+  # ---------------------------------------------------------------- 19
+  - pattern: "sim:node:seen"
+    type: "ZSet"
+    value: "member = node_id，score = 最后心跳 epoch 秒（在线判定与节点枚举索引）"
+    ttl_seconds: null
+    ttl_source: "无硬 TTL：在线 = score > now - SIM_NODE_LEASE_SECONDS；过期成员由读取方懒清理"
+    owner_service: scene-service
+    writers: [scene-service]
+    readers: [scene-service]
+    lifecycle: "注册/心跳 ZADD key <now> <node_id>；读取节点清单时对 score 落后超租约者 ZREM（崩溃残留由下次读取清理）"
+    sensitive: false
+    ops: ["ZADD", "ZRANGEBYSCORE", "ZREM"]
+    refs:
+      - "contracts/openapi/scene-service.yaml#x-hunter-simulation-flow.node_dispatch"
+
+  # ---------------------------------------------------------------- 20
+  - pattern: "sim:instance:active"
+    type: "ZSet"
+    value: "member = sim_instance_id，score = 创建 epoch 秒（活动实例索引，支撑同场景并行判定）"
+    ttl_seconds: null
+    ttl_source: "无硬 TTL：终态/取消时 ZREM；残留由读取方按 sim:instance 键是否存活懒清理"
+    owner_service: scene-service
+    writers: [scene-service]
+    readers: [scene-service]
+    lifecycle: "node 模式下创建实例 ZADD；终态回收（_finalize_instance）ZREM；查活动实例时跳过对应运行时键已消失的成员并 ZREM"
+    sensitive: false
+    ops: ["ZADD", "ZRANGE", "ZREM"]
+    refs:
+      - "contracts/openapi/scene-service.yaml#x-hunter-simulation-flow.node_dispatch"
+
+  # ---------------------------------------------------------------- 21
+  - pattern: "sim:runtime:{sim_instance_id}"
+    type: "String(JSON)"
+    value: "实例→节点归属绑定（node_id / scene_id / sim_id / last_status / updated_at）"
+    ttl_seconds: 86400
+    ttl_source: "V1.24.0：与 sim:instance 元数据同寿命（SIM_INSTANCE_TTL_SECONDS 默认 86400），终态后保留供结果查询与排障"
+    owner_service: scene-service
+    writers: [scene-service]
+    readers: [scene-service]
+    lifecycle: |
+      node 模式下创建实例成功后 SET key json EX 86400（写入 node_id 归属与初始状态）；
+      后续每次代理查询（get_instance / get_result）刷新 last_status 与 updated_at，使活动索引随查询自然收敛；
+      实例终态后 ZREM sim:instance:active、本键保留至 TTL（仅供追溯与节点定位）。
+      ⚠ 仅存 node_id、不存地址串——地址在每次调用时从 sim:node 解析（这是 IP 漂移自愈的落点）
+    sensitive: false
+    ops: ["SET key json EX 86400", "GET", "DEL"]
+    refs:
+      - "contracts/openapi/scene-service.yaml#x-hunter-simulation-flow.node_dispatch"
+
 # =====================================================================
 # 交叉校验（scripts/verify_data_layer.py / common/python/tests/test_storage_contracts.py）
 #   1) 各服务 openapi 的 x-hunter-service.redis_keys 声明的键 ∈ 本文件 keys[].pattern
 #   2) 声明中的 type / ttl_seconds 与本文件一致
 #   3) 声明键的服务 ∈ 本文件 writers ∪ readers
-#   4) 17 个受控键的 TTL 与声明一致：session 1800（G-04① 收紧，原第 8 条 7200）/ rate_limit 1 /
+#   4) 21 个受控键的 TTL 与声明一致：session 1800（G-04① 收紧，原第 8 条 7200）/ rate_limit 1 /
 #      ota:progress 86400 / cache:scene 3600 / analytics:ingest_latency 300（指标缓存，pending #10 结案）/
-#      session:service 604800（V1.23.6 服务令牌默认 7 天）/ vehicle:* 与 rc:session 不过期（null）
+#      session:service 604800（V1.23.6 服务令牌默认 7 天）/ vehicle:* 与 rc:session 不过期（null）/
+#      sim:node 90 + sim:runtime 86400（V1.24.0 动态地址直推，均为默认值、可环境变量调）/
+#      sim:node:seen 与 sim:instance:active 为 ZSet 不过期（懒清理）
 # =====================================================================
 cross_check:
   contracts:

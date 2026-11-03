@@ -6866,6 +6866,34 @@ docker exec hunter-scene python3 -c 'from app.config import Settings; s=Settings
 #    「地址非法」⇒ 值仍写错，按 details.problem 改
 ```
 
+### 5.1 实机回验记录（2026-11-02，部署机 + HunterSim；**部分完成**）
+
+**已验判据（PASS）**：
+
+| 项 | 实机证据 |
+|---|---|
+| 污染消除 | 按上方 sed 止血后：`渲染值无 # 污染` + `无行尾注释污染`（注意：把模式里的 `.*` 换成具体值会永不匹配，本轮现场第一遍就踩了这个） |
+| compose 透传（修复②） | 容器 env 出现 `CARLA_INSTANCE_{GET,RESULT,PAUSE,RESUME,STOP}_PATH=` —— V1.23.7 前这 5 个键根本不在容器里 |
+| 空值回落（修复②） | `Settings()` 仍输出 `/api/v1/instances` 与 `/api/v1/instances/{sim_instance_id}/scenario` |
+| 地址门禁（修复①）命中 1 | 现场污染值 → 「缺少 scheme（正确形态：`http://<host>[:<port>]`…）」 |
+| 地址门禁命中 2 | 误填 `http://:8090` → 「缺少主机名」，且**未发出请求**（旧镜像会把这形态泄成「不可达」误报） |
+| **契约 #9 子路径面** | 8 条路径全部命中平台默认值，**无需配置任何 `CARLA_INSTANCE_*_PATH`** |
+
+**新发现的实机事实（均非平台缺陷，但推翻了本文档原有假设）**：
+
+1. **HunterSim 控制面无 `/healthz`**（GET/POST 均 404）。三处文档原拿 `/healthz` 当管理 API 连通判据（手册 §3.12 ②、故障排查指南 §19.1、carla-integration §6.3/§7.1）**必然失败并把「对端正常」误判成「不可达」**，已全部改为探契约端点 `GET /api/v1/instances?scene_id=probe`（实机 200 `{"items":[]}`）。
+2. **子路径逐条探测**（回环、无活动实例）：`/api/v1/instances` GET=200 / POST=422；`/instances/{id}` 与 `/instances/{id}/result` GET=404（handler 报实例不存在，路由存在）；`/instances/{id}/{scenario,pause,resume,stop}` GET=405 / POST=404。判读方法（404 两种成因的分流）已写入 `docs/carla-integration.md` **§7.2.1**。
+3. **适配器已绑 `0.0.0.0:8090`**（`Get-NetTCPConnection` 实证）——本轮曾据日志 `control plane ready on 127.0.0.1:8090` 判定为硬阻塞，**该判定推翻**：日志那行不等于实际监听地址。
+4. **当前唯一的阻塞已实机定性为「平台 → HunterSim 无路可走」：跨网段存在路由环 + 中间 SNAT**（非平台缺陷、已排除防火墙与绑定地址）：HunterSim 跑在 Windows，以太网 IPv4 = `192.168.1.103/24`（DHCP，网关 `192.168.1.1`）；平台在 `192.168.31.0/24`，`ip route get 192.168.1.103` 为 `via 192.168.31.1 dev enp0s31f6`。`tracepath -n 192.168.1.103` 实测逐跳为 **`192.168.31.1 → 192.168.251.37 → 10.0.0.1 ⇄ 10.0.0.2` 无限往复至 `Too many hops`** ⇒ 中间两台路由器对 `192.168.1.0/24` 互指对方为下一跳。这与先前 `ping` 回 `Time to live exceeded`、容器内 `httpx.ConnectError: [Errno 113] No route to host` 同一成因。
+   ⚠ **「对端能连平台」为何不等于「平台能连对端」——已用抓包实证**：Windows 自述发包源为 `192.168.1.103`（接口：以太网），而平台网卡**收到的源是 `192.168.31.20`** ⇒ 两网段之间有一台设备在做 **SNAT**。于是 SYN-ACK 回 `192.168.31.20`（同网段，直接可投递）握手成功，而平台**主动新建**到 `192.168.1.103` 的连接没有 conntrack 状态可借用，只能查路由表 → 掉进上述的环。
+   > 取证方法（可复用，已写入 `docs/故障排查指南.md` §19.1.2）：平台侧 `sudo tcpdump -ni enp0s31f6 -c 30 'tcp port 8080'`，同时在对端连打三次 `Test-NetConnection ... -Port 8080 -InformationLevel Quiet`。**看到 N 组「SYN→SYN/ACK→ACK→FIN」裸握手、临时端口连续递增（本例 61917/61918/61919）即可确认抓到的源就是自己触发的那次**，排除同段其他机器干扰。
+   > 反向回访已测不通：`curl -s -m3 http://192.168.31.20:8090/api/v1/instances?scene_id=probe` 无输出（SNAT 只还原已建立会话的回程，符合预期）。**结论：平台侧无任何配置可解**，只能在网络/拓扑侧选路：① HunterSim 接入平台同网段（WLAN 连平台 WiFi；本例其 WLAN 为 169.254 未连接）；② 网络侧修环 + 做 8090 端口转发；③ HunterSim 侧反向隧道（利用已证明可用的出向；因管理 API **无鉴权**，隧道只能绑平台宿主回环/docker 桥，绝不绑 `0.0.0.0`）；④ 平台补一张网卡接入 `192.168.1.0/24`（与 ① 等效，取决于布线条件）。⚠ 无论哪条，**地址必须固化**（DHCP 保留/静态），否则 `.env` 会随地址漂移失效。
+5. **`192.168.122.14` 不是 HunterSim**：它只是 api-gateway 日志近 60min 里唯一出现的 192.168 源 IP（一条 `auth_login_succeeded username=admin`），而 HunterSim 机器上**没有 192.168.122.x 网卡**（只有 `192.168.1.103` 加若干 169.254 APIPA）。该值一度被误填进 `.env`，已由门禁与连通测试排除。（结合上条的 SNAT 实证，它**很可能是某台经 NAT 的客户端**（包括 HunterSim 早期会话），但绝非 HunterSim 本身地址。）
+6. 两条取证命令本轮被证伪、不再使用：`ss -tn state established '( sport = :8080 )'`（宿主端口经 DNAT，established socket 在容器 netns，宿主看不到）；`conntrack -L`（本机无输出）。**可靠的是服务日志里的 `client_ip=` 字段**，但它只能证明「该 IP 访问过平台」，要认定某个客户端仍需与对端网卡清单交叉比对。
+7. **Windows 防火墙已排除为本轮成因**：`New-NetFirewallRule` 需**管理员 PowerShell**（普通会话报 `PermissionDenied`，系统错误 5）；提权后已建成并自检确认 `Enabled=True / Allow / Profile=Any`（以太网落在 **Public** profile，默认入站全阻，故 `-Profile Any` 必需）。另有一次粘贴事故：两条命令被合并、PowerShell 进入 `>>` 续行态，导致第一次 `New-NetFirewallRule` **表面上执行了但实际未创建**（无规则对象输出、无报错）——因此**配置类命令必须紧跟一条存在性自检**。建好后平台侧仍秒回 `No route to host`，据此把成因从防火墙转向路由环。
+
+**当前 `.env` 状态**：`CARLA_MANAGEMENT_ENDPOINT=http://192.168.1.103:8090`——地址形态已由门禁判为 `OK`、子路径全回落默认，**平台侧无需再改任何配置**；只剩网络。若最终改走「同网段」或「端口转发」出路，此值需跟着改成 HunterSim 的新可路由地址（或转发后的对外地址）并 `--force-recreate`。
+
 ### 6. 兼容与风险
 
 - **无 API/DDL/Kafka 契约变更**：错误码仍是 5001（HTTP 503），只细化 `message` 与 `details`；**前端弹窗文案会变**（「不可达」→「地址非法」等），属预期改进，无接口破坏。
@@ -6883,7 +6911,8 @@ docker exec hunter-scene python3 -c 'from app.config import Settings; s=Settings
   - `docs/运维操作手册.md`：§3.12 ② 段由「读 `.env` 文本」改为**读容器生效值** + 形态自检 + 六类文案分流口径 + 「改 `.env` 必须 `--force-recreate`」；
   - `docs/deployment.md`：§11 待确认项 #14 补「配置写错与网络不通已分流」；§17.4 配置表三行改写 + 新增「注入对称面」注记（含插值截断与空值回落两条设计要点）；§17.5 步骤 2 补行尾注释禁令；§8 CARLA 段补 V1.23.7 形态约束；
   - `docs/01-部署概述与环境要求.md`：CARLA 说明块新增 V1.23.7 配置面补充段；§5 环境变量表 `CARLA_MANAGEMENT_ENDPOINT` 行补形态与注释禁令。
-- 另两处同步更正（非四件套，但属同一事实错误）：`docs/carla-integration.md` §6.1「现状核对」重写（明确 V1.23.3～V1.23.6 的「已对称注入」表述不实）；`docs/仿真端接入平台系统方案.md` §9.5 配置注入现状注记（并标注 `SIM_PROVIDER`/`SIM_MANAGEMENT_ENDPOINT` 等通用化别名**尚未实现**）。
+- 另三处同步更正（非四件套，但属同一事实错误）：`docs/carla-integration.md` §6.1「现状核对」重写（明确 V1.23.3～V1.23.6 的「已对称注入」表述不实）；`docs/仿真端接入平台系统方案.md` §9.5 配置注入现状注记（并标注 `SIM_PROVIDER`/`SIM_MANAGEMENT_ENDPOINT` 等通用化别名**尚未实现**）。
+- **§5.1 回验后追加的文档修正（同一批改写，未单独成条）**：`docs/运维操作手册.md` §3.12 ②、`docs/故障排查指南.md` §19.1「不可达」行、`docs/carla-integration.md` §6.3/§7.1 —— 四处凡以 `/healthz` 探外部管理 API 的命令均改为探 `GET /api/v1/instances?scene_id=probe`，并加「勿用 `/healthz`」告警；`docs/carla-integration.md` 新增 **§7.2.1**（无活动实例时的 8 路径探测脚本 + 404 两种成因的判读表）。
 
 ### 8. 结论与待办（**未修复 / 不在本轮范围**，如实登记）
 
@@ -6892,6 +6921,258 @@ docker exec hunter-scene python3 -c 'from app.config import Settings; s=Settings
    - `tests/integration/test_api_contract_surface.py::test_readyz_reports_dependency_state[ota-service]`——`/readyz` 响应多出 `minio` 键，与契约断言不符（需定性：契约补键 还是 实现去键）；
    - 同文件 `::test_implemented_routes_subset_of_contract[scene-service]`——25 个 `/api/v1/scene/{logical,generate,concrete,testcases,suites,coverage,oracles}` 端点未登记进 `contracts/openapi/scene-service.yaml` 的 `paths`（引擎侧端点长期未回填契约）。
    本轮未试图掩盖或跳过这两项；因沙箱拒绝 `git stash push -u`（`cannot create standard input pipe for update-index: Permission denied`），**未能用「回到干净工作树复跑」的方式证明其为存量**，判定依据是「失败断言与本轮改动面不相交」。
-3. **实机未回验**：本机无 Docker，§5 全部步骤待在部署机执行并回填本条目（尤其 ① `dcompose config` 渲染无 `#` 污染；② 容器内 `CARLA_INSTANCE_*_PATH` 空值确实回落默认；③ 下发仿真文案从「不可达」变为「未配置」或明确的网络类错误）。
-4. **`carla-manager` 仍未交付**（取证 C/D）：本轮只把「为什么报不可达」讲清楚，**没有**、也不可能在平台侧让仿真跑通。
+3. ~~**实机未回验**~~ → **部分回验已完成，见 §5.1**：compose 透传、空值回落、地址门禁两次命中、子路径全对齐均已实机确认。**尚缺下发闭环**——已实证为**平台→HunterSim 无路可走**（`10.0.0.1 ⇄ 10.0.0.2` 路由环 + 中间 SNAT，已排除防火墙/绑定地址/平台配置）；需按 §5.1-4 的四条出路之一打通并**固化地址**后，复跑 §5 步骤 4 记录 `POST /api/v1/scene/{id}/run` 的真实响应。
+4. **`carla-manager` 侧仍未交付**（取证 C/D；本轮只把「为什么报不可达」讲清楚，不可能在平台侧让仿真跑通）。**进展**：契约 #9 的**子路径面已实机确认**（8 条全对齐、无实例查回 200 `{"items":[]}`、无实例进度/结果查询回 404）；**仍未验的是响应体结构**——create 返回的 `sim_instance_id` 字段名与 `status` 取值域、progress/result 的字段形状，需在首次真实下发后回填，因此 #9 仍不能从 `x-hunter-pending-confirmation` 移除。`docs/carla-integration.md` §6.1「create 必须异步」告警继续生效（「8090 端口重名」仅在同机部署时成立，本轮为跨机，未命中）。
+
+## V1.24.0（新增：仿真下发链路第二模式 `node` —— 平台从注册/心跳的**入站请求头自学习** HunterSim 地址，按 `node_id` 取当前地址直推其 CARLA 管理 API；IP 漂移由**下一次心跳自愈**、无需人工处置）
+
+Date：2026-11-03
+变更类型：新增（scene-service 链路模式 + 契约 + 配置 + 部署编排 + 测试 + 文档），默认模式不变 ⇒ **向后兼容**
+
+### 1. 动机：实机拓扑推翻了 V1.23.7 的结论
+
+| 事实 | 出处 | 对链路的影响 |
+|---|---|---|
+| 平台服务器**有线**接交换机（`192.168.31.35`），HunterSim **只能走 WiFi**（`192.168.31.20`），二者**同网段** | 本轮现场记录 | 平台**可以回访** HunterSim 的 CARLA 管理端口（8090）⇒ 不必坚持「只能节点拉取」 |
+| HunterSim 的地址由 **DHCP** 分配，会漂移 | 同上（V1.23.7 §5.1 亦记录 Windows 侧以太网为 DHCP） | V1.23.7 写下的「**地址必须固化**」只对 `direct` 成立；若把地址写进 `.env`，节点重连一次 WiFi 就永久失效 |
+| V1.23.7 §5.1-4 的「平台→对端无路可走」是**跨网段**那台机器（`192.168.1.103`，`10.0.0.1 ⇄ 10.0.0.2` 路由环 + 中间 SNAT） | V1.23.7 §5.1 | 该结论**不适用于同网段的当前拓扑** ⇒ 回访可用，本模式才有落点 |
+| 需求原话：「hunter core 获取到 huntersim 的 IP……即使 huntersim 的 IP 发生变化也不会导致 hunter core 下发场景失败」 | 本轮需求 | 判据：地址是**运行时事实**而非配置项；实例只绑 `node_id`，地址在**每次调用瞬间**解析 |
+
+⚠ **同轮返工如实登记**：本任务先前实现过一套「任务队列 + 长轮询 + ack + 回报」（约 700 行实现 + 500 行测试 + 3 个 Redis 键 `sim:task:*` + 3 个契约端点），其存在前提是「平台不可回访节点」。在上面第一条事实成立后它没有用途，**已整体删除**，本节交付的是替换后的链路；因该代码从未提交，`git diff` 相对 HEAD 看不到这段删除。
+
+### 2. 链路（服务层 7 步语义零改动，只换寻址）
+
+```
+HunterSim                          scene-service（平台）
+  │ PUT /sim-nodes/{node_id} ────────▶ ① 从入站头学地址：X-Real-IP → XFF 首跳 → TCP 对端
+  │                                   ② 逐条 ipaddress 字面量校验 + CIDR 白名单 → 覆盖写 sim:node:{node_id}
+  │ POST /sim-nodes/{id}/heartbeat ─▶ ③ 同一入口每 30s 再刷一次（IP 漂移的唯一自愈点）
+  │
+  │  运营后台点「下发仿真」 ─────────▶ ④ select_node(map_id) → 按 node_id 读**当前** ip:port
+  │ ◀────── HTTP 直推 ────────────── ⑤ http://{学到的IP}:{manager_port} + 既有 8 条子路径 → CarlaManagementClient
+  │                                   ⑥ sim:runtime:{实例} 只存 node_id（不存地址）→ ③⑥⑦ 每次操控重新解析
+  │  （换 IP 后）心跳 ───────────────▶ ⑦ 基址变化 → 新建客户端并 aclose 旧的；实例归属不变 ⇒ 下发不失败
+```
+
+关键取舍：**推送失败不回落队列、不改投别的节点**，一律 5001 明确暴露（`details.endpoint` 回显目标地址）——现场才能区分「节点掉线（心跳没了）」与「节点在线但回访不通（防火墙/AP 客户端隔离）」。
+
+### 3. 变更清单
+
+**① 契约层**
+
+- `contracts/openapi/scene-service.yaml`：`x-hunter-simulation-flow.node_dispatch` 的 `delivery` 由 `queue_and_poll` 改为 `push_to_learned_endpoint`；`addressing_rule` 由「禁止按入站学到的源地址回访」改写为「地址来源 = 入站自学习、仅由注册/心跳写入、每次覆盖，实例侧只持久化 `node_id`」；新增 `endpoint_learning`（头优先级 / 采信开关 / 字面量校验 / CIDR 白名单 / IPv6 加方括号 / 全级失败 → 2001）与 `failure_semantics`（无在线节点 5001、租约过期 5001、目标不可达 5001 + `details.endpoint`）；删除 `task_types`/`reclaim`/`ack` 段落。
+- 端点收敛为 3 个：`listSimNodes` / `registerSimNode` / `heartbeatSimNode`（删 `tasks`、`tasks/{task_id}/ack`、`instances/{id}/report`）；`required_env` 补 9 个键（`SIM_DISPATCH_MODE` + 8 个 `SIM_NODE_*`）。
+- Schema：`SimNodeRegisterRequest` 新增 `manager_port`（1–65535）/`protocol`（`http|https`）；`SimNodeData` 新增 `endpoint_ip`/`manager_port`/`endpoint_source`（`real-ip|forwarded-for|socket-peer`）/`learned_at`；删 `SimTask*`/`SimInstanceReport*`/`SimulationArtifactReport`。
+- `contracts/database/redis-keys.yaml`：删 `sim:task:queue:{node_id}`、`sim:task:inflight:{task_id}`、`sim:task:inflight:seen`；`sim:node:{node_id}` 值结构补地址五字段、usage 改「注册信息与自学习地址（心跳刷新）」；`sim:runtime:{sim_instance_id}` 语义由「节点回报快照」改为「实例→节点归属绑定」（TTL 仍 `sim_instance_ttl_seconds`=86400）。
+
+**② 共享层** `common/python/hunter_common/redis_keys.py`：删 `sim_task_queue_key`/`sim_task_inflight_key`/`SIM_TASK_INFLIGHT_SEEN`，保留 `SIM_NODE`/`SIM_NODE_SEEN`/`SIM_INSTANCE_ACTIVE`/`SIM_RUNTIME`；`tests/test_storage_contracts.py` 与 `scripts/verify_data_layer.py` 的键数断言同步（受控键 21 个）。
+
+**③ scene-service**
+
+- 新增 `app/core/client_ip.py`（131 行，纯函数）：`learn_node_endpoint`/`normalize_ip`/`in_allowed_networks`/`build_base_url`；不读全局、不碰仓储 ⇒ 注册/心跳与单测都能直接驱动。
+- 新增 `app/repositories/sim_nodes.py`（322 行）：`SimNodeStore` 只做 Redis 原语，核心是 `node_endpoint(node_id, *, now)`（租约过期或无合法地址 → `None`）；无队列原语。
+- 新增 `app/repositories/sim_dispatch.py`（434 行）：`SimRuntimeBackend` Protocol（与 `CarlaManagementClient` 同签名 ⇒ 服务层 855 行的 7 步流程整体复用）+ `SimNodeBackend`（每 `node_id` 缓存一个客户端、基址变化即新建并 `aclose` 旧的、超上限按插入序淘汰；`find_active_instance` **只向归属节点单点复核**、不 fan-out；查询成功回写 `last_status` 使索引自然收敛）。
+- `app/{schemas,services,routers}/sim_nodes.py`（179/318/99 行）：3 端点；注册/心跳收 `Request` 本体做地址自学习，学习失败 → 2001；owner 首绑与校验、租约、`online` 判定沿用。
+- `app/config.py`：新增 `sim_node_manager_default_port=8090`/`sim_node_manager_scheme=http`/`sim_node_trust_forwarded_for=true`/`sim_node_allowed_networks=""`/`sim_node_client_cache_max=32`；`sim_dispatch_mode` 仍 `direct|node`（默认 `direct`）；无 `SIM_TASK_*`。
+- `app/services/simulation.py`：删 `finalize_from_report`（终态回收回到「进度/结果轮询触发」的既有路径）；`app/main.py` 装配与 docstring、`app/core/dependencies.py::require_node_permission` 文案同步。
+
+**④ 部署编排**（compose 与 K8s 对称，9 个键全部落地并实机 YAML 解析核验）
+
+- `infra/deploy/docker-compose.yml` scene-service 段 + `infra/k8s/services/scene-service.yaml` ConfigMap：`SIM_DISPATCH_MODE`、`SIM_NODE_LEASE_SECONDS`、`SIM_NODE_DEFAULT_CAPACITY`、`SIM_NODE_ROLES`、`SIM_NODE_MANAGER_DEFAULT_PORT`、`SIM_NODE_MANAGER_SCHEME`、`SIM_NODE_TRUST_FORWARDED_FOR`、`SIM_NODE_ALLOWED_NETWORKS`、`SIM_NODE_CLIENT_CACHE_MAX`。
+  ⚠ **与计划的偏离（有意为之，已在此登记）**：计划写「一律 `${KEY:-}` 透传」，实现改为**除 `SIM_NODE_ALLOWED_NETWORKS` 外一律显式默认值**。依据：`app/config.py` 只有 `CARLA_PATH_FIELDS` 有空串回落，int/bool 收到空串会 pydantic 直接启动失败；且 `_role_set("")` 返回空集 ⇒ `SIM_NODE_ROLES=` 会让**所有注册/心跳 403**。compose 侧写成 `${KEY:-默认值}`，并在两处注释标注「SIM_NODE_ROLES 不可置空」。
+- `.env.example`（根）与 `infra/deploy/.env.example`（新增小节「9a-2. 仿真下发链路模式」）：登记上述键 + 「node 模式要求平台主机可入站访问 HunterSim 的 CARLA 管理端口」。
+
+**⑤ 测试**（新增 648 行 `app/tests/test_sim_node_dispatch.py`，32 条；`app/tests/fakes.py` 的 `InMemorySimNodeStore` 去队列/inflight 分支、补 `node_endpoint`；`RecordingCarlaClientFactory` 记录 `base_url` 与调用序列）
+
+- 地址学习：`X-Real-IP` 优先于 XFF；XFF 取首跳；`trust_forwarded_for=false` 时只认 TCP 对端；域名/多值/端口后缀等非法形态逐级降级、全级不可得 → 2001；CIDR 白名单命中与拒绝。
+- 下发：基址恰为 `http://{学到的IP}:{manager_port}`；`create→submit→pause→resume→stop` 全程同节点。
+- **漂移自愈**（本特性的核心断言）：下发后换 IP，后续 `submit/get/pause/cancel` 的基址立刻变新地址、工厂只被新地址调用一次、旧客户端已 `aclose`。
+- 门禁与故障：租约过期 → 5001「仿真节点离线」；无在线节点 → 5001「无可用仿真节点」；owner 越权 1002；角色门禁 1002；未认证 1001；清单用 `scene:read`；`find_active_instance` 复核为终态后移出索引、同场景可再下发。
+- 契约护栏：`test_openapi_exposes_contract_operations` 参数表收敛为 3 个 operationId；`test_scene_contract.py` 端点/键名断言同步。
+
+**⑥ 文档**
+
+- 新增 **`docs/HunterSim接入清单.md`**（节点侧待办：服务令牌、`node_id` 命名、注册体字段表、30s 心跳、Windows 入站放行与监听地址、8 条子路径 ↔ 平台配置项对应、7 类常见坑、漂移演练与验收勾选、失败语义速查）；`docs/README.md` 登记。
+- `docs/carla-integration.md`：新增 §1.1（direct/node 对照表 + 时序图）、§6.4（node 配置项）、§7.3.1（联调 6 步 + 漂移现场验法）；§7.4 故障注入补 4 行；§9 风险表补「入站可达」与「来源头可伪造」。
+- `docs/故障排查指南.md`：新增 §19.6（19.6.1 文案↔成因↔处置表、19.6.2 IP 漂移判据、19.6.3 回访不通三分 + 防火墙/AP 隔离判据、19.6.4 两种模式选型判据）；**§19.1.2 的旧结论「地址必须固化」按模式限定**（direct 仍成立；同网段且回访可达时 node 可免除固定 IP）。
+- `docs/运维操作手册.md`：新增 §3.13（容器生效值/清单/Redis 三键/日志留痕的核查命令 + 7 条运维口径）；§6 服务令牌能力面补 V1.24.0 例外。
+- `docs/deployment.md` §17（网络前提、Redis 键 +4、配置项 +9、验收项 7）；`docs/01-部署概述与环境要求.md` §2.4 网络要求 + §3.3 端口注记。
+
+### 4. 兼容与升级影响
+
+- **默认 `direct`，现有部署零影响**：不改 `SIM_DISPATCH_MODE` 时，V1.23.7 行为（`CARLA_MANAGEMENT_ENDPOINT` 固定地址）逐字不变；`node` 模式下 `CARLA_MANAGEMENT_ENDPOINT` 不参与寻址，但 8 条 `CARLA_*_PATH` 子路径配置**继续共用**（不为节点另立接口形状）。
+- 无 DDL、无 Kafka 契约变更；Redis 侧只删 `sim:task:*`（从未上线）与改 `sim:runtime` 值结构。**升级窗口提示**：`sim:runtime` 是 node 模式的寻址事实来源，旧值缺 `node_id` 时该实例的操控会 5001「仿真实例缺少节点归属」——`direct` 模式不读该键，故不受影响；切到 `node` 前建议确认在跑实例均已在新链路重建。
+- API 面删除的 3 个端点从未发布 ⇒ 无外部调用方受影响；节点控制面 3 端点为新增。
+- `GET /api/v1/scene/sim-nodes` 用 `scene:read`（管理员），注册/心跳用 `SIM_NODE_ROLES`（默认含 `data-uploader`）⇒ HunterSim 可复用服务令牌，不需要场景库写权限。
+
+### 5. 验证（本环境实跑）
+
+- `python scripts/run_unit_tests.py`：common/python **338 passed**、scene-service **358 passed**（含 `test_sim_node_dispatch.py` **32**）、api-gateway 97、data-collector 192、data-analytics 125、vil-forwarder 9、ota-service 128、remote-control 122、ingest-platform 187、tests 100 deselected；**唯一失败为存量**：`flink-jobs/tests/test_consumer_group_contract.py::test_openapi_consumes_agree_with_group_entries`（`KeyError: 'topic'`）。该用例的两个输入 `contracts/openapi/data-analytics.yaml` 与 `contracts/kafka/consumer-groups.yaml` 本轮**均未修改**（`git status` 可证），失败断言与本轮改动面不相交。
+- `python scripts/verify_data_layer.py` **通过 34 项 / 失败 0 项**（含「Redis 键契约一致：21 个受控键 ↔ 6 份服务契约」）；`python scripts/verify_infra.py` **全部校验通过**（96 个 K8s 文档、ConfigMap 敏感字段、共享 ConfigMap 键一致性）。
+- `ruff check .`（`services/scene-service`）**All checks passed**；`common/python` 剩 **5 处存量** `UP046/UP047`（`hunter_common/responses.py`、`database/repository.py`，本轮未触碰，属 ruff 0.16 新增规则）。
+- `mypy app --ignore-missing-imports --disable-error-code=import-untyped`（scene-service）**49 errors**，与本轮前基线同族（`scene_engine` 字面量/`Literal`、测试替身注入等）；**本轮新增的 6 个实现模块 0 error**，仅 `app/tests/conftest.py:103`（`InMemorySimNodeStore` 注入）与既有 12 处同类 fake 注入告警同形。`mypy hunter_common/redis_keys.py tests/test_storage_contracts.py` **Success: no issues found**。
+- YAML 结构核验：compose 与 K8s ConfigMap 两侧各 9 行齐备（`SIM_DISPATCH_MODE` + 8 个 `SIM_NODE_*`，与契约 `required_env` 同集合）、值均为字符串。
+
+**待实机验证**（本环境无 Docker/无节点，不能替它背书）：① `node` 模式下的真实下发闭环（承接 V1.23.7 §8-3 未完成项）；② **漂移演练**——节点换 IP 后仅靠一次心跳即完成 `pause/resume/cancel`；③ 契约 #9 仍不能从 `x-hunter-pending-confirmation` 移除（create 的 `sim_instance_id` 字段名与 `status` 取值域、progress/result 字段形状仍未实机确认）。
+
+### 5.1 实机部署验证步骤（**待在部署机 + HunterSim 执行**；顺序不可颠倒，每步都带判据，不达标不要往下走）
+
+> 本环境的 shell 无 Docker、也无仿真节点，**下面步骤一条都没跑过** —— 它们是给部署机的可执行清单，跑完按 §5.2 逐行回填；任何一行未验不得把本条标为「已实机确认」。
+
+```bash
+# 0) 会话开头一次定义（后续所有步骤复用；与运维手册 §3 的封装同源）
+sudo -i && cd /opt/HunterCore && git pull
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+set -a; . ./.env; set +a
+rcli() { docker exec hunter-redis redis-cli --no-auth-warning -a "${REDIS_PASSWORD}" "$@"; }
+SELF=192.168.31.35            # 平台（部署机）地址
+NODE=sim-node-01              # node_id：与 IP 无关，定下来不再改
+NODE_IP=192.168.31.20         # HunterSim 当前 WiFi 地址（节点侧 Get-NetIPAddress 实测值）
+MPORT=8090
+```
+
+**步骤 1——网络前提（本模式的成立判据；不通就整条链路不成立，直接按 §19.6.4 改回 `direct`）**
+
+```bash
+curl -sS -m 3 -o /dev/null -w '%{http_code}\n' "http://$NODE_IP:$MPORT/api/v1/instances?scene_id=probe"
+```
+
+- 判据：出现**任意 HTTP 码**（`200`/`404`/`405`/`422` 都算通，说明 TCP+HTTP 已到达节点）；`000` 或超时 = 回访不通 → `docs/故障排查指南.md` §19.6.3 三分（监听地址 / Windows 入站 / WiFi AP 客户端隔离）。
+- ⚠ **勿用 `/healthz` 探管理面**（V1.23.7 §5.1-1 实机证实 HunterSim 管理面无此端点、GET/POST 均 404，会把「对端正常」误判成「不可达」）。
+- 节点侧（**管理员** PowerShell）两条自检（V1.23.7 §5.1-7 的教训：`New-NetFirewallRule` 必须紧跟存在性自检，否则「看起来执行了但没创建」）：
+
+```powershell
+Get-NetTCPConnection -LocalPort 8090 -State Listen | Select-Object LocalAddress
+# 判据：LocalAddress 必须是 0.0.0.0 或本机网卡 IP；出现 127.0.0.1 ⇒ 节点只监听回环，平台永远推不进去
+New-NetFirewallRule -DisplayName CARLA-mgr-from-platform -Direction Inbound -Protocol TCP -LocalPort 8090 -RemoteAddress 192.168.31.35 -Action Allow -Profile Any
+Get-NetFirewallRule -DisplayName CARLA-mgr-from-platform | Select-Object Enabled,Action,Profile
+# 判据：True / Allow / Any（以太网落在 Public profile，默认入站全阻，故 -Profile Any 必需）
+```
+
+**步骤 2——重建镜像并切模式（改了 `app/config.py` 且新增模块，**必须 `--build`**；只 `restart` 会继续跑旧代码）**
+
+```bash
+cp .env .env.bak.$(date +%Y%m%d_%H%M%S) && echo "已备份：$(ls -1 .env.bak.* | tail -1)"
+grep -q '^SIM_DISPATCH_MODE=' .env && sed -i -E 's/^SIM_DISPATCH_MODE=.*/SIM_DISPATCH_MODE=node/' .env || printf '\nSIM_DISPATCH_MODE=node\n' >> .env
+grep -n '^SIM_DISPATCH_MODE=' .env      # 自检：必须恰好 1 行且值为 node（多行＝后行生效）
+grep -nE '^SIM_[A-Z_]+=' .env | grep -E '#' || echo 'SIM_ 键无行尾注释污染'   # V1.23.7 §2-1 同形状体检：`=  # …` 会把注释当值下发
+dcompose build scene-service
+dcompose up -d --force-recreate scene-service
+```
+
+**步骤 3——容器生效值与模块存在性（不发请求）**
+
+```bash
+docker exec hunter-scene env | grep -E '^SIM_(DISPATCH_MODE|NODE_)' | sort
+# 判据：SIM_DISPATCH_MODE=node；下面的 grep 应命中 9 行 = SIM_DISPATCH_MODE + 8 个 SIM_NODE_*（未写入 .env 的键由 compose 默认值透传）
+# ⚠ SIM_NODE_ROLES 不可为空：空集 = 所有注册/心跳 403（本轮把它从 ${KEY:-} 改为显式默认值的缘由）
+docker exec hunter-scene env | grep -E '^[A-Z0-9_]+=.*#' || echo '无行尾注释污染'
+docker exec hunter-scene python3 -c "from app.config import Settings; s=Settings(); print(s.sim_dispatch_mode, s.sim_node_lease_seconds, s.sim_node_manager_default_port, s.sim_node_manager_scheme, s.sim_node_trust_forwarded_for, repr(s.sim_node_allowed_networks), s.sim_node_client_cache_max)"
+# 期望：node 90 8090 http True '' 32
+docker exec hunter-scene python3 -c "from app.core.client_ip import learn_node_endpoint; from app.repositories.sim_dispatch import SimNodeBackend; print('node 链路模块已在镜像内')"
+# 判据：打印那行文字；报 ImportError ⇒ **镜像没重建成功**（步骤 2 的 --build 被跳过了），后面所有结论无效
+docker logs --since 2m hunter-scene 2>&1 | tail -20    # 确认服务正常启动（无 Settings 校验异常堆栈）
+```
+
+**步骤 4——签服务令牌 + 注册（本步是地址自学习的现场验证点）**
+
+```bash
+ADMIN=$(curl -sS -X POST http://$SELF/api/v1/user/login -H 'Content-Type: application/json' -d '{"username":"admin","password":"<密码>"}' | jq -r '.data.access_token'); echo "admin token len=${#ADMIN}"
+SVC=$(curl -sS -X POST http://$SELF/api/v1/user/service-token -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d "{\"client_id\":\"$NODE\"}" | jq -r '.data.access_token'); echo "service token len=${#SVC}"
+# 两条 len 必须 >0；=0 则先查登录凭据与是否管理员（本段命令都是先拿结果再往下，不看返回值就粘贴会一路空报）
+curl -sS -X PUT "http://$SELF/api/v1/scene/sim-nodes/$NODE" -H "Authorization: Bearer $SVC" -H 'Content-Type: application/json' -d "{\"capacity\":1,\"manager_port\":$MPORT,\"maps\":[\"Town01\",\"Town03\"],\"carla_version\":\"0.9.13\"}" | jq '{code, message, ip: .data.endpoint_ip, src: .data.endpoint_source, online: .data.online, owner: .data.owner}'
+```
+
+判据（五条同时对）：`code=0`、`online=true`、**`ip` 逐字等于 `$NODE_IP`**、`src` 为 `real-ip`（经 web-portal 接入时）、`owner=service:sim-node-01`。
+
+分流：
+
+- `ip` 是 `172.28.x.x` 或 `127.0.0.1` ⇒ **节点没走 80/443 而是直连了网关 8080**（`X-Real-IP` 由 `infra/deploy/config/nginx.conf` 的 `proxy_set_header X-Real-IP $remote_addr` 注入；直连时无此头，scene-service 看到的 TCP 对端就是网关容器）⇒ 接入清单 §8 坑 1；同时建议 `SIM_NODE_ALLOWED_NETWORKS=192.168.31.0/24` 把错误地址变成 2001 而不是带病登记。
+- `code=2001` +「无法判定节点地址来源」⇒ 查反代头：`docker exec hunter-web grep -n 'X-Real-IP' /etc/nginx/nginx.conf`，并看 `docker logs --since 5m hunter-scene 2>&1 | grep sim_node_address_`（`_candidate_rejected` = 头值不合法；`_not_in_allowed_networks` = 被 CIDR 拦）。
+- `code=1002` ⇒ 该 `node_id` 已被其它 `client_id` 绑为 owner（换回原令牌，或换新 `node_id`）；或角色不在 `SIM_NODE_ROLES`。
+
+**步骤 5——心跳与登记表**
+
+```bash
+curl -sS -X POST "http://$SELF/api/v1/scene/sim-nodes/$NODE/heartbeat" -H "Authorization: Bearer $SVC" -H 'Content-Type: application/json' -d '{}' | jq '{code, lease: .data.lease_seconds, ip: .data.endpoint_ip}'
+rcli GET "sim:node:$NODE" | jq -c '{endpoint_ip, manager_port, protocol, endpoint_source, learned_at}'
+rcli TTL "sim:node:$NODE"                                        # 判据：接近 90 且每次心跳重新计时
+rcli ZRANGEBYSCORE sim:node:seen -inf +inf WITHSCORES            # 判据：score = 最后一次心跳的 epoch 秒
+curl -sS -H "Authorization: Bearer $ADMIN" "http://$SELF/api/v1/scene/sim-nodes?online_only=false" | jq -r '.data.items[] | [.node_id, .online, .endpoint_ip, .manager_port, .endpoint_source, .running_count, .capacity] | @tsv'
+# 判据：节点在清单里；⚠ GET 清单用 scene:read，$SVC 拿它会 403（有意区分：节点不该有场景库读权限），必须用 $ADMIN
+```
+
+**步骤 6——真实下发（本条与 V1.23.7 §8-3 欠的就是这一步）**
+
+```bash
+curl -sS -H "Authorization: Bearer $ADMIN" "http://$SELF/api/v1/scene?status=published&page_size=5" | jq -r '.data.items[] | [.scene_id, .scene_name, .config.map.map_id] | @tsv'
+# ⚠ 第 3 列 map_id 必须出现在步骤 4 注册的 maps 里（逐字相同），否则选节点阶段就过滤掉 ⇒ 5001「无可用仿真节点」
+SID=<上面的 scene_id>; IID=$(curl -sS -X POST "http://$SELF/api/v1/scene/$SID/run" -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{}' | tee /tmp/run.json | jq -r '.data.sim_instance_id'); echo "sim_instance_id=$IID"; jq '{code, message, details}' /tmp/run.json
+docker logs --since 5m hunter-scene 2>&1 | grep -E 'sim_node_(dispatch_target|instance_bound|endpoint_learned)' | tail -10
+# 判据：sim_node_dispatch_target 的 base_url **恰为 http://$NODE_IP:$MPORT**；sim_node_instance_bound 给出实例↔节点绑定
+rcli GET "sim:runtime:$IID" | jq -c
+# 判据：只有 node_id/scene_id/sim_id/last_status/created_at/updated_at —— **一个 IP 字符串都不能出现**（这是抗漂移的全部依据；出了 IP 就是实现走偏）
+curl -sS -H "Authorization: Bearer $ADMIN" "http://$SELF/api/v1/scene/simulations/$IID" | jq '{code, status: .data.status, carla_status: .data.carla_status}'   # 进度查询；本步同时回填契约 #9 的响应体结构
+```
+
+**步骤 7——漂移演练（本特性的核心收益，不做完等于没验）**
+
+```bash
+# ① 节点侧换 IP（任选其一：重连 WiFi 让 DHCP 重新分配，或管理员 PowerShell 改静态）
+#    New-NetIPAddress -InterfaceAlias WLAN -IPAddress 192.168.31.66 -PrefixLength 24 -DefaultGateway 192.168.31.1
+# ② 平台侧不等人工操作，只看一次心跳是否把地址刷回来（≤ 30s）
+docker logs --since 3m hunter-scene 2>&1 | grep -E 'sim_node_(endpoint_learned|address_unresolved)' | tail -5
+# 判据：出现 sim_node_endpoint_learned（old_ip=旧、ip=新）；没有则先排心跳是否在跑（步骤 5 的 TTL/ZSET）
+curl -sS -H "Authorization: Bearer $ADMIN" "http://$SELF/api/v1/scene/sim-nodes" | jq -r '.data.items[] | [.node_id, .endpoint_ip, .learned_at] | @tsv'
+# 判据：endpoint_ip 已是新地址，learned_at 是刚才那一刻
+# ③ 对**旧 IP 时代创建的同一个实例**继续操控（实例只绑 node_id，这是它不该失败的理由）
+curl -sS -X POST "http://$SELF/api/v1/scene/simulations/$IID/pause"  -H "Authorization: Bearer $ADMIN" | jq '{code, message}'
+curl -sS -X POST "http://$SELF/api/v1/scene/simulations/$IID/resume" -H "Authorization: Bearer $ADMIN" | jq '{code, message}'
+docker logs --since 2m hunter-scene 2>&1 | grep sim_node_endpoint_refreshed | tail -3
+# 判据：三个 code 均为 0；日志里 sim_node_endpoint_refreshed 的 old_base_url→new_base_url 就是客户端重建时刻
+# ④ 收尾：取消实例（同时验证从活动索引移出后同场景可再下发）
+curl -sS -X POST "http://$SELF/api/v1/scene/simulations/$IID/cancel" -H "Authorization: Bearer $ADMIN" | jq '{code, message}'
+rcli ZSCORE sim:instance:active "$IID"    # 判据：(nil)——已移出索引
+```
+
+**步骤 8——5001 文案的故障分流与回滚（拿两个 5001 主动造出来，才知道现场能不能读懂）**
+
+```bash
+# a) 停掉节点心跳 ≥ SIM_NODE_LEASE_SECONDS（默认 90s）后查在跑实例 → 期望 5001「仿真节点离线」+ details.node_id
+# b) 把节点侧管理端口关掉/或临时把防火墙规则删掉后对在线节点下发 → 期望 5001 且 details.endpoint 回显 http://<ip>:8090
+docker logs --since 10m hunter-scene 2>&1 | grep -E 'sim_node_offline|carla_request_failed' | tail -10
+# 判据：三类成因不能互掉——「无可用仿真节点」= 没在线节点/地图不匹配；「仿真节点离线」= 租约过期；带 details.endpoint 的 5001 = 在线但回访不通
+curl -sS -X POST "http://$SELF/api/v1/scene/$SID/run" -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{}' | jq '{code, message, details}'
+# c) 回滚（本条默认就是 direct，回滚 = 回到 V1.23.7 行为，不需改代码）
+sed -i -E 's/^SIM_DISPATCH_MODE=.*/SIM_DISPATCH_MODE=direct/' .env && dcompose up -d --force-recreate scene-service
+docker exec hunter-scene env | grep '^SIM_DISPATCH_MODE='    # 自检：direct（且 CARLA_MANAGEMENT_ENDPOINT 仍为固定地址时链路照旧可用）
+```
+
+### 5.2 实机验证结论回填表（执行后逐行填；空着即视为未验，不得写进后续条目当已有结论）
+
+| # | 验证项 | PASS 判据 | 结果 | 证据（输出/日志片段） |
+|---|--------|-----------|------|--------------------|
+| 1 | 平台→节点回访可达 | 步骤 1 的 `curl` 返回任意 HTTP 码（非 `000`） | | |
+| 2 | 节点监听与入站规则 | `LocalAddress` 非 `127.0.0.1`；规则 `True/Allow/Any` | | |
+| 3 | 镜像含新链路模块 | 步骤 3 的 import 探针成功（否则 `--build` 未生效） | | |
+| 4 | 容器生效值正确 | `SIM_DISPATCH_MODE=node` + 9 行齐备（模式 + 8 个 `SIM_NODE_*`）+ 无 `#` 污染 | | |
+| 5 | 地址自学习拿到**真实节点 IP** | 注册响应 `endpoint_ip == $NODE_IP`、`endpoint_source=real-ip` | | |
+| 6 | 心跳与租约 | `TTL≈90` 且重新计时；`sim:node:seen` score 逐次前移 | | |
+| 7 | 真实下发成功 | `run` 返 `code=0` + `sim_instance_id`；日志 `base_url=http://$NODE_IP:8090` | | |
+| 8 | 归属索引不存地址 | `sim:runtime:<id>` 的 JSON 里无任何 IP | | |
+| 9 | **漂移自愈** | 换 IP 后仅靠一次心跳，旧实例 `pause/resume/cancel` 均 `code=0`；日志 `sim_node_endpoint_refreshed` | | |
+| 10 | 三类 5001 文案可区分 | 无在线节点 / 租约过期 / 回访不通（带 `details.endpoint`）三种成因各造一次并对照 §19.6.1 | | |
+| 11 | 回滚可用 | 改回 `direct` + `--force-recreate` 后旧链路行为与 V1.23.7 一致 | | |
+| 12 | 契约 #9 响应体结构 | create 回的 `sim_instance_id` 字段名、`status` 取值域、progress/result 字段形状（本条**无法预估**，必须实测后回填契约） | | |
+
+> 未入本表的已知限制（不得归入“已验”）：本模式的鉴权只到「角色 + owner」层，**来源头本身可伪造**（`docs/carla-integration.md` §9 风险表 #12）；不受控网络中需把 `SIM_NODE_TRUST_FORWARDED_FOR=false` 并让节点直连网关，但这又会回到步骤 4 分流第一条的 socket-peer 语义——两个取舍不能同时拿，请按自己的网络拓扑选一边并在本表补一行结论。
+
+
+### 6. 分发路径注意
+
+- 受追踪变更共 **17 改 + 7 新增**（`git status` 可逐字核对）：
+  - **改**：`release.md`（本文件，属受追踪文件）、`common/python/hunter_common/redis_keys.py`、`common/python/tests/test_storage_contracts.py`、`contracts/{database/redis-keys.yaml,openapi/scene-service.yaml}`、`scripts/verify_data_layer.py`、`.env.example`、`infra/deploy/{.env.example,docker-compose.yml}`、`infra/k8s/services/scene-service.yaml`、`services/scene-service/app/{config.py,main.py,core/dependencies.py,services/simulation.py,tests/{conftest.py,fakes.py,test_scene_contract.py}}`；
+  - **新增**：`services/scene-service/app/core/client_ip.py`、`app/{schemas,services,repositories,routers}/sim_nodes.py`、`app/repositories/sim_dispatch.py`、`app/tests/test_sim_node_dispatch.py`。
+- 被 `.gitignore` 忽略（`.gitignore:157 docs/`）、需**单独同步**到服务器的共 7 份文档：`docs/HunterSim接入清单.md`（**新增文件**）、`docs/README.md`（登记新增条目）、以及改写的 `docs/{carla-integration,故障排查指南,运维操作手册,deployment,01-部署概述与环境要求}.md`。
+- **必须 `--build` 重建 scene-service 镜像**（新增模块 + 共享库 `redis_keys.py` 变更），改 `.env` 中的 `SIM_*` 需 `--force-recreate` 才生效（仅 `restart` 不重读 env-file）；K8s 侧改 ConfigMap 后滚动重启，并确认 Pod 能直接路由到节点网段（overlay 内访问宿主同网段设备需额外配置，否则一律 5001）。
 

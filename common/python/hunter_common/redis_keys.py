@@ -57,6 +57,19 @@ SIM_ARTIFACTS = "carla:sim:{sim_id}:artifacts"
 #: 用户登录/刷新/登出永不触碰本键（V1.23.6）。
 SERVICE_SESSION = "session:service:{client_id}"
 
+# ---------- 仿真节点动态地址直推（V1.24.0；scene-service 独占） ----------
+#: 设计原理：HunterSim 出向注册/心跳时平台从入站头学习来源 IP 并覆盖写入节点登记表；
+#: 下发时按 node_id 解析当前地址构造基址、直推节点 CARLA 管理 API。
+#: IP 变化下一次心跳即刷新、不影响后续操控。
+#: 仿真节点注册信息 + 自学习地址 String(JSON)（scene-service 写读；租约 TTL 90s，心跳续租）
+SIM_NODE = "sim:node:{node_id}"
+#: 节点最后心跳 ZSet（member = node_id，score = epoch 秒；无硬 TTL，懒清理）
+SIM_NODE_SEEN = "sim:node:seen"
+#: 活动仿真实例索引 ZSet（member = sim_instance_id，score = 创建 epoch；支撑同场景并行判定与节点归属查询）
+SIM_INSTANCE_ACTIVE = "sim:instance:active"
+#: 实例→节点归属绑定 String(JSON)（node_id/scene_id/sim_id/last_status/updated_at；TTL 86400）
+SIM_RUNTIME = "sim:runtime:{sim_instance_id}"
+
 #: 受控键模式全集（test_storage_contracts.py 据此比对 redis-keys.yaml）。
 CONTROLLED_PATTERNS: frozenset[str] = frozenset(
     {
@@ -77,6 +90,10 @@ CONTROLLED_PATTERNS: frozenset[str] = frozenset(
         SIM_EVENTS,
         SIM_ARTIFACTS,
         SERVICE_SESSION,
+        SIM_NODE,
+        SIM_NODE_SEEN,
+        SIM_INSTANCE_ACTIVE,
+        SIM_RUNTIME,
     }
 )
 
@@ -156,6 +173,16 @@ def service_session_key(client_id: str) -> str:
     return SERVICE_SESSION.format(client_id=client_id)
 
 
+def sim_node_key(node_id: str) -> str:
+    """``sim:node:{node_id}``（仿真节点注册信息与自学习地址）。"""
+    return SIM_NODE.format(node_id=node_id)
+
+
+def sim_runtime_key(sim_instance_id: str) -> str:
+    """``sim:runtime:{sim_instance_id}``（实例→节点归属绑定）。"""
+    return SIM_RUNTIME.format(sim_instance_id=sim_instance_id)
+
+
 __all__ = [
     "ANALYTICS_INGEST_LATENCY",
     "CACHE_SCENE",
@@ -169,7 +196,11 @@ __all__ = [
     "SIM_ARTIFACTS",
     "SIM_EVENTS",
     "SIM_INSTANCE",
+    "SIM_INSTANCE_ACTIVE",
     "SIM_METRICS",
+    "SIM_NODE",
+    "SIM_NODE_SEEN",
+    "SIM_RUNTIME",
     "SIM_STATUS",
     "VEHICLE_ONLINE_SET",
     "VEHICLE_STATUS",
@@ -186,6 +217,8 @@ __all__ = [
     "sim_events_key",
     "sim_instance_key",
     "sim_metrics_key",
+    "sim_node_key",
+    "sim_runtime_key",
     "sim_status_key",
     "vehicle_status_key",
     "vil_session_key",

@@ -12,7 +12,8 @@
   7. JSON Schema（draft-07）：结构合法、required 非空、examples 通过自身校验
   8. consumer-groups.yaml 消费的 Topic 均已登记、消费者组 ID 唯一
   9. Redis 键契约（contracts/database/redis-keys.yaml）↔ 各服务 x-hunter-service.redis_keys
-     （键模式 / 类型 / TTL / 读写方归属；9 个受控键与系统约束第 8 条一致）
+     （键模式 / 类型 / TTL / 读写方归属；受控键全集 24 个，其中系统约束第 8 条原始清单 9 个，
+     其余为实现期按「先改契约再改实现」顺序登记）
  10. 对象存储契约（contracts/database/object-storage.yaml）↔ docker 与 K8s MinIO 初始化脚本
      ↔ 各服务 x-hunter-service.minio_buckets / minio_bucket_lifecycle / 预签名 TTL（三方一致）
 
@@ -214,6 +215,11 @@ EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
     "carla:sim:{sim_id}:artifacts": ("Hash", 86400),
     # 服务令牌会话（V1.23.6）：与 session:{user_id} 隔离，默认 7 天，上限 30 天
     "session:service:{client_id}": ("String", 604800),
+    # 仿真节点动态地址直推（V1.24.0）：TTL 均为默认值（可环境变量调）
+    "sim:node:{node_id}": ("String(JSON)", 90),
+    "sim:node:seen": ("ZSet", None),
+    "sim:instance:active": ("ZSet", None),
+    "sim:runtime:{sim_instance_id}": ("String(JSON)", 86400),
 }
 
 #: MinIO Bucket 契约（名称 → 过期天数；None = 永久）——来源：系统关键约束第 7 条（名称不可更改）
@@ -1251,8 +1257,10 @@ def check_redis_keys() -> None:
             fail(f"Redis 键 {pattern}: 必须显式声明失效路径（lifecycle）")
         if expected_ttl is None:
             ops = " ".join(str(op) for op in entry.get("ops") or [])
-            if "DEL" not in ops and "SREM" not in ops:
-                fail(f"Redis 键 {pattern}: 无 TTL 时必须声明主动清理（ops 需含 DEL / SREM）")
+            if not any(op in ops for op in ("DEL", "SREM", "ZREM", "HDEL")):
+                fail(
+                    f"Redis 键 {pattern}: 无 TTL 时必须声明主动清理（ops 需含 DEL / SREM / ZREM / HDEL）"
+                )
         if not (entry.get("writers") and entry.get("readers")):
             fail(f"Redis 键 {pattern}: writers / readers 不能为空（键归属必须明确）")
         if not REDIS_KEY_NAMING_RE.match(pattern):

@@ -45,6 +45,7 @@ DDL_SCENE = ROOT / "contracts" / "database" / "ddl" / "02_scene.sql"
 ENUMS_DOC = ROOT / "contracts" / "database" / "enums.md"
 
 #: 设计文档 12.2 节 scene-service 端点（方法大写 + 契约路径）+ 决策 G-20① 新增的仿真进度/结果查询
+#: + V1.24.0 节点控制面 sim-nodes 三条（注册/心跳/清单，设计文档 12.2 未列，需同步勘误）
 EXPECTED_ENDPOINTS: set[tuple[str, str]] = {
     ("GET", "/api/v1/scene"),
     ("GET", "/api/v1/scene/{scene_id}"),
@@ -61,6 +62,9 @@ EXPECTED_ENDPOINTS: set[tuple[str, str]] = {
     ("POST", "/api/v1/scene/simulations/{sim_instance_id}/pause"),
     ("POST", "/api/v1/scene/simulations/{sim_instance_id}/resume"),
     ("POST", "/api/v1/scene/simulations/{sim_instance_id}/cancel"),
+    ("GET", "/api/v1/scene/sim-nodes"),
+    ("PUT", "/api/v1/scene/sim-nodes/{node_id}"),
+    ("POST", "/api/v1/scene/sim-nodes/{node_id}/heartbeat"),
 }
 
 #: 运维端点（K8s 探针 / Prometheus 抓取）
@@ -449,6 +453,54 @@ def test_simulation_flow_matches_4_4(contract: dict[str, Any]) -> None:
     run_data = contract["components"]["schemas"]["SceneRunData"]
     assert set(run_data["required"]) == {"sim_instance_id", "scene_id", "status", "started_at"}
     assert contract["paths"]["/api/v1/scene/{scene_id}/run"]["post"]["operationId"] == "runScene"
+
+
+#: V1.24.0 node 模式受控键（地址登记 + 实例归属 + 活动索引）
+NODE_DISPATCH_KEYS: set[str] = {
+    "sim:node:{node_id}",
+    "sim:node:seen",
+    "sim:runtime:{sim_instance_id}",
+    "sim:instance:active",
+}
+
+
+def test_node_dispatch_pushes_to_learned_endpoint(contract: dict[str, Any]) -> None:
+    """V1.24.0 链路：地址自学习 + 按节点动态直推（队列/长轮询/ack/回报已全部删除）。"""
+    node = contract["x-hunter-simulation-flow"]["node_dispatch"]
+    assert node["delivery"] == "push_to_learned_endpoint"
+    learning = node["endpoint_learning"]
+    assert learning["sources_in_order"][0] == "X-Real-IP"
+    assert "X-Forwarded-For" in learning["sources_in_order"][1]
+    assert "ipaddress" in learning["validation"]
+    assert "2001" in learning["all_failed"]
+    # 实例只绑 node_id（不绑地址串）是 IP 漂移自愈的落点
+    assert node["instance_binding"].startswith("sim:runtime:{sim_instance_id}")
+    assert "node_id" in node["addressing_rule"]
+    assert not ({"task_types", "reclaim", "ack"} & set(node)), "旧队列链路段落必须删除"
+
+    patterns = {item["pattern"] for item in contract["x-hunter-service"]["redis_keys"]}
+    assert NODE_DISPATCH_KEYS <= patterns
+    assert not [pattern for pattern in patterns if pattern.startswith("sim:task")]
+    assert {item["code"] for item in node["failure_semantics"]} == {5001, 2001}
+
+    operations = {
+        operation["operationId"]
+        for _, path, operation in iter_operations(contract)
+        if "sim-nodes" in path
+    }
+    assert operations == {"listSimNodes", "registerSimNode", "heartbeatSimNode"}
+
+    required = set(contract["x-hunter-service"]["required_env"])
+    assert {
+        "SIM_DISPATCH_MODE",
+        "SIM_NODE_LEASE_SECONDS",
+        "SIM_NODE_MANAGER_DEFAULT_PORT",
+        "SIM_NODE_MANAGER_SCHEME",
+        "SIM_NODE_TRUST_FORWARDED_FOR",
+        "SIM_NODE_ALLOWED_NETWORKS",
+        "SIM_NODE_CLIENT_CACHE_MAX",
+    } <= required
+    assert not [key for key in required if key.startswith("SIM_TASK_")]
 
 
 def test_real_vehicle_extraction_matches_4_5(contract: dict[str, Any]) -> None:

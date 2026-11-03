@@ -541,6 +541,23 @@ services:
       SCENE_GENERATION_MAX_COUNT: ${SCENE_GENERATION_MAX_COUNT:-5000}
       SCENE_ALLOWED_MAPS: ${SCENE_ALLOWED_MAPS:-}
       SCENE_CATALOG_VERSION: ${SCENE_CATALOG_VERSION:-1.0.0}
+      # 仿真下发链路模式（V1.24.0，契约 x-hunter-simulation-flow.node_dispatch）
+      #   direct = 固定地址 CARLA_MANAGEMENT_ENDPOINT（默认，V1.23.7 行为）
+      #   node   = 按注册/心跳自学习到的 ip:manager_port 直推节点上的 CARLA 管理 API
+      #     ⚠ node 模式要求平台主机可**入站**访问 HunterSim 的管理端口（防火墙/AP 客户端隔离会导致下发 5001）
+      #     ⚠ 实例只绑 node_id、地址在每次调用时重新解析 ⇒ 节点换 IP 由下一次心跳自愈，无需人工处置
+      SIM_DISPATCH_MODE: ${SIM_DISPATCH_MODE:-direct}
+      SIM_NODE_LEASE_SECONDS: ${SIM_NODE_LEASE_SECONDS:-90}
+      SIM_NODE_DEFAULT_CAPACITY: ${SIM_NODE_DEFAULT_CAPACITY:-1}
+      # ⚠ 不可留空：空 = 无任何角色可注册节点（所有注册/心跳 403）
+      SIM_NODE_ROLES: ${SIM_NODE_ROLES:-data-uploader,admin}
+      SIM_NODE_MANAGER_DEFAULT_PORT: ${SIM_NODE_MANAGER_DEFAULT_PORT:-8090}
+      SIM_NODE_MANAGER_SCHEME: ${SIM_NODE_MANAGER_SCHEME:-http}
+      # 直连部署（无反代）或反代不可信时置 false，只认 TCP 对端地址
+      SIM_NODE_TRUST_FORWARDED_FOR: ${SIM_NODE_TRUST_FORWARDED_FOR:-true}
+      # 节点地址 CIDR 白名单（逗号分隔，空 = 不限制；唯一允许透传空串的键）
+      SIM_NODE_ALLOWED_NETWORKS: ${SIM_NODE_ALLOWED_NETWORKS:-}
+      SIM_NODE_CLIENT_CACHE_MAX: ${SIM_NODE_CLIENT_CACHE_MAX:-32}
     ports:
       - "127.0.0.1:${SCENE_SERVICE_PORT:-8081}:8081"
     volumes:

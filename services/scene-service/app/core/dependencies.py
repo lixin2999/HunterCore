@@ -20,6 +20,7 @@ from app.config import settings
 from app.services.engine import SceneEngineService
 from app.services.export import SceneExportService
 from app.services.scenes import SceneService
+from app.services.sim_nodes import SimNodeService
 from app.services.simulation import SceneSimulationService
 from app.services.templates import SceneTemplateService
 
@@ -105,6 +106,23 @@ def require_review_permission(
     return user_id
 
 
+def require_node_permission(
+    principals: Annotated[tuple[str, frozenset[str]], Depends(_require_forwarded_auth)],
+) -> str:
+    """仿真节点控制面授权（注册/心跳，V1.24.0）。
+
+    与 ``scene:*`` 分开：节点是**机器身份**（服务令牌 ``service:{client_id}``，默认角色
+    ``data-uploader``），不应为了注册节点而拿到场景库的写权限。返回的调用方身份同时
+    作为节点 ``owner`` 的首次绑定值（owner 不一致的后续写调用 → 1002，在服务层判定）。
+    """
+    user_id, roles = principals
+    if not roles & settings.sim_node_role_set:
+        raise PermissionDeniedError(
+            message=f"无权限：仿真节点控制面需要角色 {sorted(settings.sim_node_role_set)}"
+        )
+    return user_id
+
+
 def trace_request_id() -> str:
     """响应体 request_id（复用链路 trace_id，兜底 UUID4）。"""
     return get_trace_id() or str(uuid4())
@@ -137,13 +155,20 @@ def get_engine_service(request: Request) -> SceneEngineService:
     return request.app.state.engine_service  # type: ignore[no-any-return]
 
 
+def get_sim_node_service(request: Request) -> SimNodeService:
+    """仿真节点控制面服务（V1.24.0：两种模式下都可用于运维查清单）。"""
+    return request.app.state.sim_node_service  # type: ignore[no-any-return]
+
+
 __all__ = [
     "get_engine_service",
     "get_export_service",
     "get_scene_service",
+    "get_sim_node_service",
     "get_simulation_service",
     "get_template_service",
     "require_execute_permission",
+    "require_node_permission",
     "require_read_permission",
     "require_read_principals",
     "require_review_permission",

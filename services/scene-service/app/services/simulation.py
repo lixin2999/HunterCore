@@ -27,11 +27,11 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.repositories.carla import (
     ACTIVE_STATUSES,
-    CarlaManagementClient,
     CarlaSimIdMismatchError,
     SimInstance,
     SimInstanceSnapshot,
 )
+from app.repositories.sim_dispatch import SimRuntimeBackend
 from app.repositories.simulations import (
     TopicProvisioner,
     VilSessionStore,
@@ -127,12 +127,17 @@ def apply_param_overrides(
 
 
 class SceneSimulationService:
-    """场景下发/控制服务（CARLA 不可达统一 5001）。"""
+    """场景下发/控制服务（CARLA 不可达统一 5001）。
+
+    ``carla`` 为 :class:`~app.repositories.sim_dispatch.SimRuntimeBackend`：直连模式注入
+    ``CarlaManagementClient``，node 模式注入 ``SimNodeBackend``（V1.24.0）—— 本服务对两者
+    无分支判断，下发链路的差异全部收敛在仓储层。
+    """
 
     def __init__(
         self,
         scenes: SceneService,
-        carla: CarlaManagementClient,
+        carla: SimRuntimeBackend,
         settings: Settings,
         storage: Any | None = None,
         *,

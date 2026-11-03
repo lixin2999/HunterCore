@@ -6,9 +6,13 @@
 - 全链路 trace_id（X-Request-ID）中间件
 - /healthz 存活探针、/readyz 就绪探针（DB/Redis 连通性）
 - /metrics Prometheus 指标端点（供 infra/monitoring 抓取）
-- 业务路由：/api/v1/scene/**（scenes / templates / export / simulation，契约 scene-service.yaml）；
+- 业务路由：/api/v1/scene/**（scenes / templates / export / simulation / sim_nodes，契约 scene-service.yaml）；
   场景引擎路由（logical / generate / concrete / testcases / suites / coverage / oracles）
   复用同一前缀，必须先于 scenes 注册（否则被 /{scene_id} 吞掉）；
+- 下发链路（SIM_DISPATCH_MODE）：direct 直连固定地址 CARLA 管理 API（默认，V1.23.7 行为）；
+  node 动态地址直推 —— 节点注册/心跳时平台从入站请求头自学其地址，下发时按 node_id
+  取**当前**地址回访节点上的 CARLA 管理 API（V1.24.0，需平台→节点可达）；
+  两种模式仅 backend 实现不同，服务层依 SimRuntimeBackend 协议复用同一套流程；
 - Kafka：仅消费 analytics_result（组 scene-service-analytics-result，4.5 节实车场景自动提取）；
   契约禁止本服务生产任何 Topic（x-hunter-kafka.produces = []）
 """
@@ -48,13 +52,16 @@ from app.repositories.engine import (
     TestCaseRepository,
 )
 from app.repositories.scenes import SceneRepository
+from app.repositories.sim_dispatch import SimNodeBackend
+from app.repositories.sim_nodes import SimNodeStore
 from app.repositories.simulations import SimTopicProvisioner, VilSessionStore
 from app.repositories.storage import get_storage
-from app.routers import engine, export, scenes, simulation, templates
+from app.routers import engine, export, scenes, sim_nodes, simulation, templates
 from app.routers.health import router as health_router
 from app.services.engine import SceneEngineService
 from app.services.export import SceneExportService
 from app.services.scenes import SceneService
+from app.services.sim_nodes import SimNodeService
 from app.services.simulation import SceneSimulationService
 from app.services.templates import SceneTemplateService
 
@@ -67,6 +74,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state 装配清单（路由经 Depends 从 state 取服务，测试可整体替换）：
     - db / redis：hunter_common 管理器；storage：MinIO（boto3 经 to_thread）；
+    - carla：下发后端（SimRuntimeBackend）—— node 模式为 SimNodeBackend（按自学习地址直推），
+      否则 CarlaManagementClient（固定地址）；
+      sim_node_store / sim_node_service：仿真节点控制面（两种模式都装配，便于运维查清单）；
     - scene_service / template_service / export_service / simulation_service：业务服务；
     - analytics_result_consumer：Kafka 消费任务（SCENE_EXTRACTION_CONSUMER_ENABLED=false 可关闭）。
     """
@@ -88,19 +98,39 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.scene_export_presign_expire_seconds,
         secure=settings.minio_secure,
     )
-    app.state.carla = CarlaManagementClient(
-        settings.carla_management_endpoint,
-        create_path=settings.carla_instance_create_path,
-        query_path=settings.carla_instance_query_path,
-        scenario_path=settings.carla_scenario_submit_path,
-        timeout_seconds=settings.carla_request_timeout_seconds,
-        max_retries=settings.carla_request_max_retries,
-        get_path=settings.carla_instance_get_path,
-        result_path=settings.carla_instance_result_path,
-        pause_path=settings.carla_instance_pause_path,
-        resume_path=settings.carla_instance_resume_path,
-        stop_path=settings.carla_instance_stop_path,
+    # 仿真节点仓储（两种模式都装配：node 用于下发寻址，direct 下仍可供运维查节点清单）
+    sim_node_store = SimNodeStore(
+        app.state.redis.client,
+        lease_seconds=settings.sim_node_lease_seconds,
+        instance_ttl_seconds=settings.sim_instance_ttl_seconds,
+        default_capacity=settings.sim_node_default_capacity,
     )
+    app.state.sim_node_store = sim_node_store
+    if settings.sim_dispatch_via_node:
+        # 动态地址直推：平台按注册/心跳学到的 ip:port 回访节点上的 CARLA 管理 API
+        app.state.carla = SimNodeBackend(sim_node_store, settings)
+        logger.info(
+            "sim_dispatch_mode",
+            mode=settings.sim_dispatch_mode,
+            lease_seconds=settings.sim_node_lease_seconds,
+            manager_default_port=settings.sim_node_manager_default_port,
+            trust_forwarded_for=settings.sim_node_trust_forwarded_for,
+            allowed_networks=settings.sim_node_allowed_networks or None,
+        )
+    else:
+        app.state.carla = CarlaManagementClient(
+            settings.carla_management_endpoint,
+            create_path=settings.carla_instance_create_path,
+            query_path=settings.carla_instance_query_path,
+            scenario_path=settings.carla_scenario_submit_path,
+            timeout_seconds=settings.carla_request_timeout_seconds,
+            max_retries=settings.carla_request_max_retries,
+            get_path=settings.carla_instance_get_path,
+            result_path=settings.carla_instance_result_path,
+            pause_path=settings.carla_instance_pause_path,
+            resume_path=settings.carla_instance_resume_path,
+            stop_path=settings.carla_instance_stop_path,
+        )
     # VIL 会话仓储（scene-service 为唯一写方；vil-forwarder 只读）
     vil_sessions = VilSessionStore(
         app.state.redis.client, ttl_seconds=settings.vil_session_ttl_seconds
@@ -137,6 +167,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         topics=topic_provisioner,
         topic_delete_delay_seconds=settings.sim_topic_delete_delay_seconds,
     )
+    app.state.sim_node_service = SimNodeService(sim_node_store, settings)
     # 场景引擎（服务私有 schema scene_engine；未初始化 DDL 时读取自动回落到内置目录）
     app.state.engine_service = SceneEngineService(
         LogicalScenarioRepository(app.state.db),
@@ -221,12 +252,13 @@ async def trace_id_middleware(request: Request, call_next) -> Response:
 
 
 app.include_router(health_router)
-# 注意：templates / export / simulation / engine / scenes 共用前缀 /api/v1/scene，
-# 必须先注册具体路径（/templates、/export、/oracles、/testcases、/suites、/generate、/concrete），
+# 注意：templates / export / simulation / sim_nodes / engine / scenes 共用前缀 /api/v1/scene，
+# 必须先注册具体路径（/templates、/export、/simulations、/sim-nodes、/oracles、/testcases、/suites、/generate、/concrete），
 # 再注册含 {scene_id} 的 scenes 路由，否则具体路径会被 /{scene_id} 优先匹配。
 app.include_router(templates.router)
 app.include_router(export.router)
 app.include_router(simulation.router)
+app.include_router(sim_nodes.router)
 app.include_router(engine.router)
 app.include_router(scenes.router)
 register_metrics(app, settings.service_name, version="0.1.0")

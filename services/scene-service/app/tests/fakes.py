@@ -3,6 +3,8 @@
 - InMemorySceneRepository：与 SceneRepository 同方法签名的内存实现（软删除、名称唯一、
   筛选与排序语义对齐真实 SQL 行为）；
 - FakeSceneCache / InMemorySceneStorage / FakeCarlaClient：缓存、对象存储、Carla 管理 API 替身；
+- InMemorySimNodeStore：仿真节点登记表 + 实例归属索引（Redis 实现）的内存替身（V1.24.0）；
+- RecordingCarlaClientFactory：node 模式代理的客户端工厂替身（断言「按学到的地址直推」与 IP 漂移）；
 - 数据工厂：config_payload / create_payload / make_scene_model（契约字段名与取值一致）。
 """
 from __future__ import annotations
@@ -20,7 +22,9 @@ from hunter_common.exceptions import (
     ServiceUnavailableError,
 )
 
+from app.core.client_ip import build_base_url
 from app.repositories.carla import SimInstance, SimInstanceSnapshot
+from app.repositories.sim_nodes import NodeEndpoint
 
 #: 默认创建者（与契约 creator 的 uuid 语义一致）
 DEFAULT_CREATOR = UUID("11111111-1111-4111-8111-111111111111")
@@ -455,6 +459,310 @@ class FakeCarlaClient:
         return None
 
 
+class InMemorySimNodeStore:
+    """SimNodeStore 内存替身（不依赖 Redis；语义与真实实现逐条对齐）。
+
+    与 Redis 版本的共同语义：节点登记为覆盖式写 + 刷新 seen 分数、在线 = 心跳未超租约、
+    元数据消失时懒清理索引成员、选节点按「空闲容量降序 → node_id 升序」、
+    ``node_endpoint`` 只在在线且地址合法时返回当前基址（否则 None ⇒ 调用方转 5001）。
+    """
+
+    def __init__(
+        self,
+        *,
+        lease_seconds: int = 90,
+        instance_ttl_seconds: int = 86400,
+        default_capacity: int = 1,
+    ) -> None:
+        self.nodes: dict[str, dict[str, Any]] = {}
+        self.seen: dict[str, float] = {}
+        self.runtime: dict[str, dict[str, Any]] = {}
+        self.active: dict[str, float] = {}
+        self._lease = lease_seconds
+        self._instance_ttl = instance_ttl_seconds
+        self._default_capacity = default_capacity
+        # 测试可注入故障，验证 5001 不被吞成 5000
+        self.unavailable = False
+
+    @property
+    def lease_seconds(self) -> int:
+        return self._lease
+
+    @property
+    def instance_ttl_seconds(self) -> int:
+        return self._instance_ttl
+
+    @property
+    def default_capacity(self) -> int:
+        return self._default_capacity
+
+    def _check(self) -> None:
+        if self.unavailable:
+            raise ServiceUnavailableError("仿真节点存储不可用")
+
+    # ---------- 节点登记表 ----------
+
+    async def get_node(self, node_id: str) -> dict[str, Any] | None:
+        self._check()
+        return self.nodes.get(node_id)
+
+    async def save_node(self, node_id: str, record: dict[str, Any], *, now: float) -> None:
+        self._check()
+        self.nodes[node_id] = dict(record)
+        self.seen[node_id] = now
+
+    async def node_online(self, node_id: str, *, now: float) -> bool:
+        self._check()
+        score = self.seen.get(node_id)
+        if score is None or score <= now - self._lease:
+            return False
+        return node_id in self.nodes
+
+    async def list_nodes(self, *, online_only: bool, now: float) -> list[dict[str, Any]]:
+        self._check()
+        nodes: list[dict[str, Any]] = []
+        for node_id, score in sorted(self.seen.items()):
+            record = self.nodes.get(node_id)
+            if record is None:
+                self.seen.pop(node_id, None)
+                continue
+            online = score > now - self._lease
+            if online_only and not online:
+                continue
+            running = record.get("running_instance_ids")
+            nodes.append(
+                {
+                    **record,
+                    "node_id": node_id,
+                    "online": online,
+                    "last_seen_at": score,
+                    "lease_seconds": self._lease,
+                    "running_count": len(running) if isinstance(running, list) else 0,
+                }
+            )
+        return nodes
+
+    # ---------- 下发寻址（只返回**当前**学到的地址） ----------
+
+    async def node_endpoint(self, node_id: str, *, now: float) -> NodeEndpoint | None:
+        self._check()
+        score = self.seen.get(node_id)
+        if score is None or score <= now - self._lease:
+            return None
+        record = self.nodes.get(node_id)
+        if record is None:
+            return None
+        ip = str(record.get("endpoint_ip") or "").strip()
+        port = record.get("manager_port")
+        if not ip or not isinstance(port, int) or not 1 <= port <= 65535:
+            return None
+        scheme = str(record.get("protocol") or "http").strip().lower()
+        if scheme not in ("http", "https"):
+            scheme = "http"
+        return NodeEndpoint(
+            node_id=node_id,
+            base_url=build_base_url(ip, port, scheme),
+            ip=ip,
+            port=port,
+            scheme=scheme,
+            source=str(record.get("endpoint_source") or "") or None,
+        )
+
+    # ---------- 运行时快照与活动实例 ----------
+
+    async def save_runtime(self, sim_instance_id: str, snapshot: dict[str, Any]) -> None:
+        self._check()
+        self.runtime[sim_instance_id] = dict(snapshot)
+
+    async def get_runtime(self, sim_instance_id: str) -> dict[str, Any] | None:
+        self._check()
+        return self.runtime.get(sim_instance_id)
+
+    async def add_active_instance(self, sim_instance_id: str, *, now: float) -> None:
+        self._check()
+        self.active[sim_instance_id] = now
+
+    async def remove_active_instance(self, sim_instance_id: str) -> None:
+        self._check()
+        self.active.pop(sim_instance_id, None)
+
+    async def active_instance_records(self, *, now: float) -> list[dict[str, Any]]:
+        self._check()
+        records: list[dict[str, Any]] = []
+        for sim_instance_id in sorted(self.active):
+            snapshot = self.runtime.get(sim_instance_id)
+            if snapshot is None:
+                self.active.pop(sim_instance_id, None)
+                continue
+            records.append({**snapshot, "sim_instance_id": sim_instance_id})
+        return records
+
+    async def select_node(
+        self, *, now: float, map_id: str | None = None, prefer: str | None = None
+    ) -> dict[str, Any] | None:
+        self._check()
+        nodes = await self.list_nodes(online_only=True, now=now)
+        if not nodes:
+            return None
+        if prefer:
+            return next((node for node in nodes if node.get("node_id") == prefer), None)
+        candidates = [
+            node
+            for node in nodes
+            if not map_id
+            or not _declared_maps(node)
+            or map_id in _declared_maps(node)
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=_free_capacity_sort_key)
+        return candidates[0]
+
+
+class RecordingCarlaClient:
+    """node 模式代理的委派对象：把基址（``base_url``）与调用序列全部记到工厂上。
+
+    只关心「发到哪个地址」这件事：基址断言 = 「按学到的 IP 直推」与「IP 变更后基址变化」
+    的共同证据；对已关闭客户端的调用直接断语失败 ⇒ 旧基址不可能还在用。
+    """
+
+    def __init__(self, base_url: str, factory: RecordingCarlaClientFactory) -> None:
+        self.base_url = base_url
+        self.factory = factory
+        self.closed = False
+        self.unavailable = False
+        self.progress: dict[str, dict[str, Any]] = {}
+        self.results: dict[str, dict[str, Any]] = {}
+
+    def _check(self, action: str, target: str = "") -> None:
+        if self.closed:
+            raise AssertionError(f"客户端已关闭仍被调用：{self.base_url} {action}")
+        self.factory.calls.append((self.base_url, action))
+        if self.unavailable:
+            raise ServiceUnavailableError(
+                "Carla 管理 API 不可达", details={"endpoint": self.base_url, "stage": action}
+            )
+        if target and self.factory.missing_instances and target not in (
+            *self.progress,
+            *self.results,
+            *self.factory.known_instances,
+        ):
+            raise ResourceNotFoundError(
+                f"仿真实例不存在或已回收：{target}", details={"sim_instance_id": target}
+            )
+
+    async def create_instance(
+        self,
+        *,
+        scene_id: str,
+        scene_name: str,
+        scene_config: dict[str, Any],
+        sim_id: str | None = None,
+        **kwargs: Any,
+    ) -> SimInstance:
+        self._check("create_instance")
+        instance_id = self.factory.next_instance_id()
+        self.factory.known_instances.append(instance_id)
+        self.factory.created.append(
+            {"base_url": self.base_url, "instance_id": instance_id, "scene_id": scene_id, "sim_id": sim_id}
+        )
+        return SimInstance(
+            instance_id=instance_id,
+            status=self.factory.status,
+            sim_id=sim_id,
+            data={"scene_name": scene_name, **kwargs},
+        )
+
+    async def submit_scenario(self, instance_id: str, payload: dict[str, Any]) -> None:
+        self._check("submit_scenario", instance_id)
+        self.factory.submitted.append((self.base_url, instance_id))
+
+    async def get_instance(self, instance_id: str) -> SimInstanceSnapshot:
+        self._check("get_instance", instance_id)
+        body = self.progress.get(instance_id) or {"status": self.factory.status}
+        return SimInstanceSnapshot(
+            instance_id=instance_id, status=str(body.get("status") or "running"), data=dict(body)
+        )
+
+    async def get_result(self, instance_id: str) -> SimInstanceSnapshot:
+        self._check("get_result", instance_id)
+        body = self.results.get(instance_id) or {"status": self.factory.status}
+        return SimInstanceSnapshot(
+            instance_id=instance_id, status=str(body.get("status") or "running"), data=dict(body)
+        )
+
+    async def pause_instance(self, instance_id: str) -> None:
+        self._check("pause_instance", instance_id)
+
+    async def resume_instance(self, instance_id: str) -> None:
+        self._check("resume_instance", instance_id)
+
+    async def stop_instance(self, instance_id: str) -> None:
+        self._check("stop_instance", instance_id)
+
+    async def find_active_instance(self, scene_id: str) -> SimInstance | None:
+        self._check("find_active_instance")
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
+        self.factory.closed_base_urls.append(self.base_url)
+
+
+class RecordingCarlaClientFactory:
+    """``SimNodeBackend(client_factory=...)`` 替身：记录创建了哪些基址、关闭了哪些、调用序列。
+
+    用法：``factory.unreachable.add("http://192.168.31.99:8090")`` 模拟回访不通；
+    ``factory.calls`` 是「基址 → 动作」的完整序列，可直接断言 IP 变更后新基址只被新客户端调用。
+    """
+
+    def __init__(self, *, status: str = "running", missing_instances: bool = False) -> None:
+        self.status = status
+        self.missing_instances = missing_instances
+        self.clients: list[RecordingCarlaClient] = []
+        self.by_base_url: dict[str, RecordingCarlaClient] = {}
+        self.calls: list[tuple[str, str]] = []
+        self.created: list[dict[str, Any]] = []
+        self.submitted: list[tuple[str, str]] = []
+        self.closed_base_urls: list[str] = []
+        self.known_instances: list[str] = []
+        self.unreachable: set[str] = set()
+        self._seq = 0
+
+    def __call__(self, base_url: str) -> RecordingCarlaClient:
+        client = RecordingCarlaClient(base_url, self)
+        client.unavailable = base_url in self.unreachable
+        self.clients.append(client)
+        self.by_base_url.setdefault(base_url, client)
+        return client
+
+    def next_instance_id(self) -> str:
+        self._seq += 1
+        return f"sim-node-{self._seq:04d}"
+
+    def client_for(self, base_url: str) -> RecordingCarlaClient:
+        return self.by_base_url[base_url]
+
+    def actions_for(self, base_url: str) -> list[str]:
+        return [action for url, action in self.calls if url == base_url]
+
+    def live_clients(self) -> list[RecordingCarlaClient]:
+        return [client for client in self.clients if not client.closed]
+
+
+def _declared_maps(node: dict[str, Any]) -> tuple[str, ...]:
+    maps = node.get("maps")
+    return tuple(str(item) for item in maps if str(item).strip()) if isinstance(maps, list) else ()
+
+
+def _free_capacity_sort_key(node: dict[str, Any]) -> tuple[int, str]:
+    raw_capacity = node.get("capacity")
+    capacity = raw_capacity if isinstance(raw_capacity, int) else 1
+    running = node.get("running_instance_ids")
+    busy = len(running) if isinstance(running, list) else 0
+    return (-(max(0, capacity - busy)), str(node.get("node_id") or ""))
+
+
 __all__ = [
     "DEFAULT_CREATOR",
     "FakeCarlaClient",
@@ -463,6 +771,9 @@ __all__ = [
     "FakeVilSessionStore",
     "InMemorySceneRepository",
     "InMemorySceneStorage",
+    "InMemorySimNodeStore",
+    "RecordingCarlaClient",
+    "RecordingCarlaClientFactory",
     "config_payload",
     "create_payload",
     "make_scene_model",

@@ -47,6 +47,29 @@ class Settings(HunterBaseConfig):
     carla_request_timeout_seconds: float = 5.0
     carla_request_max_retries: int = 1
 
+    # ---------- 仿真下发链路模式（V1.24.0，契约 x-hunter-simulation-flow.node_dispatch） ----------
+    # direct：平台直连 Carla 管理 API（默认，保持 V1.23.7 行为不变）
+    # node  ：按自学习地址直推节点 CARLA 管理 API（需平台→节点可达）
+    #         地址来自注册/心跳的入站请求头，实例只绑 node_id、每次调用重新解析 ⇒ IP 漂移自愈；
+    #         此模式下 carla_management_endpoint 不参与寻址（子路径配置继续复用）
+    sim_dispatch_mode: str = "direct"
+    # 在线租约：sim:node:{node_id} 的 TTL 与 sim:node:seen 的在线判定窗口
+    sim_node_lease_seconds: int = 90
+    # 注册未声明 capacity 时的默认可并发实例数
+    sim_node_default_capacity: int = 1
+    # 允许调用节点控制面的角色（服务令牌角色默认 data-uploader；契约 x-hunter-simulation-flow.node_dispatch.auth）
+    sim_node_roles: str = "data-uploader,admin"
+    # 注册未声明 manager_port 时的节点 CARLA 管理 API 默认端口
+    sim_node_manager_default_port: int = 8090
+    # 拼接节点基址的默认协议（仅 http/https；注册体 protocol 优先）
+    sim_node_manager_scheme: str = "http"
+    # 是否采信 X-Real-IP / X-Forwarded-For（false = 只认 TCP 对端，用于直连部署与防头伪造）
+    sim_node_trust_forwarded_for: bool = True
+    # 节点地址 CIDR 白名单（逗号分隔，空 = 不限制；不命中则降级到下一地址来源）
+    sim_node_allowed_networks: str = ""
+    # 每节点 CARLA 客户端缓存上限（超出按插入序淘汰；基址变化即新建并关闭旧的）
+    sim_node_client_cache_max: int = 32
+
     # ---------- 仿真会话 / 动态 Topic（CARLA 接入方案 P1） ----------
     # VIL 会话 Redis 契约：vil:session:{vehicle_id}（String JSON，7200s）、vil:active（Set）
     vil_session_ttl_seconds: int = 7200
@@ -125,6 +148,12 @@ class Settings(HunterBaseConfig):
 
     # ---------- Carla 子路径归一（V1.23.7） ----------
 
+    #: 下发模式合法取值（契约 x-hunter-simulation-flow.node_dispatch.mode_switch）
+    SIM_DISPATCH_MODES: ClassVar[tuple[str, ...]] = ("direct", "node")
+
+    #: 节点基址协议合法取值（契约 x-hunter-simulation-flow.node_dispatch.endpoint_learning.base_url）
+    NODE_MANAGER_SCHEMES: ClassVar[tuple[str, ...]] = ("http", "https")
+
     #: 允许“空串回落默认”的 Carla 子路径键（V1.23.7）。
     #
     #: compose 侧统一用 ``${CARLA_*_PATH:-}`` 透传：① 避开 docker compose 变量插值在默认值
@@ -142,7 +171,7 @@ class Settings(HunterBaseConfig):
 
     @model_validator(mode="after")
     def _blank_carla_paths_fallback(self) -> Settings:
-        """子路径留空/纯空白 → 回落字段默认值（与 K8s ConfigMap 默认一致）。"""
+        """子路径留空/纯空白 → 回落字段默认值（与 K8s ConfigMap 默认一致）；同时归一下发模式。"""
         fields = type(self).model_fields
         for name in self.CARLA_PATH_FIELDS:
             value = getattr(self, name)
@@ -150,6 +179,16 @@ class Settings(HunterBaseConfig):
                 setattr(self, name, fields[name].default)
             elif value != value.strip():
                 setattr(self, name, value.strip())
+        # 下发模式归一：大小写/空白容忍，非法值回落 direct（禁止因拼写错误静默换链路）
+        mode = self.sim_dispatch_mode.strip().lower()
+        if mode not in self.SIM_DISPATCH_MODES:
+            mode = "direct"
+        object.__setattr__(self, "sim_dispatch_mode", mode)
+        # 节点协议归一：同上，非法值回落 http（避免拼出 http://…:// 形态的非法基址）
+        scheme = self.sim_node_manager_scheme.strip().lower()
+        if scheme not in self.NODE_MANAGER_SCHEMES:
+            scheme = "http"
+        object.__setattr__(self, "sim_node_manager_scheme", scheme)
         return self
 
     # ---------- 派生集合 ----------
@@ -173,6 +212,21 @@ class Settings(HunterBaseConfig):
     def scene_review_role_set(self) -> frozenset[str]:
         """评审授权角色集合（发布/基线锁定）。"""
         return self._role_set(self.scene_review_roles)
+
+    @property
+    def sim_node_role_set(self) -> frozenset[str]:
+        """节点控制面授权角色集合（注册/心跳）。"""
+        return self._role_set(self.sim_node_roles)
+
+    @property
+    def sim_node_allowed_network_list(self) -> tuple[str, ...]:
+        """节点地址 CIDR 白名单（已去空白；空元组 = 不限制）。"""
+        return tuple(item.strip() for item in self.sim_node_allowed_networks.split(",") if item.strip())
+
+    @property
+    def sim_dispatch_via_node(self) -> bool:
+        """当前是否按节点动态地址直推（node 模式；否则为固定地址直连 Carla 管理 API）。"""
+        return self.sim_dispatch_mode == "node"
 
     @property
     def map_bounds(self) -> tuple[float, float, float, float] | None:

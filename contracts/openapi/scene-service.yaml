@@ -69,6 +69,8 @@ tags:
     description: 场景导出（Carla ScenarioRunner XML / OpenSCENARIO 1.2）
   - name: simulation
     description: 场景下发到 Carla 仿真（4.4 节下发流程）
+  - name: sim-node
+    description: 仿真节点控制面（V1.24.0：注册/心跳 + 地址自学习，按节点动态直推 CARLA 管理 API）
   - name: ops
     description: 运维探针与指标（K8s probe / Prometheus 抓取）
 
@@ -427,6 +429,11 @@ paths:
         - Carla 管理 API 不可达/超时返回 5001（依赖服务不可用）
         - 同一场景已有 `running` 实例时按 `sim_config.allow_parallel` 决定复用或 3003
         - 参数覆盖（`param_overrides`）仅覆盖 4.2.2 白名单路径，禁止新增结构字段
+
+        下发链路（`SIM_DISPATCH_MODE`，见 `x-hunter-simulation-flow.node_dispatch`）：
+        - `direct`（默认）：固定地址 `CARLA_MANAGEMENT_ENDPOINT`；
+        - `node`：先选在线节点，再按该节点**当前学习到的** `ip:manager_port` 构造基址，
+          子路径与请求体与 direct 完全共用；无在线节点 → 5001「无可用仿真节点」。
       operationId: runScene
       parameters:
         - $ref: "#/components/parameters/SceneIdPath"
@@ -593,6 +600,114 @@ paths:
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  # =====================================================================
+  # 仿真节点控制面（V1.24.0，tag: sim-node）
+  # 实机拓扑：平台有线接交换机、HunterSim 走 WiFi 出向连平台，但二者同网段
+  # （实录 192.168.31.35 可访问 192.168.31.20:8090）⇒ 平台可回访节点上的 CARLA 管理端口。
+  # 节点每次注册/心跳时，服务从**入站请求头学习来源地址**并覆盖登记；下发时按 node_id
+  # 取出当前地址构造 `http://{ip}:{port}` 基址（语义见 x-hunter-simulation-flow.node_dispatch）。
+  # 路由注册顺序约束：本组路径必须先于 /api/v1/scene/{scene_id} 实现（否则 node_id 会被 scene_id 抢先匹配）。
+  # =====================================================================
+  /api/v1/scene/sim-nodes:
+    get:
+      tags: [sim-node]
+      summary: 查询仿真节点清单（含在线状态与当前下发的目标地址）
+      description: |
+        运维视图（RBAC `scene:read`，普通用户令牌即可）：`online` = 心跳未落后超租约
+        （`SIM_NODE_LEASE_SECONDS`）；`endpoint_ip` / `manager_port` / `protocol` /
+        `endpoint_source` / `learned_at` 即平台**当前**用于下发的目标——排障「节点掉线」还是
+        「平台不可达节点」以及「IP 是否已漂移」均读这几个字段。默认仅返回在线节点，
+        `online_only=false` 含离线节点（元数据键已过 TTL 的成员不会出现）。
+      operationId: listSimNodes
+      parameters:
+        - $ref: "#/components/parameters/SimNodeOnlineOnlyQuery"
+      responses:
+        "200":
+          description: 节点清单（code=0）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimNodeListResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/sim-nodes/{node_id}:
+    put:
+      tags: [sim-node]
+      summary: 注册/更新仿真节点（幂等 upsert：能力声明 + 地址自学习 + 续租）
+      description: |
+        节点能力声明与登记，**调用一次即完成注册 + 地址学习 + 租约续期**（幂等 upsert）。
+
+        地址自学习（`node_dispatch.endpoint_learning`）：服务按 `X-Real-IP` → `X-Forwarded-For`
+        首跳 → TCP 对端的顺序取来源地址（`SIM_NODE_TRUST_FORWARDED_FOR=false` 时只认对端），
+        逐个做字面量 IP 校验与 `SIM_NODE_ALLOWED_NETWORKS` CIDR 过滤，不合法则降级到下一来源；
+        全部不可得 → 2001「无法判定节点地址来源」。端口/协议取请求体 `manager_port` / `protocol`
+        （缺省取 `SIM_NODE_MANAGER_DEFAULT_PORT` / `SIM_NODE_MANAGER_SCHEME`）。
+
+        ⚙ 地址**不在请求体里**：`node_id` 由节点自行命名且与 IP 无关（IP 漂移不改变身份）；
+        学习结果每次**覆盖式**写入 `sim:node:{node_id}`，因此无需人工处理漂移。
+        首次注册把调用方写入 `owner`，后续 owner 不一致的写调用 → 1002。
+
+        鉴权：节点使用服务令牌（api-gateway `POST /api/v1/user/service-token`），角色限
+        `SIM_NODE_ROLES`（默认 `data-uploader,admin`）；身份取网关注入的 `X-User-Id`。
+      operationId: registerSimNode
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SimNodeRegisterRequest" }
+      responses:
+        "200":
+          description: 注册成功（回显租约与当前学到的地址）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimNodeResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/sim-nodes/{node_id}/heartbeat:
+    post:
+      tags: [sim-node]
+      summary: 节点心跳（续租 + 覆盖式刷新来源地址：IP 漂移的唯一自愈点）
+      description: |
+        轻量续租（请求体可空）：每次 `SET sim:node:{node_id} EX {lease}` + `ZADD sim:node:seen`，
+        并**重新执行一次地址自学习**后覆盖地址字段——节点重连 / DHCP 换址后，一次心跳即恢复正常。
+        未注册（或租约已过）→ 3001，必须先调 `PUT /sim-nodes/{node_id}`；owner 不一致 → 1002。
+        推荐心跳间隔 ≤ lease/3（默认 90s 租约 ⇒ 30s）。
+      operationId: heartbeatSimNode
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SimNodeHeartbeatRequest" }
+      responses:
+        "200":
+          description: 续租成功（code=0，data 回显在线状态与学到的地址）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimNodeResponse" }
+        "404": { $ref: "#/components/responses/SceneNotFound" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /healthz:
     get:
       tags: [ops]
@@ -674,6 +789,20 @@ components:
       required: true
       description: Carla 仿真实例 ID（POST /api/v1/scene/{scene_id}/run 返回值，4.4 节第 5 步）
       schema: { type: string, maxLength: 128 }
+    SimNodeIdPath:
+      name: node_id
+      in: path
+      required: true
+      description: |
+        仿真节点标识（契约 SimNodeId）：节点自行命名且**与 IP 无关**，因此 IP 漂移不改变身份、
+        不影响到已登记实例的归属（实例只绑 node_id）。
+      schema: { $ref: "#/components/schemas/SimNodeId" }
+    SimNodeOnlineOnlyQuery:
+      name: online_only
+      in: query
+      required: false
+      description: 仅返回在线节点（默认 true；false 时含租约已过但元数据尚存的节点）
+      schema: { type: boolean, default: true }
     PageQuery:
       name: page
       in: query
@@ -1531,6 +1660,200 @@ components:
           nullable: true
           description: "回放配置（mode=replay 必填）"
 
+    # ---------- 仿真节点控制面（V1.24.0：node_dispatch，地址自学习） ----------
+    SimNodeId:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9._-]{2,63}$"
+      description: |
+        节点标识：与 IP 无关、节点自行命名并保持长期稳定（`node_dispatch.instance_binding`：
+        实例只绑 node_id，因此地址变化不会使已有实例失控）。
+      example: huntersim-lab-01
+
+    SimNodeProtocol:
+      type: string
+      enum: [http, https]
+      description: 拼接节点基址所用协议（缺省取 SIM_NODE_MANAGER_SCHEME）
+
+    SimNodeEndpointSource:
+      type: string
+      enum: [real-ip, forwarded-for, socket-peer]
+      description: |
+        地址来源标记（排障用，判断是否被代理/网关改写）：`real-ip` = `X-Real-IP`；
+        `forwarded-for` = `X-Forwarded-For` 首跳；`socket-peer` = TCP 对端。取值语义见
+        `node_dispatch.endpoint_learning`。
+
+    SimNodeRegisterRequest:
+      type: object
+      description: |
+        节点能力声明（幂等 upsert）。⚠ 不携带地址字段：`endpoint_ip` / `endpoint_source` /
+        `learned_at` 只能由服务端从入站请求头自学习写入（见 `node_dispatch.endpoint_learning`）；
+        请求体只声明监听端口与协议。
+      additionalProperties: false
+      properties:
+        carla_version:
+          type: string
+          nullable: true
+          maxLength: 64
+          description: 节点上 CARLA 服务版本（仅展示与兼容性排查）
+        maps:
+          type: array
+          nullable: true
+          maxItems: 64
+          items: { type: string, minLength: 1, maxLength: 64 }
+          description: |
+            可用地图清单（选节点策略：声明了 maps 且不含目标地图的在线节点被排除；
+            未声明视为通用）
+        capacity:
+          type: integer
+          minimum: 1
+          maximum: 32
+          default: 1
+          description: 可同时运行的仿真实例上限（节点自述值，平台不做二次削减）
+        labels:
+          type: object
+          nullable: true
+          additionalProperties: { type: string, maxLength: 128 }
+          description: 自定义标签（机房/显卡型号等，仅展示）
+        manager_port:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 65535
+          description: |
+            节点 CARLA 管理 API 端口（缺省取 SIM_NODE_MANAGER_DEFAULT_PORT，默认 8090）；
+            与学习到的 IP 共拼装下发基址
+        protocol:
+          allOf:
+            - $ref: "#/components/schemas/SimNodeProtocol"
+          nullable: true
+          description: 拼基址的协议（缺省取 SIM_NODE_MANAGER_SCHEME）
+        runtime_hint:
+          type: string
+          nullable: true
+          maxLength: 256
+          description: 节点自述服务地址（**仅展示，绝不参与寻址**）
+
+    SimNodeHeartbeatRequest:
+      type: object
+      description: |
+        轻量续租（请求体可完全省略）。心跳同时是一次地址自学习，因此 IP 变化无需额外调用。
+      additionalProperties: false
+      properties:
+        running_instance_ids:
+          type: array
+          nullable: true
+          maxItems: 32
+          items: { type: string, maxLength: 128 }
+          description: 节点正在运行的实例 ID（用于空闲容量估算；超出 capacity 仅告警不改写）
+        capacity:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 32
+          description: 容量变更时携带
+        message:
+          type: string
+          nullable: true
+          maxLength: 512
+          description: 节点侧健康提示（回显给运维，不参与调度判定）
+
+    SimNodeData:
+      type: object
+      description: |
+        节点视图。`endpoint_*` 四条是排障与下发的唯一事实来源：只反映**最后一次注册/心跳
+        时学到的地址**（IP 漂移后下一次心跳自动刷新，无需人工处置）。
+      required: [node_id, owner, online, lease_seconds]
+      properties:
+        node_id: { $ref: "#/components/schemas/SimNodeId" }
+        owner:
+          type: string
+          description: 首次注册绑定的调用方身份（服务令牌为 `service:{client_id}`）
+        online:
+          type: boolean
+          description: 心跳未超租约（`SIM_NODE_LEASE_SECONDS`）
+        last_seen_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 最后一次成功注册/心跳时间
+        lease_seconds:
+          type: integer
+          minimum: 1
+          description: 当前生效的租约秒数（节点据此计算心跳间隔，建议 ≤ lease/3）
+        carla_version: { type: string, nullable: true, maxLength: 64 }
+        maps:
+          type: array
+          nullable: true
+          maxItems: 64
+          items: { type: string, maxLength: 64 }
+        capacity: { type: integer, minimum: 1, maximum: 32 }
+        running_count:
+          type: integer
+          minimum: 0
+          description: 心跳上报的运行中实例数（选节点时算空闲容量用）
+        labels:
+          type: object
+          nullable: true
+          additionalProperties: { type: string, maxLength: 128 }
+        endpoint_ip:
+          type: string
+          nullable: true
+          maxLength: 45
+          description: 当前学习到的节点来源地址（IPv6 已去方括号，拼 URL 时自动加回）
+        manager_port:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 65535
+          description: 节点 CARLA 管理 API 端口
+        protocol:
+          allOf:
+            - $ref: "#/components/schemas/SimNodeProtocol"
+          nullable: true
+        endpoint_source:
+          allOf:
+            - $ref: "#/components/schemas/SimNodeEndpointSource"
+          nullable: true
+        learned_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 最后一次地址刷新时间（与 `last_seen_at` 同点写入）
+        runtime_hint: { type: string, nullable: true, maxLength: 256, description: "仅展示，不参与寻址" }
+        registered_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 首次注册时间（upsert 不会覆写）
+        message: { type: string, nullable: true, maxLength: 512 }
+
+    SimNodeListData:
+      type: object
+      description: 节点清单（GET /api/v1/scene/sim-nodes）
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: "#/components/schemas/SimNodeData" }
+        total: { type: integer, minimum: 0 }
+
+    SimNodeResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SimNodeData" }
+
+    SimNodeListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SimNodeListData" }
+
 
 # =====================================================================
 # 扩展字段：机器可校验契约（由 services/scene-service/app/tests/test_openapi_contract.py 强制校验）
@@ -1559,6 +1882,22 @@ x-hunter-service:
       type: "String(JSON)"
       ttl_seconds: 86400
       usage: "仿真实例元数据（pause/resume/cancel 与 Topic 清理）"
+    - pattern: "sim:node:{node_id}"
+      type: "String(JSON)"
+      ttl_seconds: 90
+      usage: "节点注册信息与**自学习地址**（每次注册/心跳覆盖；owner / maps / capacity / running / endpoint_ip / manager_port / protocol / endpoint_source / learned_at）"
+    - pattern: "sim:node:seen"
+      type: "ZSet"
+      ttl_seconds: null
+      usage: "member = node_id，score = 最后心跳 epoch 秒（在线判定与节点枚举索引；过期成员读取时懒清理 ZREM）"
+    - pattern: "sim:runtime:{sim_instance_id}"
+      type: "String(JSON)"
+      ttl_seconds: 86400
+      usage: "实例→节点归属绑定（node_id / scene_id / sim_id / last_status / updated_at）；仅存 node_id，地址在每次调用时解析"
+    - pattern: "sim:instance:active"
+      type: "ZSet"
+      ttl_seconds: null
+      usage: "活动实例索引（创建 ZADD；终态回收/复核为终态时 ZREM）"
   config_source: "pydantic-settings（环境变量 / K8s ConfigMap scene-service-config + Secret hunter-app-secrets）"
   required_env:
     - SERVICE_NAME
@@ -1604,6 +1943,17 @@ x-hunter-service:
     - SCENE_EXTRACTION_DEFAULT_EGO_MODEL
     - SCENE_EXTRACTION_MIN_SAFE_DISTANCE
     - SCENE_EXTRACTION_MAX_SPEED_DEVIATION
+    # ---------- 仿真节点控制面与动态地址直推（V1.24.0，x-hunter-simulation-flow.node_dispatch） ----------
+    - SIM_DISPATCH_MODE                     # direct（默认，固定地址）| node（按自学习地址直推节点 CARLA 管理 API）
+    - SIM_NODE_LEASE_SECONDS                # 在线租约秒数（sim:node TTL 与离线判定窗口，默认 90）
+    - SIM_NODE_DEFAULT_CAPACITY             # 注册未声明 capacity 时的默认可并发数（默认 1）
+    - SIM_NODE_ROLES                        # 允许调用节点控制面的角色（默认 data-uploader,admin）
+    - SIM_NODE_MANAGER_DEFAULT_PORT         # 节点 CARLA 管理 API 默认端口（默认 8090）
+    - SIM_NODE_MANAGER_SCHEME               # 拼基址默认协议（http|https，默认 http）
+    - SIM_NODE_TRUST_FORWARDED_FOR          # 是否采信 X-Real-IP / X-Forwarded-For（false = 只认 TCP 对端）
+    - SIM_NODE_ALLOWED_NETWORKS             # 节点地址 CIDR 白名单（逗号分隔，空 = 不限制）
+    - SIM_NODE_CLIENT_CACHE_MAX             # 每节点 CARLA 客户端缓存上限（超出按插入序淘汰）
+    - SIM_INSTANCE_TTL_SECONDS              # sim:instance / sim:runtime 保留期（默认 86400）
   performance:
     api_p95_ms: 200             # 13.2 节：API 响应 P95 ≤ 200ms
     list_default_page_size: 20
@@ -1630,6 +1980,10 @@ x-hunter-endpoints:
     - "POST /api/v1/scene/simulations/{sim_instance_id}/pause"
     - "POST /api/v1/scene/simulations/{sim_instance_id}/resume"
     - "POST /api/v1/scene/simulations/{sim_instance_id}/cancel"
+    # 仿真节点控制面（V1.24.0 动态地址直推；设计文档 12.2 未列，需同步勘误）
+    - "GET /api/v1/scene/sim-nodes"
+    - "PUT /api/v1/scene/sim-nodes/{node_id}"
+    - "POST /api/v1/scene/sim-nodes/{node_id}/heartbeat"
   ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]
 
 x-hunter-scene-types:
@@ -1789,6 +2143,76 @@ x-hunter-simulation-flow:
     - {message: "Carla 管理 API 连接超时", cause: "CARLA_REQUEST_TIMEOUT_SECONDS 内未响应（对端同步阻塞/防火墙丢包）", retryable_by_config: "调大超时或修对端异步返回"}
     - {message: "Carla 管理 API 不可达", cause: "传输层错误（DNS 不可解析 / 连接被拒）", retryable_by_config: "修地址与网络"}
     - {message: "Carla 管理 API 返回 <code>", cause: "连得通但路由/权限不对", retryable_by_config: "核对子路径（待确认 #9）"}
+
+  # ---------- V1.24.0：下发链路模式（direct 固定地址 / node 地址自学习动态直推） ----------
+  node_dispatch:
+    status: implemented
+    source: "实机拓扑确认（平台有线接交换机，HunterSim 走 WiFi；二者同网段：实录 192.168.31.35 可访问 192.168.31.20:8090）"
+    rationale: |
+      HunterSim 只能出向连接平台（WiFi），但平台与它同网段 ⇒ 平台可回访 HunterSim 上的
+      CARLA 管理端口。因此不需要任务队列/长轮询：平台只需知道“节点现在在哪个 IP”，
+      而这个信息在节点每次注册/心跳时从入站请求头自然获得。
+    delivery: push_to_learned_endpoint
+    addressing_rule: |
+      地址来源 = 入站请求头自学习，仅由注册/心跳写入，每次覆盖；实例侧只持久化 `node_id`，
+      地址在每次调用时解析。因此：节点重连/DHCP 换址后，下一次心跳即刷新登记表；已下发实例的
+      后续操控（③⑥⑦）每次调用都重新解析地址 ⇒ IP 漂移自愈，不需要任何人工处置。
+      禁止把地址串随实例持久化（否则地址一变就只会打中旧地址、只能等失败）。
+    endpoint_learning:
+      sources_in_order: ["X-Real-IP", "X-Forwarded-For 首跳", "TCP 对端（request.client.host）"]
+      trust_header: "SIM_NODE_TRUST_FORWARDED_FOR=false 时只认 TCP 对端（直连部署/防头伪造）"
+      validation: "每个候选值必须过 ipaddress 字面量校验（域名/多值/空白=非法），非法则丢弃并降级到下一来源"
+      allowed_networks: "SIM_NODE_ALLOWED_NETWORKS（CIDR 逗号分隔白名单，空=不限制）；不命中同样降级"
+      all_failed: "注册/心跳返回 2001「无法判定节点地址来源」（不把无法下发的节点登为在线）"
+      base_url: "`{protocol}://{ip}:{manager_port}`；IPv6 拼为 `{protocol}://[{ip}]:{manager_port}`"
+      port_and_protocol: "取注册体 manager_port / protocol，缺省取 SIM_NODE_MANAGER_DEFAULT_PORT / SIM_NODE_MANAGER_SCHEME"
+      never_used: "节点自述的 runtime_hint 与业务字段一律不参与寻址"
+    direction: "平台 → 节点（同步直推，与 direct 模式同方向）"
+    transport: "httpx（复用 CarlaManagementClient，子路径与请求体完全共用 CARLA_INSTANCE_*_PATH）"
+    gateway_reuse: |
+      节点控制面落在既有前缀 /api/v1/scene 下 ⇒ 无需修改 x-hunter-gateway-routes；
+      网关只剥离逐跳头与身份头、注入 X-Real-IP / X-Forwarded-For ⇒ 两个地址头可透传到服务。
+    auth: "服务令牌（api-gateway POST /api/v1/user/service-token）；角色限 SIM_NODE_ROLES（默认 data-uploader,admin）；节点清单用 scene:read"
+    owner_binding: "首次注册写入 owner=service:{client_id}；owner 不一致的写调用 → 1002（防越权接管节点）"
+    lease: "sim:node:{node_id} SET EX SIM_NODE_LEASE_SECONDS（默认 90）+ ZADD sim:node:seen；在线 = score > now - lease"
+    step_mapping:
+      - "② 创建实例：select_node(map_id) → node_endpoint(node_id) → POST {base_url}{CARLA_INSTANCE_CREATE_PATH}（sim_instance_id 由节点 CARLA 返回，与 direct 一致）"
+      - "③ 下发场景：sim:runtime 取 node_id → POST {base_url}{CARLA_SCENARIO_SUBMIT_PATH}"
+      - "⑥ 进度：sim:runtime 取 node_id → GET {base_url}{CARLA_INSTANCE_GET_PATH}，结果回写 last_status/updated_at"
+      - "⑦ 结果/操控：同上走 CARLA_INSTANCE_RESULT_PATH / PAUSE / RESUME / STOP_PATH"
+    node_selection: |
+      在线节点中取空闲容量（capacity - len(running_instance_ids)）最多者，同空闲度按 node_id 升序（确定性）；
+      声明了 maps 且不含目标地图的节点被排除（未声明视为通用）；`prefer` 显式指定时必须在线。
+      ⚠ 容量为节点自述值：本模式为同步直推，超额时由节点上的 CARLA 直接拒绝 ⇒ 失败按 5001 原样暴露。
+    instance_binding: "sim:runtime:{sim_instance_id} = {node_id, scene_id, sim_id, last_status, updated_at}；**只绑 node_id，不绑地址串**（抗 IP 漂移的落点）"
+    active_index: |
+      sim:instance:active 支撑“同场景已有活动实例”判定：候选只向**其归属节点单点** get_instance 复核
+      （不向全部节点 fan-out）；复核为终态则移出索引并继续下一个。
+    client_cache: "dict[node_id, (base_url, client)] + asyncio.Lock；base_url 变化则新建并 aclose 旧的；超过 SIM_NODE_CLIENT_CACHE_MAX 按插入序淘汰"
+    log_events:
+      - {event: sim_node_registered, fields: "node_id / owner / capacity / endpoint_ip / endpoint_source"}
+      - {event: sim_node_endpoint_learned, fields: "node_id / ip / source / manager_port"}
+      - {event: sim_node_endpoint_refreshed, fields: "node_id / old_base_url / new_base_url（IP 漂移自愈点）"}
+      - {event: sim_node_dispatch_target, fields: "node_id / base_url / scene_id"}
+      - {event: sim_node_offline, fields: "node_id / lease_seconds"}
+      - {event: sim_node_client_cache_evicted, fields: "node_id / max"}
+    failure_semantics:
+      - {code: 5001, message: "无可用仿真节点", cause: "无在线节点（或均不满足地图/指定节点约束）"}
+      - {code: 5001, message: "仿真节点离线", cause: "节点租约已过或登记无合法地址；details 含 node_id / lease_seconds"}
+      - {code: 5001, message: "仿真实例缺少节点归属", cause: "sim:runtime 已过期/丢失（超出保留期或跨环境）"}
+      - {code: 5001, message: "Carla 管理 API 不可达/连接超时", cause: "目标 ip:port 连不通；details.endpoint 回显当前基址（不得吞为 5000）"}
+      - {code: 2001, message: "无法判定节点地址来源", cause: "注册/心跳时所有地址来源均不合法"}
+    finalization: "终态回收与 direct 模式同源：进度/结果轮询进入终态 → _finalize_instance（释放 VIL 会话 + 延迟删除动态 Topic）；无回报端点"
+    mode_switch: |
+      SIM_DISPATCH_MODE=direct|node（默认 direct，现有部署零影响）；node 模式下 CARLA_MANAGEMENT_ENDPOINT
+      不参与寻址（子路径配置继续复用）。切换不会使已有实例失控：旧实例仍可通过新模式的归属索引找回。
+    network_precondition: |
+      node 模式要求**平台主机可入站访问 HunterSim 的 CARLA 管理端口**（容器内预检：
+      `curl -m 3 http://<节点IP>:8090/api/v1/instances`；Windows 防火墙放行节点入站）。
+      WiFi AP 开客户端隔离时本模式不成立 ⇒ 改回 direct 或给节点固定 IP。
+    pending:
+      - "节点侧 CARLA 管理 API 是否与平台 direct 模式同源版本（子路径与请求体形状）需实机验证（实录显示 8090 可用）"
+      - "服务令牌轮换与多节点共用令牌时的 owner 粒度（当前：一个 client_id = 一组节点的 owner）"
 
 x-hunter-real-vehicle-extraction:
   source: "设计文档 4.5 节"

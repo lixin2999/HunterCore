@@ -19,6 +19,7 @@ from app.main import app
 from app.services.engine import SceneEngineService
 from app.services.export import SceneExportService
 from app.services.scenes import SceneService
+from app.services.sim_nodes import SimNodeService
 from app.services.simulation import SceneSimulationService
 from app.services.templates import SceneTemplateService
 from app.tests.fakes import (
@@ -28,6 +29,7 @@ from app.tests.fakes import (
     FakeVilSessionStore,
     InMemorySceneRepository,
     InMemorySceneStorage,
+    InMemorySimNodeStore,
 )
 from app.tests.fakes_engine import (
     InMemoryAuditLogRepository,
@@ -63,6 +65,8 @@ STATE_KEYS: tuple[str, ...] = (
     "export_service",
     "simulation_service",
     "engine_service",
+    "sim_node_store",
+    "sim_node_service",
     "db",
     "redis",
     "storage",
@@ -79,6 +83,7 @@ def scene_env() -> Iterator[SimpleNamespace]:
     carla = FakeCarlaClient()
     vil_sessions = FakeVilSessionStore()
     topic_provisioner = FakeTopicProvisioner()
+    sim_node_store = InMemorySimNodeStore()
     scene_service = SceneService(repository, cache, settings)
     app.state.scene_repository = repository
     app.state.scene_service = scene_service
@@ -94,6 +99,8 @@ def scene_env() -> Iterator[SimpleNamespace]:
         topics=topic_provisioner,
         topic_delete_delay_seconds=0,
     )
+    app.state.sim_node_store = sim_node_store
+    app.state.sim_node_service = SimNodeService(sim_node_store, settings)
     logical_repository = InMemoryLogicalScenarioRepository()
     concrete_repository = InMemoryConcreteScenarioRepository()
     task_repository = InMemoryGenerationTaskRepository()
@@ -118,6 +125,8 @@ def scene_env() -> Iterator[SimpleNamespace]:
         carla=carla,
         service=scene_service,
         simulation_service=app.state.simulation_service,
+        sim_node_store=sim_node_store,
+        sim_node_service=app.state.sim_node_service,
         vil_sessions=vil_sessions,
         topic_provisioner=topic_provisioner,
         engine=app.state.engine_service,
