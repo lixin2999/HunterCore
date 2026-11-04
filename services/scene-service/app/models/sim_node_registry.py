@@ -74,5 +74,28 @@ class SimNodeRegistry(Base, CreateTimeMixin, UpdateTimeMixin):
         JSONB, nullable=False, default=dict, server_default="{}"
     )
 
+    # ---- V1.24.2 一键开通编排态（对齐 vehicle_svc.vehicles.provision_status）----
+    # 骨架 {"state": "pending|in_progress|ready|failed", "steps": {db,scram,topics,cert}}；
+    # 由 sim_provisioner 逐步回写（DB→SCRAM→Topics→Cert），失败逆序回滚后落失败态。
+    provision_status: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default='{"state":"pending","steps":{}}',
+        comment="一键开通编排态（四步 + 聚合态），对齐车辆 provision_status",
+    )
+    # Kafka SCRAM 主体名（= sim-{node_id}，与 Kafka 证书 CN 一致）；⚠ 一次性口令不落库
+    scram_username: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="Kafka SCRAM 主体名（sim-{node_id}）；口令本身不存"
+    )
+    # 口令生成/轮换时间（provision scram 步 / rotate_scram 回写）
+    scram_credential_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 双证书到期快照（取 Kafka 证书 notAfter，供到期预警）
+    cert_not_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="证书到期时间快照（取 Kafka 证书）"
+    )
+
 
 __all__ = ["SimNodeRegistry"]

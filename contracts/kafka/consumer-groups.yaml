@@ -180,6 +180,21 @@ groups:
     idempotency_key: "(sim_id, seq)"
     notes: "CARLA 侧 vil-mapper 消费 VIL 实车状态；单会话单消费者，latest-wins"
 
+  # =====================================================================
+  # 仿真端节点级独立回传通道消费组（V1.24.2 一键开通；与实例级 carla.* 分离）
+  #   - 动态 Topic 模板 simulation.{node_id}.result，key = sim_id；
+  #   - 消费侧订阅写法 simulation.*.result（单层通配，匹配具体 node_id）；
+  #   - 生产者凭据 = 节点 SCRAM 主体 sim-{node_id}（由 scene-service 一键开通创建，非手工注入）。
+  # =====================================================================
+  - group_id: data-collector-simulation
+    service: data-collector
+    subscribes: ["simulation.*.result"]
+    subscribe_mode: regex_pattern
+    produces: [sensor_file]
+    writes: [data_collector.vehicle_telemetry, data_collector.events]
+    idempotency_key: "(sim_id, seq)"
+    notes: "消费仿真端节点级回传（非实例生命周期产出/状态）；与 data-collector-carla 同构：回传→vehicle_telemetry（vehicle_id=SIM-{sim_id}）/可映射事件→events；不跨 schema 写 data_analytics"
+
   - group_id: scene-service-analytics-result
     service: scene-service
     subscribes: [analytics_result]

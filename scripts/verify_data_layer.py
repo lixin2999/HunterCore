@@ -169,6 +169,12 @@ EXPECTED_CARLA_TOPICS: dict[str, tuple[int, int]] = {
     "carla.{sim_id}.sensor_data": (3, 604_800_000),
 }
 
+#: 仿真端节点级独立回传 Topic（topics.yaml#simulation_node_topics；V1.24.2）
+#: 不静态创建，按 node_id 由 scene-service 一键开通（provisionSimNode）创建 / deprovision 删除。
+EXPECTED_SIMULATION_TOPICS: dict[str, tuple[int, int]] = {
+    "simulation.{node_id}.result": (3, 604_800_000),
+}
+
 #: 被 ingest 消费的订阅 Topic（派生 {topic}.dlq；分区继承源 Topic、保留取 naming.dlq_retention_ms）
 EXPECTED_INGEST_CONSUMED: tuple[str, ...] = (
     "vehicle.bag.manifest",
@@ -1003,6 +1009,28 @@ def check_kafka_topics() -> dict[str, Any]:
         if entry.get("dynamic") is not True:
             fail(f"CARLA Topic {name}: 必须标记 dynamic=true（禁止静态创建）")
 
+    # 仿真端节点级回传 Topic（topics.yaml#simulation_node_topics；V1.24.2，不入静态脚本四方同步）
+    sim_topics = {entry["name"]: entry for entry in topics.get("simulation_node_topics", [])}
+    if set(sim_topics) != set(EXPECTED_SIMULATION_TOPICS):
+        fail(
+            f"仿真端节点级 Topic 清单不一致: 契约={sorted(sim_topics)} "
+            f"期望={sorted(EXPECTED_SIMULATION_TOPICS)}"
+        )
+    for name, (partitions, retention) in EXPECTED_SIMULATION_TOPICS.items():
+        entry = sim_topics.get(name)
+        if entry is None:
+            continue
+        if entry.get("partitions") != partitions:
+            fail(f"仿真端 Topic {name}: 分区数 {entry.get('partitions')} != {partitions}")
+        if entry.get("retention_ms") != retention:
+            fail(f"仿真端 Topic {name}: 保留时间 {entry.get('retention_ms')} != {retention}")
+        if entry.get("key") != "sim_id":
+            fail(f"仿真端 Topic {name}: 消息 key 必须为 sim_id")
+        if entry.get("dynamic") is not True:
+            fail(f"仿真端 Topic {name}: 必须标记 dynamic=true（由一键开通创建）")
+        if entry.get("dlq") is not True:
+            fail(f"仿真端 Topic {name}: 必须标记 dlq=true（provisioner 一并创建死信）")
+
     # ingest-platform Topic（topics.yaml#ingest_platform_topics ↔ EXPECTED_INGEST_TOPICS）
     ingest_topics = {entry["name"]: entry for entry in topics.get("ingest_platform_topics", [])}
     if set(ingest_topics) != set(EXPECTED_INGEST_TOPICS):
@@ -1047,7 +1075,7 @@ def check_kafka_topics() -> dict[str, Any]:
     #   alert_event 由 data-analytics 契约 6.2 节补全）
     tbd_allowed: set[str] = set()
     tbd_actual: set[str] = set()
-    for group in ("vehicle_topics", "platform_topics", "carla_topics"):
+    for group in ("vehicle_topics", "platform_topics", "carla_topics", "simulation_node_topics"):
         for entry in topics.get(group, []):
             ref = entry.get("schema")
             if ref is None:
@@ -1181,6 +1209,9 @@ def check_consumer_groups() -> None:
     # CARLA 动态 Topic：模板、具体实例与 regex 订阅写法均视为已登记
     known_topics |= set(EXPECTED_CARLA_TOPICS)
     known_topics |= {name.replace("{sim_id}", "*") for name in EXPECTED_CARLA_TOPICS}
+    # 仿真端节点级回传（V1.24.2）：模板与 regex 订阅写法均视为已登记
+    known_topics |= set(EXPECTED_SIMULATION_TOPICS)
+    known_topics |= {name.replace("{node_id}", "*") for name in EXPECTED_SIMULATION_TOPICS}
     known_topics |= {f"{name}.dlq" for name in known_topics}
     known_topics |= {f"{name}.dlq" for name in EXPECTED_INGEST_CONSUMED}
 

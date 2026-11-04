@@ -74,6 +74,10 @@ EXPECTED_ENDPOINTS: set[tuple[str, str]] = {
     ("POST", "/api/v1/scene/sim-nodes/{node_id}/issue-kafka-cert"),
     ("POST", "/api/v1/scene/sim-nodes/{node_id}/issue-platform-cert"),
     ("GET", "/api/v1/scene/sim-nodes/{node_id}/bundle"),
+    # V1.24.2 仿真端一键开通（对齐车辆 provisioning：建节点即产出 SCRAM 口令 + 双证书 + 接入包）
+    ("POST", "/api/v1/scene/sim-nodes"),
+    ("POST", "/api/v1/scene/sim-nodes/{node_id}/rotate-scram"),
+    ("POST", "/api/v1/scene/sim-nodes/{node_id}/retry-provision"),
 }
 
 #: 运维端点（K8s 探针 / Prometheus 抓取）
@@ -497,7 +501,8 @@ def test_node_dispatch_pushes_to_learned_endpoint(contract: dict[str, Any]) -> N
         for _, path, operation in iter_operations(contract)
         if "sim-nodes" in path
     }
-    assert operations == {"listSimNodes", "registerSimNode", "heartbeatSimNode"}
+    # V1.24.0 控制面三操作必须存在（V1.24.1 管理端点 + V1.24.2 一键开通端点由 EXPECTED_ENDPOINTS 逐项覆盖）
+    assert {"listSimNodes", "registerSimNode", "heartbeatSimNode"} <= operations
 
     required = set(contract["x-hunter-service"]["required_env"])
     assert {

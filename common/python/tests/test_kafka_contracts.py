@@ -52,6 +52,12 @@ EXPECTED_CARLA_TOPICS: dict[str, tuple[int, str, str, int]] = {
     "carla.{sim_id}.sensor_data": (3, "all", "sim_id", 604_800_000),
 }
 
+#: 仿真端节点级独立回传 Topic 模板（分区数, acks, key, 保留毫秒）—— topics.yaml#simulation_node_topics（V1.24.2）
+#: 由 scene-service 一键开通（provisionSimNode）显式创建 / deprovision 删除，与实例级 carla.* 分离。
+EXPECTED_SIMULATION_TOPICS: dict[str, tuple[int, str, str, int]] = {
+    "simulation.{node_id}.result": (3, "all", "sim_id", 604_800_000),
+}
+
 #: 车端 Topic（分区数, acks, 频率）
 EXPECTED_VEHICLE_TOPICS: dict[str, tuple[int, str, str]] = {
     "hunter.{vehicle_id}.telemetry": (6, "1", "10-50Hz"),
@@ -145,6 +151,31 @@ def test_carla_topics_are_provisioned_dynamically_not_statically() -> None:
     for script in (COMPOSE_SCRIPT, K8S_JOB):
         text = script.read_text(encoding="utf-8")
         assert "carla." not in text, f"{script.name} 不得静态创建 CARLA 动态 Topic"
+
+
+def test_simulation_node_topic_contract_values() -> None:
+    """仿真端节点级回传 Topic（V1.24.2）：模板/分区/acks/key/retention/动态与命名一致，且不静态创建。"""
+    topics = load_yaml(KAFKA_DIR / "topics.yaml")
+    sim = {entry["name"]: entry for entry in topics["simulation_node_topics"]}
+    # 死信由源 Topic 的 dlq:true 隐式派生（不单独列项，与 carla.*.sensor_data 同惯例）
+    assert set(sim) == set(EXPECTED_SIMULATION_TOPICS)
+    for name, (partitions, acks, key, retention) in EXPECTED_SIMULATION_TOPICS.items():
+        entry = sim[name]
+        assert entry["dynamic"] is True
+        assert entry["partitions"] == partitions
+        assert str(entry["acks"]) == acks
+        assert entry["key"] == key
+        assert entry["retention_ms"] == retention
+        assert entry["lifecycle"] == "per_node"
+        assert entry["dlq"] is True
+        assert (SCHEMA_DIR / entry["schema"].split("/")[-1]).is_file()
+        # V1.24.2：节点级 Topic 由一键开通显式创建 ⇒ 必须声明 SCRAM 主体 sim-{node_id}
+        assert "SCRAM" in entry["auth"] and "sim-" in entry["auth"]
+    assert topics["naming"]["node_id_topic_pattern"] == "simulation.{node_id}.<type>"
+    # 节点级回传与 carla.* 同为动态：静态建 Topic 脚本不得创建 simulation.*
+    for script in (COMPOSE_SCRIPT, K8S_JOB):
+        text = script.read_text(encoding="utf-8")
+        assert "simulation." not in text, f"{script.name} 不得静态创建节点级回传 Topic"
 
 
 def test_topic_defaults_follow_security_and_producer_baseline() -> None:
@@ -295,9 +326,11 @@ def test_consumer_groups_only_reference_registered_topics() -> None:
         | set(EXPECTED_VEHICLE_TOPICS)
         | set(EXPECTED_INGEST_TOPICS)
         | set(EXPECTED_CARLA_TOPICS)
+        | set(EXPECTED_SIMULATION_TOPICS)
     )
     known |= {name.replace("{vehicle_id}", "*") for name in EXPECTED_VEHICLE_TOPICS}
     known |= {name.replace("{sim_id}", "*") for name in EXPECTED_CARLA_TOPICS}
+    known |= {name.replace("{node_id}", "*") for name in EXPECTED_SIMULATION_TOPICS}
     known |= {f"{name}.dlq" for name in known}
 
     group_ids = [group["group_id"] for group in groups]

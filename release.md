@@ -7346,9 +7346,9 @@ docker exec hunter-scene sh -c "test -d $CERTS/$NODE && echo LEFTOVER || echo CL
 
 | # | 验证项 | PASS 判据 | 结果 | 证据（输出/日志片段） |
 |---|--------|-----------|------|--------------------|
-| 1 | DDL 建表 | `\d scene_svc.sim_node_registry` 含 4 管理列 | | |
-| 2 | 镜像含 openssl + 管理模块 | `which openssl` 有路径；import 探针成功 | | |
-| 3 | CA 只读挂载 & 写域可写 | `CA-RO-OK` + `WRITABLE`；env 中 `SIM_NODE_CERTS_DIR`/`KAFKA_CA_*` 正确 | | |
+| 1 | DDL 建表 | `\d scene_svc.sim_node_registry` 含 4 管理列 | PASS（2026-11-04） | `08_sim_nodes.sql` 回显 `CREATE TABLE`+3×`CREATE INDEX`+`CREATE TRIGGER`+`DDL OK`；`\d` grep 命中 `token_id`/`kafka_cert_sn`/`plat_cert_sn`/`owner_client_id` 4 列 + `idx_sim_node_registry_owner` |
+| 2 | 镜像含 openssl + 管理模块 | `which openssl` 有路径；import 探针成功 | PASS（2026-11-04） | `dcompose build scene-service` 成功、`--force-recreate` 起 `hunter-scene`；`which openssl`→`/usr/bin/openssl`；import 探针→`管理侧模块已在镜像内` |
+| 3 | CA 只读挂载 & 写域可写 | `CA-RO-OK` + `WRITABLE`；env 中 `SIM_NODE_CERTS_DIR`/`KAFKA_CA_*` 正确 | PASS（2026-11-04） | `CA-RO-OK` + `WRITABLE`；env：`SIM_NODE_CERTS_DIR=/app/data/sim-node-certs`、`KAFKA_CA_CERT_PATH=/srv/kafka-ca/ca-cert.pem`、`KAFKA_CA_KEY_PATH=/srv/kafka-ca/ca-key.pem`、`APIGATEWAY_INTERNAL_URL=http://api-gateway:8080` |
 | 4 | 清单向后兼容富化 | `items` 带 4 新列（未签发=null）、旧字段不变 | | |
 | 5 | 令牌签发（经网关带自定义头） | `code=0`、`access_token` 一次性、`token_id=jti`、登记表回写 | | |
 | 6 | 令牌负向 2001 | 不带 `X-Admin-Access-Token` 经网关 ⇒ `code=2001` | | |
@@ -7358,8 +7358,10 @@ docker exec hunter-scene sh -c "test -d $CERTS/$NODE && echo LEFTOVER || echo CL
 | 10 | 未签证书下载负向 | 对无证书节点请求 bundle ⇒ 返回 JSON 信封（`code≠0`）非空 zip | | |
 | 11 | PATCH 管理信息 | 请求 `description`/响应 `registry_description` 回显新值 | | |
 | 12 | 下线三清 | `EXISTS=0` + 表行 `count=0` + 目录 `CLEANED` | | |
-| 13 | 前端页面闭环 | 菜单/清单/详情/签发/证书/下载/PATCH/删除各一次，行为同 curl | | |
+| 13 | 前端页面闭环 | 菜单/清单/详情/签发/证书/下载/PATCH/删除各一次，行为同 curl | 部分（菜单+清单页渲染已验；节点级操作未验） | web-portal 重建 + `hunter-web Started`；登录 `len=687`；侧栏出现「仿真端管理」，清单页加载（共 0 个节点，无已注册节点，详情/签发/证书/下载/PATCH/删除未跑） |
 
+> **回填进度（2026-11-04 实机）**：行 1/2/3 已 PASS；行 13 仅菜单与清单页渲染通过（无已注册节点）。首批 §5.1 步骤 3–8 的 curl 因登录口令占位符未替换（`admin token len=4`，即 `null`）全部返回 `1001/401 未认证`，且登记表始终 0 行，故行 4–12 **均未验**。后续须：① 用真实口令登录（已复核 `len=687`）；② 先用服务令牌 `PUT /sim-nodes/{node_id}` 建一个已注册节点；③ 再按步骤 3–8 逐条以 `$ADMIN` 重跑并回填。
+>
 > 未入本表的已知限制（不得归入「已验」）：① `X-Admin-Access-Token` 依赖「网关透传自定义头」——若现场 nginx/网关只放行固定头集合，步骤 4 必 2001，需改走「scene-service 侧另行获取管理员凭据」方案（§6）；② K8s 形态本轮未落地 env/挂载，须对称补齐后再在 K8s 复验（仅 compose 已验）。
 
 ### 6. 风险与待人工确认
@@ -7373,4 +7375,29 @@ docker exec hunter-scene sh -c "test -d $CERTS/$NODE && echo LEFTOVER || echo CL
 - 后端受追踪改动：`contracts/openapi/scene-service.yaml`、`services/scene-service/app/{config.py,main.py,models/sim_node_registry.py(新),repositories/sim_node_registry.py(新),services/sim_node_cert_signer.py(新),services/sim_nodes.py,schemas/sim_nodes.py,routers/sim_nodes.py,tests/{test_scene_contract.py,test_sim_node_dispatch.py}}`、`services/scene-service/Dockerfile`、`infra/deploy/{docker-compose.yml,.env.example}`、`contracts/database/ddl/08_sim_nodes.sql(新)`。
 - 前端受追踪改动：`frontend/src/{types/sim-node.ts(新),constants/sim-node.ts(新),constants/index.ts,api/sim-node.ts(新),api/request.ts,views/sim-node/SimNodeListView.vue(新),views/sim-node/SimNodeDetailView.vue(新),router/index.ts,layouts/MainLayout.vue}`。
 - **scene-service 镜像必须 `--build`**（新增 openssl + 证书目录）；CA 证书/私钥与 `sim-node-certs` 目录需在部署机预置并按 compose 挂载点授权（容器非 root `10001` 需可写证书目录）；K8s 侧需对称补齐 env 与挂载（本轮仅落地 compose）。
+
+## V1.24.2（新增：仿真端一键开通——**本轮只交契约 + 文档**，对齐车辆侧 `Provisioner.provision()` 四步编排，平台建节点即产出 SCRAM 口令 + 双证书 + 接入包；scene-service/前端代码为后续步骤）
+
+Date：2026-10-23
+变更类型：新增（契约先行：DDL 增列 + OpenAPI + Kafka 契约 + 方案/接入文档）；**无运行时代码改动**，现有部署零影响 ⇒ **向后兼容**
+
+### 1. 交付项（均为契约/文档）
+
+1. **DDL 增列**（`contracts/database/ddl/08_sim_nodes.sql`）：`scene_svc.sim_node_registry` 新增 `provision_status JSONB`（骨架 `{state,steps:{db,scram,topics,cert}}`，对齐 `vehicle_svc.vehicles.provision_status`）、`scram_username`、`scram_credential_updated_at`、`cert_not_after` 四列 + 幂等 `ALTER ... ADD COLUMN IF NOT EXISTS` 迁移 + `provision_state` 部分索引；**一次性 SCRAM 口令不落本表**。ORM `services/scene-service/app/models/sim_node_registry.py` 同步 4 列。
+2. **OpenAPI 契约**（`contracts/openapi/scene-service.yaml`）：新增 `POST /sim-nodes`（`provisionSimNode`，201 一次性返回 `scram_password`）、`rotate-scram`/`retry-provision`，`DELETE` 语义升级为 deprovision 回收；新增一批 schemas 与顶层扩展 `x-hunter-sim-provisioning`（steps/resource_per_step/credentials_model/lifecycle_endpoints）；`x-hunter-simulation-flow.node_dispatch` 增 `security: mTLS_client_cert`（平台以 `sim-platform-{node_id}` 证书保护下发）；`x-hunter-endpoints` 登记 3 新端点。
+3. **Kafka 契约**：`topics.yaml` 新增 `simulation_node_topics`（节点级回传 `simulation.{node_id}.result`，`dlq` 隐式派生，key=sim_id/acks=all/retention 7d，SCRAM 主体 `sim-{node_id}` ACL 最小化、随一键开通动态创建）+ `naming.node_id_topic_pattern`；`consumer-groups.yaml` 新增 `data-collector-simulation`（订阅 `simulation.*.result`，regex_pattern）；契约测试登记（`test_kafka_contracts.py` EXPECTED_SIMULATION_TOPICS、`verify_data_layer.py`）。
+4. **方案文档 V2.0**（`docs/仿真端接入平台系统方案.md`）：升 V2.0，新增 §2.5（一键开通时序、节点级回传、SCRAM/ACL、下发 mTLS、bundle 与口令一次性投递、deprovision、存量迁移），**关闭旧 §5.2 规则 7「不实现鉴权」、§9.3、§14 R6/待拍板 3 的鉴权缺口**。
+5. **接入清单**（`docs/HunterSim接入清单.md`）：升 V1.24.2，新增 §1.5「三步接入」（下 bundle → 用开通口令填 `kafka.properties` → 节点启用 TLS 信任平台 CA），**废弃旧“手工注入凭据”章节**，同步更新 §1/§5/§7/§9。
+
+### 2. 验证（仅真实执行项）
+
+- 契约测试全绿：`common/python/tests/test_kafka_contracts.py` + `services/scene-service/app/tests/test_scene_contract.py` + `services/scene-service/app/tests/test_sim_node_dispatch.py` 合计 **91 passed**（sim-node 契约端点集合含新增 provision/rotate/retry，node_dispatch security 段、simulation 节点级 Topic 契约值均校验通过）。
+- `scripts/verify_data_layer.py`：**31 项通过 / 1 项失败**。失败项为 `[FAIL] DDL 出现契约外新增表: ['scene_svc.sim_node_registry']`。经 `git cat-file -e HEAD:contracts/database/ddl/08_sim_nodes.sql` 确认该 DDL 与表**在 HEAD（V1.24.1）已存在**，从未登记进 verify 的 EXPECTED_TABLES 契约清单 ⇒ **属 V1.24.1 既有缺口，本轮未引入**（本轮只增列）。完整登记需同步 Alembic 离线 SQL/er.md/orm-mapping.md，属数据层架构决策 ⇒ **登记为待办**，本轮不以文档改动掩盖该红灯。
+
+### 3. 待办（后续实现步骤，不混入本轮）
+
+- 后端 `app/services/sim_provisioner.py`（镜像车辆 Provisioner：四步 + 逆序回滚 + `_persist_status`）、`sim_dispatch.py` mTLS 注入、`config.py` 开关（`sim_scram_enabled`/`SIM_DISPATCH_MTLS_ENABLED` 等）；`kafka_admin` 是否下沉 `hunter_common` 共用待评估。
+- 前端「创建仿真端」向导（一次性口令弹窗 + bundle 下载 + provision 四态步骤条）。
+- 数据层契约登记：`scene_svc.sim_node_registry` 入 `verify_data_layer.py` EXPECTED_TABLES + Alembic 离线 SQL + er.md/orm-mapping.md（V1.24.1 遗留，需评审）。
+- 实机端到端验证：一键开通/回传/mTLS 需待后端代码落地后按《HunterSim接入清单》§9 新增项逐条实跑回填（本轮仅契约，无运行时代码可验）。
 

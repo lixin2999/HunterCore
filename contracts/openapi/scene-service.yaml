@@ -634,6 +634,42 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
         "500": { $ref: "#/components/responses/InternalError" }
+    post:
+      tags: [sim-node]
+      summary: 一键开通仿真端节点（DB 建登记行 → Kafka SCRAM 口令 → 节点级回传 Topic → 双证书）
+      description: |
+        **V1.24.2 一键开通**（RBAC `scene:execute`，对齐车辆 `POST /vehicles`）：平台先建节点，
+        一次编排四项资源（见 `x-hunter-sim-provisioning`）：
+          1. **db**     INSERT `scene_svc.sim_node_registry`（初始 provision_status 骨架，各步 pending）
+          2. **scram**  AdminClient UPSERT SCRAM-SHA-512 用户（username=`sim-{node_id}`，服务端生成一次性口令）
+          3. **topics** 创建节点级回传 Topic `simulation.{node_id}.result` + 死信 `.dlq`（见 topics.yaml#simulation_node_topics）
+          4. **cert**   openssl 签发双证书：Kafka 客户端（CN=`sim-{node_id}`）+ 平台访问（CN=`sim-platform-{node_id}`）
+
+        任一步失败 → 逆序回滚已创建资源 → 落失败态（可用 retry-provision 续跑）。
+        `scram_password` **仅此一次**在响应体返回，不落库/不入接入包/不写日志（丢失只能 rotate-scram）。
+
+        ⚙ 一键开通**不依赖节点先自注册**：node_id 由管理员指定（格式同 SimNodeId），节点后续以
+        下发的接入包（证书 + kafka.properties）+ 本响应的一次性口令完成注册/心跳。
+      operationId: provisionSimNode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SimNodeProvisionRequest" }
+      responses:
+        "201":
+          description: 开通成功（code=0，data.scram_password 仅此一次可见；含四步终态快照）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimNodeProvisionResponse" }
+        "409": { $ref: "#/components/responses/SceneStateConflict" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
 
   /api/v1/scene/sim-nodes/{node_id}:
     get:
@@ -686,21 +722,23 @@ paths:
         "500": { $ref: "#/components/responses/InternalError" }
     delete:
       tags: [sim-node]
-      summary: 从登记表移除仿真节点并清理资源（Redis + 登记表 + 证书目录）
+      summary: 下线仿真节点并回收全部资源（证书目录 → SCRAM 用户 → 节点级 Topic → 登记行 → Redis）
       description: |
-        节点下线（RBAC `scene:delete`）：幂等删除 Redis 登记（`sim:node:{node_id}` + ZREM seen）、
-        登记行与证书目录。
+        **V1.24.2 deprovision 回收**（RBAC `scene:delete`，对齐车辆下线）：逆序幂等回收开通时
+        创建的外部资源与登记数据——证书目录 → SCRAM 用户（`sim-{node_id}`）→ 节点级回传 Topic
+        （`simulation.{node_id}.result` + `.dlq`）→ 登记行 → Redis（`sim:node:{node_id}` + ZREM seen）。
+        外部资源不存在视为幂等成功；响应 `data` 回显清理摘要（供审计）。
       operationId: deleteSimNode
       parameters:
         - $ref: "#/components/parameters/SimNodeIdPath"
       responses:
         "200":
-          description: 已删除（code=0）
+          description: 已回收（code=0，data 为清理摘要）
           headers:
             X-Request-ID: { $ref: "#/components/headers/RequestId" }
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/SimNodeEmptyResponse" }
+              schema: { $ref: "#/components/schemas/SimNodeDeprovisionResponse" }
         "422": { $ref: "#/components/responses/InvalidParameter" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -898,6 +936,56 @@ paths:
             application/zip:
               schema: { type: string, format: binary }
         "404": { $ref: "#/components/responses/SceneNotFound" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/sim-nodes/{node_id}/rotate-scram:
+    post:
+      tags: [sim-node]
+      summary: 轮换仿真节点 Kafka SCRAM 口令（AdminClient UPSERT 覆盖旧凭据；新口令一次性返回）
+      description: |
+        **V1.24.2**（RBAC `scene:execute`，对齐车辆 `rotate_scram`）：对 `sim-{node_id}` SCRAM 用户
+        UPSERT 新口令（覆盖旧值），回写 `scram_credential_updated_at`；新口令仅响应体返回，
+        不落库/不入接入包。节点需用新口令更新 kafka.properties 后重连。
+      operationId: rotateSimNodeScram
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      responses:
+        "200":
+          description: 轮换成功（code=0，data.scram_password 仅此一次可见）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RotateScramResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/sim-nodes/{node_id}/retry-provision:
+    post:
+      tags: [sim-node]
+      summary: 从失败步续跑一键开通（幂等：先回收残留再重跑，适用于 provision 中途失败）
+      description: |
+        **V1.24.2**（RBAC `scene:execute`）：当首次 `provisionSimNode` 因外部服务（Kafka/Admin/
+        openssl）瞬时不可用而落失败态时，调本端点从失败步重试。语义等价“先回收本次残留→重跑四步”，
+        因此幂等可多次调用；成功时同样一次性返回 `scram_password`。
+      operationId: retrySimNodeProvision
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      responses:
+        "201":
+          description: 开通成功（code=0，data.scram_password 仅此一次可见；含四步终态快照）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimNodeProvisionResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
@@ -2091,6 +2179,27 @@ components:
               nullable: true
               additionalProperties: { type: string, maxLength: 128 }
               description: 管理员在登记表设定的标签（与节点自报 `labels` 分开）
+            # ---- V1.24.2 一键开通编排态（未开通/懒建行时为默认骨架）----
+            provision_state:
+              type: string
+              nullable: true
+              enum: [pending, in_progress, ready, failed]
+              description: 四步聚合态（provision_status.state）
+            provision_steps:
+              type: array
+              nullable: true
+              items: { $ref: "#/components/schemas/SimNodeProvisionStep" }
+              description: 按 db/scram/topics/cert 顺序展平的步骤列表
+            scram_username:
+              type: string
+              nullable: true
+              description: Kafka SCRAM 主体名（= sim-{node_id}）；⚠ 口令本身永不返回
+            scram_credential_updated_at: { type: string, format: date-time, nullable: true }
+            cert_not_after:
+              type: string
+              format: date-time
+              nullable: true
+              description: 证书到期快照（取 Kafka 证书）
 
     SimNodeRegistryPatch:
       type: object
@@ -2166,6 +2275,114 @@ components:
         - type: object
           properties:
             data: { type: object, nullable: true, description: 恒为 null }
+
+    # ---------- V1.24.2 一键开通（provision / rotate-scram / deprovision） ----------
+    SimNodeProvisionRequest:
+      type: object
+      description: |
+        一键开通请求体（管理员指定 node_id + 基础元信息）。node_id 格式同 `SimNodeId`；
+        开通后节点用同一 node_id 完成注册/心跳（地址仍由服务端自学习，不经本体传递）。
+      required: [node_id]
+      additionalProperties: false
+      properties:
+        node_id: { $ref: "#/components/schemas/SimNodeId" }
+        display_name: { type: string, nullable: true, maxLength: 128, description: 展示名称 }
+        description: { type: string, nullable: true, maxLength: 500, description: 备注描述 }
+        labels:
+          type: object
+          nullable: true
+          additionalProperties: { type: string, maxLength: 128 }
+          description: 管理员自定义标签（机房/显卡型号等）
+        takeover_existing:
+          type: boolean
+          default: false
+          description: SCRAM/Topic/证书已存在时接管复用（跳过创建，state=skipped；回滚时不清理这些外部既有资源）
+
+    SimNodeProvisionStep:
+      type: object
+      description: 单步编排状态（对齐车辆 ProvisionStep；name=db|scram|topics|cert）
+      required: [name, state]
+      properties:
+        name: { type: string, enum: [db, scram, topics, cert] }
+        state: { type: string, enum: [pending, in_progress, ok, failed, skipped] }
+        error: { type: string, nullable: true, maxLength: 500, description: 失败时错误摘要（已截断） }
+        ts: { type: integer, nullable: true, description: 步骤完成 epoch 秒 }
+
+    SimNodeProvisionResult:
+      type: object
+      description: 一键开通结果（成功含一次性口令与证书序列号；四步终态快照）
+      required: [node_id, scram_username, provision_state, steps]
+      properties:
+        node_id: { $ref: "#/components/schemas/SimNodeId" }
+        scram_username:
+          type: string
+          description: Kafka SCRAM 主体名（sim-node_id 形式，与证书 CN 一致）
+        scram_password:
+          type: string
+          writeOnly: true
+          description: 一次性 SCRAM 口令（服务端生成）；不落库/不入接入包/不写日志，丢失后需 rotate-scram
+        kafka_cert_sn: { type: string, nullable: true, description: Kafka 客户端证书序列号（大写 HEX） }
+        plat_cert_sn: { type: string, nullable: true, description: 平台访问证书序列号（大写 HEX） }
+        provision_state:
+          type: string
+          enum: [pending, in_progress, ready, failed]
+          description: 四步聚合态
+        steps:
+          type: array
+          items: { $ref: "#/components/schemas/SimNodeProvisionStep" }
+          description: 按 db/scram/topics/cert 顺序展平
+
+    RotateScramResult:
+      type: object
+      description: 口令轮换一次性响应（scram_password 不落日志）
+      required: [node_id, scram_username, scram_password]
+      properties:
+        node_id: { $ref: "#/components/schemas/SimNodeId" }
+        scram_username: { type: string }
+        scram_password:
+          type: string
+          writeOnly: true
+          description: 新一次性口令（仅此响应可见）
+        credential_updated_at: { type: string, format: date-time }
+
+    SimNodeDeprovisionResult:
+      type: object
+      description: 下线回收摘要（各资源清理结果；供审计）
+      required: [node_id]
+      properties:
+        node_id: { $ref: "#/components/schemas/SimNodeId" }
+        cert_dir_removed: { type: boolean, description: 证书目录是否已删（不存在=true） }
+        scram_removed: { type: boolean, description: SCRAM 用户是否已删（不存在=true） }
+        topics_removed:
+          type: array
+          items: { type: string }
+          description: 已删的节点级回传 Topic 名（含 .dlq）
+        registry_removed: { type: boolean, description: 登记行是否已删 }
+        redis_removed: { type: boolean, description: Redis 登记是否已清理 }
+
+    SimNodeProvisionResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SimNodeProvisionResult" }
+
+    RotateScramResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/RotateScramResult" }
+
+    SimNodeDeprovisionResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SimNodeDeprovisionResult" }
 
 
 # =====================================================================
@@ -2306,6 +2523,10 @@ x-hunter-endpoints:
     - "POST /api/v1/scene/sim-nodes/{node_id}/issue-kafka-cert"
     - "POST /api/v1/scene/sim-nodes/{node_id}/issue-platform-cert"
     - "GET /api/v1/scene/sim-nodes/{node_id}/bundle"
+    # 仿真端一键开通（V1.24.2：对齐车辆 provisioning；建节点即产出 SCRAM 口令 + 双证书 + 接入包）
+    - "POST /api/v1/scene/sim-nodes"
+    - "POST /api/v1/scene/sim-nodes/{node_id}/rotate-scram"
+    - "POST /api/v1/scene/sim-nodes/{node_id}/retry-provision"
   ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]
 
 x-hunter-scene-types:
@@ -2491,6 +2712,17 @@ x-hunter-simulation-flow:
       never_used: "节点自述的 runtime_hint 与业务字段一律不参与寻址"
     direction: "平台 → 节点（同步直推，与 direct 模式同方向）"
     transport: "httpx（复用 CarlaManagementClient，子路径与请求体完全共用 CARLA_INSTANCE_*_PATH）"
+    # ---------- V1.24.2：下发通道 mTLS 保护（替代旧“不实现鉴权/手工注入凭据”） ----------
+    security:
+      mode: mTLS_client_cert
+      status: contract_defined   # 本轮定契约；代码接入为后续步骤（sim_dispatch 注入证书）
+      platform_side: "平台以 sim-platform-{node_id} 客户端证书（provision 时签发、存 SIM_NODE_CERTS_DIR/{node_id}/platform/）呈现"
+      node_side: "节点 CARLA 管理 API 须启用 TLS 并信任平台 CA（接入包内含平台 CA 证书），仅接受 CN=sim-platform-{node_id} 的客户端"
+      rationale: |
+        旧现状：平台→节点直推无任何鉴权（节点管理端口裸 HTTP），依赖同网段隔离；V1.24.2 改为平台 mTLS
+        ⇒ 下发通道双向可验证，不再依赖“凭据由运行环境手工注入”（见 carla.py kafka 段旧注释）。
+      backoff: "SIM_DISPATCH_MTLS_ENABLED=false 时退回旧直推（仅供灰度/回滚），生产默认应置 true"
+    auth: "服务令牌（api-gateway POST /api/v1/user/service-token）；角色限 SIM_NODE_ROLES（默认 data-uploader,admin）；节点清单用 scene:read"
     gateway_reuse: |
       节点控制面落在既有前缀 /api/v1/scene 下 ⇒ 无需修改 x-hunter-gateway-routes；
       网关只剥离逐跳头与身份头、注入 X-Real-IP / X-Forwarded-For ⇒ 两个地址头可透传到服务。
@@ -2535,6 +2767,40 @@ x-hunter-simulation-flow:
     pending:
       - "节点侧 CARLA 管理 API 是否与平台 direct 模式同源版本（子路径与请求体形状）需实机验证（实录显示 8090 可用）"
       - "服务令牌轮换与多节点共用令牌时的 owner 粒度（当前：一个 client_id = 一组节点的 owner）"
+
+# =====================================================================
+# V1.24.2 仿真端一键开通编排（对齐 vehicle-service.yaml x-hunter-provisioning）
+# =====================================================================
+x-hunter-sim-provisioning:
+  source: "对齐 services/vehicle-service/app/services/provisioner.py（DB→SCRAM→Topics→Cert 四步 + 逆序回滚）"
+  status: contract_defined   # 本轮定契约；scene-service 实现 sim_provisioner.py 为后续步骤
+  entrypoint: "POST /api/v1/scene/sim-nodes（provisionSimNode，RBAC scene:execute）"
+  steps: [db, scram, topics, cert]        # 顺序固定；回滚逆序 cert→topics→scram（DB 行保留供审计/续跑）
+  resource_per_step:
+    db: "INSERT scene_svc.sim_node_registry（初始 provision_status 骨架）"
+    scram: "AdminClient UPSERT SCRAM-SHA-512 用户：username=sim-{node_id}，口令 = secrets.token_urlsafe(24)"
+    topics: "创建节点级回传 Topic simulation.{node_id}.result + 死信 .dlq（契约见 contracts/kafka/topics.yaml#simulation_node_topics）"
+    cert: "openssl 签发双证书：Kafka 客户端 CN=sim-{node_id} + 平台访问 CN=sim-platform-{node_id}，落 SIM_NODE_CERTS_DIR/{node_id}/"
+  provision_status_schema:
+    state: "pending|in_progress|ready|failed"
+    steps: "{db|scram|topics|cert} 各 {name,state,error,ts}；state=pending|in_progress|ok|failed|skipped"
+  credentials_model:
+    scram_password: "仅经开通/轮换响应一次性返回；不落 DB/不入 bundle/不写日志（与车辆一致）"
+    bundle: "ZIP 含 CA + Kafka/平台证书 + kafka.properties（sasl.username=sim-{node_id}，口令位以占位符提示取自开通响应）+ README"
+    takeover_existing: "true 时 SCRAM/Topic/证书已存在则接管复用（skipped）；回滚不清理这些外部既有资源"
+  lifecycle_endpoints:
+    provision: "POST /sim-nodes（一键开通）"
+    rotate_scram: "POST /sim-nodes/{node_id}/rotate-scram（重发口令）"
+    retry_provision: "POST /sim-nodes/{node_id}/retry-provision（从失败步续跑）"
+    reissue_cert: "POST /sim-nodes/{node_id}/issue-kafka-cert | issue-platform-cert（单项重签，保留）"
+    deprovision: "DELETE /sim-nodes/{node_id}（证书目录→SCRAM→节点级 Topic→登记行→Redis）"
+  kafka_admin:
+    scram_mechanism: SCRAM-SHA-512
+    impl_note: "复用/对齐 vehicle-service kafka_admin（confluent-kafka KIP-95 alter_user_scram_credentials + kafka-python-ng AdminClient）；是否下沉 hunter_common 共用待实现步骤评估"
+  dispatch_security: "见 x-hunter-simulation-flow.node_dispatch.security（平台 mTLS sim-platform-{node_id} 证书保护平台→节点下发）"
+  backward_compat:
+    - "保留现有 8 个管理端点（详情/PATCH/令牌/证书/bundle/删除）；一键开通为新增主入口，不强制取代逐项签发"
+    - "存量懒建行 provision_status 默认 {state:pending,steps:{}}；首次一键开通或 PATCH 时回写"
 
 x-hunter-real-vehicle-extraction:
   source: "设计文档 4.5 节"
