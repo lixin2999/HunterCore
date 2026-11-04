@@ -7399,6 +7399,7 @@ Date：2026-10-23（契约/文档）；2026-11-04（代码落地回填）
 6. **data-collector 节点级回传消费**（`app/consumers/simulation.py`，新增）：`SimulationNodeConsumer` **继承** `CarlaSensorConsumer`（`simulation.{node_id}.result` 与 `carla.{sim_id}.sensor_data` 同构、复用 `carla_sensor_data.schema.json`），仅覆盖 `group_id=data-collector-simulation` + `subscribe_pattern=simulation.*.result`（幂等命名空间取自 group_id，两组独立 offset）；`config.py` 追加消费组 + `simulation_consumer_enabled`、`main.py` `_build_consumers` 接线；契约三处同步（`openapi/data-collector.yaml` consumes + required_env、K8s `services/data-collector.yaml`、docker-compose/.env）并**重生** `03-configmap-contracts.yaml`。
 7. **前端向导**（`frontend/src/`）：`types/sim-node.ts` 增 5 组 provision 类型 + `SimNodeDetail` 扩展 5 字段；`api/sim-node.ts` 增 `provisionSimNode`/`retrySimNodeProvision`/`rotateSimNodeScram`、`deleteSimNode` 返回 deprovision 摘要；`constants/sim-node.ts` 增 provision 态/步/态词表；`SimNodeListView.vue` 增「创建仿真端」一键开通向导（一次性口令弹窗 + 下线摘要 + 开通态列）；`SimNodeDetailView.vue` 增四步 `el-steps` 开通卡 + 重试/轮换/下线动作。
 8. **单测**：`app/tests/test_sim_provisioner.py`（fake admin/cert 覆盖四步成功 / 逐步失败逆序回滚 / retry / rotate / deprovision / 接管 skipped）、`app/tests/fakes.py` 补 fake Kafka admin + cert signer；data-collector `app/tests/test_simulation_consumer.py`（继承契约、consumer-groups 解析、幂等键、遥测缓冲落库、事件映射）+ 契约测试 consumes 集合登记 `data-collector-simulation`。
+9. **部署纳管修复（现场报错驱动）**：发现 `08_sim_nodes.sql` 从未被任何部署脚本应用（`init-db.sh` 仅纳管 06/07、`schema.sql` 不含该表）⇒ V1.24.1 手工建表的存量库升 V1.24.2 后，创建仿真端报 `asyncpg UndefinedColumnError: column "provision_status" of relation "sim_node_registry" does not exist`。在 `scripts/init-db.sh` 新增 3d 步（镜像 07 策略）幂等应用 `08_sim_nodes.sql`（`CREATE TABLE IF NOT EXISTS` + `ALTER ... ADD COLUMN IF NOT EXISTS` 补四列，存量库/新库两路径均安全）。**现场即时解阻塞**：`docker exec -i hunter-postgres psql -U hunter -d hunter_core -v ON_ERROR_STOP=1 < contracts/database/ddl/08_sim_nodes.sql`。`[待实机]` 本修复仅静态/逻辑核验，补列后重跑创建需部署机确认。
 
 ### 3. 验证（仅真实执行项）
 
@@ -7415,9 +7416,81 @@ Date：2026-10-23（契约/文档）；2026-11-04（代码落地回填）
 - 前端 `vue-tsc --noEmit` **零错误**（s10 类型/API/向导接线全部通过类型检查）。
 - `scripts/generate_contracts_configmap.py --check` **PASS**（`03-configmap-contracts.yaml` 与 `contracts/kafka` 一致，含 `simulation_node_topics` / `data-collector-simulation`）。
 
-### 4. 待办（后续实现步骤）
+### 4. 实机执行步骤（**待在部署机回验**；本轮只完成代码/编排/文档落地，无 live Kafka(SCRAM)+CA+CARLA+DB）
 
-- 数据层契约登记：`scene_svc.sim_node_registry` 入 `verify_data_layer.py` EXPECTED_TABLES + Alembic 离线 SQL + er.md/orm-mapping.md（V1.24.1 遗留，需评审；本轮 `verify_data_layer` 唯一红灯即此项）。
-- 实机端到端验证：一键开通四步 / SCRAM 鉴权回传 / 下发 mTLS 握手 / bundle 口令一次性投递，需在有 live Kafka(SCRAM)+CA+CARLA+DB 的环境按《HunterSim接入清单》§9 逐条实跑回填（本轮无 live 依赖，编排/admin/mTLS 均以 fake/unit 验证，**未声称已实机跑通**）。
+> 容器名沿用单机 compose（`hunter-scene`/`hunter-collector`/`hunter-kafka`/`hunter-postgres`）；`$KC` 为 Kafka `--command-config` 临时文件（含 admin SASL 凭据，见运维手册 §3）；示例 `node_id`=`node-01`（需匹配 `^[a-z0-9][a-z0-9._-]{2,63}$`）⇒ SCRAM 主体 `sim-node-01`、回传 Topic `simulation.node-01.result`。**下列命令均待在部署机执行，未执行=未验证**（纪律：未跑通不写已修复）。
+
+```bash
+sudo -i && cd /opt/HunterCore && git pull
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+SERVER_IP=$(grep -E '^SERVER_IP=' .env | cut -d= -f2 | tr -d '" ')
+# 取管理员 JWT：登录门户或从浏览器 DevTools 复制 Authorization（勿用 issue-token，那是设备令牌通道）
+TOKEN='<粘贴管理员 JWT>'
+KC=/tmp/admin.properties   # 含 admin SASL 凭据 + security.protocol（见运维手册 §3）
+
+# 1) 重建并拉起（改了 config.py / sim_* / 消费者 ⇒ **必须 --build**；只 restart 会继续跑旧代码）
+dcompose build scene-service data-collector web-portal
+dcompose up -d --force-recreate scene-service data-collector web-portal   # 改 .env 后必须 force-recreate：restart 不重读 .env
+
+# 2) 前置体检（不发请求；缺一后续必红）
+docker exec hunter-scene which openssl   # 期望：有路径输出（无=镜像未装 openssl，证书签发必失败）
+docker exec hunter-scene ls -l /srv/kafka-ca/ca-cert.pem /srv/kafka-ca/ca-key.pem   # 期望：CA 两文件存在可读（compose 挂 ./certs/kafka→/srv/kafka-ca:ro，非 config.py 默认的 /certs）
+docker exec hunter-scene sh -c 'touch "$SIM_NODE_CERTS_DIR/.w" && rm -f "$SIM_NODE_CERTS_DIR/.w" && echo WR_OK'   # 期望 WR_OK（$SIM_NODE_CERTS_DIR=/app/data/sim-node-certs）；PermissionError=持久卷以 root 预建，需 chown 到容器 uid(10001)
+docker exec -i hunter-postgres psql -U hunter -d hunter_core -tA -c "SELECT column_name FROM information_schema.columns WHERE table_schema='scene_svc' AND table_name='sim_node_registry' AND column_name IN ('provision_status','scram_username','cert_not_after')"   # 期望：三行列出；缺列（column provision_status does not exist）⇒ 重放幂等 DDL：docker exec -i hunter-postgres psql -U hunter -d hunter_core -v ON_ERROR_STOP=1 < contracts/database/ddl/08_sim_nodes.sql（V1.24.2 起 init-db.sh 已纳管此步）后重查
+docker exec hunter-scene env | grep -E '^SIM_'   # 期望见 SIM_NODE_* / SIM_TOPIC_* / SIM_DISPATCH_MODE；SIM_PROVISION_ENABLED/SIM_SCRAM_ENABLED/SIM_DISPATCH_MTLS_ENABLED 缺席=正常（未预置进 compose，走 config.py 默认 provision=true/scram=true/mtls=false）
+docker exec hunter-collector env | grep '^SIMULATION_CONSUMER_ENABLED'   # 期望 true（此键已落 compose:619 与 K8s:35，节点级回传消费开）
+docker exec hunter-scene env | grep -E '^[A-Z0-9_]+=.*#' || echo '无行尾注释污染'   # V1.23.7 教训：值里出现 # 会被当值下发
+# 2z) Kafka admin 需具备 KIP-95（CreateScramUsers）+ CreateTopics 权限、9092 内部监听可达（缺权限则 scram/topics 步会红）
+
+# 3) 一键开通四步（POST /sim-nodes，需 scene:execute，经门户反代 :80/:443）
+curl -sS -X POST "http://$SERVER_IP/api/v1/scene/sim-nodes" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"node_id":"node-01","display_name":"验证节点","takeover_existing":false}'
+#    期望：201，data.provision_state=ready，data.steps[] 按 db/scram/topics/cert 全部 state=ok，data.scram_password 非空（**仅此响应可见**），data.kafka_cert_sn/plat_cert_sn 非空
+docker exec -i hunter-postgres psql -U hunter -d hunter_core -tA -c "SELECT provision_status->>'state', scram_username, cert_not_after FROM scene_svc.sim_node_registry WHERE node_id='node-01'"   # 3b db 步：期望 ready | sim-node-01 | 有日期；**口令不落表**
+docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --command-config $KC --describe --entity-type users --entity-name sim-node-01   # 3c scram 步：期望列 SCRAM-SHA-512（迭代 8192）；does not exist=本步未生效
+docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --command-config $KC --list | grep -E 'simulation\.node-01\.result(\.dlq)?$'   # 3d topics 步：期望两行 .result 与 .result.dlq
+docker exec hunter-scene sh -c 'ls -l "$SIM_NODE_CERTS_DIR/node-01/"'   # 3e cert 步：期望含 sim-node-01 与 sim-platform-node-01 的 cert/key
+
+# 4) 一次性口令投递边界（安全断言，必验）
+curl -sS "http://$SERVER_IP/api/v1/scene/sim-nodes/node-01" -H "Authorization: Bearer $TOKEN" | grep -q scram_password && echo 'FAIL 详情不应含口令' || echo 'OK GET 详情不含口令'
+docker logs --since 10m hunter-scene 2>&1 | grep -qi scram_password && echo 'FAIL 口令落日志' || echo 'OK 日志无口令'
+curl -sS "http://$SERVER_IP/api/v1/scene/sim-nodes/node-01/bundle" -H "Authorization: Bearer $TOKEN" -o /tmp/bundle.zip && unzip -p /tmp/bundle.zip '*kafka.properties' | grep -i password   # 期望：口令为占位（节点侧手填一次性口令），与废弃的旧手工注入凭据一致
+
+# 5) 节点接入 + 节点级回传消费（node 侧填一次性口令 + 信任平台 CA，见《HunterSim接入清单》§1.5；以 key=sim_id 向 simulation.node-01.result 回传 carla_sensor_data 同构消息）
+docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --command-config $KC --describe --group data-collector-simulation   # 期望：分区有 assignment、CURRENT-OFFSET 前推、LAG 不持续累加（"尚无 offset 提交"=从未回传非积压）
+docker exec -i hunter-postgres psql -U hunter -d hunter_core -tA -c "SELECT count(*) FROM data_collector.vehicle_telemetry WHERE vehicle_id LIKE 'SIM-%'"   # 期望随回传递增；可映射事件入 events+event_raw、状态/指标进 Redis carla:sim:{sim_id}:*
+docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --command-config $KC --describe --group data-collector-carla   # 期望：与本节点回传无关、两组独立 offset 互不干扰
+
+# 6) 下发通道 mTLS（需显式开启；前提：节点已启用 TLS 并信任平台 CA）
+#    ⚠ SIM_DISPATCH_MODE 已落 compose（可经 .env 改）；SIM_DISPATCH_MTLS_ENABLED 未预置 ⇒ 先在 scene-service.environment 补一行 SIM_DISPATCH_MTLS_ENABLED: ${SIM_DISPATCH_MTLS_ENABLED:-false}（与其余 SIM_ 键对称），再在 .env 置值，否则 .env 不会透传进容器
+grep -q '^SIM_DISPATCH_MODE=' .env && sed -i -E 's|^SIM_DISPATCH_MODE=.*|SIM_DISPATCH_MODE=node|' .env || echo 'SIM_DISPATCH_MODE=node' >> .env
+grep -q '^SIM_DISPATCH_MTLS_ENABLED=' .env && sed -i -E 's|^SIM_DISPATCH_MTLS_ENABLED=.*|SIM_DISPATCH_MTLS_ENABLED=true|' .env || echo 'SIM_DISPATCH_MTLS_ENABLED=true' >> .env   # 行尾禁止加注释（V1.23.7 污染教训）
+dcompose up -d --force-recreate scene-service
+#    走一次场景下发（node 模式），按文案分流：running⇒平台以 sim-platform-node-01 证书握手成功；证书/握手类错⇒节点未信任 CA；验完把开关置回即恢复旧 http 明文直推
+
+# 7) 失败逆序回滚 + 重试（负路径：临时收回 admin 的 CreateTopics 权限或指向不可达 broker，使某步报错）
+#    期望：provision_state=failed + 对应 steps[].state=failed 带 error；已建 scram/cert 被逆序回收（kafka-configs 查无主体、证书目录无残留）；仅回滚某步失败才有 sim_rollback_*_failed 且不阻断其余
+docker logs --since 10m hunter-scene 2>&1 | grep -iE 'sim_rollback|provision'   # 期望：失败步与回滚事件可读
+curl -sS -X POST "http://$SERVER_IP/api/v1/scene/sim-nodes/node-01/retry-provision" -H "Authorization: Bearer $TOKEN" -o /dev/null -w 'HTTP %{http_code}\n'   # 恢复权限后续跑：期望 201（先回收本次残留再自失败步续跑→ready + 一次性新口令，幂等可多次）
+#    takeover_existing=true 重开：外部既有 SCRAM/Topic/证书对应步置 state=skipped，回滚不清理这些外部资源
+
+# 8) 口令轮换 + 下线全链路回收
+curl -sS -X POST "http://$SERVER_IP/api/v1/scene/sim-nodes/node-01/rotate-scram" -H "Authorization: Bearer $TOKEN"   # 期望仅响应返回新口令；节点更新 kafka.properties 后重连，旧口令 SASL 认证失败
+curl -sS -X DELETE "http://$SERVER_IP/api/v1/scene/sim-nodes/node-01" -H "Authorization: Bearer $TOKEN"   # 期望 SimNodeDeprovisionResult：cert_dir/scram/registry/redis_removed=true、topics_removed 含两 Topic
+docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 --command-config $KC --describe --entity-type users --entity-name sim-node-01   # 回收复验：期望 does not exist
+docker exec hunter-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --command-config $KC --list | grep -E 'simulation\.node-01\.result' || echo 'OK Topic 已删'
+docker exec -i hunter-postgres psql -U hunter -d hunter_core -tA -c "SELECT count(*) FROM scene_svc.sim_node_registry WHERE node_id='node-01'"   # 期望 0
+docker exec hunter-scene sh -c 'ls "$SIM_NODE_CERTS_DIR/node-01/"' 2>/dev/null || echo 'OK 证书目录已删'
+
+# 9) 前端向导（web-portal 已随步骤 1 重建；浏览器实操）
+#    列表页「创建仿真端」向导⇒一次性口令弹窗 + 四步终态；「开通态」列与详情 el-steps 一致；详情“重试开通”仅 failed 可见、“轮换口令”需 scram_username、“下线节点”回收入参摘要弹窗；口令弹窗关闭后不再可取
+```
+
+> 全部步骤在部署机实测通过后方可把本特性从“代码落地”升级为“实机验证通过”（届时仿 V1.23.7 §5.1 追加“实机回验记录”）；在此之前 §3 仅声称单元/fake/静态校验。
+
+### 5. 待办（后续实现步骤）
+
+- 数据层契约登记：`scene_svc.sim_node_registry` 入 `verify_data_layer.py` EXPECTED_TABLES + Alembic 离线 SQL + er.md/orm-mapping.md（V1.24.1 遗留，需评审；本轮 `verify_data_layer` 唯一红灯即此项）。——init-db.sh **纳管已于本轮 §2#9 修复**（幂等应用 08），此条仅剩上述文档/校验登记。
+- 实机端到端验证：按 §4 逐条在有 live Kafka(SCRAM)+CA+CARLA+DB 环境实跑；全绿后仿 V1.23.7 §5.1 追加“实机回验记录”（本轮无 live 依赖，编排/admin/mTLS 均以 fake/unit 验证，**未声称已实机跑通**）。
+- 编排开关未预置进清单：`SIM_PROVISION_ENABLED`/`SIM_SCRAM_ENABLED`/`SIM_DISPATCH_MTLS_ENABLED` 当前仅在 `config.py` 内置默认（provision=true/scram=true/mtls=false）、**未写入 compose scene-service.environment 与 K8s ConfigMap**（与已落的 `SIMULATION_CONSUMER_ENABLED`/`SIM_DISPATCH_MODE` 不对称）⇒ 环境可调性受限，若需按环境开关应补两侧对称键（§4 步骤 6 已标需先补 compose 键）。
 - `kafka_admin` 是否下沉 `hunter_common` 与 vehicle-service 共用：当前 `SimKafkaAdminOps` 独立于 scene，待评估合并。
 

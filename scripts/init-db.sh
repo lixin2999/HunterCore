@@ -244,6 +244,19 @@ main() {
     log_warn "未找到 ${scene_engine_ddl}：跳过 scene_engine DDL（场景生成器/场景管理接口将因缺表返回 5000）"
   fi
 
+  # ---------- 3d) sim_node_registry（V1.24.1/V1.24.2，scene-service 仿真端一键开通登记表） ----------
+  #   单一事实来源：contracts/database/ddl/08_sim_nodes.sql（自包含 CREATE TABLE IF NOT EXISTS +
+  #   V1.24.2 增列 ALTER ... ADD COLUMN IF NOT EXISTS + 索引 + 触发器，全幂等）。
+  #   ⚠ 不计入上方 schema/表校验（服务私有表，与 06/07 同策略）。
+  #   既有 V1.24.1 库经本步幂等补列，修复「column provision_status does not exist」；新库经 CREATE TABLE 已含四列。
+  sim_nodes_ddl="${APP_DIR}/contracts/database/ddl/08_sim_nodes.sql"
+  if [ -f "$sim_nodes_ddl" ]; then
+    log_info "应用 sim_node_registry 结构：08_sim_nodes.sql（scene-service 私有表 + V1.24.2 增列，幂等）"
+    apply_sql "$C_POSTGRES" "$POSTGRES_USER" "$POSTGRES_DB" "$sim_nodes_ddl" || return 1
+  else
+    log_warn "未找到 ${sim_nodes_ddl}：跳过 sim_node_registry DDL（仿真端一键开通将因缺表/缺列返回 5000）"
+  fi
+
   # ---------- 4) 初始数据（admin/角色/权限/验证车辆；幂等） ----------
   if [ -n "$ADMIN_PASSWORD_HASH" ]; then
     hash="$ADMIN_PASSWORD_HASH"
