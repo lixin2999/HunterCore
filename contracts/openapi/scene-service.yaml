@@ -636,6 +636,76 @@ paths:
         "500": { $ref: "#/components/responses/InternalError" }
 
   /api/v1/scene/sim-nodes/{node_id}:
+    get:
+      tags: [sim-node]
+      summary: 查询仿真节点详情（Redis 实时态 + 登记表合并；懒建登记行）
+      description: |
+        管理详情视图（RBAC `scene:read`）：合并 Redis 实时态（在线/地址/运行实例）与
+        PostgreSQL `scene_svc.sim_node_registry`（展示名/令牌/证书）。**懒建语义**：首次访问自动
+        创建登记行，即使节点尚未注册也可预览详情。
+      operationId: getSimNode
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      responses:
+        "200":
+          description: 节点详情（code=0）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimNodeDetailResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [sim-node]
+      summary: 更新仿真节点管理字段（展示名 / 描述 / 标签）
+      description: 管理员 PATCH（RBAC `scene:update`）：仅更新登记表基础字段，不涉及令牌/证书；返回更新后的完整详情。
+      operationId: patchSimNode
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SimNodeRegistryPatch" }
+      responses:
+        "200":
+          description: 更新成功（code=0，返回最新详情）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimNodeRegistryPatchResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    delete:
+      tags: [sim-node]
+      summary: 从登记表移除仿真节点并清理资源（Redis + 登记表 + 证书目录）
+      description: |
+        节点下线（RBAC `scene:delete`）：幂等删除 Redis 登记（`sim:node:{node_id}` + ZREM seen）、
+        登记行与证书目录。
+      operationId: deleteSimNode
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      responses:
+        "200":
+          description: 已删除（code=0）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimNodeEmptyResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
     put:
       tags: [sim-node]
       summary: 注册/更新仿真节点（幂等 upsert：能力声明 + 地址自学习 + 续租）
@@ -703,6 +773,131 @@ paths:
               schema: { $ref: "#/components/schemas/SimNodeResponse" }
         "404": { $ref: "#/components/responses/SceneNotFound" }
         "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ---------- V1.24.1 仿真端管理：令牌 / 证书 / 接入包（均 RBAC scene:execute） ----------
+  /api/v1/scene/sim-nodes/{node_id}/issue-token:
+    post:
+      tags: [sim-node]
+      summary: 为仿真节点签发服务令牌（代理 api-gateway；access_token 一次性返回、不落日志）
+      description: |
+        scene-service 代理调用 api-gateway `POST /api/v1/user/service-token`（请求体 `{client_id: node_id}`），
+        并更新登记表 `token_id`/`token_issued_at`。因网关会剥离 Authorization，需经 `X-Admin-Access-Token`
+        头携带原始管理员 JWT（同一 client_id 重复签发即轮换）。
+      operationId: issueSimNodeToken
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+        - $ref: "#/components/parameters/SimNodeAdminAccessToken"
+      responses:
+        "200":
+          description: 签发成功（code=0，data.access_token 仅此一次可见）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssueTokenResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/sim-nodes/{node_id}/token:
+    delete:
+      tags: [sim-node]
+      summary: 撤销仿真节点服务令牌（代理 api-gateway + 清空登记表 token）
+      description: |
+        代理调用 api-gateway `DELETE /api/v1/user/service-token/{client_id}`（client_id = node_id），并清空
+        登记表 `token_id`/`token_issued_at`。同样需经 `X-Admin-Access-Token` 头携带原始管理员 JWT。
+      operationId: revokeSimNodeToken
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+        - $ref: "#/components/parameters/SimNodeAdminAccessToken"
+      responses:
+        "200":
+          description: 已撤销（code=0）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimNodeEmptyResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/sim-nodes/{node_id}/issue-kafka-cert:
+    post:
+      tags: [sim-node]
+      summary: 签发 / 重签 Kafka mTLS 客户端证书（CN=sim-{node_id}）
+      description: |
+        通过 openssl 子进程以只读挂载的 Kafka CA 签发客户端证书（EKU=clientAuth，SAN=DNS:sim-{node_id}），
+        产物写入 `{SIM_NODE_CERTS_DIR}/{node_id}/kafka/`，并更新登记表 `kafka_cert_sn`/`kafka_cert_issued_at`。
+      operationId: issueSimNodeKafkaCert
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      responses:
+        "200":
+          description: 签发成功（code=0）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssueCertResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/sim-nodes/{node_id}/issue-platform-cert:
+    post:
+      tags: [sim-node]
+      summary: 签发 / 重签平台访问 mTLS 客户端证书（CN=sim-platform-{node_id}）
+      description: |
+        与 Kafka 证书同一 CA；CN=sim-platform-{node_id}，用于节点以 mTLS 访问平台 HTTP API。
+        产物写入 `{SIM_NODE_CERTS_DIR}/{node_id}/platform/`，并更新登记表 `plat_cert_sn`/`plat_cert_issued_at`。
+      operationId: issueSimNodePlatformCert
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      responses:
+        "200":
+          description: 签发成功（code=0）
+          headers:
+            X-Request-ID: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssueCertResponse" }
+        "422": { $ref: "#/components/responses/InvalidParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/sim-nodes/{node_id}/bundle:
+    get:
+      tags: [sim-node]
+      summary: 下载仿真节点接入包（ZIP：CA + Kafka/平台证书 + kafka.properties + README）
+      description: |
+        契约例外：直接返回 ZIP 二进制（不走统一信封），RBAC `scene:execute`。尚未签发任何证书 → 3001。
+      operationId: downloadSimNodeBundle
+      parameters:
+        - $ref: "#/components/parameters/SimNodeIdPath"
+      responses:
+        "200":
+          description: ZIP 二进制
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: 'attachment; filename="<node_id>-bundle.zip"'
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/SceneNotFound" }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "503": { $ref: "#/components/responses/ServiceUnavailable" }
@@ -803,6 +998,16 @@ components:
       required: false
       description: 仅返回在线节点（默认 true；false 时含租约已过但元数据尚存的节点）
       schema: { type: boolean, default: true }
+    SimNodeAdminAccessToken:
+      name: X-Admin-Access-Token
+      in: header
+      required: true
+      description: |
+        管理员原始 Access Token（JWT），供 scene-service 代理调用 api-gateway
+        `POST/DELETE /api/v1/user/service-token`。网关转发时会**剥离 Authorization**
+        （后端只信任 X-User-Id/X-Roles），故需经此自定义头（网关透传）携带。
+        直连 / dev（无网关）可回退标准 `Authorization: Bearer <jwt>`。
+      schema: { type: string }
     PageQuery:
       name: page
       in: query
@@ -1829,13 +2034,16 @@ components:
 
     SimNodeListData:
       type: object
-      description: 节点清单（GET /api/v1/scene/sim-nodes）
+      description: |
+        节点清单（GET /api/v1/scene/sim-nodes）。`items` 复用 `SimNodeDetailData`：
+        登记表可用时附带管理字段（`display_name`/`token_id`/`kafka_cert_sn`/`plat_cert_sn` 等），
+        未登记或无登记表时为 `null`（向后兼容，仅新增可空字段）。
       required: [items, total]
       properties:
         items:
           type: array
           maxItems: 100
-          items: { $ref: "#/components/schemas/SimNodeData" }
+          items: { $ref: "#/components/schemas/SimNodeDetailData" }
         total: { type: integer, minimum: 0 }
 
     SimNodeResponse:
@@ -1854,6 +2062,111 @@ components:
           properties:
             data: { $ref: "#/components/schemas/SimNodeListData" }
 
+    # ---------- V1.24.1 仿真端管理：详情 / 登记 / 令牌 / 证书 ----------
+    SimNodeDetailData:
+      description: |
+        节点详情视图（`SimNodeData` 叠加登记表 `scene_svc.sim_node_registry` 字段）。
+        Redis 实时态提供 `endpoint_*`/`online`/`last_seen_at`/`running_count`；
+        PostgreSQL 登记表提供 `display_name`/`token_*`/`kafka_cert_*`/`plat_cert_*`（懒建：首次访问自动建行）。
+      allOf:
+        - $ref: "#/components/schemas/SimNodeData"
+        - type: object
+          properties:
+            display_name: { type: string, nullable: true, maxLength: 128, description: 管理员设定的展示名称 }
+            registry_description: { type: string, nullable: true, maxLength: 500, description: 管理员设定的备注 }
+            owner_client_id: { type: string, nullable: true, description: 注册时绑定的调用方 client_id }
+            token_id: { type: string, nullable: true, description: 已签发服务令牌的 jti；未签发/已撤销 = null }
+            token_issued_at: { type: string, format: date-time, nullable: true }
+            kafka_cert_sn: { type: string, nullable: true, description: Kafka 客户端证书序列号（大写 HEX） }
+            kafka_cert_issued_at: { type: string, format: date-time, nullable: true }
+            plat_cert_sn: { type: string, nullable: true, description: 平台访问证书序列号（大写 HEX） }
+            plat_cert_issued_at: { type: string, format: date-time, nullable: true }
+            registry_first_seen_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: 登记行创建时间（≈ 管理员首次查看时间）
+            registry_labels:
+              type: object
+              nullable: true
+              additionalProperties: { type: string, maxLength: 128 }
+              description: 管理员在登记表设定的标签（与节点自报 `labels` 分开）
+
+    SimNodeRegistryPatch:
+      type: object
+      description: 管理员 PATCH 请求体（仅更新登记基础信息，不涉及令牌/证书）
+      additionalProperties: false
+      properties:
+        display_name: { type: string, nullable: true, maxLength: 128, description: 展示名称；传空串 = 清除 }
+        description: { type: string, nullable: true, maxLength: 500, description: 备注描述；传空串 = 清除 }
+        labels:
+          type: object
+          nullable: true
+          additionalProperties: { type: string, maxLength: 128 }
+          description: 管理员自定义标签（整体覆盖）
+
+    IssueTokenResult:
+      type: object
+      description: 签发服务令牌一次性响应（`access_token` 不落日志，仅响应体出现）
+      required: [node_id, access_token, token_id]
+      properties:
+        node_id: { $ref: "#/components/schemas/SimNodeId" }
+        access_token:
+          type: string
+          writeOnly: true
+          description: 一次性服务令牌（JWT）；平台不落盘不写日志，丢失后需重新签发
+        token_id: { type: string, description: 服务令牌的 jti（登记展示用；撤销按 client_id=node_id） }
+        expires_at: { type: string, format: date-time, nullable: true, description: 令牌到期时间；永久令牌为 null }
+
+    IssueCertResult:
+      type: object
+      description: 签发/重签证书响应
+      required: [node_id, cert_type, serial_hex, issued_at]
+      properties:
+        node_id: { $ref: "#/components/schemas/SimNodeId" }
+        cert_type: { type: string, enum: [kafka, platform] }
+        serial_hex: { type: string, description: 新证书序列号（大写十六进制） }
+        issued_at: { type: string, format: date-time }
+
+    SimNodeDetailResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SimNodeDetailData" }
+
+    SimNodeRegistryPatchResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/SimNodeDetailData" }
+
+    IssueTokenResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/IssueTokenResult" }
+
+    IssueCertResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          required: [data]
+          properties:
+            data: { $ref: "#/components/schemas/IssueCertResult" }
+
+    SimNodeEmptyResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { type: object, nullable: true, description: 恒为 null }
+
 
 # =====================================================================
 # 扩展字段：机器可校验契约（由 services/scene-service/app/tests/test_openapi_contract.py 强制校验）
@@ -1863,7 +2176,7 @@ x-hunter-service:
   port: 8081
   gateway_prefix: /api/v1/scene
   db_schema: scene_svc
-  db_tables: [scenes]
+  db_tables: [scenes, sim_node_registry]
   minio_buckets: [hunter-scene-assets]
   redis_keys:
     - pattern: "cache:scene:{scene_id}"
@@ -1984,6 +2297,15 @@ x-hunter-endpoints:
     - "GET /api/v1/scene/sim-nodes"
     - "PUT /api/v1/scene/sim-nodes/{node_id}"
     - "POST /api/v1/scene/sim-nodes/{node_id}/heartbeat"
+    # 仿真端管理（V1.24.1：详情/登记/令牌/证书/下线；RBAC 复用 scene:*）
+    - "GET /api/v1/scene/sim-nodes/{node_id}"
+    - "PATCH /api/v1/scene/sim-nodes/{node_id}"
+    - "DELETE /api/v1/scene/sim-nodes/{node_id}"
+    - "POST /api/v1/scene/sim-nodes/{node_id}/issue-token"
+    - "DELETE /api/v1/scene/sim-nodes/{node_id}/token"
+    - "POST /api/v1/scene/sim-nodes/{node_id}/issue-kafka-cert"
+    - "POST /api/v1/scene/sim-nodes/{node_id}/issue-platform-cert"
+    - "GET /api/v1/scene/sim-nodes/{node_id}/bundle"
   ops_endpoints: ["GET /healthz", "GET /readyz", "GET /metrics"]
 
 x-hunter-scene-types:

@@ -3,6 +3,12 @@
 契约段落：components.schemas 的 SimNode*，设计说明见
 `x-hunter-simulation-flow.node_dispatch`（V1.24.0：注册/心跳 + 按自学习地址直推）。
 
+V1.24.1 仿真端管理扩展：
+- ``SimNodeDetailData``：在 SimNodeData 基础上叠加登记表字段（展示名/令牌/证书）；
+- ``SimNodeRegistryPatch``：管理员 PATCH 请求体（展示名/描述/标签）；
+- ``IssueTokenResult``：签发服务令牌一次性响应；
+- ``IssueCertResult``：签发证书响应。
+
 地址字段的来源：``endpoint_ip`` / ``endpoint_source`` / ``learned_at`` **只能由服务端写入**
 （从入站请求头自学习），因此只出现在响应模型里；请求体只声明 ``manager_port`` / ``protocol``。
 """
@@ -136,15 +142,96 @@ class SimNodeData(BaseModel):
     message: str | None = None
 
 
-class SimNodeListData(BaseModel):
-    """节点清单（契约 SimNodeListData）。"""
+class SimNodeDetailData(SimNodeData):
+    """节点详情视图（在 SimNodeData 上叠加登记表字段）。
 
-    items: list[SimNodeData] = Field(default_factory=list, max_length=NODE_LIST_MAX_ITEMS)
+    字段来源于：
+    - Redis 实时登记表：``endpoint_*``/``online``/``last_seen_at``/``running_count`` 等；
+    - PostgreSQL ``scene_svc.sim_node_registry``：``display_name``/``description``/``token_*``/``kafka_cert_*``/``plat_cert_*``；
+    - 懒建语义：管理员首次访问时自动创建登记行，因此即使节点未注册也可预览详情。
+
+    同时用于清单 ``items``：``online_only=False`` 时后端从登记表补充管理字段（展示名/令牌/证书序列号），
+    未登记或无登记表时为 ``None``（响应格式向后兼容，仅新增可空字段）。
+    """
+
+    display_name: str | None = Field(default=None, description="管理员设定的展示名称")
+    registry_description: str | None = Field(default=None, description="管理员设定的备注")
+    owner_client_id: str | None = Field(
+        default=None, description="注册时绑定的调用方 client_id（与 owner 字段含义相同，来源登记）"
+    )
+    token_id: str | None = Field(default=None, description="已签发服务令牌的 jti；未签发或已撤销 = None")
+    token_issued_at: datetime | None = None
+    kafka_cert_sn: str | None = Field(default=None, description="Kafka 客户端证书序列号（大写 HEX）")
+    kafka_cert_issued_at: datetime | None = None
+    plat_cert_sn: str | None = Field(default=None, description="平台访问证书序列号（大写 HEX）")
+    plat_cert_issued_at: datetime | None = None
+    registry_first_seen_at: datetime | None = Field(
+        default=None, description="登记行创建时间（≈ 管理员首次查看时间，与 registered_at 可相同）"
+    )
+    registry_labels: dict[str, str] | None = Field(
+        default=None, description="管理员在登记表中设定的标签（与 labels 分开）"
+    )
+
+
+class SimNodeListData(BaseModel):
+    """节点清单（契约 SimNodeListData；items 复用 SimNodeDetailData 以附带登记字段）。"""
+
+    items: list[SimNodeDetailData] = Field(default_factory=list, max_length=NODE_LIST_MAX_ITEMS)
     total: int = 0
 
 
 # =====================================================================
-# 三、统一响应包装
+# 三、V1.24.1 仿真端管理：详情 / 登记 / 令牌 / 证书
+# =====================================================================
+
+#: 管理员 PATCH 字段上限
+REGISTRY_DISPLAY_NAME_MAX_LENGTH = 128
+REGISTRY_DESCRIPTION_MAX_LENGTH = 500
+
+
+class SimNodeRegistryPatch(BaseModel):
+    """管理员 PATCH 请求体（仅更新登记基础信息，不涉及令牌/证书）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None = Field(
+        default=None, max_length=REGISTRY_DISPLAY_NAME_MAX_LENGTH,
+        description="展示名称；传空串 = 清除名称",
+    )
+    description: str | None = Field(
+        default=None, max_length=REGISTRY_DESCRIPTION_MAX_LENGTH,
+        description="备注描述；传空串 = 清除描述",
+    )
+    labels: dict[str, str] | None = Field(
+        default=None, description="管理员自定义标签（整体覆盖）"
+    )
+
+
+class IssueTokenResult(BaseModel):
+    """签发服务令牌一次性响应（``access_token`` 不落日志，仅响应体出现）。"""
+
+    node_id: str
+    access_token: str = Field(
+        ..., write_only=True,
+        description="一次性服务令牌（JWT）；平台不落盘不写日志，丢失后需重新签发",
+    )
+    token_id: str = Field(..., description="服务令牌 jti（撤销时需要）")
+    expires_at: datetime | None = Field(
+        default=None, description="令牌到期时间；永久令牌为 None"
+    )
+
+
+class IssueCertResult(BaseModel):
+    """签发/重签证书响应。"""
+
+    node_id: str
+    cert_type: Literal["kafka", "platform"]
+    serial_hex: str = Field(..., description="新证书序列号（大写十六进制）")
+    issued_at: datetime
+
+
+# =====================================================================
+# 四、统一响应包装
 # =====================================================================
 
 
@@ -156,10 +243,34 @@ class SimNodeListResponse(ApiResponse[SimNodeListData]):
     """节点清单响应（GET /api/v1/scene/sim-nodes）。"""
 
 
+class SimNodeDetailResponse(ApiResponse[SimNodeDetailData]):
+    """节点详情响应（GET /api/v1/scene/sim-nodes/{node_id}）。"""
+
+
+class SimNodeRegistryPatchResponse(ApiResponse[SimNodeDetailData]):
+    """PATCH 登记响应（更新后返回最新详情）。"""
+
+
+class IssueTokenResponse(ApiResponse[IssueTokenResult]):
+    """签发服务令牌响应。"""
+
+
+class IssueCertResponse(ApiResponse[IssueCertResult]):
+    """签发证书响应。"""
+
+
+class SimNodeEmptyResponse(ApiResponse[None]):
+    """无数据响应（撤销令牌/删除节点等）。"""
+
+
 __all__ = [
     "CAPACITY_MAX",
     "CAPACITY_MIN",
     "ENDPOINT_SOURCES",
+    "IssueCertResponse",
+    "IssueCertResult",
+    "IssueTokenResponse",
+    "IssueTokenResult",
     "MANAGER_PORT_MAX",
     "MANAGER_PORT_MIN",
     "NODE_ID_PATTERN",
@@ -168,11 +279,18 @@ __all__ = [
     "NODE_PROTOCOLS",
     "NODE_TEXT_MAX_LENGTH",
     "NODE_VERSION_MAX_LENGTH",
+    "REGISTRY_DESCRIPTION_MAX_LENGTH",
+    "REGISTRY_DISPLAY_NAME_MAX_LENGTH",
     "RUNNING_INSTANCES_MAX_ITEMS",
     "SimNodeData",
+    "SimNodeDetailData",
+    "SimNodeDetailResponse",
+    "SimNodeEmptyResponse",
     "SimNodeHeartbeatRequest",
     "SimNodeListData",
     "SimNodeListResponse",
     "SimNodeRegisterRequest",
+    "SimNodeRegistryPatch",
+    "SimNodeRegistryPatchResponse",
     "SimNodeResponse",
 ]

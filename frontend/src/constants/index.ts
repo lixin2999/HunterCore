@@ -13,6 +13,7 @@ export * from './engine'
 export * from './ota'
 export * from './permissions'
 export * from './remote'
+export * from './sim-node'
 export * from './vehicle'
 
 /** 应用标题 */

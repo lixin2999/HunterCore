@@ -623,6 +623,15 @@ async def _published_scene_id(node_env: SimpleNamespace, scene_name: str) -> str
         ("get", "/api/v1/scene/sim-nodes", "listSimNodes"),
         ("put", "/api/v1/scene/sim-nodes/{node_id}", "registerSimNode"),
         ("post", "/api/v1/scene/sim-nodes/{node_id}/heartbeat", "heartbeatSimNode"),
+        # V1.24.1 仿真端管理
+        ("get", "/api/v1/scene/sim-nodes/{node_id}", "getSimNode"),
+        ("patch", "/api/v1/scene/sim-nodes/{node_id}", "patchSimNode"),
+        ("delete", "/api/v1/scene/sim-nodes/{node_id}", "deleteSimNode"),
+        ("post", "/api/v1/scene/sim-nodes/{node_id}/issue-token", "issueSimNodeToken"),
+        ("delete", "/api/v1/scene/sim-nodes/{node_id}/token", "revokeSimNodeToken"),
+        ("post", "/api/v1/scene/sim-nodes/{node_id}/issue-kafka-cert", "issueSimNodeKafkaCert"),
+        ("post", "/api/v1/scene/sim-nodes/{node_id}/issue-platform-cert", "issueSimNodePlatformCert"),
+        ("get", "/api/v1/scene/sim-nodes/{node_id}/bundle", "downloadSimNodeBundle"),
     ],
 )
 def test_openapi_exposes_contract_operations(method: str, path: str, operation_id: str) -> None:
@@ -645,4 +654,9 @@ def test_task_queue_endpoints_are_removed_from_openapi() -> None:
         "/api/v1/scene/sim-nodes",
         "/api/v1/scene/sim-nodes/{node_id}",
         "/api/v1/scene/sim-nodes/{node_id}/heartbeat",
+        "/api/v1/scene/sim-nodes/{node_id}/issue-token",
+        "/api/v1/scene/sim-nodes/{node_id}/token",
+        "/api/v1/scene/sim-nodes/{node_id}/issue-kafka-cert",
+        "/api/v1/scene/sim-nodes/{node_id}/issue-platform-cert",
+        "/api/v1/scene/sim-nodes/{node_id}/bundle",
     }

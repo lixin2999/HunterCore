@@ -246,6 +246,21 @@ class SimNodeStore:
             sim_instance_id=sim_instance_id,
         )
 
+    # ---------- 节点下线清理（V1.24.1 仿真端管理） ----------
+
+    async def delete_node(self, node_id: str) -> None:
+        """删除节点登记：DEL sim:node:{node_id} + ZREM sim:node:seen（幂等）。"""
+        await self._await(
+            self._redis.delete(sim_node_key(node_id)),
+            op="delete_node",
+            node_id=node_id,
+        )
+        await self._await(
+            self._redis.zrem(SIM_NODE_SEEN, node_id),
+            op="delete_node_seen",
+            node_id=node_id,
+        )
+
     async def active_instance_records(self, *, now: float) -> list[dict[str, Any]]:
         """活动实例的运行时快照清单；快照已消失（回收/TTL）的成员顺手 ZREM。"""
         members = await self._await(

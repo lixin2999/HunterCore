@@ -44,7 +44,15 @@ const REQUEST_TIMEOUT_MS = 20_000
 const TOKEN_REFRESH_AHEAD_MS = 60_000
 
 /** 带重试标记的请求配置 */
-type RetryableConfig = AxiosRequestConfig & { __retried?: boolean }
+type RetryableConfig = AxiosRequestConfig & {
+  __retried?: boolean
+  /**
+   * 需向后端透传原始管理员 JWT 的请求（仿真端令牌签发/撤销代理）。
+   * 网关会剥离 Authorization，故经自定义头 X-Admin-Access-Token 携带原始 JWT（网关透传自定义头），
+   * 供 scene-service 代理调用 api-gateway 签发服务令牌。
+   */
+  withAdminBearer?: boolean
+}
 
 /** 底层实例（不导出，业务统一走 request()） */
 const http: AxiosInstance = axios.create({
@@ -67,6 +75,10 @@ http.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
       }
     }
     config.headers.Authorization = `Bearer ${token}`
+    // 代理签发类请求：额外经自定义头透传原始 JWT（网关剥离 Authorization，自定义头可透传）
+    if ((config as RetryableConfig).withAdminBearer) {
+      config.headers['X-Admin-Access-Token'] = token
+    }
   }
   // trace_id：服务端契约 TraceRequestId 头，便于 Jaeger/日志关联
   if (!config.headers['X-Request-ID']) {
@@ -156,6 +168,9 @@ http.interceptors.response.use(
         const token = await refreshAccessToken()
         config.__retried = true
         config.headers = { ...(config.headers ?? {}), Authorization: `Bearer ${token}` }
+        if (config.withAdminBearer) {
+          ;(config.headers as Record<string, string>)['X-Admin-Access-Token'] = token
+        }
         return http.request(config)
       }
       if (payload.code === 1001) {

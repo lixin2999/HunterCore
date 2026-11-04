@@ -153,6 +153,26 @@ const routes: RouteRecordRaw[] = [
         ],
       },
       {
+        path: 'sim-nodes',
+        name: 'sim-nodes',
+        redirect: { name: 'sim-node-list' },
+        meta: { title: '仿真端管理', icon: 'Cpu', permission: PERMISSIONS.sceneRead },
+        children: [
+          {
+            path: 'list',
+            name: 'sim-node-list',
+            component: () => import('@/views/sim-node/SimNodeListView.vue'),
+            meta: { title: '仿真端管理', icon: 'Cpu', permission: PERMISSIONS.sceneRead },
+          },
+          {
+            path: ':node_id',
+            name: 'sim-node-detail',
+            component: () => import('@/views/sim-node/SimNodeDetailView.vue'),
+            meta: { title: '仿真端详情', permission: PERMISSIONS.sceneRead },
+          },
+        ],
+      },
+      {
         path: 'forbidden',
         name: 'forbidden',
         component: () => import('@/views/error/ForbiddenView.vue'),

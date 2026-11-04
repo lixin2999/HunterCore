@@ -10,25 +10,41 @@
 
 ⚠ 注册/心跳必须拿到 ``Request`` 本体：下发目标地址是从**入站请求头**自学习的（契约
 ``node_dispatch.endpoint_learning``），不是请求体里的字段。
+
+V1.24.1 仿真端管理（契约 tag: sim-node 追加 8 个管理端点）：
+- 详情/PATCH（scene:read / scene:update）、令牌签发/撤销 + 证书签发 + 接入包下载（scene:execute）、
+  删除节点（scene:delete）；
+- ⚠ 令牌签发/撤销需代理调用 api-gateway ``POST/DELETE /api/v1/user/service-token``，而网关**会剥离
+  Authorization**（后端只信任 X-User-Id/X-Roles）。故前端需经**自定义头** ``X-Admin-Access-Token``
+  携带原始管理员 JWT（网关透传自定义头），``require_admin_bearer`` 优先取该头、回退 Authorization（直连/dev）。
 """
 from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
+from hunter_common.exceptions import InvalidParameterError
 
 from app.core.dependencies import (
     get_sim_node_service,
+    require_execute_permission,
     require_node_permission,
     require_read_permission,
+    require_write_permission,
     trace_request_id,
 )
 from app.routers.errors import COMMON_ERRORS
 from app.schemas.sim_nodes import (
     NODE_ID_PATTERN,
+    IssueCertResponse,
+    IssueTokenResponse,
+    SimNodeDetailResponse,
+    SimNodeEmptyResponse,
     SimNodeHeartbeatRequest,
     SimNodeListResponse,
     SimNodeRegisterRequest,
+    SimNodeRegistryPatch,
+    SimNodeRegistryPatchResponse,
     SimNodeResponse,
 )
 from app.services.sim_nodes import SimNodeService
@@ -95,4 +111,180 @@ async def heartbeat_sim_node(
     return SimNodeResponse(data=data, request_id=trace_request_id())
 
 
+# =====================================================================
+# V1.24.1 仿真端管理：详情 / 登记 / 令牌 / 证书 / 下线
+# =====================================================================
+
+
+async def require_admin_bearer(
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+    x_admin_access_token: Annotated[
+        str | None, Header(alias="X-Admin-Access-Token")
+    ] = None,
+) -> str:
+    """提取可转发的管理员 Access Token（令牌签发/撤销代理用）。
+
+    网关会剥离 ``Authorization``，故生产链路取 ``X-Admin-Access-Token``（前端携带原始 JWT，
+    网关透传自定义头）；直连 / dev（无网关）回退 ``Authorization: Bearer <jwt>``。两者均缺 → 2001。
+    """
+    raw = x_admin_access_token or authorization or ""
+    token = raw[7:].strip() if raw.lower().startswith("bearer ") else raw.strip()
+    if not token:
+        raise InvalidParameterError(
+            "缺少可转发的管理员 Access Token：网关已剥离 Authorization，"
+            "请经 X-Admin-Access-Token 头携带原始 JWT（供代理签发服务令牌）"
+        )
+    return token
+
+
+AdminBearer = Annotated[str, Depends(require_admin_bearer)]
+
+
+@router.get(
+    "/sim-nodes/{node_id}",
+    operation_id="getSimNode",
+    response_model=SimNodeDetailResponse,
+    summary="查询仿真节点详情（Redis 实时态 + 登记表合并；懒建登记行）",
+    responses={**COMMON_ERRORS},
+)
+async def get_sim_node(
+    node_id: NodeIdPath,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_read_permission)],
+) -> SimNodeDetailResponse:
+    data = await service.get_detail(node_id)
+    return SimNodeDetailResponse(data=data, request_id=trace_request_id())
+
+
+@router.patch(
+    "/sim-nodes/{node_id}",
+    operation_id="patchSimNode",
+    response_model=SimNodeRegistryPatchResponse,
+    summary="更新仿真节点管理字段（展示名 / 描述 / 标签）",
+    responses={**COMMON_ERRORS},
+)
+async def patch_sim_node(
+    node_id: NodeIdPath,
+    payload: SimNodeRegistryPatch,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_write_permission)],
+) -> SimNodeRegistryPatchResponse:
+    data = await service.patch_registry(node_id, payload)
+    return SimNodeRegistryPatchResponse(data=data, request_id=trace_request_id())
+
+
+@router.post(
+    "/sim-nodes/{node_id}/issue-token",
+    operation_id="issueSimNodeToken",
+    response_model=IssueTokenResponse,
+    summary="为仿真节点签发服务令牌（代理 api-gateway；access_token 一次性返回、不落日志）",
+    responses={**COMMON_ERRORS},
+)
+async def issue_sim_node_token(
+    node_id: NodeIdPath,
+    bearer: AdminBearer,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> IssueTokenResponse:
+    data = await service.issue_token(node_id, bearer)
+    return IssueTokenResponse(data=data, request_id=trace_request_id())
+
+
+@router.delete(
+    "/sim-nodes/{node_id}/token",
+    operation_id="revokeSimNodeToken",
+    response_model=SimNodeEmptyResponse,
+    summary="撤销仿真节点服务令牌（代理 api-gateway + 清空登记表 token）",
+    responses={**COMMON_ERRORS},
+)
+async def revoke_sim_node_token(
+    node_id: NodeIdPath,
+    bearer: AdminBearer,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> SimNodeEmptyResponse:
+    await service.revoke_token(node_id, bearer)
+    return SimNodeEmptyResponse(data=None, request_id=trace_request_id())
+
+
+@router.post(
+    "/sim-nodes/{node_id}/issue-kafka-cert",
+    operation_id="issueSimNodeKafkaCert",
+    response_model=IssueCertResponse,
+    summary="签发 / 重签 Kafka mTLS 客户端证书（CN=sim-{node_id}）",
+    responses={**COMMON_ERRORS},
+)
+async def issue_sim_node_kafka_cert(
+    node_id: NodeIdPath,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> IssueCertResponse:
+    data = await service.issue_kafka_cert(node_id)
+    return IssueCertResponse(data=data, request_id=trace_request_id())
+
+
+@router.post(
+    "/sim-nodes/{node_id}/issue-platform-cert",
+    operation_id="issueSimNodePlatformCert",
+    response_model=IssueCertResponse,
+    summary="签发 / 重签平台访问 mTLS 客户端证书（CN=sim-platform-{node_id}）",
+    responses={**COMMON_ERRORS},
+)
+async def issue_sim_node_platform_cert(
+    node_id: NodeIdPath,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> IssueCertResponse:
+    data = await service.issue_platform_cert(node_id)
+    return IssueCertResponse(data=data, request_id=trace_request_id())
+
+
+@router.get(
+    "/sim-nodes/{node_id}/bundle",
+    operation_id="downloadSimNodeBundle",
+    summary="下载仿真节点接入包（ZIP：CA + Kafka/平台证书 + kafka.properties + README）",
+    responses={
+        200: {
+            "description": "ZIP 二进制",
+            "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}},
+            "headers": {
+                "Content-Disposition": {
+                    "schema": {"type": "string"},
+                    "description": 'attachment; filename="<node_id>-bundle.zip"',
+                }
+            },
+        },
+        **COMMON_ERRORS,
+    },
+)
+async def download_sim_node_bundle(
+    node_id: NodeIdPath,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> Response:
+    payload = await service.download_bundle(node_id)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{node_id}-bundle.zip"',
+        "X-Request-ID": trace_request_id(),
+    }
+    return Response(content=payload, media_type="application/zip", headers=headers)
+
+
+@router.delete(
+    "/sim-nodes/{node_id}",
+    operation_id="deleteSimNode",
+    response_model=SimNodeEmptyResponse,
+    summary="从登记表移除仿真节点并清理资源（Redis + 登记表 + 证书目录）",
+    responses={**COMMON_ERRORS},
+)
+async def delete_sim_node(
+    node_id: NodeIdPath,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_write_permission)],
+) -> SimNodeEmptyResponse:
+    await service.remove_node(node_id)
+    return SimNodeEmptyResponse(data=None, request_id=trace_request_id())
+
+
 __all__ = ["router"]
+

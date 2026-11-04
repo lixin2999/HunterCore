@@ -65,6 +65,15 @@ EXPECTED_ENDPOINTS: set[tuple[str, str]] = {
     ("GET", "/api/v1/scene/sim-nodes"),
     ("PUT", "/api/v1/scene/sim-nodes/{node_id}"),
     ("POST", "/api/v1/scene/sim-nodes/{node_id}/heartbeat"),
+    # V1.24.1 仿真端管理（详情/登记/令牌/证书/下线）
+    ("GET", "/api/v1/scene/sim-nodes/{node_id}"),
+    ("PATCH", "/api/v1/scene/sim-nodes/{node_id}"),
+    ("DELETE", "/api/v1/scene/sim-nodes/{node_id}"),
+    ("POST", "/api/v1/scene/sim-nodes/{node_id}/issue-token"),
+    ("DELETE", "/api/v1/scene/sim-nodes/{node_id}/token"),
+    ("POST", "/api/v1/scene/sim-nodes/{node_id}/issue-kafka-cert"),
+    ("POST", "/api/v1/scene/sim-nodes/{node_id}/issue-platform-cert"),
+    ("GET", "/api/v1/scene/sim-nodes/{node_id}/bundle"),
 }
 
 #: 运维端点（K8s 探针 / Prometheus 抓取）

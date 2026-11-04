@@ -53,6 +53,7 @@ from app.repositories.engine import (
 )
 from app.repositories.scenes import SceneRepository
 from app.repositories.sim_dispatch import SimNodeBackend
+from app.repositories.sim_node_registry import SimNodeRegistryStore
 from app.repositories.sim_nodes import SimNodeStore
 from app.repositories.simulations import SimTopicProvisioner, VilSessionStore
 from app.repositories.storage import get_storage
@@ -167,7 +168,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         topics=topic_provisioner,
         topic_delete_delay_seconds=settings.sim_topic_delete_delay_seconds,
     )
-    app.state.sim_node_service = SimNodeService(sim_node_store, settings)
+    app.state.sim_node_service = SimNodeService(
+        sim_node_store,
+        settings,
+        # V1.24.1 仿真端管理：登记表（scene_svc.sim_node_registry）与 Redis 实时态互补；
+        # 未初始化 DDL 时管理接口按需懒建行，读写走 DB（与令牌/证书登记一致）
+        registry_store=SimNodeRegistryStore(app.state.db),
+    )
     # 场景引擎（服务私有 schema scene_engine；未初始化 DDL 时读取自动回落到内置目录）
     app.state.engine_service = SceneEngineService(
         LogicalScenarioRepository(app.state.db),

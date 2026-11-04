@@ -7176,3 +7176,201 @@ docker exec hunter-scene env | grep '^SIM_DISPATCH_MODE='    # 自检：direct�
 - 被 `.gitignore` 忽略（`.gitignore:157 docs/`）、需**单独同步**到服务器的共 7 份文档：`docs/HunterSim接入清单.md`（**新增文件**）、`docs/README.md`（登记新增条目）、以及改写的 `docs/{carla-integration,故障排查指南,运维操作手册,deployment,01-部署概述与环境要求}.md`。
 - **必须 `--build` 重建 scene-service 镜像**（新增模块 + 共享库 `redis_keys.py` 变更），改 `.env` 中的 `SIM_*` 需 `--force-recreate` 才生效（仅 `restart` 不重读 env-file）；K8s 侧改 ConfigMap 后滚动重启，并确认 Pod 能直接路由到节点网段（overlay 内访问宿主同网段设备需额外配置，否则一律 5001）。
 
+## V1.24.1（新增：仿真端管理 —— 后台查看已接入仿真节点、签发服务令牌与 mTLS 证书、下载接入包、下线清理；沿用「节点自注册 + 后台管理」模型，注册/心跳链路零改动）
+
+Date：2026-11-03
+变更类型：新增（scene-service 管理侧 DDL + 登记表 + 证书签发 + 令牌代理 + 8 个管理端点 + OpenAPI + 前端管理页面 + 部署编排），既有注册/心跳与下发链路不变 ⇒ **向后兼容**
+
+### 1. 背景与范围
+
+运营需要在后台看到「哪些 HunterSim 节点接入了、在离线、地址、令牌/证书状态」，并能一键签发服务令牌、签发/重签 Kafka 与平台两类 mTLS 客户端证书、下载接入包、下线节点。设计原则：
+
+- **节点自注册 + 后台管理**：现有 `PUT /sim-nodes/{node_id}` 注册、`POST /heartbeat` 自注册与地址自学习逻辑**不改**；管理端只是「查看已接入节点 + 签发凭证」，登记行采用**懒建**（管理员首次查看/操作时自动创建）。
+- **两类证书，同一 CA**：Kafka mTLS 客户端证书（CN=`sim-{node_id}`）与平台访问 mTLS 客户端证书（CN=`sim-platform-{node_id}`），复用 vehicle-service `cert_signer` 的 openssl 子进程模式。
+- **服务令牌由 scene-service 代理 api-gateway** `POST/DELETE /api/v1/user/service-token`。
+- **RBAC 复用 scene 权限域**（`scene:read`/`scene:update`/`scene:execute`），不引入新权限域。
+
+### 2. 两个契约级发现（决定了实现形态，务必记录）
+
+- **网关剥离 `Authorization`**：`api-gateway` 的 `proxy_service._STRIPPED_REQUEST_HEADERS` 明确包含 `authorization`，后端只信任网关注入的 `X-User-Id`/`X-Roles`。故计划里「scene-service 转发原始 JWT」在过网关时**拿不到** `Authorization`。落地方案：新增自定义头 **`X-Admin-Access-Token`**（网关透传自定义头）承载原始管理员 JWT，路由 `require_admin_bearer` 优先取该头、回退 `Authorization`（dev/直连无网关时可用）；前端 `request.ts` 对签发/撤销令牌两类请求通过 `withAdminBearer` 标记镜像该头。**若不同步发送该头，issue/revoke token 运行时必然 2001。**
+- **`ServiceToken` 响应无 `jti`/`token_id`/`expires_at`**：api-gateway 只返回 `access_token`/`token_type`/`expires_in`(秒)/`client_id`/`roles`。故 `issue_token` 从 JWT payload base64 解出 `jti` 作为 `token_id`（解不出回退 `node_id`），用 `expires_in` 计算 `expires_at`；撤销按 `client_id`（= `node_id`）走 `DELETE /user/service-token/{node_id}`，非按 jti。
+
+### 3. 变更清单
+
+**① 数据契约**
+
+- 新增 `contracts/database/ddl/08_sim_nodes.sql`：`scene_svc.sim_node_registry`（`node_id` 主键 + 展示名/描述/owner_client_id/token_id/token_issued_at/kafka_cert_sn/plat_cert_sn/first_seen_at/labels(JSONB)）；幂等 `CREATE TABLE IF NOT EXISTS` + `CREATE OR REPLACE TRIGGER` 复用 `public.common_set_update_time()`。管理侧持久化数据与 Redis 实时状态互补。
+
+**② scene-service 后端**
+
+- `app/config.py`：新增 `sim_node_certs_dir`（默认 `/data/sim-node-certs`）、`sim_node_cert_validity_days`（`3650`）、`sim_node_cert_signer_timeout_seconds`（`15`）、`apigateway_internal_url`（`http://api-gateway:8080`）。
+- 新增 `app/models/sim_node_registry.py`（SQLAlchemy 2.0 `Mapped` ORM，共用 hunter_common `Base`）与 `app/repositories/sim_node_registry.py`（`SimNodeRegistryStore`：`get`/`exists`/`get_map`（列表页批量联查）/`upsert`（懒建，PG `ON CONFLICT DO UPDATE`）/`patch`/`set_token`/`clear_token`/`set_kafka_cert`/`set_plat_cert`/`delete`）。
+- 新增 `app/services/sim_node_cert_signer.py`：`aissue_kafka_cert`/`aissue_platform_cert`（目录 `{certs_dir}/{node_id}/{kafka|platform}/`，产物 client-key/client-cert/kafka-client.p12(仅 kafka)/p12-password；`CN`、`O=HunterCore`、`EKU=clientAuth`、`SAN` 按类型；序列号 `secrets.randbits(64)|0x01`；失败清残迹）、`delete_node_cert_dir`。
+- `app/schemas/sim_nodes.py`：新增 `SimNodeDetailData`（叠加登记字段）、`SimNodeRegistryPatch`、`IssueTokenResult`、`IssueCertResult` 及各 `ApiResponse` 包装；**`SimNodeListData.items` 由 `SimNodeData` 改为复用 `SimNodeDetailData`**（见「兼容」）。注意请求体字段是 `description`、响应是 `registry_description`。
+- `app/services/sim_nodes.py`：新增 `get_detail`（Redis+DB 合并，懒建）、`patch_registry`、`issue_token`/`revoke_token`（httpx 代理网关 + 回写登记表）、`issue_kafka_cert`/`issue_platform_cert`、`download_bundle`（ZIP：CA + 两类证书 + kafka.properties + README）、`remove_node`（Redis 登记 + 登记表 + 证书目录三清）；辅助 `_to_detail`/`_merge_registry`/`_ensure_registry_row`/`_require_registry`/`_extract_jwt_jti`；`list_nodes` 在**登记表可用时**用 `get_map` 批量补充管理字段（未装配时降级不查）。
+- `app/routers/sim_nodes.py`：`require_admin_bearer` 依赖 + 8 端点（详情 `GET /sim-nodes/{node_id}`=read、PATCH `{node_id}`=update、`POST .../issue-token`=execute、`DELETE .../token`=execute、`POST .../issue-kafka-cert`、`POST .../issue-platform-cert`、`GET .../bundle`=execute（返回 `application/zip`）、`DELETE /sim-nodes/{node_id}`=**update**）；均置于既有清单/心跳路由之后、注册 PUT 之前，避免路径冲突。
+- `app/main.py`：lifespan 装配 `SimNodeService(..., registry_store=SimNodeRegistryStore(app.state.db))`。
+
+**③ OpenAPI 契约** `contracts/openapi/scene-service.yaml`：`sim-node` tag 追加 8 路径与上述 Schema，新增请求头参数 `SimNodeAdminAccessToken`（`X-Admin-Access-Token`），更新 `x-hunter-endpoints`（+8）与 `db_tables`（补 `sim_node_registry`）。
+
+**④ 部署编排**
+
+- `services/scene-service/Dockerfile`：runner 阶段安装 `openssl` + `ca-certificates`，创建 `/app/data/sim-node-certs` 并 chown `10001`。
+- `infra/deploy/docker-compose.yml` scene-service 段：新增 CA 目录**只读** bind 挂载（`./certs/kafka:/srv/kafka-ca:ro`，与 vehicle-service 同源 `gen-kafka-certs.sh` 产物）、证书写域 bind 挂载（`${DATA_DIR}/sim-node-certs:/app/data/sim-node-certs:rw`）；环境变量 `SIM_NODE_CERTS_DIR`（写死 `/app/data/sim-node-certs`）、`KAFKA_CA_CERT_PATH`/`KAFKA_CA_KEY_PATH`（写死 `/srv/kafka-ca/ca-{cert,key}.pem`）、`SIM_NODE_CERT_VALIDITY_DAYS`/`SIM_NODE_CERT_SIGNER_TIMEOUT_SECONDS`/`APIGATEWAY_INTERNAL_URL`（均 `${VAR:-默认}` 可覆）。
+- `infra/deploy/.env.example`：新增「仿真端管理」小节登记上述键。
+
+**⑤ 前端（Vue 3 + Element Plus）**
+
+- `types/sim-node.ts`、`constants/sim-node.ts`（并在 `constants/index.ts` 导出）、`api/sim-node.ts`（9 接口）；`api/request.ts` 新增 `withAdminBearer`，请求拦截器与 1003 重放路径均透传 `X-Admin-Access-Token`。
+- `views/sim-node/SimNodeListView.vue`（清单 + 在线/关键词筛选 + 令牌/证书状态列 + 详情/下载/删除）、`SimNodeDetailView.vue`（基本信息/接入凭证/实时状态三卡 + 签发撤销令牌（一次性展示）+ 两类证书签发/重签 + 下载接入包 + PATCH 管理信息 + 删除）。
+- `router/index.ts` 父子路由 `sim-nodes`（`list`/`:node_id`，icon `Cpu`，`scene:read`）；`layouts/MainLayout.vue` 菜单「仿真端管理」。
+
+### 4. 兼容与升级影响
+
+- **纯新增**：既有 `PUT` 注册、`heartbeat`、清单默认行为、`direct`/`node` 下发链路均不改。
+- **清单响应向后兼容**：`SimNodeListData.items` 由 `SimNodeData` 变为其**超集** `SimNodeDetailData`，旧字段原样保留、仅新增可空管理字段（未登记节点为 `null`）；既有消费方读取不受影响。
+- 新增 8 端点、1 张表（幂等 DDL）、镜像内新增 `openssl`；不改 Kafka/其他契约。
+- **删除端点用 `scene:update`**（`require_write_permission`），与早期设计表格中的 `scene:delete` 不同；前端按钮已按实际门禁对齐。
+
+### 5. 验证（本环境实跑受限，如实登记）
+
+- 后端：9 个文件 `py_compile` 通过；`contracts/openapi/scene-service.yaml` `yaml.safe_load` 通过（23 paths，`SimNodeListData.items.$ref` 正确指向 `SimNodeDetailData`）。
+- 契约护栏（本功能）：`app/tests/test_scene_contract.py::EXPECTED_ENDPOINTS` 与 `app/tests/test_sim_node_dispatch.py`（`parametrize` 8 操作 + `node_paths` 集合 5 子路径）已同步纳入 8 新端点。
+- ⚠ **本环境无 pytest/pydantic、前端无 `node_modules`**，以下**均未执行**、不得当作已通过：`run_unit_tests.py`（含新端点与富化清单）、`vue-tsc` 类型检查、`mypy`、DDL 建表与证书签发/令牌代理的运行时联调。
+
+**待实机验证**：① 8 端点经网关的完整 RBAC + `X-Admin-Access-Token` 透传（**先确认 nginx/网关不剥离该自定义头**，否则签发/撤销令牌 2001）；② openssl 在 scene-service 容器内用只读挂载 CA 实际签发两类证书并打包下载；③ `service:{client_id}` 令牌签发/撤销与 owner 首绑语义一致性；④ 前端页面登录后台后的清单富化与操作闭环。
+
+### 5.1 实机部署验证步骤（**待在部署机执行**；顺序不可颠倒，每步都带判据，不达标不要往下走）
+
+> 本环境的 shell 无 Docker、无数据库、无已接入节点，**下面步骤一条都没跑过** —— 它们是给部署机的可执行清单，跑完按 §5.2 逐行回填；任何一行未验不得把本条标为「已实机确认」。
+> 前置：本特性依附于 `node`/`direct` 下发链路（V1.24.0），故步骤 3 需要一个**已注册节点**——若无，先按《V1.24.0 §5.1 步骤 4》用服务令牌 `PUT /sim-nodes/{node_id}` 建一个。
+
+```bash
+# 0) 会话开头一次定义（后续复用）
+sudo -i && cd /opt/HunterCore && git pull
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+set -a; . ./.env; set +a
+psqlq()    { docker exec -i hunter-postgres psql -U "${POSTGRES_USER:-hunter}" -d "${POSTGRES_DB:-hunter_core}" "$@"; }
+rcli()     { docker exec hunter-redis redis-cli --no-auth-warning -a "${REDIS_PASSWORD}" "$@"; }
+SELF=192.168.31.35            # 平台（部署机）地址
+NODE=sim-node-01              # 已接入的 node_id
+CERTS=/app/data/sim-node-certs
+ADMIN=$(curl -sS -X POST http://$SELF/api/v1/user/login -H 'Content-Type: application/json' -d '{"username":"admin","password":"<密码>"}' | jq -r '.data.access_token'); echo "admin token len=${#ADMIN}"   # 必须 >0
+```
+
+**步骤 1——建表（DDL 幂等；不建表时 8 个管理端点全部 5001「仿真端登记表不可用」）**
+
+```bash
+docker exec -i hunter-postgres psql -U "${POSTGRES_USER:-hunter}" -d "${POSTGRES_DB:-hunter_core}" -v ON_ERROR_STOP=1 < contracts/database/ddl/08_sim_nodes.sql && echo "DDL OK"
+psqlq -c '\d scene_svc.sim_node_registry' | grep -E 'token_id|kafka_cert_sn|plat_cert_sn|owner_client_id'   # 判据：4 个管理列都命中
+```
+
+**步骤 2——重建镜像（新增 openssl）+ CA 只读挂载 + 证书写域授权 + `.env` 新键**
+
+```bash
+ls -l ./certs/kafka/ca-cert.pem ./certs/kafka/ca-key.pem    # CA 源（gen-kafka-certs.sh 产物）；缺失先补，否则证书签发必 5001
+mkdir -p "${DATA_DIR:-/data}/sim-node-certs" && chown 10001:10001 "${DATA_DIR:-/data}/sim-node-certs" && echo 'cert 写域属主=10001 ok'
+cp .env .env.bak.$(date +%Y%m%d_%H%M%S)
+grep -qE '^APIGATEWAY_INTERNAL_URL=' .env || printf 'APIGATEWAY_INTERNAL_URL=http://api-gateway:8080\n' >> .env   # 其余 SIM_NODE_CERT_* / KAFKA_CA_* 由 compose 默认值透传
+dcompose build scene-service
+dcompose up -d --force-recreate scene-service
+docker exec hunter-scene which openssl                                   # 判据：返回路径；空 ⇒ --build 未生效，后面结论均无效
+docker exec hunter-scene sh -c 'test -r /srv/kafka-ca/ca-cert.pem && test -r /srv/kafka-ca/ca-key.pem && echo CA-RO-OK'   # 只读挂载到位
+docker exec hunter-scene sh -c "touch $CERTS/.w && rm $CERTS/.w && echo WRITABLE"                                        # 容器用户 10001 可写证书目录
+docker exec hunter-scene env | grep -E '^(SIM_NODE_CERT|APIGATEWAY_INTERNAL_URL|KAFKA_CA_)' | sort                        # 判据：SIM_NODE_CERTS_DIR=/app/data/sim-node-certs、KAFKA_CA_*=/srv/kafka-ca/ca-*.pem 齐备
+docker exec hunter-scene python3 -c "from app.services.sim_node_cert_signer import aissue_kafka_cert; from app.repositories.sim_node_registry import SimNodeRegistryStore; print('管理侧模块已在镜像内')"   # 报 ImportError ⇒ 镜像未重建
+```
+
+**步骤 3——清单富化（读面 `scene:read`，必须用 `$ADMIN`，服务令牌会 403）**
+
+```bash
+curl -sS -H "Authorization: Bearer $ADMIN" "http://$SELF/api/v1/scene/sim-nodes?online_only=false" | jq -r '.data.items[] | [.node_id,.online,.endpoint_ip,.display_name,.token_id,.kafka_cert_sn,.plat_cert_sn] | @tsv'
+# 判据：已注册节点出现在清单；新增列 display_name/token_id/kafka_cert_sn/plat_cert_sn 均存在（未签发为 null）；旧字段（endpoint_ip/online）逐字不变 ⇒ 向后兼容
+```
+
+**步骤 4——签发/撤销服务令牌（本特性最大坑：`X-Admin-Access-Token`）**
+
+```bash
+# 经网关：必须同时带 Authorization（做 RBAC）与 X-Admin-Access-Token（供代理回传原始 JWT）
+curl -sS -X POST "http://$SELF/api/v1/scene/sim-nodes/$NODE/issue-token" -H "Authorization: Bearer $ADMIN" -H "X-Admin-Access-Token: $ADMIN" | jq '{code, token_id: .data.token_id, expires_at: .data.expires_at, at_present: (.data.access_token|length>0)}'
+psqlq -c "select token_id, owner_client_id, token_issued_at is not null as issued from scene_svc.sim_node_registry where node_id='$NODE'"   # 判据：token_id 非空、issued=t
+curl -sS -X POST "http://$SELF/api/v1/scene/sim-nodes/$NODE/issue-token" -H "Authorization: Bearer $ADMIN" | jq '{code, message}'           # 负向：不带自定义头 ⇒ 期望 code=2001「缺少可转发的管理员 Access Token」
+curl -sS -X DELETE "http://$SELF/api/v1/scene/sim-nodes/$NODE/token" -H "Authorization: Bearer $ADMIN" -H "X-Admin-Access-Token: $ADMIN" | jq '{code}'
+psqlq -c "select token_id from scene_svc.sim_node_registry where node_id='$NODE'"   # 判据：撤销后 token_id 回到 null
+```
+
+- 判据（五条）：签发 `code=0` 且 `access_token` **一次性**出现在响应体（前端弹窗展示、**平台不落盘不写日志**，丢失只能重签）；`token_id` = JWT 的 `jti`（网关无 `jti` 时回退展示 `node_id`）；`expires_at` 由 `expires_in` 算出（永久令牌为 null）；登记表回写；不带 `X-Admin-Access-Token` 经网关必 2001（**先确认 nginx/网关未过滤该自定义头**）。
+- 直连 scene-service（绕过网关，如 `port-forward`/dev）时 `require_admin_bearer` 回退 `Authorization`，**不需**该头——用这个差异可快速判定「头到底有没有透传到位」。
+
+**步骤 5——两类 mTLS 证书签发（openssl 实跑；这两个端点走普通 `Authorization`，不需 `X-Admin-Access-Token`）**
+
+```bash
+curl -sS -X POST "http://$SELF/api/v1/scene/sim-nodes/$NODE/issue-kafka-cert"    -H "Authorization: Bearer $ADMIN" | jq '{code, cert_type: .data.cert_type, sn: .data.serial_hex}'
+curl -sS -X POST "http://$SELF/api/v1/scene/sim-nodes/$NODE/issue-platform-cert" -H "Authorization: Bearer $ADMIN" | jq '{code, cert_type: .data.cert_type, sn: .data.serial_hex}'
+docker exec hunter-scene sh -c "ls -R $CERTS/$NODE"   # 判据：kafka/{client-cert,client-key,kafka-client.p12,p12-password} + platform/{client-cert,client-key}
+docker exec hunter-scene openssl x509 -in $CERTS/$NODE/kafka/client-cert.pem -noout -subject -issuer -ext subjectAltName   # 判据：subject CN=sim-$NODE、issuer=同一 CA；platform 的 CN=sim-platform-$NODE
+psqlq -c "select kafka_cert_sn, plat_cert_sn from scene_svc.sim_node_registry where node_id='$NODE'"   # 判据：两序列号（大写 HEX）已回写，与接口返回一致
+```
+
+- 判据：两类证书 **CN 分别 `sim-{node_id}` / `sim-platform-{node_id}`、同一 CA 签发**；`serial_hex` 与 `kafka_cert_sn`/`plat_cert_sn` 逐字相同；重签会生成新序列号但**不吊销旧证**（无 CRL，与车辆 MVP 同）。
+- 报 5001/5000 openssl 失败 ⇒ 回查步骤 2：镜像无 openssl / CA 不可读 / 写域不可写 / 子进程超时（必要时调 `SIM_NODE_CERT_SIGNER_TIMEOUT_SECONDS`）。
+
+**步骤 6——下载接入包（ZIP；未签任何证书时返回 JSON 信封而非 zip）**
+
+```bash
+curl -sS -o /tmp/$NODE-bundle.zip -w '%{content_type} %{http_code}\n' "http://$SELF/api/v1/scene/sim-nodes/$NODE/bundle" -H "Authorization: Bearer $ADMIN"
+unzip -l /tmp/$NODE-bundle.zip    # 判据：ca-cert.pem + kafka/{client-cert,client-key,kafka-client.p12,p12-password} + platform/{client-cert,client-key} + kafka.properties + README
+```
+
+- 判据：`content_type=application/zip`、`http_code=200`；对一个**未签任何证书**的 node_id 请求 ⇒ 返回统一信封 JSON（`code≠0`），不是空 zip。
+
+**步骤 7——PATCH 管理信息（请求体 `description`、响应 `registry_description`）**
+
+```bash
+curl -sS -X PATCH "http://$SELF/api/v1/scene/sim-nodes/$NODE" -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"display_name":"节点01","description":"实验室A","labels":{"env":"lab"}}' | jq '{code, dn: .data.display_name, rd: .data.registry_description, labels: .data.registry_labels}'
+# 判据：code=0；display_name/registry_description/registry_labels 回显新值（注意请求写 description、响应读 registry_description）
+```
+
+**步骤 8——下线三清（Redis 登记 + 登记表行 + 证书目录；权限 `scene:update`，非 `scene:delete`）**
+
+```bash
+curl -sS -X DELETE "http://$SELF/api/v1/scene/sim-nodes/$NODE" -H "Authorization: Bearer $ADMIN" -w '\n%{http_code}\n'
+rcli EXISTS "sim:node:$NODE"    # 判据：0（Redis 实时登记已删）
+psqlq -c "select count(*) from scene_svc.sim_node_registry where node_id='$NODE'"   # 判据：0（登记表行已删）
+docker exec hunter-scene sh -c "test -d $CERTS/$NODE && echo LEFTOVER || echo CLEANED"   # 判据：CLEANED（证书目录已删）
+```
+
+**步骤 9——前端闭环（人工）**：登录后台 → 「仿真端管理」菜单 → 清单在线/关键词筛选、令牌/证书状态列、详情三卡、签发撤销/两类证书/下载接入包/PATCH/删除各操作一次，行为与步骤 3–8 的 curl 判据一致（前端对签发/撤销请求经 `withAdminBearer` 自动带 `X-Admin-Access-Token`）。
+
+### 5.2 实机验证结论回填表（执行后逐行填；空着即视为未验，不得写进后续条目当已有结论）
+
+| # | 验证项 | PASS 判据 | 结果 | 证据（输出/日志片段） |
+|---|--------|-----------|------|--------------------|
+| 1 | DDL 建表 | `\d scene_svc.sim_node_registry` 含 4 管理列 | | |
+| 2 | 镜像含 openssl + 管理模块 | `which openssl` 有路径；import 探针成功 | | |
+| 3 | CA 只读挂载 & 写域可写 | `CA-RO-OK` + `WRITABLE`；env 中 `SIM_NODE_CERTS_DIR`/`KAFKA_CA_*` 正确 | | |
+| 4 | 清单向后兼容富化 | `items` 带 4 新列（未签发=null）、旧字段不变 | | |
+| 5 | 令牌签发（经网关带自定义头） | `code=0`、`access_token` 一次性、`token_id=jti`、登记表回写 | | |
+| 6 | 令牌负向 2001 | 不带 `X-Admin-Access-Token` 经网关 ⇒ `code=2001` | | |
+| 7 | 令牌撤销 | `DELETE .../token` `code=0`，`token_id` 回 null | | |
+| 8 | 两类证书签发 | CN=`sim-$NODE`/`sim-platform-$NODE`、同一 CA；`serial_hex` 回写一致 | | |
+| 9 | 接入包下载 | `content_type=application/zip`；`unzip -l` 含 CA+两类证书+kafka.properties+README | | |
+| 10 | 未签证书下载负向 | 对无证书节点请求 bundle ⇒ 返回 JSON 信封（`code≠0`）非空 zip | | |
+| 11 | PATCH 管理信息 | 请求 `description`/响应 `registry_description` 回显新值 | | |
+| 12 | 下线三清 | `EXISTS=0` + 表行 `count=0` + 目录 `CLEANED` | | |
+| 13 | 前端页面闭环 | 菜单/清单/详情/签发/证书/下载/PATCH/删除各一次，行为同 curl | | |
+
+> 未入本表的已知限制（不得归入「已验」）：① `X-Admin-Access-Token` 依赖「网关透传自定义头」——若现场 nginx/网关只放行固定头集合，步骤 4 必 2001，需改走「scene-service 侧另行获取管理员凭据」方案（§6）；② K8s 形态本轮未落地 env/挂载，须对称补齐后再在 K8s 复验（仅 compose 已验）。
+
+### 6. 风险与待人工确认
+
+- `X-Admin-Access-Token` 依赖「网关透传自定义头」这一前提（未在本环境验证网关头白名单策略）；若网关只放行固定头集合，需改走「scene-service 侧另行获取管理员凭据」的方案。
+- 证书**重签不吊销旧证**（无 CRL，与车辆 MVP 同）；`sim_node_cert_validity_days` 默认 3650 天，长效证书需评估吊销策略。
+- 令牌 `token_id` 依赖 JWT 是否含 `jti`；api-gateway 若签发无 `jti` 的令牌则回退用 `node_id`，撤销仍按 `client_id` 生效，但展示的 `token_id` 语义会退化。
+
+### 7. 分发路径注意
+
+- 后端受追踪改动：`contracts/openapi/scene-service.yaml`、`services/scene-service/app/{config.py,main.py,models/sim_node_registry.py(新),repositories/sim_node_registry.py(新),services/sim_node_cert_signer.py(新),services/sim_nodes.py,schemas/sim_nodes.py,routers/sim_nodes.py,tests/{test_scene_contract.py,test_sim_node_dispatch.py}}`、`services/scene-service/Dockerfile`、`infra/deploy/{docker-compose.yml,.env.example}`、`contracts/database/ddl/08_sim_nodes.sql(新)`。
+- 前端受追踪改动：`frontend/src/{types/sim-node.ts(新),constants/sim-node.ts(新),constants/index.ts,api/sim-node.ts(新),api/request.ts,views/sim-node/SimNodeListView.vue(新),views/sim-node/SimNodeDetailView.vue(新),router/index.ts,layouts/MainLayout.vue}`。
+- **scene-service 镜像必须 `--build`**（新增 openssl + 证书目录）；CA 证书/私钥与 `sim-node-certs` 目录需在部署机预置并按 compose 挂载点授权（容器非 root `10001` 需可写证书目录）；K8s 侧需对称补齐 env 与挂载（本轮仅落地 compose）。
+

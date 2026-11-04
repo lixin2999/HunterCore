@@ -58,6 +58,7 @@ const MENU: MenuItem[] = [
   },
   { name: 'data-events', title: '事件与文件', icon: 'Warning', permission: PERMISSIONS.dataRead },
   { name: 'vehicle-list', title: '车辆管理', icon: 'Van', permission: PERMISSIONS.vehicleRead },
+  { name: 'sim-node-list', title: '仿真端管理', icon: 'Cpu', permission: PERMISSIONS.sceneRead },
 ]
 
 /** 按权限过滤后的菜单 */

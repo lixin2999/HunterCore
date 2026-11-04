@@ -70,6 +70,19 @@ class Settings(HunterBaseConfig):
     # 每节点 CARLA 客户端缓存上限（超出按插入序淘汰；基址变化即新建并关闭旧的）
     sim_node_client_cache_max: int = 32
 
+    # ---------- 仿真端管理（V1.24.1：令牌/证书/登记） ----------
+    # 节点证书存储根目录（与车辆证书目录独立；子目录：{node_id}/{kafka|platform}/）
+    sim_node_certs_dir: str = "/data/sim-node-certs"
+    # 节点 mTLS 客户端证书有效期（天）；3650 ≈ 10 年，与车辆证书一致
+    sim_node_cert_validity_days: int = 3650
+    # openssl 子进程超时（秒）
+    sim_node_cert_signer_timeout_seconds: int = 15
+    # api-gateway 内部地址（签发/撤销服务令牌时代理调用）
+    apigateway_internal_url: str = "http://api-gateway:8080"
+    # CA 证书与私钥路径（与 vehicle-service 使用同一套 Kafka CA；只读挂载）
+    kafka_ca_cert_path: str = "/certs/ca-cert.pem"
+    kafka_ca_key_path: str = "/certs/ca-key.pem"
+
     # ---------- 仿真会话 / 动态 Topic（CARLA 接入方案 P1） ----------
     # VIL 会话 Redis 契约：vil:session:{vehicle_id}（String JSON，7200s）、vil:active（Set）
     vil_session_ttl_seconds: int = 7200
