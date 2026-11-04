@@ -85,6 +85,10 @@ logs/
 *.rej
 ~$*
 
+# 会话内命令输出重定向临时日志（pytest/ruff/vue-tsc/git 输出捕获，无留存价值）
+# 注意：只忽略 *.txt，保留 scripts/output/*.json（batch_add_scenes.py 场景数据产物）
+scripts/output/*.txt
+
 # ===== IDE / 编辑器 =====
 .idea/
 .vscode/

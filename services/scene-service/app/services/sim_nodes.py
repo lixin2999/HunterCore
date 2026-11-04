@@ -151,16 +151,31 @@ class SimNodeService:
         ``online_only=False`` 时含租约已过但元数据键尚存的节点：现场排障需要先分清
         「节点掉线」与「平台不可达节点」，二者的判据都在 ``endpoint_*`` 与 ``last_seen_at`` 上。
 
+        V1.24.2 修复：``online_only=False`` 时**并入 DB 登记行中不在 Redis 的节点**——一键开通后
+        尚未自注册的节点只写 DB、不在 Redis，旧实现仅枚举 Redis 致其“已开通却不可见”，管理员
+        无法从列表进入详情做重试/轮换/下载接入包。这类行以离线态呈现（online=False、无
+        endpoint/last_seen），登记/开通字段照常合并；``online_only=True`` 维持 Redis 在线语义不变。
+
         清单附带登记管理字段（展示名/令牌/证书序列号）：仅在登记表可用时批量联查补充，
         未登记的节点这些字段为 None（不影响清单可读性）。
         """
         now = now_epoch()
         records = await self._store.list_nodes(online_only=online_only, now=now)
         items = [self._to_detail(r) for r in records]
-        if self._registry is not None and items:
-            reg_map = await self._registry.get_map([it.node_id for it in items])
-            if reg_map:
+        if self._registry is not None:
+            if online_only:
+                if items:
+                    reg_map = await self._registry.get_map([it.node_id for it in items])
+                    if reg_map:
+                        items = [self._merge_registry(it, reg_map.get(it.node_id)) for it in items]
+            else:
+                rows = await self._registry.list_all()
+                reg_map = {r.node_id: r for r in rows}
                 items = [self._merge_registry(it, reg_map.get(it.node_id)) for it in items]
+                seen = {it.node_id for it in items}
+                for row in rows:
+                    if row.node_id not in seen:
+                        items.append(self._registry_only_detail(row))
         return SimNodeListData(items=items, total=len(items))
 
     # ---------- 节点侧调用（owner 绑定与校验 + 地址自学习） ----------
@@ -404,6 +419,26 @@ class SimNodeService:
                 "cert_not_after": row.cert_not_after,
             }
         )
+
+    def _registry_only_detail(self, row: Any) -> SimNodeDetailData:
+        """DB 登记行但不在 Redis 的节点（已开通/已登记、未上线）→ 离线态清单行。
+
+        基座用最小字段（online=False、无 endpoint/last_seen），再经 ``_merge_registry``
+        叠加登记/开通字段（与 ``get_detail`` 对 Redis 缺失节点的合成一致）。
+        """
+        base = self._to_detail(
+            {
+                "node_id": row.node_id,
+                "owner": row.owner_client_id or "",
+                "online": False,
+                "last_seen_at": None,
+                "lease_seconds": self._store.lease_seconds,
+                "capacity": self._store.default_capacity,
+                "running_count": 0,
+                "registered_at": _epoch_of(row.first_seen_at or row.create_time),
+            }
+        )
+        return self._merge_registry(base, row)
 
     # ===================================================================
     # V1.24.1 仿真端管理：详情 / 令牌 / 证书 / 下线

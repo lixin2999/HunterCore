@@ -72,6 +72,23 @@ class SimNodeRegistryStore:
             )
             return {r.node_id: r for r in rows}
 
+    async def list_all(self) -> list[SimNodeRegistry]:
+        """列出全部登记行（供清单并入「已开通/已登记但当前不在 Redis」的节点）。
+
+        V1.24.2 修复：一键开通只写 DB 行、节点尚未自注册时不在 Redis，旧清单仅枚举
+        Redis 导致这类节点“已开通却不可见”。清单 ``online_only=False`` 时并入本方法结果。
+        """
+        async with self._db.session() as session:
+            return list(
+                (
+                    await session.execute(
+                        select(SimNodeRegistry).order_by(SimNodeRegistry.node_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
     # ---------- 写 ----------
 
     async def upsert(

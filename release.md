@@ -7487,10 +7487,68 @@ docker exec hunter-scene sh -c 'ls "$SIM_NODE_CERTS_DIR/node-01/"' 2>/dev/null |
 
 > 全部步骤在部署机实测通过后方可把本特性从“代码落地”升级为“实机验证通过”（届时仿 V1.23.7 §5.1 追加“实机回验记录”）；在此之前 §3 仅声称单元/fake/静态校验。
 
+### 4.1 实机回验记录（2026-11-04，部署机 hunter-core-server（live Kafka SCRAM + CA + DB）；**部分完成**）
+
+**已验判据（PASS）**：
+
+| 项 | 实机证据 |
+|---|---|
+| §2#9 init-db.sh 纳管修复 | 手工重放 `08_sim_nodes.sql`：`relation "sim_node_registry" already exists, skipping` + **`ALTER TABLE`**（补四列）+ `CREATE INDEX`（provision_state）+ `CREATE TRIGGER`；`information_schema.columns` 复核 `provision_status`/`cert_not_after`/`scram_username` 三列均存在 ⇒ 原 `column "provision_status" ... does not exist` 消除 |
+| §4 步骤 1 四步开通 ready | 页面「一键开通」`sim-node-01` ⇒ **开通成功**，`db: ok / scram: ok / topics: ok / cert: ok`（live SCRAM 主体创建 + 节点级 Topic 创建 + 双证书签发均实跑通过，**非 fake/unit**） |
+| §4 步骤 2 口令一次性投递 | 开通弹窗展示一次性口令并标注“不入库/不入接入包”（界面层已验；DB 不落库可另跑 `SELECT scram_username,...` 复核） |
+
+**新发现（非缺陷，但需认知）**：SCRAM 主体名 = `sim_node_scram_prefix`（`sim-`）+ `node_id` 拼接；本例 `node_id` 本身含 `sim-` 前缀⇒ 主体呈 `sim-sim-node-01`，属预期行为非 bug（若要主体简洁，建节点时 `node_id` 不带 `sim-` 前缀）。
+
+**实跑发现（已单列为 V1.24.3 修复，待重建 scene-service 后复验）**：开通成功后列表仍“共 0 个节点 / 暂无仿真端”——根因为列表仅枚举 Redis（修复详见 V1.24.3）。代码已修（`online_only=False` 并入 DB 登记行）+ 3 项单测绿，但**尚未在部署机重建后实跑确认**：需 `dcompose build scene-service && dcompose up -d --force-recreate scene-service` 后回列表切“全部/离线”验证已开通节点以离线态出现（存量 DB 行无需迁移）。
+
+**尚未实机验证（仍为待办，见 §4 步骤 3–9）**：节点级回传消费落库、下发 mTLS 握手、失败逆序回滚+retry、rotate-scram、deprovision 全回收、前端下线摘要。本表仅覆盖步骤 1–2，不得据此对外声称全链路已跑通。
+
 ### 5. 待办（后续实现步骤）
 
 - 数据层契约登记：`scene_svc.sim_node_registry` 入 `verify_data_layer.py` EXPECTED_TABLES + Alembic 离线 SQL + er.md/orm-mapping.md（V1.24.1 遗留，需评审；本轮 `verify_data_layer` 唯一红灯即此项）。——init-db.sh **纳管已于本轮 §2#9 修复**（幂等应用 08），此条仅剩上述文档/校验登记。
 - 实机端到端验证：按 §4 逐条在有 live Kafka(SCRAM)+CA+CARLA+DB 环境实跑；全绿后仿 V1.23.7 §5.1 追加“实机回验记录”（本轮无 live 依赖，编排/admin/mTLS 均以 fake/unit 验证，**未声称已实机跑通**）。
 - 编排开关未预置进清单：`SIM_PROVISION_ENABLED`/`SIM_SCRAM_ENABLED`/`SIM_DISPATCH_MTLS_ENABLED` 当前仅在 `config.py` 内置默认（provision=true/scram=true/mtls=false）、**未写入 compose scene-service.environment 与 K8s ConfigMap**（与已落的 `SIMULATION_CONSUMER_ENABLED`/`SIM_DISPATCH_MODE` 不对称）⇒ 环境可调性受限，若需按环境开关应补两侧对称键（§4 步骤 6 已标需先补 compose 键）。
 - `kafka_admin` 是否下沉 `hunter_common` 与 vehicle-service 共用：当前 `SimKafkaAdminOps` 独立于 scene，待评估合并。
+
+## V1.24.3（修复：仿真端一键开通后列表不显示——`SimNodeService.list_nodes` 仅枚举 Redis 实时登记表、未并入 DB 登记行，致已开通/未自注册节点恒不可见）
+
+Date：2026-11-04
+变更类型：修复（纯读取路径修复，无契约/DDL/OpenAPI/Kafka 改动、向后兼容；**需重建 scene-service 镜像后生效**，存量已开通节点无需数据迁移）
+
+### 1. 背景与根因（现场“仿真端已开通，但列表里没有”驱动）
+
+- 现象：V1.24.2 一键开通四步（db/scram/topics/cert）全 ok、DB 行已写 `provision_status=ready`，但「仿真端管理」列表切「全部」仍“共 0 个节点 / 暂无仿真端”。
+- 根因：`GET /api/v1/scene/sim-nodes` 的 `SimNodeService.list_nodes` 数据源是 **Redis 实时登记表**（`self._store`），DB registry（`scene_svc.sim_node_registry`）旧实现仅用于给“已在 Redis 里的节点”批量补充管理字段（`get_map`）。一键开通只写 DB 行、节点尚未自注册/心跳 ⇒ 不在 Redis ⇒ 不进枚举，列表恒 0；且 `online_only` 怎么切都不影响（DB-only 行根本进不了枚举）。管理员因此无法从列表进入详情做重试/轮换/下载接入包。
+
+### 2. 修复项
+
+1. **清单并入 DB 登记行**（`app/services/sim_nodes.py`：`list_nodes` + 新增 `_registry_only_detail`）：`online_only=False`（“全部/离线”视图）时，除 Redis 记录外**并入 `SimNodeRegistryStore.list_all()` 中不在 Redis 的登记行**，以离线态呈现（`online=False`、无 endpoint/last_seen，登记/开通字段经 `_merge_registry` 照常合并，与 `get_detail` 对 Redis 缺失节点的合成一致）；已在两源同时存在的节点不重复合成。`online_only=True` 维持 Redis 在线语义不变。
+2. **登记表全量读**（`app/repositories/sim_node_registry.py`：新增 `list_all`）：`select(SimNodeRegistry).order_by(node_id)` 全量列出登记行，供上条并入。
+3. **生产接线无需改动**：`app/main.py` 自 V1.24.1 起已向 `SimNodeService(..., registry_store=SimNodeRegistryStore(app.state.db))` 注入登记表，`self._registry` 非 None ⇒ 新逻辑在生产生效（测试未注入 registry 时 `self._registry=None`，逻辑以 `if self._registry is not None` 守卫，不破坏既有用例）。
+
+### 3. 验证（仅真实执行项）
+
+- scene-service 全量 **384 passed**（381 + 新增 `app/tests/test_sim_node_list_registry.py` 3 项：Redis 空 + 一条 DB 已开通行 ⇒ `online_only=False` 出现该离线行且开通字段完整 / `online_only=True` 排除 DB-only 行 / 同一节点两源同存只出一条在线态、不重复合成）。
+- `ruff check app/services/sim_nodes.py app/repositories/sim_node_registry.py app/tests/test_sim_node_list_registry.py` **All checks passed**。
+- 前端无需改动：列表页“全部/离线”已传 `online_only=false`（`query.online === 'online'` 才为 true），修复后自动呈现 DB-only 行。
+
+### 4. 实机执行步骤（**待在部署机回验**；本轮无 live 环境实跑确认）
+
+```bash
+sudo -i && cd /opt/HunterCore && git pull
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+
+# 1) 改了 app/services/sim_nodes.py 与 repositories ⇒ 必须 --build（只 restart 会继续跑旧代码）
+dcompose build scene-service
+dcompose up -d --force-recreate scene-service   # 重建容器加载新代码
+
+# 2) 自检新代码已在容器内（期望 True；False=镜像未更新）
+docker exec hunter-scene python3 -c "from app.repositories.sim_node_registry import SimNodeRegistryStore as S; print('list_all' in dir(S))"
+
+# 3) 回「仿真端管理」页，在线状态选「全部」（前端传 online_only=false）⇒ 已开通未自注册的节点以离线态出现
+#    API 层复验（应含已开通节点、online=false）：
+#    curl -sS "http://$SERVER_IP/api/v1/scene/sim-nodes?online_only=false" -H "Authorization: Bearer $TOKEN"
+```
+
+> 存量已开通节点无需数据迁移：DB 行本就在，重建后自动以离线态出现。**未执行=未验证**（纪律：未跑通不写已修复）；实跑通过后在 V1.24.2 §4.1 或本版本追加“实机回验记录”。
 
