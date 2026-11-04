@@ -25,7 +25,7 @@ class SimNodeRegistry(Base, CreateTimeMixin, UpdateTimeMixin):
     """scene_svc.sim_node_registry（仿真端管理登记行）。"""
 
     __tablename__ = "sim_node_registry"
-    __table_args__ = {"schema": SCENE_SCHEMA}
+    __table_args__ = ({"schema": SCENE_SCHEMA},)
 
     # 主键：节点标识，与 Redis sim:node:{node_id} 同值
     node_id: Mapped[str] = mapped_column(

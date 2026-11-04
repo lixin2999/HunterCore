@@ -19,6 +19,15 @@ export type SimNodeProtocol = 'http' | 'https'
 /** 证书类型（契约 IssueCertResult.cert_type） */
 export type SimNodeCertType = 'kafka' | 'platform'
 
+/** 一键开通四步聚合态（契约 SimNodeProvisionResult.provision_state / SimNodeDetailData.provision_state） */
+export type SimNodeProvisionState = 'pending' | 'in_progress' | 'ready' | 'failed'
+
+/** 单步名称（契约 SimNodeProvisionStep.name） */
+export type SimNodeProvisionStepName = 'db' | 'scram' | 'topics' | 'cert'
+
+/** 单步状态（契约 SimNodeProvisionStep.state） */
+export type SimNodeProvisionStepState = 'pending' | 'in_progress' | 'ok' | 'failed' | 'skipped'
+
 /** 节点列表行（契约 SimNodeData：清单/实时视图） */
 export interface SimNodeRow {
   node_id: string
@@ -68,6 +77,14 @@ export interface SimNodeDetail extends SimNodeRow {
   registry_first_seen_at?: string | null
   /** 管理员在登记表中设定的标签（与节点自述 labels 分开） */
   registry_labels?: Record<string, string> | null
+  /* ---- V1.24.2 一键开通编排态（未开通/懒建行时为默认骨架）---- */
+  provision_state?: SimNodeProvisionState | null
+  provision_steps?: SimNodeProvisionStep[] | null
+  /** Kafka SCRAM 主体名（= sim-{node_id}）；⚠ 口令本身永不返回 */
+  scram_username?: string | null
+  scram_credential_updated_at?: string | null
+  /** 证书到期时间（Kafka 客户端证书 notAfter） */
+  cert_not_after?: string | null
 }
 
 /** 清单响应数据（契约 SimNodeListData；items 复用详情结构以附带登记管理字段） */
@@ -106,4 +123,64 @@ export interface IssueCertResult {
   /** 新证书序列号（大写十六进制） */
   serial_hex: string
   issued_at: string
+}
+
+/* ------------------------------ V1.24.2 一键开通 ------------------------------ */
+
+/** 一键开通请求（契约 SimNodeProvisionRequest；POST /scene/sim-nodes） */
+export interface SimNodeProvisionRequest {
+  node_id: string
+  display_name?: string | null
+  description?: string | null
+  labels?: Record<string, string> | null
+  /** SCRAM/Topic/证书已存在时接管复用（跳过创建，state=skipped；回滚不清理外部既有资源） */
+  takeover_existing?: boolean
+}
+
+/** 单步编排状态（契约 SimNodeProvisionStep） */
+export interface SimNodeProvisionStep {
+  name: SimNodeProvisionStepName
+  state: SimNodeProvisionStepState
+  /** 失败时错误摘要（已截断 ≤500） */
+  error?: string | null
+  /** 步骤完成 epoch 秒 */
+  ts?: number | null
+}
+
+/** 一键开通结果（契约 SimNodeProvisionResult；scram_password 仅一次性返回） */
+export interface SimNodeProvisionResult {
+  node_id: string
+  /** Kafka SCRAM 主体名（sim-{node_id}，与证书 CN 一致） */
+  scram_username: string
+  /** 一次性 SCRAM 口令；不落库/不入接入包/不写日志，丢失后需 rotate-scram */
+  scram_password?: string
+  kafka_cert_sn?: string | null
+  plat_cert_sn?: string | null
+  provision_state: SimNodeProvisionState
+  /** 按 db/scram/topics/cert 顺序展平 */
+  steps: SimNodeProvisionStep[]
+}
+
+/** 口令轮换一次性响应（契约 RotateScramResult） */
+export interface RotateScramResult {
+  node_id: string
+  scram_username: string
+  /** 新一次性口令（仅此响应可见） */
+  scram_password: string
+  credential_updated_at: string
+}
+
+/** 下线回收摘要（契约 SimNodeDeprovisionResult；DELETE 响应） */
+export interface SimNodeDeprovisionResult {
+  node_id: string
+  /** 证书目录是否已删（不存在=true） */
+  cert_dir_removed: boolean
+  /** SCRAM 用户是否已删（不存在=true） */
+  scram_removed: boolean
+  /** 已删的节点级回传 Topic 名（含 .dlq） */
+  topics_removed: string[]
+  /** 登记行是否已删 */
+  registry_removed: boolean
+  /** Redis 登记是否已清理 */
+  redis_removed: boolean
 }

@@ -15,10 +15,10 @@ data:
   API_PORT: "8082"
   DB_POOL_SIZE: "5"          # 单副本可用 CPU(2 核) × 2 + 1
   DB_MAX_OVERFLOW: "5"
-  # 消费者组 / 订阅（对齐 contracts/kafka/consumer-groups.yaml：车端 + CARLA 回传正则订阅，
-  # 五个数据域独立 offset，禁止擅自新增 Topic 或消费组）
-  KAFKA_CONSUMER_GROUPS: "data-collector-telemetry,data-collector-events,data-collector-health,data-collector-command-result,data-collector-carla"
-  KAFKA_SUBSCRIBE_PATTERNS: "hunter.*.telemetry,hunter.*.event,hunter.*.health,hunter.*.command_result,carla.*.sensor_data"
+  # 消费者组 / 订阅（对齐 contracts/kafka/consumer-groups.yaml：车端 + CARLA 回传 + 仿真端节点级回传正则订阅，
+  # 各数据域独立 offset，禁止擅自新增 Topic 或消费组）
+  KAFKA_CONSUMER_GROUPS: "data-collector-telemetry,data-collector-events,data-collector-health,data-collector-command-result,data-collector-carla,data-collector-simulation"
+  KAFKA_SUBSCRIBE_PATTERNS: "hunter.*.telemetry,hunter.*.event,hunter.*.health,hunter.*.command_result,carla.*.sensor_data,simulation.*.result"
   KAFKA_PRODUCE_TOPICS: "telemetry_raw,telemetry_clean,event_raw,sensor_file"
   KAFKA_AUTO_OFFSET_RESET: "earliest"
   # 消费侧契约 Schema 校验（默认开启）：运行时契约目录由 hunter-contracts ConfigMap 挂载
@@ -31,6 +31,8 @@ data:
   HEALTH_CONSUMER_ENABLED: "true"
   # CARLA 仿真回传（carla.*.sensor_data；消费组 data-collector-carla）
   CARLA_SENSOR_CONSUMER_ENABLED: "true"
+  # 仿真端节点级回传（simulation.*.result；消费组 data-collector-simulation，V1.24.2 一键开通）
+  SIMULATION_CONSUMER_ENABLED: "true"
   CARLA_SIM_CACHE_TTL_SECONDS: "86400"
   CARLA_SIM_EVENTS_MAX: "1000"
   # 仿真遥测批量入库（设计 7.3.3：2000 条/批，批次收尾统一提交）

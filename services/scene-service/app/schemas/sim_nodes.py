@@ -9,6 +9,16 @@ V1.24.1 仿真端管理扩展：
 - ``IssueTokenResult``：签发服务令牌一次性响应；
 - ``IssueCertResult``：签发证书响应。
 
+V1.24.2 一键开通扩展（契约 ``x-hunter-sim-provisioning``）：
+- ``SimNodeProvisionRequest`` / ``SimNodeProvisionResult`` / ``SimNodeProvisionStep``：
+  POST /sim-nodes 与 retry-provision 的请求/响应（DB→SCRAM→Topics→Cert 四步编排）；
+- ``RotateScramResult``：口令轮换一次性响应；
+- ``SimNodeDeprovisionResult``：下线回收摘要（DELETE /sim-nodes/{node_id}）；
+- ``SimNodeDetailData`` 叠加开通态字段（provision_state/provision_steps/scram_username 等）。
+
+⚠ ``scram_password`` 为 writeOnly 语义：只在 provision/retry/rotate 的响应体一次性返回，
+平台不落库、不入接入包、不写日志（丢失只能 rotate-scram）。
+
 地址字段的来源：``endpoint_ip`` / ``endpoint_source`` / ``learned_at`` **只能由服务端写入**
 （从入站请求头自学习），因此只出现在响应模型里；请求体只声明 ``manager_port`` / ``protocol``。
 """
@@ -38,6 +48,10 @@ NODE_LIST_MAX_ITEMS = 100
 NODE_TEXT_MAX_LENGTH = 512
 NODE_HINT_MAX_LENGTH = 256
 NODE_VERSION_MAX_LENGTH = 64
+
+PROVISION_STEP_NAMES = ("db", "scram", "topics", "cert")
+PROVISION_STEP_STATES = ("pending", "in_progress", "ok", "failed", "skipped")
+PROVISION_AGGREGATE_STATES = ("pending", "in_progress", "ready", "failed")
 
 #: 基址协议（契约 endpoint_learning.base_url）
 NODE_PROTOCOLS = ("http", "https")
@@ -171,6 +185,20 @@ class SimNodeDetailData(SimNodeData):
     registry_labels: dict[str, str] | None = Field(
         default=None, description="管理员在登记表中设定的标签（与 labels 分开）"
     )
+    # ---- V1.24.2 一键开通编排态（契约 SimNodeDetailData 追加字段）----
+    provision_state: Literal["pending", "in_progress", "ready", "failed"] | None = Field(
+        default=None, description="四步聚合态（provision_status.state）；未开通为 None"
+    )
+    provision_steps: list[SimNodeProvisionStep] | None = Field(
+        default=None, description="按 db/scram/topics/cert 顺序展平的步骤列表"
+    )
+    scram_username: str | None = Field(
+        default=None, description="Kafka SCRAM 主体名（= sim-{node_id}）；⚠ 口令本身永不返回"
+    )
+    scram_credential_updated_at: datetime | None = None
+    cert_not_after: datetime | None = Field(
+        default=None, description="证书到期快照（取 Kafka 证书 notAfter）"
+    )
 
 
 class SimNodeListData(BaseModel):
@@ -231,7 +259,86 @@ class IssueCertResult(BaseModel):
 
 
 # =====================================================================
-# 四、统一响应包装
+# 四、V1.24.2 一键开通：provision / rotate-scram / retry / deprovision
+# =====================================================================
+
+
+class SimNodeProvisionRequest(BaseModel):
+    """一键开通请求体（契约 SimNodeProvisionRequest：管理员指定 node_id + 基础元信息）。
+
+    开通**不依赖节点先自注册**：node_id 由本请求给定，节点后续以接入包（证书 +
+    kafka.properties）+ 响应中的一次性口令完成注册/心跳（地址仍由服务端自学习）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(..., pattern=NODE_ID_PATTERN, description="节点标识（同 SimNodeId 格式）")
+    display_name: str | None = Field(
+        default=None, max_length=REGISTRY_DISPLAY_NAME_MAX_LENGTH, description="展示名称"
+    )
+    description: str | None = Field(
+        default=None, max_length=REGISTRY_DESCRIPTION_MAX_LENGTH, description="备注描述"
+    )
+    labels: dict[str, str] | None = Field(
+        default=None, description="管理员自定义标签（机房/显卡型号等）"
+    )
+    takeover_existing: bool = Field(
+        default=False,
+        description="SCRAM/Topic/证书已存在时接管复用（跳过创建 state=skipped；回滚时不清理这些外部既有资源）",
+    )
+
+
+class SimNodeProvisionStep(BaseModel):
+    """单步编排状态（契约 SimNodeProvisionStep，对齐车辆 ProvisionStep）。"""
+
+    name: Literal["db", "scram", "topics", "cert"]
+    state: Literal["pending", "in_progress", "ok", "failed", "skipped"]
+    error: str | None = Field(default=None, max_length=500, description="失败时错误摘要（已截断）")
+    ts: int | None = Field(default=None, description="步骤完成 epoch 秒")
+
+
+class SimNodeProvisionResult(BaseModel):
+    """一键开通结果（成功含一次性口令与证书序列号；四步终态快照）。"""
+
+    node_id: str
+    scram_username: str = Field(..., description="Kafka SCRAM 主体名（sim-{node_id}，与证书 CN 一致）")
+    scram_password: str = Field(
+        ...,
+        write_only=True,
+        description="一次性 SCRAM 口令（服务端生成）；不落库/不入接入包/不写日志，丢失后需 rotate-scram",
+    )
+    kafka_cert_sn: str | None = Field(default=None, description="Kafka 客户端证书序列号（大写 HEX）")
+    plat_cert_sn: str | None = Field(default=None, description="平台访问证书序列号（大写 HEX）")
+    provision_state: Literal["pending", "in_progress", "ready", "failed"] = Field(
+        ..., description="四步聚合态"
+    )
+    steps: list[SimNodeProvisionStep] = Field(
+        default_factory=list, description="按 db/scram/topics/cert 顺序展平"
+    )
+
+
+class RotateScramResult(BaseModel):
+    """口令轮换一次性响应（``scram_password`` 不落日志）。"""
+
+    node_id: str
+    scram_username: str
+    scram_password: str = Field(..., write_only=True, description="新一次性口令（仅此响应可见）")
+    credential_updated_at: datetime
+
+
+class SimNodeDeprovisionResult(BaseModel):
+    """下线回收摘要（各资源清理结果；供审计）。"""
+
+    node_id: str
+    cert_dir_removed: bool = Field(default=False, description="证书目录是否已删（不存在=true）")
+    scram_removed: bool = Field(default=False, description="SCRAM 用户是否已删（不存在=true）")
+    topics_removed: list[str] = Field(default_factory=list, description="已删的节点级回传 Topic 名（含 .dlq）")
+    registry_removed: bool = Field(default=False, description="登记行是否已删")
+    redis_removed: bool = Field(default=False, description="Redis 登记是否已清理")
+
+
+# =====================================================================
+# 五、统一响应包装
 # =====================================================================
 
 
@@ -260,17 +367,25 @@ class IssueCertResponse(ApiResponse[IssueCertResult]):
 
 
 class SimNodeEmptyResponse(ApiResponse[None]):
-    """无数据响应（撤销令牌/删除节点等）。"""
+    """无数据响应（撤销令牌等）。"""
+
+
+class SimNodeProvisionResponse(ApiResponse[SimNodeProvisionResult]):
+    """一键开通响应（POST /sim-nodes 与 retry-provision）。"""
+
+
+class RotateScramResponse(ApiResponse[RotateScramResult]):
+    """口令轮换响应。"""
+
+
+class SimNodeDeprovisionResponse(ApiResponse[SimNodeDeprovisionResult]):
+    """下线回收响应（DELETE /sim-nodes/{node_id} 升级后的响应体）。"""
 
 
 __all__ = [
     "CAPACITY_MAX",
     "CAPACITY_MIN",
     "ENDPOINT_SOURCES",
-    "IssueCertResponse",
-    "IssueCertResult",
-    "IssueTokenResponse",
-    "IssueTokenResult",
     "MANAGER_PORT_MAX",
     "MANAGER_PORT_MIN",
     "NODE_ID_PATTERN",
@@ -279,16 +394,31 @@ __all__ = [
     "NODE_PROTOCOLS",
     "NODE_TEXT_MAX_LENGTH",
     "NODE_VERSION_MAX_LENGTH",
+    "PROVISION_AGGREGATE_STATES",
+    "PROVISION_STEP_NAMES",
+    "PROVISION_STEP_STATES",
     "REGISTRY_DESCRIPTION_MAX_LENGTH",
     "REGISTRY_DISPLAY_NAME_MAX_LENGTH",
     "RUNNING_INSTANCES_MAX_ITEMS",
+    "IssueCertResponse",
+    "IssueCertResult",
+    "IssueTokenResponse",
+    "IssueTokenResult",
+    "RotateScramResponse",
+    "RotateScramResult",
     "SimNodeData",
+    "SimNodeDeprovisionResponse",
+    "SimNodeDeprovisionResult",
     "SimNodeDetailData",
     "SimNodeDetailResponse",
     "SimNodeEmptyResponse",
     "SimNodeHeartbeatRequest",
     "SimNodeListData",
     "SimNodeListResponse",
+    "SimNodeProvisionRequest",
+    "SimNodeProvisionResponse",
+    "SimNodeProvisionResult",
+    "SimNodeProvisionStep",
     "SimNodeRegisterRequest",
     "SimNodeRegistryPatch",
     "SimNodeRegistryPatchResponse",

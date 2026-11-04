@@ -15,6 +15,12 @@ V1.24.1 仿真端管理扩展：
 - ``download_bundle``：打包 ZIP（CA + 两类证书 + kafka.properties + README）；
 - ``remove_node``：删除 Redis + 登记表 + 证书目录。
 
+V1.24.2 一键开通扩展（契约 x-hunter-sim-provisioning）：
+- ``provision`` / ``retry_provision``：四步编排（DB→SCRAM→Topics→Cert）+ 失败逆序回滚，
+  一次性口令只在响应体返回；
+- ``rotate_scram``：轮换 SCRAM 口令；
+- ``deprovision_node``：下线升级为全链路回收（证书目录→SCRAM→节点 Topic→登记行→Redis）。
+
 IP 漂移不需要人工处置：心跳是唯一的自愈点 —— 每次心跳都重写地址，实例只绑 ``node_id``，
 后续操控在每次调用瞬间重新解析基址。
 """
@@ -47,10 +53,14 @@ from app.schemas.sim_nodes import (
     NODE_PROTOCOLS,
     IssueCertResult,
     IssueTokenResult,
+    RotateScramResult,
     SimNodeData,
+    SimNodeDeprovisionResult,
     SimNodeDetailData,
     SimNodeHeartbeatRequest,
     SimNodeListData,
+    SimNodeProvisionRequest,
+    SimNodeProvisionResult,
     SimNodeRegisterRequest,
     SimNodeRegistryPatch,
 )
@@ -61,6 +71,12 @@ from app.services.sim_node_cert_signer import (
     delete_node_cert_dir,
     node_dir,
     read_p12_password,
+)
+from app.services.sim_provisioner import (
+    SimProvisioner,
+    aggregate_from_status,
+    initial_provision_status,
+    steps_to_list,
 )
 
 logger = get_logger("app.services.sim_nodes")
@@ -120,10 +136,12 @@ class SimNodeService:
         store: SimNodeStore,
         settings: Settings,
         registry_store: SimNodeRegistryStore | None = None,
+        provisioner: SimProvisioner | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         self._registry = registry_store  # None 表示登记表未装配（测试场景），管理接口会降级
+        self._provisioner = provisioner  # None 表示开通依赖未装配（retry/rotate/deprovision 降级 5001）
 
     # ---------- 运维视图 ----------
 
@@ -378,6 +396,12 @@ class SimNodeService:
                 "plat_cert_issued_at": row.plat_cert_issued_at,
                 "registry_first_seen_at": row.create_time,
                 "registry_labels": row.labels or None,
+                # V1.24.2 开通态（清单行同样可见，运维一眼分辨未开通/失败节点）
+                "provision_state": aggregate_from_status(row.provision_status),
+                "provision_steps": steps_to_list(row.provision_status),
+                "scram_username": row.scram_username,
+                "scram_credential_updated_at": row.scram_credential_updated_at,
+                "cert_not_after": row.cert_not_after,
             }
         )
 
@@ -392,13 +416,13 @@ class SimNodeService:
         return self._registry
 
     async def _ensure_registry_row(self, node_id: str) -> None:
-        """懒建登记行：若不存在则创建（仅存 node_id + Redis 中的 owner/first_seen）。"""
+        """懒建登记行：若不存在则创建（仅存 node_id + Redis 中的 owner/first_seen + 开通骨架）。"""
         registry = self._require_registry()
         if await registry.exists(node_id):
             return
         # 尝试从 Redis 补充 owner 和 registered_at
         redis_record = await self._store.get_node(node_id)
-        defaults: dict[str, Any] = {}
+        defaults: dict[str, Any] = {"provision_status": initial_provision_status()}
         if redis_record is not None:
             owner = str(redis_record.get("owner") or "")
             if owner:
@@ -443,6 +467,12 @@ class SimNodeService:
             plat_cert_issued_at=reg_row.plat_cert_issued_at if reg_row else None,
             registry_first_seen_at=reg_row.create_time if reg_row else None,
             registry_labels=reg_row.labels if reg_row and reg_row.labels else None,
+            # V1.24.2 开通态（懒建行 provision_status 为默认骨架 → state=pending）
+            provision_state=aggregate_from_status(reg_row.provision_status if reg_row else None),
+            provision_steps=steps_to_list(reg_row.provision_status if reg_row else None),
+            scram_username=reg_row.scram_username if reg_row else None,
+            scram_credential_updated_at=reg_row.scram_credential_updated_at if reg_row else None,
+            cert_not_after=reg_row.cert_not_after if reg_row else None,
         )
 
     async def patch_registry(self, node_id: str, payload: SimNodeRegistryPatch) -> SimNodeDetailData:
@@ -640,14 +670,84 @@ class SimNodeService:
             f"3. 启动心跳循环：POST .../heartbeat（周期 ≤30s）\n"
         )
 
+    # ===================================================================
+    # V1.24.2 一键开通：provision / retry / rotate-scram / deprovision
+    # ===================================================================
+
+    def _require_provisioner(self) -> SimProvisioner:
+        """开通依赖可用（未装配时 5001；与车辆侧 kafka_admin=None 降级同语义）。"""
+        if self._provisioner is None:
+            raise ServiceUnavailableError(
+                "一键开通依赖未装配（Kafka Admin/登记表不可用）",
+                details={"hint": "检查 SIM_PROVISION_ENABLED / Kafka 连通性与 DDL"},
+            )
+        return self._provisioner
+
+    async def provision(self, payload: SimNodeProvisionRequest) -> SimNodeProvisionResult:
+        """一键开通（POST /sim-nodes）：四步编排；口令一次性返回不落日志。"""
+        outcome = await self._require_provisioner().provision(
+            payload.node_id,
+            display_name=payload.display_name,
+            description=payload.description,
+            labels=payload.labels,
+            takeover_existing=payload.takeover_existing,
+        )
+        return self._to_provision_result(outcome)
+
+    async def retry_provision(self, node_id: str) -> SimNodeProvisionResult:
+        """从失败步续跑（先回收本次残留再重跑四步；幂等可多次调用）。"""
+        outcome = await self._require_provisioner().retry_provision(node_id)
+        return self._to_provision_result(outcome)
+
+    @staticmethod
+    def _to_provision_result(outcome: Any) -> SimNodeProvisionResult:
+        # 接管/禁用场景下无新口令：返回空串（契约 required 字段，前端据 steps 判断是否展示）
+        return SimNodeProvisionResult(
+            node_id=outcome.node_id,
+            scram_username=outcome.scram_username,
+            scram_password=outcome.scram_password or "",
+            kafka_cert_sn=outcome.kafka_cert_sn,
+            plat_cert_sn=outcome.plat_cert_sn,
+            provision_state=outcome.aggregate,
+            steps=steps_to_list({"steps": outcome.steps}),
+        )
+
+    async def rotate_scram(self, node_id: str) -> RotateScramResult:
+        """轮换 SCRAM 口令（一次性返回新口令）。"""
+        password, updated_at = await self._require_provisioner().rotate_scram(node_id)
+        return RotateScramResult(
+            node_id=node_id,
+            scram_username=f"{self._settings.sim_node_scram_prefix}{node_id}",
+            scram_password=password,
+            credential_updated_at=updated_at,
+        )
+
+    async def deprovision_node(self, node_id: str) -> SimNodeDeprovisionResult:
+        """下线全链路回收；开通依赖未装配时退化为旧 remove_node 路径（摘要如实标注）。"""
+        if self._provisioner is None:
+            await self.remove_node(node_id)
+            row_present = self._registry is not None
+            return SimNodeDeprovisionResult(
+                node_id=node_id,
+                cert_dir_removed=True,
+                scram_removed=False,
+                topics_removed=[],
+                registry_removed=row_present,
+                redis_removed=True,
+            )
+        summary = await self._provisioner.deprovision(
+            node_id, redis_deleter=self._store.delete_node
+        )
+        return SimNodeDeprovisionResult(**summary)
+
     async def remove_node(self, node_id: str) -> None:
-        """删除节点：Redis + 登记表 + 证书目录（幂等）。"""
+        """删除节点：Redis + 登记表 + 证书目录（幂等；不含 SCRAM/Topic 回收的老路径，供降级与测试）。"""
         # 1. 尝试撤销令牌（best-effort，不影响删除）
         registry = self._registry
         if registry is not None:
             try:
                 await registry.delete(node_id)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("sim_node_registry_delete_failed", node_id=node_id)
         # 2. 删除 Redis（无论登记表是否存在）
         await self._store.delete_node(node_id)

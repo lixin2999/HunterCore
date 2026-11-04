@@ -659,4 +659,7 @@ def test_task_queue_endpoints_are_removed_from_openapi() -> None:
         "/api/v1/scene/sim-nodes/{node_id}/issue-kafka-cert",
         "/api/v1/scene/sim-nodes/{node_id}/issue-platform-cert",
         "/api/v1/scene/sim-nodes/{node_id}/bundle",
+        # V1.24.2 一键开通（provisionSimNode 复用 POST /sim-nodes；以下为新增子路径）
+        "/api/v1/scene/sim-nodes/{node_id}/rotate-scram",
+        "/api/v1/scene/sim-nodes/{node_id}/retry-provision",
     }

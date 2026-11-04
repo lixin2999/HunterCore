@@ -473,6 +473,7 @@ def test_kafka_participation_matches_contracts(contract: dict[str, Any]) -> None
         "data-collector-health",
         "data-collector-command-result",
         "data-collector-carla",
+        "data-collector-simulation",
     }
     for group_id, entry in consumes.items():
         assert entry["enabled"] is True

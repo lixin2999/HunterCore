@@ -1,6 +1,8 @@
 """仿真端管理登记数据访问（scene_svc.sim_node_registry）。
 
 V1.24.1 仿真端管理功能：懒建语义 + 管理字段 PATCH + 令牌/证书序列号更新。
+V1.24.2 一键开通：``update_provision_status`` 回写编排态 JSONB 与开通快照列
+（scram_username / scram_credential_updated_at / cert_not_after / 双证书序列号）。
 
 事务策略与 VehicleStore 相同：
 - 读方法开独立短事务；
@@ -244,6 +246,51 @@ class SimNodeRegistryStore:
                 return None
             row.plat_cert_sn = serial_hex
             row.plat_cert_issued_at = issued_at
+            await session.flush()
+            return row
+
+    # 开通快照可回写的列（sim_provisioner 逐步回写；None = 本次不更新该列）
+    _PROVISION_MUTABLE_COLUMNS = (
+        "provision_status",
+        "scram_username",
+        "scram_credential_updated_at",
+        "cert_not_after",
+        "kafka_cert_sn",
+        "kafka_cert_issued_at",
+        "plat_cert_sn",
+        "plat_cert_issued_at",
+    )
+
+    async def update_provision_status(
+        self,
+        node_id: str,
+        payload: dict[str, Any],
+        **fields: Any,
+    ) -> SimNodeRegistry | None:
+        """回写一键开通编排态（provision_status JSONB + 可选快照列）。
+
+        ``fields`` 仅接受 ``_PROVISION_MUTABLE_COLUMNS`` 内的列名；值为 None 的键跳过
+        （与车辆侧 update_provision_status(device_cert_sn=...) 同一语义：失败步回写时
+        尚未产出的字段保持原值）。行不存在返回 None（不懒建：开通前 db 步已建行）。
+        """
+        unknown = set(fields) - set(self._PROVISION_MUTABLE_COLUMNS)
+        if unknown:
+            raise ValueError(f"不支持的开通快照列: {sorted(unknown)}")
+        values: dict[str, Any] = {"provision_status": payload}
+        values.update({k: v for k, v in fields.items() if v is not None})
+
+        async with self._db.session() as session:
+            row = (
+                await session.execute(
+                    select(SimNodeRegistry)
+                    .where(SimNodeRegistry.node_id == node_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            for key, value in values.items():
+                setattr(row, key, value)
             await session.flush()
             return row
 

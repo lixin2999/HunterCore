@@ -1,0 +1,21 @@
+........................................................................ [ 18%]
+........................................................................ [ 37%]
+........................................................................ [ 56%]
+........................................................................ [ 75%]
+........................................................................ [ 94%]
+.....................                                                    [100%]
+============================== warnings summary ===============================
+app\schemas\sim_nodes.py:242
+  e:\python_work\HunterPilot\HunterCore\services\scene-service\app\schemas\sim_nodes.py:242: PydanticDeprecatedSince20: Using extra keyword arguments on `Field` is deprecated and will be removed. Use `json_schema_extra` instead. (Extra keys: 'write_only'). Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    access_token: str = Field(
+
+app\schemas\sim_nodes.py:305
+  e:\python_work\HunterPilot\HunterCore\services\scene-service\app\schemas\sim_nodes.py:305: PydanticDeprecatedSince20: Using extra keyword arguments on `Field` is deprecated and will be removed. Use `json_schema_extra` instead. (Extra keys: 'write_only'). Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    scram_password: str = Field(
+
+app\schemas\sim_nodes.py:325
+  e:\python_work\HunterPilot\HunterCore\services\scene-service\app\schemas\sim_nodes.py:325: PydanticDeprecatedSince20: Using extra keyword arguments on `Field` is deprecated and will be removed. Use `json_schema_extra` instead. (Extra keys: 'write_only'). Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    scram_password: str = Field(..., write_only=True, description="新一次性口令（仅此响应可见）")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+381 passed, 3 warnings in 7.87s

@@ -13,9 +13,13 @@ import { downloadBlob, request } from './request'
 import type {
   IssueCertResult,
   IssueTokenResult,
+  RotateScramResult,
+  SimNodeDeprovisionResult,
   SimNodeDetail,
   SimNodeListData,
   SimNodeListQuery,
+  SimNodeProvisionRequest,
+  SimNodeProvisionResult,
   SimNodeRegistryPatch,
 } from '@/types/sim-node'
 
@@ -97,10 +101,44 @@ export function downloadSimNodeBundle(nodeId: string): Promise<{ blob: Blob; fil
 
 /* ------------------------------ 下线 ------------------------------ */
 
-/** 删除节点并清理资源（DELETE /api/v1/scene/sim-nodes/{node_id}；Redis + 登记表 + 证书目录） */
-export function deleteSimNode(nodeId: string): Promise<null> {
-  return request<null>({
+/**
+ * 下线回收（DELETE /api/v1/scene/sim-nodes/{node_id}，V1.24.2 升级为 deprovision）
+ * 逆序回收：证书目录 → SCRAM 用户 → 节点级 Topic（含 .dlq）→ 登记行 → Redis；返回各项清理摘要。
+ */
+export function deleteSimNode(nodeId: string): Promise<SimNodeDeprovisionResult> {
+  return request<SimNodeDeprovisionResult>({
     url: `/scene/sim-nodes/${encodeURIComponent(nodeId)}`,
     method: 'delete',
+  })
+}
+
+/* ------------------------------ V1.24.2 一键开通 ------------------------------ */
+
+/**
+ * 一键开通仿真端（POST /api/v1/scene/sim-nodes，scene:execute，201）
+ * 四步编排 db→scram→topics→cert；任一步失败逆序回滚。
+ * scram_password 仅此响应一次性返回，不落库/不入接入包/不写日志。
+ */
+export function provisionSimNode(payload: SimNodeProvisionRequest): Promise<SimNodeProvisionResult> {
+  return request<SimNodeProvisionResult>({
+    url: '/scene/sim-nodes',
+    method: 'post',
+    data: payload,
+  })
+}
+
+/** 从失败步续跑开通（POST .../retry-provision，scene:execute，201；先回收本次残留再重跑四步） */
+export function retrySimNodeProvision(nodeId: string): Promise<SimNodeProvisionResult> {
+  return request<SimNodeProvisionResult>({
+    url: `/scene/sim-nodes/${encodeURIComponent(nodeId)}/retry-provision`,
+    method: 'post',
+  })
+}
+
+/** 轮换 SCRAM 口令（POST .../rotate-scram，scene:execute；新口令仅一次性返回） */
+export function rotateSimNodeScram(nodeId: string): Promise<RotateScramResult> {
+  return request<RotateScramResult>({
+    url: `/scene/sim-nodes/${encodeURIComponent(nodeId)}/rotate-scram`,
+    method: 'post',
   })
 }

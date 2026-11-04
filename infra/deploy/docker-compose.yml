@@ -615,6 +615,8 @@ services:
       VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS: ${VEHICLE_LEDGER_WRITE_INTERVAL_SECONDS:-30}
       # CARLA 仿真回传（carla.*.sensor_data；消费组 data-collector-carla，与 K8s ConfigMap 对称）
       CARLA_SENSOR_CONSUMER_ENABLED: ${CARLA_SENSOR_CONSUMER_ENABLED:-true}
+      # 仿真端节点级回传（simulation.*.result；消费组 data-collector-simulation，V1.24.2 一键开通）
+      SIMULATION_CONSUMER_ENABLED: ${SIMULATION_CONSUMER_ENABLED:-true}
       CARLA_SIM_CACHE_TTL_SECONDS: ${CARLA_SIM_CACHE_TTL_SECONDS:-86400}
       CARLA_SIM_EVENTS_MAX: ${CARLA_SIM_EVENTS_MAX:-1000}
       # 仿真遥测批量入库（设计 7.3.3）

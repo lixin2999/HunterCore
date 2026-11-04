@@ -83,6 +83,21 @@ class Settings(HunterBaseConfig):
     kafka_ca_cert_path: str = "/certs/ca-cert.pem"
     kafka_ca_key_path: str = "/certs/ca-key.pem"
 
+    # ---------- 仿真端一键开通（V1.24.2：DB→SCRAM→Topics→Cert 四步编排，对齐车辆 provisioning） ----------
+    # 总开关：false 时 POST /sim-nodes 一键开通端点返回 5001（保留逐项签发/管理端点不受影响）
+    sim_provision_enabled: bool = True
+    # SCRAM 步开关：false 时跳过创建 sim-{node_id} SCRAM 用户（仅供无 KIP-95 权限的灰度环境）
+    sim_scram_enabled: bool = True
+    # SCRAM 主体前缀（与 Kafka 证书 CN 前缀一致；主体 = f"{prefix}{node_id}"）
+    sim_node_scram_prefix: str = "sim-"
+    # SCRAM 迭代次数（KIP-95 建议默认，与 vehicle-service kafka_admin._SCRAM_ITERATIONS 对齐）
+    sim_scram_iterations: int = 8192
+    # 节点级回传 Topic（simulation.{node_id}.result + .dlq）创建/删除超时（毫秒）
+    sim_kafka_admin_timeout_ms: int = 10_000
+    # 下发通道 mTLS（V1.24.2，x-hunter-simulation-flow.node_dispatch.security）：
+    # false = 旧直推（http 明文，仅供灰度/回滚）；true = 平台以 sim-platform-{node_id} 客户端证书回访节点 CARLA 管理 API
+    sim_dispatch_mtls_enabled: bool = False
+
     # ---------- 仿真会话 / 动态 Topic（CARLA 接入方案 P1） ----------
     # VIL 会话 Redis 契约：vil:session:{vehicle_id}（String JSON，7200s）、vil:active（Set）
     vil_session_ttl_seconds: int = 7200

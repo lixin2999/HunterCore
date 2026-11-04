@@ -45,8 +45,9 @@ KEY_SIM_ID: Final[str] = "sim_id"
 _DLQ_SUFFIX: Final[str] = ".dlq"
 
 #: 订阅写法中代表动态实例的通配记号（``hunter.*.telemetry`` 与模板名等价；
-#: ``carla.*.sensor_data`` 与 ``carla.{sim_id}.sensor_data`` 等价）
-_WILDCARD_TOKENS: Final[tuple[str, ...]] = ("*", "{vehicle_id}", "{sim_id}")
+#: ``carla.*.sensor_data`` 与 ``carla.{sim_id}.sensor_data`` 等价；
+#: ``simulation.*.result`` 与 ``simulation.{node_id}.result`` 等价，V1.24.2 节点级回传通道）
+_WILDCARD_TOKENS: Final[tuple[str, ...]] = ("*", "{vehicle_id}", "{sim_id}", "{node_id}")
 
 
 class KafkaContractError(HunterBaseException):
@@ -184,6 +185,8 @@ class KafkaContract:
         self._vehicle_by_template: dict[str, TopicSpec] = {}
         self._carla_by_type: dict[str, TopicSpec] = {}
         self._carla_by_template: dict[str, TopicSpec] = {}
+        self._simnode_by_type: dict[str, TopicSpec] = {}
+        self._simnode_by_template: dict[str, TopicSpec] = {}
         self._groups: dict[str, ConsumerGroupSpec] = {}
         self._schema_cache: dict[str, dict[str, Any]] = {}
         self._validator_cache: dict[str, Draft7Validator] = {}
@@ -241,6 +244,11 @@ class KafkaContract:
             topic_type = spec.name.removeprefix("carla.{sim_id}.")
             self._carla_by_type[topic_type] = spec
             self._carla_by_template[spec.name] = spec
+        for entry in self._topics_doc.get("simulation_node_topics") or []:
+            spec = _topic_spec_of(entry, defaults)
+            topic_type = spec.name.removeprefix("simulation.{node_id}.")
+            self._simnode_by_type[topic_type] = spec
+            self._simnode_by_template[spec.name] = spec
         for entry in self._groups_doc.get("groups") or []:
             self._groups[str(entry["group_id"])] = _consumer_group_spec_of(
                 entry, self._groups_doc.get("defaults") or {}
@@ -251,6 +259,7 @@ class KafkaContract:
             platform_topics=len(self._platform),
             vehicle_topics=len(self._vehicle_by_type),
             carla_topics=len(self._carla_by_type),
+            simulation_node_topics=len(self._simnode_by_type),
             consumer_groups=len(self._groups),
         )
 
@@ -276,6 +285,11 @@ class KafkaContract:
         """CARLA 动态 Topic 模板：{carla.{sim_id}.<type>: spec}。"""
         return dict(self._carla_by_template)
 
+    @property
+    def simulation_node_topics(self) -> dict[str, TopicSpec]:
+        """仿真端节点级回传 Topic 模板（V1.24.2）：{simulation.{node_id}.<type>: spec}。"""
+        return dict(self._simnode_by_template)
+
     def try_topic_spec(self, topic: str) -> TopicSpec | None:
         """解析 Topic，未登记返回 None。
 
@@ -290,6 +304,7 @@ class KafkaContract:
             or self._broadcast.get(base)
             or self._vehicle_by_template.get(base)
             or self._carla_by_template.get(base)
+            or self._simnode_by_template.get(base)
         )
         if spec is not None:
             return spec
@@ -299,6 +314,9 @@ class KafkaContract:
         carla_type = _carla_type_of(base)
         if carla_type is not None:
             return self._carla_by_type.get(carla_type)
+        simnode_type = _simnode_type_of(base)
+        if simnode_type is not None:
+            return self._simnode_by_type.get(simnode_type)
         return None
 
     def topic_spec(self, topic: str) -> TopicSpec:
@@ -332,6 +350,11 @@ class KafkaContract:
     def render_carla_topic(template: str, sim_id: str) -> str:
         """CARLA 动态模板 → 具体 Topic（``carla.{sim_id}.sensor_data`` + ``sim-1``）。"""
         return KafkaContract.render_topic(template, sim_id, field="sim_id")
+
+    @staticmethod
+    def render_simulation_node_topic(template: str, node_id: str) -> str:
+        """节点级回传动态模板 → 具体 Topic（V1.24.2，``simulation.{node_id}.result`` + ``node-1``）。"""
+        return KafkaContract.render_topic(template, node_id, field="node_id")
 
     @staticmethod
     def dlq_topic(topic: str) -> str:
@@ -525,6 +548,14 @@ def _carla_type_of(topic: str) -> str | None:
     """``carla.<sim_id|*>.sensor_data``（含模板写法）→ ``sensor_data``。"""
     parts = topic.split(".")
     if len(parts) == 3 and parts[0] == "carla" and parts[2]:
+        return parts[2]
+    return None
+
+
+def _simnode_type_of(topic: str) -> str | None:
+    """``simulation.<node_id|*>.result``（含模板写法）→ ``result``（V1.24.2 节点级回传）。"""
+    parts = topic.split(".")
+    if len(parts) == 3 and parts[0] == "simulation" and parts[2]:
         return parts[2]
     return None
 

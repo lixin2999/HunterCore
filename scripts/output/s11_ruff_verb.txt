@@ -1,0 +1,231 @@
+[2026-11-04][12:12:19][ruff::resolve][DEBUG] Using configuration file (via parent) at: e:\python_work\HunterPilot\HunterCore\services\scene-service\pyproject.toml
+[2026-11-04][12:12:19][ignore::gitignore][DEBUG] opened gitignore file: C:\Users\lixintao\.config\git/ignore
+[2026-11-04][12:12:19][ruff::commands::check][DEBUG] Identified files to lint in: 3.6894ms
+[2026-11-04][12:12:19][ruff::diagnostics][DEBUG] Checking: e:\python_work\HunterPilot\HunterCore\services\scene-service\app\services\sim_provisioner.py
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'secrets' as Known(StandardLibrary) (KnownStandardLibrary)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'time' as Known(StandardLibrary) (KnownStandardLibrary)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'hunter_common.exceptions' as Known(ThirdParty) (NoMatch)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'app.services.sim_kafka_admin' as Known(FirstParty) (SamePackage)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'app.repositories.sim_node_registry' as Known(FirstParty) (SamePackage)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'app.schemas.sim_nodes' as Known(FirstParty) (SamePackage)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'typing' as Known(StandardLibrary) (KnownStandardLibrary)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'hunter_common.logging' as Known(ThirdParty) (NoMatch)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized '__future__' as Known(Future) (Future)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'datetime' as Known(StandardLibrary) (KnownStandardLibrary)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'app.config' as Known(FirstParty) (SamePackage)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'dataclasses' as Known(StandardLibrary) (KnownStandardLibrary)
+[2026-11-04][12:12:19][ruff_linter::rules::isort::categorize][DEBUG] Categorized 'app.services' as Known(FirstParty) (SamePackage)
+[2026-11-04][12:12:19][ruff::commands::check][DEBUG] Checked 1 files in: 5.4638ms
+RUF100 [*] Unused `noqa` directive (non-enabled: `B008`)
+   --> app\services\sim_provisioner.py:163:46
+    |
+161 |         settings_obj: Settings,
+162 |         *,
+163 |         cert_module_obj: Any = cert_module,  # noqa: B008 - 允许测试注入 fake 签发模块
+    |                                              ^^^^^^^^^^^^
+164 |     ) -> None:
+165 |         self._registry = registry
+    |
+help: Remove unused `noqa` directive
+    |
+162 |         *,
+    -         cert_module_obj: Any = cert_module,  # noqa: B008 - 允许测试注入 fake 签发模块
+163 +         cert_module_obj: Any = cert_module,
+164 |     ) -> None:
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:219:35
+    |
+217 |         except (ResourceAlreadyExistsError, InvalidParameterError):
+218 |             raise
+219 |         except Exception as exc:  # noqa: BLE001 - DB 层未知异常
+    |                                   ^^^^^^^^^^^^^^
+220 |             steps["db"] = _new_step("db", "failed", str(exc))
+221 |             await self._persist_status(node_id, steps, failed=True)
+    |
+help: Remove unused `noqa` directive
+    |
+218 |             raise
+    -         except Exception as exc:  # noqa: BLE001 - DB 层未知异常
+219 +         except Exception as exc:
+220 |             steps["db"] = _new_step("db", "failed", str(exc))
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:235:39
+    |
+233 |                 await self._admin.upsert_scram_user(username, scram_password)
+234 |                 steps["scram"] = _new_step("scram", "ok")
+235 |             except Exception as exc:  # noqa: BLE001
+    |                                       ^^^^^^^^^^^^^^
+236 |                 steps["scram"] = _new_step("scram", "failed", str(exc))
+237 |                 await self._rollback(node_id, steps, takeover_existing=takeover_existing)
+    |
+help: Remove unused `noqa` directive
+    |
+234 |                 steps["scram"] = _new_step("scram", "ok")
+    -             except Exception as exc:  # noqa: BLE001
+235 +             except Exception as exc:
+236 |                 steps["scram"] = _new_step("scram", "failed", str(exc))
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:253:35
+    |
+251 |             topic_state: StepState = "skipped" if (takeover_existing and not created_topics) else "ok"
+252 |             steps["topics"] = _new_step("topics", topic_state, created=created_topics)
+253 |         except Exception as exc:  # noqa: BLE001
+    |                                   ^^^^^^^^^^^^^^
+254 |             steps["topics"] = _new_step("topics", "failed", str(exc), created=created_topics)
+255 |             await self._rollback(
+    |
+help: Remove unused `noqa` directive
+    |
+252 |             steps["topics"] = _new_step("topics", topic_state, created=created_topics)
+    -         except Exception as exc:  # noqa: BLE001
+253 +         except Exception as exc:
+254 |             steps["topics"] = _new_step("topics", "failed", str(exc), created=created_topics)
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:291:39
+    |
+289 |                 cert_issued = True
+290 |                 steps["cert"] = _new_step("cert", "ok", cert_issued=True)
+291 |             except Exception as exc:  # noqa: BLE001
+    |                                       ^^^^^^^^^^^^^^
+292 |                 steps["cert"] = _new_step("cert", "failed", str(exc), cert_issued=cert_issued)
+293 |                 await self._rollback(
+    |
+help: Remove unused `noqa` directive
+    |
+290 |                 steps["cert"] = _new_step("cert", "ok", cert_issued=True)
+    -             except Exception as exc:  # noqa: BLE001
+291 +             except Exception as exc:
+292 |                 steps["cert"] = _new_step("cert", "failed", str(exc), cert_issued=cert_issued)
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:372:32
+    |
+370 |             try:
+371 |                 self._certs.delete_node_cert_dir(node_id)
+372 |             except Exception:  # noqa: BLE001
+    |                                ^^^^^^^^^^^^^^
+373 |                 logger.exception("sim_retry_recycle_cert_failed", node_id=node_id)
+374 |         # Topic：只删记录在 created 列表里的（本次新建；外部既有不动）
+    |
+help: Remove unused `noqa` directive
+    |
+371 |                 self._certs.delete_node_cert_dir(node_id)
+    -             except Exception:  # noqa: BLE001
+372 +             except Exception:
+373 |                 logger.exception("sim_retry_recycle_cert_failed", node_id=node_id)
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:379:32
+    |
+377 |             try:
+378 |                 await self._admin.delete_node_topics([str(t) for t in created])
+379 |             except Exception:  # noqa: BLE001
+    |                                ^^^^^^^^^^^^^^
+380 |                 logger.exception("sim_retry_recycle_topics_failed", node_id=node_id, count=len(created))
+381 |         # SCRAM：本次创建过（state=ok）→ 删除后由重跑重建
+    |
+help: Remove unused `noqa` directive
+    |
+378 |                 await self._admin.delete_node_topics([str(t) for t in created])
+    -             except Exception:  # noqa: BLE001
+379 +             except Exception:
+380 |                 logger.exception("sim_retry_recycle_topics_failed", node_id=node_id, count=len(created))
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:385:32
+    |
+383 |             try:
+384 |                 await self._admin.delete_scram_user(self.scram_username(node_id))
+385 |             except Exception:  # noqa: BLE001
+    |                                ^^^^^^^^^^^^^^
+386 |                 logger.exception("sim_retry_recycle_scram_failed", node_id=node_id)
+    |
+help: Remove unused `noqa` directive
+    |
+384 |                 await self._admin.delete_scram_user(self.scram_username(node_id))
+    -             except Exception:  # noqa: BLE001
+385 +             except Exception:
+386 |                 logger.exception("sim_retry_recycle_scram_failed", node_id=node_id)
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:408:32
+    |
+406 |             try:
+407 |                 self._certs.delete_node_cert_dir(node_id)
+408 |             except Exception:  # noqa: BLE001
+    |                                ^^^^^^^^^^^^^^
+409 |                 logger.exception("sim_rollback_cert_failed", node_id=node_id)
+    |
+help: Remove unused `noqa` directive
+    |
+407 |                 self._certs.delete_node_cert_dir(node_id)
+    -             except Exception:  # noqa: BLE001
+408 +             except Exception:
+409 |                 logger.exception("sim_rollback_cert_failed", node_id=node_id)
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:417:32
+    |
+415 |             try:
+416 |                 await self._admin.delete_node_topics(list(topics))
+417 |             except Exception:  # noqa: BLE001
+    |                                ^^^^^^^^^^^^^^
+418 |                 logger.exception("sim_rollback_topics_failed", node_id=node_id, count=len(topics))
+    |
+help: Remove unused `noqa` directive
+    |
+416 |                 await self._admin.delete_node_topics(list(topics))
+    -             except Exception:  # noqa: BLE001
+417 +             except Exception:
+418 |                 logger.exception("sim_rollback_topics_failed", node_id=node_id, count=len(topics))
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:423:32
+    |
+421 |             try:
+422 |                 await self._admin.delete_scram_user(self.scram_username(node_id))
+423 |             except Exception:  # noqa: BLE001
+    |                                ^^^^^^^^^^^^^^
+424 |                 logger.exception("sim_rollback_scram_failed", node_id=node_id)
+    |
+help: Remove unused `noqa` directive
+    |
+422 |                 await self._admin.delete_scram_user(self.scram_username(node_id))
+    -             except Exception:  # noqa: BLE001
+423 +             except Exception:
+424 |                 logger.exception("sim_rollback_scram_failed", node_id=node_id)
+    |
+
+RUF100 [*] Unused `noqa` directive (unused: `BLE001`)
+   --> app\services\sim_provisioner.py:440:28
+    |
+438 |         try:
+439 |             await self._registry.update_provision_status(node_id, payload, **fields)
+440 |         except Exception:  # noqa: BLE001 - 状态回写失败不掩盖原始异常
+    |                            ^^^^^^^^^^^^^^
+441 |             logger.exception("sim_provision_status_persist_failed", node_id=node_id)
+    |
+help: Remove unused `noqa` directive
+    |
+439 |             await self._registry.update_provision_status(node_id, payload, **fields)
+    -         except Exception:  # noqa: BLE001 - 状态回写失败不掩盖原始异常
+440 +         except Exception:
+441 |             logger.exception("sim_provision_status_persist_failed", node_id=node_id)
+    |
+
+Found 12 errors.
+[*] 12 fixable with the `--fix` option.

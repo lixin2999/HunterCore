@@ -1,0 +1,44 @@
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Generating static SQL
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> 0001_initial_schema, 0001 初始数据库结构：8 个服务 schema + 13 张业务/时序表 + hypertable + 保留策略
+INFO  [alembic.runtime.migration] Running upgrade 0001_initial_schema -> 0002_gap_columns, 0002 差距整改列：users 强制改密/MFA（G-06/G-23）+ vehicles 地理围栏（G-11）
+INFO  [alembic.runtime.migration] Running upgrade 0002_gap_columns -> 0003_ota_review_status, 0003 OTA 版本审核流状态（G-18 决策②：实现设计文档 §7.2.2 testing/reviewing 审核流）
+INFO  [alembic.runtime.migration] Running upgrade 0003_ota_review_status -> 0004_event_pre_warning, 0004 事件类型扩展（G-22 决策②：新增 collision_pre_warning，18 种 → 19 种）
+HunterCore 数据层契约校验（L2）
+==============================================================================
+------------------------------------------------------------------------------
+[PASS] DDL 契约存在: contracts/database/ddl/00_schemas.sql
+[PASS] DDL 契约存在: contracts/database/ddl/01_core.sql
+[PASS] DDL 契约存在: contracts/database/ddl/02_scene.sql
+[PASS] DDL 契约存在: contracts/database/ddl/03_ota.sql
+[PASS] DDL 契约存在: contracts/database/ddl/04_events.sql
+[PASS] DDL 契约存在: contracts/database/ddl/05_timeseries.sql
+[PASS] 数据库契约文档存在: contracts/database/README.md
+[PASS] 数据库契约文档存在: contracts/database/er.md
+[PASS] 数据库契约文档存在: contracts/database/enums.md
+[PASS] 数据库契约文档存在: contracts/database/orm-mapping.md
+[PASS] schema 定义齐备（8 个）
+[PASS] Kafka 契约存在: contracts/kafka/topics.yaml
+[PASS] Kafka 契约存在: contracts/kafka/consumer-groups.yaml
+[PASS] Kafka 契约存在: contracts/kafka/README.md
+[PASS] 消息 JSON Schema 齐备（14 个）
+[FAIL] DDL 出现契约外新增表: ['scene_svc.sim_node_registry']（需先更新契约并评审）
+[PASS] ORM 表清单与契约一致（13 张）
+[PASS] 受控词表一致（11 处 CHECK ↔ StrEnum，含 19 种事件类型/9 态 OTA 状态机）
+[PASS] 事件类型等级映射完整（19 条）
+[PASS] Alembic 离线 SQL 覆盖全部契约表（13 张）
+[PASS] 模型 ↔ Repository 一一对应（13 个模型 / Repository）
+[PASS] relationship 全部显式声明异步安全 lazy 策略（16 条）
+[PASS] orm-mapping.md 关系表与实现一致（16 条 relationship）
+[PASS] orm-mapping.md Repository 表与实现一致（13 个 Repository）
+[PASS] Repository 专属方法与契约双向一致（13 个 Repository / 44 个专属方法）
+[PASS] 服务 → Repository 白名单一致（9 个服务，越界 0 处；当前共享层实际被引用 2 处）
+[PASS] 写路径纪律（SAVEPOINT 顺序 / 禁止 expunge）与序列读取窗口规则均已在契约显式声明
+[PASS] Kafka Topic 契约一致（车端 9 + 平台 7 + ingest 13，含死信 14 项：topics.yaml ↔ create-topics.sh ↔ kafka-init Job ↔ init-kafka.sh ↔ provisioning 派生）
+[PASS] 消息 JSON Schema 全部合法（draft-07，14 个文件，examples 自校验通过）
+[PASS] 消费者组契约合法（29 个组，订阅 Topic 均已登记、幂等键齐备）
+[PASS] Redis 键契约一致（21 个受控键 ↔ 6 份服务契约声明，键模式 / 类型 / TTL / 读写方全部匹配）
+[PASS] 对象存储契约一致（9 个 Bucket ↔ 2 份初始化脚本 ↔ 5 份服务契约：生命周期 / 预签名 TTL / 读写方全部匹配）
+------------------------------------------------------------------------------
+结果：通过 31 项，失败 1 项

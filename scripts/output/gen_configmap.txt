@@ -1,0 +1,1 @@
+[OK] 已生成 infra\k8s\base\03-configmap-contracts.yaml（109734 字节）

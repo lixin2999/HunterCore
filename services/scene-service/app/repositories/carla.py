@@ -134,6 +134,8 @@ class CarlaManagementClient:
         pause_path: str = "",
         resume_path: str = "",
         stop_path: str = "",
+        ssl_cert: tuple[str, str] | None = None,
+        ssl_ca: str | bool = True,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         # 地址形态门禁（构造期判定，不阻塞启动：场景库 CRUD 不应被 CARLA 配置缺陷带下）
@@ -155,6 +157,10 @@ class CarlaManagementClient:
         self._stop_path = stop_path
         self._timeout_seconds = timeout_seconds
         self._max_retries = max(0, max_retries)
+        # 下发通道 mTLS（V1.24.2）：ssl_cert = (client-cert.pem, client-key.pem)，
+        # ssl_ca = CA 路径（或 True 用系统信任）；None 时保持旧明文直推行为。
+        self._ssl_cert = ssl_cert
+        self._ssl_ca = ssl_ca
         self._client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()
 
@@ -176,9 +182,12 @@ class CarlaManagementClient:
         if self._client is None:
             async with self._lock:
                 if self._client is None:
-                    self._client = httpx.AsyncClient(
-                        timeout=httpx.Timeout(self._timeout_seconds)
-                    )
+                    client_kwargs: dict[str, Any] = {"timeout": httpx.Timeout(self._timeout_seconds)}
+                    if self._ssl_cert is not None:
+                        # 平台以 sim-platform-{node_id} 客户端证书回访节点 CARLA 管理 API（mTLS 双向）
+                        client_kwargs["cert"] = self._ssl_cert
+                        client_kwargs["verify"] = self._ssl_ca
+                    self._client = httpx.AsyncClient(**client_kwargs)
         return self._client
 
     async def close(self) -> None:

@@ -1410,6 +1410,7 @@ x-hunter-service:
     - FILE_UPLOAD_MAX_BYTES_PER_SECOND
     - VEHICLE_TELEMETRY_MAX_MSG_PER_SEC
     - CARLA_SENSOR_CONSUMER_ENABLED
+    - SIMULATION_CONSUMER_ENABLED
     - CARLA_SIM_CACHE_TTL_SECONDS
     - CARLA_SIM_EVENTS_MAX
   env_derived:
@@ -1662,6 +1663,13 @@ x-hunter-kafka:
       produces: [sensor_file]
       enabled: true
       reason: "CARLA 仿真回传：sim_telemetry→vehicle_telemetry（vehicle_id=SIM-{sim_id}）；可映射事件→events+event_raw；状态/指标/产物→Redis；sensor_file 复用现有通知 Topic"
+    - topic_pattern: "simulation.*.result"
+      group_id: data-collector-simulation
+      subscribe_mode: regex_pattern
+      schema: contracts/kafka/schemas/carla_sensor_data.schema.json
+      produces: [sensor_file]
+      enabled: true
+      reason: "仿真端节点级回传（V1.24.2 一键开通；与实例级 carla.*.sensor_data 分离，消息结构复用 carla_sensor_data）：与 data-collector-carla 同构——回传→vehicle_telemetry（vehicle_id=SIM-{sim_id}）/可映射事件→events+event_raw；状态/指标/产物→Redis；sensor_file 复用现有通知 Topic"
   produces:
     - topic: telemetry_raw
       schema: contracts/kafka/schemas/telemetry.schema.json

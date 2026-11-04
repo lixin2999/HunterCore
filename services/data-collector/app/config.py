@@ -20,7 +20,7 @@ class Settings(HunterBaseConfig):
     kafka_consumer_groups: str = (
         "data-collector-telemetry,data-collector-events,"
         "data-collector-health,data-collector-command-result,"
-        "data-collector-carla"
+        "data-collector-carla,data-collector-simulation"
     )
     kafka_subscribe_patterns: str = (
         "hunter.*.telemetry,hunter.*.event,hunter.*.health,hunter.*.command_result"
@@ -39,6 +39,7 @@ class Settings(HunterBaseConfig):
     event_consumer_enabled: bool = True           # data-collector-events
     health_consumer_enabled: bool = True          # data-collector-health
     carla_sensor_consumer_enabled: bool = True    # data-collector-carla（carla.*.sensor_data）
+    simulation_consumer_enabled: bool = True       # data-collector-simulation（simulation.*.result，V1.24.2 节点级回传）
     # 消费侧契约 Schema 校验（契约先行：默认开启；需 KAFKA_CONTRACT_DIR 可访问，
     # K8s 由 hunter-contracts ConfigMap 挂载）。仅在明确知悉风险时关闭（记录 CRITICAL 告警）。
     ingest_schema_validation_enabled: bool = True

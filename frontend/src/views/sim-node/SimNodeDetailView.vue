@@ -21,7 +21,9 @@ import {
   issueSimNodePlatformCert,
   issueSimNodeToken,
   patchSimNode,
+  retrySimNodeProvision,
   revokeSimNodeToken,
+  rotateSimNodeScram,
 } from '@/api/sim-node'
 import {
   SIM_NODE_CERT_TYPE_LABELS,
@@ -30,9 +32,13 @@ import {
   SIM_NODE_ENDPOINT_SOURCE_LABELS,
   SIM_NODE_ONLINE_LABELS,
   SIM_NODE_ONLINE_TAG_TYPES,
+  SIM_NODE_PROVISION_STATE_LABELS,
+  SIM_NODE_PROVISION_STATE_TAG_TYPES,
+  SIM_NODE_PROVISION_STEP_LABELS,
+  SIM_NODE_PROVISION_STEP_STATE_LABELS,
 } from '@/constants/sim-node'
 import { PERMISSIONS } from '@/constants/permissions'
-import type { SimNodeDetail } from '@/types/sim-node'
+import type { SimNodeDetail, SimNodeProvisionResult, SimNodeProvisionStep } from '@/types/sim-node'
 import { HunterApiError } from '@/utils/error-code'
 import { formatDateTimeString, formatRelativeTime } from '@/utils/format'
 
@@ -88,6 +94,94 @@ const labelPairs = computed<Array<[string, string]>>(() => {
   const src = d?.registry_labels && Object.keys(d.registry_labels).length ? d.registry_labels : d?.labels
   return src ? Object.entries(src) : []
 })
+
+/* ------------------------------ 一键开通（四步编排） ------------------------------ */
+const provisionSteps = computed<SimNodeProvisionStep[]>(() => detail.value?.provision_steps ?? [])
+const provisionState = computed<string>(() => detail.value?.provision_state ?? 'pending')
+function provisionStateLabel(state: string): string {
+  return SIM_NODE_PROVISION_STATE_LABELS[state] ?? state
+}
+function provisionStateTag(state: string): string {
+  return SIM_NODE_PROVISION_STATE_TAG_TYPES[state] ?? 'info'
+}
+function stepLabel(name: string): string {
+  return SIM_NODE_PROVISION_STEP_LABELS[name] ?? name
+}
+/** 单步状态 → el-step status */
+function stepStatus(state: string): 'wait' | 'process' | 'finish' | 'error' {
+  if (state === 'ok' || state === 'skipped') return 'finish'
+  if (state === 'failed') return 'error'
+  if (state === 'in_progress') return 'process'
+  return 'wait'
+}
+
+const retrying = ref(false)
+async function handleRetryProvision(): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `将从失败步续跑开通 ${nodeId.value}（先回收本次残留 → 重跑四步，幂等可多次调用）。成功时一次性返回新口令。是否继续？`,
+      '重试开通',
+      { type: 'warning', confirmButtonText: '确认重试', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  retrying.value = true
+  try {
+    const result = await retrySimNodeProvision(nodeId.value)
+    await showProvisionResult(result)
+    await load()
+  } catch (error) {
+    ElMessage.error(error instanceof HunterApiError ? error.message : '重试开通失败')
+  } finally {
+    retrying.value = false
+  }
+}
+
+const rotating = ref(false)
+async function handleRotateScram(): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `将轮换 ${nodeId.value} 的 SCRAM 口令（覆盖旧值）。节点需用新口令更新 kafka.properties 后重连。是否继续？`,
+      '轮换 SCRAM 口令',
+      { type: 'warning', confirmButtonText: '确认轮换', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  rotating.value = true
+  try {
+    const result = await rotateSimNodeScram(nodeId.value)
+    await ElMessageBox.alert(
+      `新口令（仅展示一次，请立即复制）：\n\n${result.scram_password}`,
+      'SCRAM 口令已轮换',
+      { type: 'warning', confirmButtonText: '我已安全保存' },
+    ).catch(() => undefined)
+    await load()
+  } catch (error) {
+    ElMessage.error(error instanceof HunterApiError ? error.message : 'SCRAM 口令轮换失败')
+  } finally {
+    rotating.value = false
+  }
+}
+
+/** 开通结果展示（与列表页一致：一次性口令 + 四步终态） */
+async function showProvisionResult(result: SimNodeProvisionResult): Promise<void> {
+  const failed = result.provision_state === 'failed'
+  const lines: string[] = []
+  lines.push(`SCRAM 主体：${result.scram_username}`)
+  if (result.scram_password) {
+    lines.push('一次性口令（请立即复制，不入库/不入接入包）：')
+    lines.push(result.scram_password)
+  }
+  lines.push(
+    result.steps.map((s) => `${stepLabel(s.name)}: ${SIM_NODE_PROVISION_STEP_STATE_LABELS[s.state] ?? s.state}${s.error ? `（${s.error}）` : ''}`).join('\n'),
+  )
+  await ElMessageBox.alert(lines.join('\n\n'), failed ? '开通失败（可重试）' : '开通成功', {
+    type: failed ? 'error' : 'success',
+    confirmButtonText: '我已记录口令',
+  }).catch(() => undefined)
+}
 
 /* ------------------------------ 服务令牌 ------------------------------ */
 const issuingToken = ref(false)
@@ -250,23 +344,30 @@ async function submitEdit(): Promise<void> {
   }
 }
 
-/* ------------------------------ 删除节点 ------------------------------ */
+/* ------------------------------ 下线（deprovision） ------------------------------ */
 async function handleDelete(): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      `将删除仿真端 ${nodeId.value} 并清理全部资源（Redis 登记 + 登记表行 + 证书目录），令牌/证书随之失效。是否继续？`,
-      '删除仿真端',
-      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+      `将下线仿真端 ${nodeId.value}，逆序回收全部资源（证书目录 → SCRAM 用户 → 节点级回传 Topic（含 .dlq）→ 登记行 → Redis），令牌/证书随之失效。是否继续？`,
+      '下线仿真端',
+      { type: 'warning', confirmButtonText: '确认下线', cancelButtonText: '取消' },
     )
   } catch {
     return
   }
   try {
-    await deleteSimNode(nodeId.value)
-    ElMessage.success('仿真端已删除')
+    const result = await deleteSimNode(nodeId.value)
+    const parts = [
+      `证书目录${result.cert_dir_removed ? '已删' : '未删'}`,
+      `SCRAM${result.scram_removed ? '已删' : '未删'}`,
+      `Topic 已删 ${result.topics_removed.length} 个`,
+      `登记行${result.registry_removed ? '已删' : '未删'}`,
+      `Redis${result.redis_removed ? '已清理' : '未清理'}`,
+    ]
+    ElMessage.success(`仿真端已下线：${parts.join('，')}`)
     router.push({ name: 'sim-node-list' })
   } catch (error) {
-    ElMessage.error(error instanceof HunterApiError ? error.message : '删除失败')
+    ElMessage.error(error instanceof HunterApiError ? error.message : '下线失败')
   }
 }
 
@@ -287,6 +388,26 @@ watch(
     <el-page-header content="仿真端详情" @back="() => $router.back()">
       <template #extra>
         <div class="actions">
+          <el-button
+            v-if="detail?.provision_state === 'failed'"
+            v-permission="PERMISSIONS.sceneExecute"
+            type="warning"
+            plain
+            :loading="retrying"
+            @click="handleRetryProvision"
+          >
+            重试开通
+          </el-button>
+          <el-button
+            v-if="detail?.scram_username"
+            v-permission="PERMISSIONS.sceneExecute"
+            type="warning"
+            plain
+            :loading="rotating"
+            @click="handleRotateScram"
+          >
+            轮换口令
+          </el-button>
           <el-button v-permission="PERMISSIONS.sceneUpdate" @click="openEdit">修改管理信息</el-button>
           <el-button
             v-if="detail?.token_id"
@@ -314,12 +435,48 @@ watch(
           >
             下载接入包
           </el-button>
-          <el-button v-permission="PERMISSIONS.sceneUpdate" type="danger" @click="handleDelete">删除节点</el-button>
+          <el-button v-permission="PERMISSIONS.sceneUpdate" type="danger" @click="handleDelete">下线节点</el-button>
         </div>
       </template>
     </el-page-header>
 
     <template v-if="detail">
+      <!-- 一键开通卡（四步编排：DB → SCRAM → Topics → Cert） -->
+      <el-card shadow="never" class="card">
+        <template #header>
+          <div class="card__header">
+            <span>一键开通</span>
+            <el-tag :type="provisionStateTag(provisionState) as never" size="small">
+              {{ provisionStateLabel(provisionState) }}
+            </el-tag>
+          </div>
+        </template>
+        <el-steps v-if="provisionSteps.length" :active="provisionSteps.length" finish-status="success" align-center>
+          <el-step
+            v-for="step in provisionSteps"
+            :key="step.name"
+            :title="stepLabel(step.name)"
+            :status="stepStatus(step.state)"
+            :description="step.error || SIM_NODE_PROVISION_STEP_STATE_LABELS[step.state] || step.state"
+          />
+        </el-steps>
+        <el-alert
+          v-else
+          type="info"
+          :closable="false"
+          show-icon
+          title="尚未开通"
+          description="该节点尚无一键开通编排记录。可在列表页「创建仿真端」发起四步开通（登记入库 → SCRAM 主体 → 回传 Topic → 证书签发），成功后一次性获取 SCRAM 口令。"
+          class="provision-alert"
+        />
+        <el-descriptions v-if="detail.scram_username" :column="2" border size="small" class="provision-desc">
+          <el-descriptions-item label="SCRAM 主体">{{ detail.scram_username }}</el-descriptions-item>
+          <el-descriptions-item label="口令更新时">{{ formatDateTimeString(detail.scram_credential_updated_at) }}</el-descriptions-item>
+          <el-descriptions-item label="证书到期">{{ formatDateTimeString(detail.cert_not_after) }}</el-descriptions-item>
+          <el-descriptions-item label="Kafka 证书">{{ detail.kafka_cert_sn || '-' }}</el-descriptions-item>
+        </el-descriptions>
+      </el-card>
+
       <!-- 基本信息卡 -->
       <el-card shadow="never" class="card">
         <template #header>
@@ -496,5 +653,13 @@ watch(
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.provision-alert {
+  margin-top: 4px;
+}
+
+.provision-desc {
+  margin-top: 16px;
 }
 </style>

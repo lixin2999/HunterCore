@@ -205,6 +205,21 @@ data:
         idempotency_key: "(sim_id, seq)"
         notes: "CARLA 侧 vil-mapper 消费 VIL 实车状态；单会话单消费者，latest-wins"
 
+      # =====================================================================
+      # 仿真端节点级独立回传通道消费组（V1.24.2 一键开通；与实例级 carla.* 分离）
+      #   - 动态 Topic 模板 simulation.{node_id}.result，key = sim_id；
+      #   - 消费侧订阅写法 simulation.*.result（单层通配，匹配具体 node_id）；
+      #   - 生产者凭据 = 节点 SCRAM 主体 sim-{node_id}（由 scene-service 一键开通创建，非手工注入）。
+      # =====================================================================
+      - group_id: data-collector-simulation
+        service: data-collector
+        subscribes: ["simulation.*.result"]
+        subscribe_mode: regex_pattern
+        produces: [sensor_file]
+        writes: [data_collector.vehicle_telemetry, data_collector.events]
+        idempotency_key: "(sim_id, seq)"
+        notes: "消费仿真端节点级回传（非实例生命周期产出/状态）；与 data-collector-carla 同构：回传→vehicle_telemetry（vehicle_id=SIM-{sim_id}）/可映射事件→events；不跨 schema 写 data_analytics"
+
       - group_id: scene-service-analytics-result
         service: scene-service
         subscribes: [analytics_result]
@@ -2110,6 +2125,9 @@ data:
       # 仿真动态 Topic：按 sim_id（场景仿真实例）隔离；由 scene-service 在实例创建前显式创建，
       # 终态后延迟删除或依赖 retention 清理（broker 关闭 auto.create.topics.enable）。
       sim_id_topic_pattern: "carla.{sim_id}.<type>"
+      # 仿真端**节点级**独立回传通道：按 node_id（仿真端管理登记的物理节点）隔离；
+      # 由 scene-service 在一键开通（provisionSimNode）时显式创建，deprovision 时删除（V1.24.2）。
+      node_id_topic_pattern: "simulation.{node_id}.<type>"
       # DLQ 由 hunter_common.kafka.consumer 派生：{original_topic}.dlq（保留 30 天，分区数继承源 Topic）
       dlq_pattern: "{original_topic}.dlq"
       dlq_retention_ms: 2592000000          # 30 天：人工排查与重放窗口（与 event_raw 对齐）
@@ -2417,6 +2435,40 @@ data:
         schema: schemas/carla_sensor_data.schema.json
         lifecycle: per_simulation
         description: "仿真回传：状态/事件/指标/传感器文件通知/产物；不传文件本体"
+        # V1.24.2：实例级 Topic 的生产者凭据来源由旧“运行环境手工注入”改为**节点 SCRAM 主体**（sim-{node_id}），
+        #   与节点级回传通道共用同一 SCRAM 用户与证书（见 simulation_node_topics 与 scene-service x-hunter-sim-provisioning）。
+
+    # =====================================================================
+    # 二a′、仿真端节点级独立回传通道（V1.24.2 一键开通；与实例级 carla.{sim_id}.* 分离）
+    #   - 名称模板 simulation.{node_id}.<type>，key = sim_id（同会话有序）；
+    #   - 一个物理仿真节点对应一个主体 sim-{node_id}，可写自身前缀 Topic（ACL 最小化）；
+    #   - 由 scene-service 在 provisionSimNode 的 topics 步显式创建，deprovision 时删除；
+    #   - 与 DLQ 均遵循 auto.create.topics.enable=false 显式创建基线（由 provisioner 负责，不再手工注入）。
+    # =====================================================================
+    simulation_node_topics:
+      - name: "simulation.{node_id}.result"
+        direction: node_to_platform
+        dynamic: true                   # 随节点一键开通创建 / deprovision 删除
+        dlq: true                        # 派生 simulation.{node_id}.result.dlq（provisioner 一并创建）
+        partitions: 3
+        partition_strategy: hash(sim_id)
+        key: sim_id
+        acks: all
+        frequency: "状态 1Hz / 结果触发 / 批量回传"
+        retention_ms: 604800000          # 7 天
+        retention_human: "7 天"
+        producer: "simulation node (sim-{node_id})"
+        consumers: [data-collector-simulation]
+        schema: schemas/carla_sensor_data.schema.json   # 复用仿真回传消息结构
+        lifecycle: per_node
+        auth: "SASL_SSL / SCRAM-SHA-512（主体 sim-{node_id}，一键开通时由平台创建）；ACL：仅允许写 simulation.{node_id}.*"
+        description: |
+          仿真端节点级回传（与实例级 carla.{sim_id}.sensor_data 区分）：承载非实例生命周期的
+          节点产出/状态回传；凭据由平台一键开通产出（取消旧“手工注入”），接入包 kafka.properties 含
+          sasl.username=sim-{node_id}，口令取自开通响应（不入包）。
+
+      # 死信 simulation.{node_id}.result.dlq 由上方源 Topic 的 dlq:true 标志隐式派生（与 carla.*.sensor_data 同惯例），
+      # 由 provisioner 在开通时一并显式创建、deprovision 一并回收（分区继承源 Topic=3，保留取 naming.dlq_retention_ms=30天）。
 
     # =====================================================================
     # 二b、ingest-platform 数据消费/解析 Topic（服务端数据消费解析与处理详细设计文档 §5.1/§7.5/§9.4/§12.3）

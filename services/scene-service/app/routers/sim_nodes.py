@@ -17,6 +17,12 @@ V1.24.1 仿真端管理（契约 tag: sim-node 追加 8 个管理端点）：
 - ⚠ 令牌签发/撤销需代理调用 api-gateway ``POST/DELETE /api/v1/user/service-token``，而网关**会剥离
   Authorization**（后端只信任 X-User-Id/X-Roles）。故前端需经**自定义头** ``X-Admin-Access-Token``
   携带原始管理员 JWT（网关透传自定义头），``require_admin_bearer`` 优先取该头、回退 Authorization（直连/dev）。
+
+V1.24.2 一键开通（契约 x-hunter-sim-provisioning）：
+- ``POST /sim-nodes``（provisionSimNode，201）：DB→SCRAM→Topics→Cert 四步编排，响应一次性返回口令；
+- ``POST /sim-nodes/{node_id}/rotate-scram``：轮换口令（新口令一次性返回）；
+- ``POST /sim-nodes/{node_id}/retry-provision``（201）：失败步续跑（先回收残留再重跑，幂等）；
+- ``DELETE /sim-nodes/{node_id}`` 升级为 deprovision 全链路回收，响应体回显清理摘要。
 """
 from __future__ import annotations
 
@@ -38,10 +44,14 @@ from app.schemas.sim_nodes import (
     NODE_ID_PATTERN,
     IssueCertResponse,
     IssueTokenResponse,
+    RotateScramResponse,
+    SimNodeDeprovisionResponse,
     SimNodeDetailResponse,
     SimNodeEmptyResponse,
     SimNodeHeartbeatRequest,
     SimNodeListResponse,
+    SimNodeProvisionRequest,
+    SimNodeProvisionResponse,
     SimNodeRegisterRequest,
     SimNodeRegistryPatch,
     SimNodeRegistryPatchResponse,
@@ -138,6 +148,24 @@ async def require_admin_bearer(
 
 
 AdminBearer = Annotated[str, Depends(require_admin_bearer)]
+
+
+@router.post(
+    "/sim-nodes",
+    operation_id="provisionSimNode",
+    response_model=SimNodeProvisionResponse,
+    status_code=201,
+    summary="一键开通仿真端节点（DB 建登记行 → Kafka SCRAM 口令 → 节点级回传 Topic → 双证书）",
+    responses={**COMMON_ERRORS},
+)
+async def provision_sim_node(
+    payload: SimNodeProvisionRequest,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> SimNodeProvisionResponse:
+    """V1.24.2：平台先建节点（不依赖节点先自注册）；``scram_password`` 仅此一次可见、不落日志。"""
+    data = await service.provision(payload)
+    return SimNodeProvisionResponse(data=data, request_id=trace_request_id())
 
 
 @router.get(
@@ -270,20 +298,54 @@ async def download_sim_node_bundle(
     return Response(content=payload, media_type="application/zip", headers=headers)
 
 
+@router.post(
+    "/sim-nodes/{node_id}/rotate-scram",
+    operation_id="rotateSimNodeScram",
+    response_model=RotateScramResponse,
+    summary="轮换仿真节点 Kafka SCRAM 口令（AdminClient UPSERT 覆盖旧凭据；新口令一次性返回）",
+    responses={**COMMON_ERRORS},
+)
+async def rotate_sim_node_scram(
+    node_id: NodeIdPath,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> RotateScramResponse:
+    data = await service.rotate_scram(node_id)
+    return RotateScramResponse(data=data, request_id=trace_request_id())
+
+
+@router.post(
+    "/sim-nodes/{node_id}/retry-provision",
+    operation_id="retrySimNodeProvision",
+    response_model=SimNodeProvisionResponse,
+    status_code=201,
+    summary="从失败步续跑一键开通（幂等：先回收残留再重跑，适用于 provision 中途失败）",
+    responses={**COMMON_ERRORS},
+)
+async def retry_sim_node_provision(
+    node_id: NodeIdPath,
+    service: Annotated[SimNodeService, Depends(get_sim_node_service)],
+    _user_id: Annotated[str, Depends(require_execute_permission)],
+) -> SimNodeProvisionResponse:
+    data = await service.retry_provision(node_id)
+    return SimNodeProvisionResponse(data=data, request_id=trace_request_id())
+
+
 @router.delete(
     "/sim-nodes/{node_id}",
     operation_id="deleteSimNode",
-    response_model=SimNodeEmptyResponse,
-    summary="从登记表移除仿真节点并清理资源（Redis + 登记表 + 证书目录）",
+    response_model=SimNodeDeprovisionResponse,
+    summary="下线仿真节点并回收全部资源（证书目录 → SCRAM 用户 → 节点级 Topic → 登记行 → Redis）",
     responses={**COMMON_ERRORS},
 )
 async def delete_sim_node(
     node_id: NodeIdPath,
     service: Annotated[SimNodeService, Depends(get_sim_node_service)],
     _user_id: Annotated[str, Depends(require_write_permission)],
-) -> SimNodeEmptyResponse:
-    await service.remove_node(node_id)
-    return SimNodeEmptyResponse(data=None, request_id=trace_request_id())
+) -> SimNodeDeprovisionResponse:
+    """V1.24.2：升级为 deprovision 全链路回收；响应 data 回显清理摘要（供审计）。"""
+    data = await service.deprovision_node(node_id)
+    return SimNodeDeprovisionResponse(data=data, request_id=trace_request_id())
 
 
 __all__ = ["router"]

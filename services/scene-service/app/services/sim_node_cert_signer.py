@@ -81,7 +81,7 @@ def _common_name(node_id: str, cert_type: str) -> str:
 def _run(cmd: list[str], *, timeout: int | None = None) -> str:
     """执行 openssl 命令；失败映射 5001 ServiceUnavailable。"""
     try:
-        result = subprocess.run(  # noqa: S603
+        result = subprocess.run(
             cmd,
             check=True,
             capture_output=True,

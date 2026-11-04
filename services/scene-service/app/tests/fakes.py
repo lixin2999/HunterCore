@@ -729,7 +729,7 @@ class RecordingCarlaClientFactory:
         self.unreachable: set[str] = set()
         self._seq = 0
 
-    def __call__(self, base_url: str) -> RecordingCarlaClient:
+    def __call__(self, base_url: str, node_id: str = "") -> RecordingCarlaClient:
         client = RecordingCarlaClient(base_url, self)
         client.unavailable = base_url in self.unreachable
         self.clients.append(client)

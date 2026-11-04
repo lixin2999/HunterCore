@@ -38,7 +38,7 @@ from hunter_common.logging import (
 from hunter_common.metrics import register_metrics
 from hunter_common.redis import RedisManager
 
-from app.config import settings
+from app.config import Settings, settings
 from app.consumers.analytics_result import AnalyticsResultConsumer
 from app.core.error_handlers import register_exception_handlers
 from app.repositories.cache import SceneDetailCache
@@ -62,11 +62,25 @@ from app.routers.health import router as health_router
 from app.services.engine import SceneEngineService
 from app.services.export import SceneExportService
 from app.services.scenes import SceneService
+from app.services.sim_kafka_admin import SimKafkaAdminOps
 from app.services.sim_nodes import SimNodeService
+from app.services.sim_provisioner import SimProvisioner
 from app.services.simulation import SceneSimulationService
 from app.services.templates import SceneTemplateService
 
 logger = get_logger("app.main")
+
+
+async def _build_sim_provisioner(app: FastAPI, settings: Settings) -> SimProvisioner | None:
+    """装配一键开通编排器（V1.24.2）；Kafka 控制面连接失败时仍返回（provision 报 5001）。
+
+    SimKafkaAdminOps 自建独立 confluent AdminClient（SCRAM + 节点级 Topic），与共享
+    ``app.state.kafka_admin``（仅 CARLA 会话 Topic）隔离；建连失败降级为 admin=None。
+    """
+    admin = await SimKafkaAdminOps.build_safe(settings)
+    if admin is None:
+        logger.warning("sim_provisioner_admin_unavailable")
+    return SimProvisioner(SimNodeRegistryStore(app.state.db), admin, settings)
 
 
 @asynccontextmanager
@@ -174,6 +188,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # V1.24.1 仿真端管理：登记表（scene_svc.sim_node_registry）与 Redis 实时态互补；
         # 未初始化 DDL 时管理接口按需懒建行，读写走 DB（与令牌/证书登记一致）
         registry_store=SimNodeRegistryStore(app.state.db),
+        # V1.24.2 一键开通：SCRAM + 节点级 Topic 控制面（连接失败降级为 None，开通端点返回 5001）
+        provisioner=await _build_sim_provisioner(app, settings),
     )
     # 场景引擎（服务私有 schema scene_engine；未初始化 DDL 时读取自动回落到内置目录）
     app.state.engine_service = SceneEngineService(

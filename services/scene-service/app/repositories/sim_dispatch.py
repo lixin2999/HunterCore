@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from hunter_common.exceptions import ServiceUnavailableError
@@ -33,6 +34,7 @@ from app.repositories.carla import (
     SimInstanceSnapshot,
 )
 from app.repositories.sim_nodes import NodeEndpoint, SimNodeStore, now_epoch
+from app.services.sim_node_cert_signer import cert_paths_ready
 from app.services.sim_status import to_platform_status
 
 logger = get_logger("app.repositories.sim_dispatch")
@@ -80,8 +82,39 @@ class SimRuntimeBackend(Protocol):
     async def close(self) -> None: ...
 
 
-def _carla_client_factory(base_url: str, settings: Settings) -> SimRuntimeBackend:
-    """默认客户端工厂：同一套子路径配置，只把基址换成节点学到的 ``http://{ip}:{port}``。"""
+#: 客户端工厂签名：(base_url, node_id) → backend（node_id 用于解析该节点的 mTLS 客户端证书）
+ClientFactory = Callable[[str, str], "SimRuntimeBackend"]
+
+
+def _platform_mtls_material(
+    node_id: str, settings: Settings
+) -> tuple[tuple[str, str], str | bool] | None:
+    """解析平台回访该节点所需的 mTLS 材料（``sim-platform-{node_id}`` 客户端证书 + CA）。
+
+    仅当 ``SIM_DISPATCH_MTLS_ENABLED=true`` 且该节点平台证书产物齐全时返回；否则 None
+    （回落旧明文直推，便于灰度/未开通节点仍可 http 下发）。
+    """
+    if not settings.sim_dispatch_mtls_enabled or not node_id:
+        return None
+    if not cert_paths_ready(node_id, "platform"):
+        logger.warning("sim_dispatch_mtls_cert_missing", node_id=node_id)
+        return None
+    plat_dir = Path(settings.sim_node_certs_dir) / node_id / "platform"
+    cert = (str(plat_dir / "client-cert.pem"), str(plat_dir / "client-key.pem"))
+    ca = settings.kafka_ca_cert_path or True
+    return cert, ca
+
+
+def _carla_client_factory(base_url: str, settings: Settings, *, node_id: str = "") -> SimRuntimeBackend:
+    """默认客户端工厂：同一套子路径配置，只把基址换成节点学到的 ``http://{ip}:{port}``。
+
+    V1.24.2：``sim_dispatch_mtls_enabled`` 且节点平台证书就绪时，附带 mTLS 客户端证书回访。
+    """
+    ssl_cert: tuple[str, str] | None = None
+    ssl_ca: str | bool = True
+    material = _platform_mtls_material(node_id, settings)
+    if material is not None:
+        ssl_cert, ssl_ca = material
     return CarlaManagementClient(
         base_url,
         create_path=settings.carla_instance_create_path,
@@ -94,6 +127,8 @@ def _carla_client_factory(base_url: str, settings: Settings) -> SimRuntimeBacken
         pause_path=settings.carla_instance_pause_path,
         resume_path=settings.carla_instance_resume_path,
         stop_path=settings.carla_instance_stop_path,
+        ssl_cert=ssl_cert,
+        ssl_ca=ssl_ca,
     )
 
 
@@ -105,12 +140,12 @@ class SimNodeBackend:
         store: SimNodeStore,
         settings: Settings,
         *,
-        client_factory: Callable[[str], SimRuntimeBackend] | None = None,
+        client_factory: Callable[..., SimRuntimeBackend] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         self._client_factory = client_factory or (
-            lambda base_url: _carla_client_factory(base_url, settings)
+            lambda base_url, node_id="": _carla_client_factory(base_url, settings, node_id=node_id)
         )
         #: node_id → (base_url, client)；dict 保序 ⇒ 超上限时按插入序淘汰
         self._clients: dict[str, tuple[str, SimRuntimeBackend]] = {}
@@ -321,7 +356,7 @@ class SimNodeBackend:
                 )
                 del self._clients[endpoint.node_id]
                 await self._aclose(cached[1])
-            client = self._client_factory(endpoint.base_url)
+            client = self._client_factory(endpoint.base_url, endpoint.node_id)
             self._clients[endpoint.node_id] = (endpoint.base_url, client)
             while len(self._clients) > self._cache_max:
                 # dict 保序 ⇒ 迭代首项就是最早插入的节点（dict.popitem 不支持 last= 关键字）

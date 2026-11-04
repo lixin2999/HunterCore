@@ -38,6 +38,7 @@ from app.consumers.base import BaseIngestConsumer
 from app.consumers.carla import CarlaSensorConsumer
 from app.consumers.events import EventIngestConsumer
 from app.consumers.health import HealthIngestConsumer
+from app.consumers.simulation import SimulationNodeConsumer
 from app.consumers.telemetry import TelemetryIngestConsumer
 from app.core.error_handlers import register_exception_handlers
 from app.producers.pipeline import PipelineProducer
@@ -164,6 +165,20 @@ def _build_consumers(
                     sensor_file_producer=sensor_file_producer,
                 ),
                 CarlaSensorConsumer.group_id,
+            )
+        )
+    if config.simulation_consumer_enabled:
+        supervisors.append(
+            _SupervisedConsumer(
+                lambda: SimulationNodeConsumer(
+                    config,
+                    redis_client=redis_client,
+                    telemetry_repository=telemetry_repository,
+                    event_repository=event_repository,
+                    pipeline_producer=pipeline_producer,
+                    sensor_file_producer=sensor_file_producer,
+                ),
+                SimulationNodeConsumer.group_id,
             )
         )
     return supervisors
