@@ -199,12 +199,20 @@ async function handleDelete(row: Scene): Promise<void> {
 }
 
 /** 下发 Carla 仿真（scene:execute） */
+const runningIds = ref<Set<string>>(new Set())
+
 async function handleRun(row: Scene): Promise<void> {
+  if (runningIds.value.has(row.scene_id)) return
+  runningIds.value = new Set(runningIds.value).add(row.scene_id)
   try {
     const data = await runScene(row.scene_id, {})
     ElMessage.success(`仿真已下发（实例 ${data.sim_instance_id}，状态 ${data.status}）`)
   } catch (error) {
     ElMessage.error(error instanceof HunterApiError ? error.message : '下发失败')
+  } finally {
+    const next = new Set(runningIds.value)
+    next.delete(row.scene_id)
+    runningIds.value = next
   }
 }
 
@@ -321,7 +329,7 @@ void loadScenes()
             >
               发布
             </el-button>
-            <el-button v-permission="PERMISSIONS.sceneExecute" link type="warning" @click="handleRun(row)">下发仿真</el-button>
+            <el-button v-permission="PERMISSIONS.sceneExecute" link type="warning" :loading="runningIds.has(row.scene_id)" :disabled="runningIds.has(row.scene_id)" @click="handleRun(row)">下发仿真</el-button>
             <el-button v-permission="PERMISSIONS.sceneDelete" link type="danger" @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>

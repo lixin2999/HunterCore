@@ -7605,3 +7605,37 @@ docker exec hunter-scene python3 -c "from app.config import Settings; print(Sett
 
 - 实机回验下载接入包（含证书文件、kafka.properties、README 内容完整性）。
 
+## V1.24.5（修复：场景库“下发仿真”按钮点击后无响应——缺少 loading 状态致用户无视觉反馈）
+
+Date：2026-11-05
+变更类型：修复（前端 UX，无后端逻辑/契约/DDL 改动、向后兼容；仅需重建前端镜像）
+
+### 1. 现象与根因
+
+- **现象**：场景库列表页/详情页点击“下发仿真”按钮后，按钮无任何加载指示、无禁用状态，用户感觉“点了没反应”；等待 ~5s 后才弹出红色提示“Carla 管理 API 连接超时”。
+- **根因**：`SceneListView.vue` 和 `SceneDetailView.vue` 的 `handleRun` 函数未维护 loading 状态，按钮未绑定 `:loading` / `:disabled`。后端 `scene-service` 调用 CARLA 管理 API 超时（`CARLA_REQUEST_TIMEOUT_SECONDS=5s`）期间前端无任何反馈。
+
+### 2. 修复内容
+
+1. **SceneListView.vue**：新增 `runningIds: Set<string>` 跟踪正在下发的场景行，按钮绑定 `:loading="runningIds.has(row.scene_id)"` + `:disabled`，`finally` 中移除标记；入口处加幂等判断防重复点击。
+2. **SceneDetailView.vue**：新增 `running: boolean` 状态，按钮同样绑定 `:loading` + `:disabled`，`finally` 中恢复。
+
+### 3. 向后兼容性
+
+- 纯前端交互层改动，无 API/契约/数据结构变更，旧版后端无需配合升级。
+
+### 4. 实机执行步骤
+
+```bash
+sudo -i && cd /opt/HunterCore && git pull
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+dcompose build web-portal
+dcompose up -d --force-recreate web-portal
+# 回验：场景库列表点“下发仿真”——应立刻显示转圈并禁止重复点击，超时后显示错误提示并恢复按钮可用
+```
+
+### 5. 待办
+
+- CARLA 管理 API 连接超时本身属外部服务未部署/不可达的预期行为，非代码缺陷。
+- 实机回验前端按钮 loading 状态效果。
+

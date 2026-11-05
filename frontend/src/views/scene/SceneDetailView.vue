@@ -38,6 +38,7 @@ const userStore = useUserStore()
 const sceneId = computed<string>(() => String(route.params.scene_id ?? ''))
 const loading = ref(false)
 const saving = ref(false)
+const running = ref(false)
 const scene = ref<Scene | null>(null)
 /** 是否可编辑：状态为 draft（契约：发布后只读，修改需复制为新草稿） */
 const editable = computed<boolean>(() => scene.value?.status === 'draft')
@@ -159,11 +160,15 @@ async function handleExport(format: string): Promise<void> {
 
 /** 下发 Carla 仿真（scene:execute） */
 async function handleRun(): Promise<void> {
+  if (running.value) return
+  running.value = true
   try {
     const data = await runScene(sceneId.value, {})
     ElMessage.success(`已下发仿真：实例 ${data.sim_instance_id}（${data.status}）`)
   } catch (error) {
     ElMessage.error(error instanceof HunterApiError ? error.message : '下发失败')
+  } finally {
+    running.value = false
   }
 }
 
@@ -210,7 +215,7 @@ watch(
             >
               发布
             </el-button>
-            <el-button v-permission="PERMISSIONS.sceneExecute" type="warning" @click="handleRun">下发 Carla 仿真</el-button>
+            <el-button v-permission="PERMISSIONS.sceneExecute" type="warning" :loading="running" :disabled="running" @click="handleRun">下发 Carla 仿真</el-button>
             <el-dropdown v-permission="PERMISSIONS.sceneRead" @command="handleExport">
               <el-button>导出<el-icon><ArrowDown /></el-icon></el-button>
               <template #dropdown>
