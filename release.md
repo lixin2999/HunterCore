@@ -7639,3 +7639,51 @@ dcompose up -d --force-recreate web-portal
 - CARLA 管理 API 连接超时本身属外部服务未部署/不可达的预期行为，非代码缺陷。
 - 实机回验前端按钮 loading 状态效果。
 
+## V1.24.6（修复：下发仿真报“Carla 管理 API 不可达”——mTLS 回访未启用且 compose 缺失透传键）
+
+Date：2026-11-05
+变更类型：修复（配置透传补齐 + 部署指导，无代码逻辑改动、向后兼容；需重建 scene-service 容器）
+
+### 1. 现场与根因
+
+- **现象**：仿真端节点在线（心跳正常），点“下发仿真”报 “Carla 管理 API 不可达”（HTTP 503 + code=5001）。
+- **拓扑变化**：旧环境 NAT 路由器下平台学到的是路由器 WAN IP（192.168.31.20），回访时路由器未做 8090 端口转发导致超时。现改为直连（无 NAT），节点真实 IP 为 192.168.122.111，TCP 可达。
+- **新错误**：`curl -k https://192.168.122.111:8090/...` 报 `SSL_read: unexpected eof while reading`——TCP 已到但 TLS 握手失败。
+- **根因**：HunterSim 的 CARLA 管理 API 启用 mTLS（uvicorn 强制客户端证书），但平台侧 `SIM_DISPATCH_MTLS_ENABLED` 默认为 `false`，且该键**未预置到 compose 环境透传**（V1.24.2 待办项未落地），导致平台回访时不带客户端证书，服务端直接断开连接。
+
+### 2. 修复内容
+
+1. **compose 补齐透传键**（`infra/deploy/docker-compose.yml` scene-service 段）：新增 `SIM_DISPATCH_MTLS_ENABLED: ${SIM_DISPATCH_MTLS_ENABLED:-false}`，与其余 `SIM_*` 键对称。
+2. **K8s ConfigMap 补齐**（`infra/k8s/services/scene-service.yaml`）：同步新增 `SIM_DISPATCH_MTLS_ENABLED: "false"`。
+3. **`.env.example` 补齐**：添加键说明与默认值。
+
+### 3. 部署操作（实机生效步骤）
+
+```bash
+sudo -i && cd /opt/HunterCore && git pull
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+
+# 启用 node 模式 + mTLS
+grep -q '^SIM_DISPATCH_MODE=' .env && sed -i -E 's|^SIM_DISPATCH_MODE=.*|SIM_DISPATCH_MODE=node|' .env || echo 'SIM_DISPATCH_MODE=node' >> .env
+grep -q '^SIM_DISPATCH_MTLS_ENABLED=' .env && sed -i -E 's|^SIM_DISPATCH_MTLS_ENABLED=.*|SIM_DISPATCH_MTLS_ENABLED=true|' .env || echo 'SIM_DISPATCH_MTLS_ENABLED=true' >> .env
+
+dcompose up -d --force-recreate scene-service
+
+# 自检
+docker exec hunter-scene env | grep SIM_DISPATCH_MTLS    # 期望: true
+docker exec hunter-scene ls /app/data/sim-node-certs/sim-node-01/platform/   # 期望: client-cert.pem client-key.pem
+
+# 回验下发
+curl -m 5 -k --cert /app/data/sim-node-certs/sim-node-01/platform/client-cert.pem --key /app/data/sim-node-certs/sim-node-01/platform/client-key.pem --cacert /srv/kafka-ca/ca-cert.pem https://192.168.122.111:8090/api/v1/instances
+```
+
+### 4. 向后兼容性
+
+- 默认值仍为 `false`，未显式置 `true` 的现有部署行为不变。
+- 无代码逻辑改动，仅配置透传补齐。
+
+### 5. 待办
+
+- 实机回验 mTLS 下发全链路（证书就绪 + 节点心跳学到新 IP + 下发成功）。
+- HunterSim 侧确认已信任平台 CA（接入包内 ca-cert.pem）且允许 CN=sim-platform-sim-node-01 的客户端。
+

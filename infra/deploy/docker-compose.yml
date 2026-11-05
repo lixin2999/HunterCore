@@ -558,6 +558,9 @@ services:
       # 节点地址 CIDR 白名单（逗号分隔，空 = 不限制；唯一允许透传空串的键）
       SIM_NODE_ALLOWED_NETWORKS: ${SIM_NODE_ALLOWED_NETWORKS:-}
       SIM_NODE_CLIENT_CACHE_MAX: ${SIM_NODE_CLIENT_CACHE_MAX:-32}
+      # 下发通道 mTLS（V1.24.2）：true = 平台以 sim-platform-{node_id} 客户端证书回访节点 CARLA 管理 API
+      #   前提：节点已启用 TLS 并信任平台 CA（一键开通时已签发平台证书到 sim-node-certs/{node_id}/platform/）
+      SIM_DISPATCH_MTLS_ENABLED: ${SIM_DISPATCH_MTLS_ENABLED:-false}
       # 仿真端管理（V1.24.1：服务令牌代理 + 每节点 mTLS 证书签发）
       #   运行期需 openssl 子进程（scene-service 镜像须预装，与 vehicle-service 同策略）；
       #   CA 证书/私钥只读挂载（与 vehicle-service 共用 ./certs/kafka），ca-key 权限由 install.sh 保证 gid 可读；
