@@ -93,6 +93,9 @@ def _platform_mtls_material(
 
     仅当 ``SIM_DISPATCH_MTLS_ENABLED=true`` 且该节点平台证书产物齐全时返回；否则 None
     （回落旧明文直推，便于灰度/未开通节点仍可 http 下发）。
+
+    V1.24.7：``SIM_DISPATCH_SSL_VERIFY=false`` 时 ssl_ca 返回 False（跳过服务端证书验证），
+    适用于节点服务端证书非 Kafka CA 签发（如自签）的场景，mTLS 客户端认证仍保留。
     """
     if not settings.sim_dispatch_mtls_enabled or not node_id:
         return None
@@ -101,7 +104,11 @@ def _platform_mtls_material(
         return None
     plat_dir = Path(settings.sim_node_certs_dir) / node_id / "platform"
     cert = (str(plat_dir / "client-cert.pem"), str(plat_dir / "client-key.pem"))
-    ca = settings.kafka_ca_cert_path or True
+    if not settings.sim_dispatch_ssl_verify:
+        # 跳过服务端证书验证（节点服务端证书不由 Kafka CA 签发时使用）
+        ca: str | bool = False
+    else:
+        ca = settings.kafka_ca_cert_path or True
     return cert, ca
 
 

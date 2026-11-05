@@ -7687,3 +7687,64 @@ curl -m 5 -k --cert /app/data/sim-node-certs/sim-node-01/platform/client-cert.pe
 - 实机回验 mTLS 下发全链路（证书就绪 + 节点心跳学到新 IP + 下发成功）。
 - HunterSim 侧确认已信任平台 CA（接入包内 ca-cert.pem）且允许 CN=sim-platform-sim-node-01 的客户端。
 
+## V1.24.7（修复：mTLS 下发报“不可达”——服务端证书验证失败“unsuitable certificate purpose”）
+
+Date：2026-11-05
+变更类型：修复（新增配置键 + 客户端逻辑分支，向后兼容；需重建 scene-service 镜像）
+
+### 1. 现场与根因
+
+- **现象**：V1.24.6 启用 `SIM_DISPATCH_MTLS_ENABLED=true` 后，下发仍报 “Carla 管理 API 不可达”。
+- **取证**：
+  - 带客户端证书 + `verify=False` → **200 OK**（mTLS 客户端认证正常）
+  - 带客户端证书 + `verify=KAFKA_CA` → **SSL: CERTIFICATE_VERIFY_FAILED: unsuitable certificate purpose**
+  - 不带客户端证书 → **Broken pipe**（服务端强制 mTLS）
+- **根因**：`_platform_mtls_material` 用 `KAFKA_CA_CERT_PATH` 验证节点服务端证书，但 Kafka CA 的 EKU 仅含 `clientAuth`，不具备验证服务端证书的用途。HunterSim 的服务端证书是自签的，不在此 CA 链下。
+
+### 2. 修复内容
+
+1. **新增配置键** `SIM_DISPATCH_SSL_VERIFY`（`app/config.py`）：默认 `true`（保持现有安全行为）；置 `false` 时跳过服务端证书验证，mTLS 客户端认证仍保留、链路仍加密。
+2. **逻辑分支**（`app/repositories/sim_dispatch.py`）：`_platform_mtls_material` 根据 `sim_dispatch_ssl_verify` 决定 `ssl_ca` 为 `False` 或 CA 路径。
+3. **compose / K8s / .env.example 补齐透传**：与 `SIM_DISPATCH_MTLS_ENABLED` 对称。
+
+### 3. 向后兼容性
+
+- 默认值 `true`，现有部署行为不变。
+- 仅当节点服务端证书非 Kafka CA 签发时显式置 `false`，安全模型仍保留双向证书认证。
+
+### 4. 实机执行步骤
+
+```bash
+sudo -i && cd /opt/HunterCore && git pull
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+
+# .env 置值
+grep -q '^SIM_DISPATCH_SSL_VERIFY=' .env && \
+  sed -i -E 's|^SIM_DISPATCH_SSL_VERIFY=.*|SIM_DISPATCH_SSL_VERIFY=false|' .env || \
+  echo 'SIM_DISPATCH_SSL_VERIFY=false' >> .env
+
+# 重建镜像（代码改了）+ 重启容器
+dcompose build scene-service
+dcompose up -d --force-recreate scene-service
+
+# 自检
+docker exec hunter-scene env | grep SIM_DISPATCH_SSL_VERIFY   # 期望: false
+
+# 回验下发
+docker exec hunter-scene python3 -c "
+import httpx
+c = httpx.Client(
+    cert=('/app/data/sim-node-certs/sim-node-01/platform/client-cert.pem',
+          '/app/data/sim-node-certs/sim-node-01/platform/client-key.pem'),
+    verify=False, timeout=5)
+r = c.get('https://192.168.122.111:8090/api/v1/instances')
+print(r.status_code, r.text[:100])
+c.close()
+"
+```
+
+### 5. 待办
+
+- 实机回验下发全链路成功。
+- 后续安全加固：让 HunterSim 服务端证书由统一 CA 签发（具备 serverAuth EKU），然后回置 `SIM_DISPATCH_SSL_VERIFY=true`。
+

@@ -99,6 +99,10 @@ class Settings(HunterBaseConfig):
     # 下发通道 mTLS（V1.24.2，x-hunter-simulation-flow.node_dispatch.security）：
     # false = 旧直推（http 明文，仅供灰度/回滚）；true = 平台以 sim-platform-{node_id} 客户端证书回访节点 CARLA 管理 API
     sim_dispatch_mtls_enabled: bool = False
+    # 下发通道服务端证书验证（V1.24.7）：
+    # true（默认）= 用 KAFKA_CA_CERT_PATH 验证节点服务端证书；
+    # false = 跳过服务端验证（节点服务端证书非 Kafka CA 签发时使用，mTLS 客户端认证仍保留、链路仍加密）
+    sim_dispatch_ssl_verify: bool = True
 
     # ---------- 仿真会话 / 动态 Topic（CARLA 接入方案 P1） ----------
     # VIL 会话 Redis 契约：vil:session:{vehicle_id}（String JSON，7200s）、vil:active（Set）

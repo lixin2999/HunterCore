@@ -56,6 +56,7 @@ data:
   SIM_NODE_ALLOWED_NETWORKS: ""            # 逗号分隔 CIDR；收紧为仅办公网段时填写（空 = 不限制）
   SIM_NODE_CLIENT_CACHE_MAX: "32"
   SIM_DISPATCH_MTLS_ENABLED: "false"       # true = 平台以 sim-platform-{node_id} 客户端证书回访节点 CARLA 管理 API
+  SIM_DISPATCH_SSL_VERIFY: "true"          # false = 跳过服务端证书验证（节点服务端证书非 Kafka CA 签发时使用）
   # 运行时契约目录（KafkaAdmin 读取 topics.yaml / consumer-groups.yaml）
   KAFKA_CONTRACT_DIR: "/app/contracts/kafka"
   # 场景约束与缓存（SCENE_DETAIL_CACHE_TTL_SECONDS 与 Redis Key 契约同源 = 3600）
