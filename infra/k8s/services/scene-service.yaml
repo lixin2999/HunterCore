@@ -84,6 +84,15 @@ data:
   SCENE_EXTRACTION_DEFAULT_EGO_MODEL: "HUNTER_SE"
   SCENE_EXTRACTION_MIN_SAFE_DISTANCE: "1"
   SCENE_EXTRACTION_MAX_SPEED_DEVIATION: "1"
+  # 仿真端管理（V1.24.1/2：证书签发 + 接入包 + 一键开通）
+  SIM_NODE_CERTS_DIR: "/app/data/sim-node-certs"
+  SIM_NODE_CERT_VALIDITY_DAYS: "3650"
+  SIM_NODE_CERT_SIGNER_TIMEOUT_SECONDS: "15"
+  APIGATEWAY_INTERNAL_URL: "http://api-gateway:8080"
+  KAFKA_CA_CERT_PATH: "/srv/kafka-ca/ca-cert.pem"
+  KAFKA_CA_KEY_PATH: "/srv/kafka-ca/ca-key.pem"
+  # 接入包 README 组装注册 URL（由环境 overlay 注入真实 IP）
+  SERVER_IP: ""
 ---
 apiVersion: apps/v1
 kind: Deployment

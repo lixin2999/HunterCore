@@ -7552,3 +7552,56 @@ docker exec hunter-scene python3 -c "from app.repositories.sim_node_registry imp
 
 > 存量已开通节点无需数据迁移：DB 行本就在，重建后自动以离线态出现。**未执行=未验证**（纪律：未跑通不写已修复）；实跑通过后在 V1.24.2 §4.1 或本版本追加“实机回验记录”。
 
+### 5. 实机回验记录（2026-11-04，部署机 hunter-core-server；**已验证通过**）
+
+| 项 | 实机证据 |
+|---|---|
+| 代码入镜像 | 提交/推送后部署机 `git pull` → `dcompose build scene-service` 真实重编（`COPY app/` 执行、`pip install` 129.8s，不再全 `CACHED`）→ `up -d --force-recreate`；容器内 `list_all in dir(SimNodeRegistryStore)` = **True** |
+| 列表并入 DB-only 行 | 「仿真端管理」切「全部」⇒ 已开通未自注册的 `sim-node-01`（展示名 Carla01）**以离线态出现**：在线 0 / 离线 1 / 共 1 个节点，证书列「已签发（Kafka:已签发）」⇒ `online_only=False` 合并逻辑实跑生效 |
+
+⇒ V1.24.3 从“代码落地”升级为“**实机验证通过**”。（并发发现：同页可见节点行后，节点侧 `huntersim connect` 下载接入包报 `401/code=1001`——经诊断为**接入包下载端点鉴权/凭据选型问题**，非代码缺陷，见 §6。）
+
+### 6. 接入包下载 401 诊断与文档纠正（非代码缺陷）
+
+- **现象**：节点侧 `huntersim connect` 调 `GET /sim-nodes/{node_id}/bundle` 返回 `401 / code=1001 未认证`。
+- **根因（行为符合权限模型、非 bug）**：bundle 端点挂 `require_execute_permission`（`scene_execute_roles=admin,operator`）；身份只来自网关注入的 `X-User-Id`/`X-Roles`，**缺头→1001、身份在但角色不足→1002**。节点服务令牌默认角色 `data-uploader` 本就无权下载（即便过了认证也会 1002）；且包内含 Kafka 客户端私钥，属敏感物，设计上就是**管理员动作**（后台页「下载接入包」按钮）。
+- **处置（仅改文档，本轮未改代码）**：纠正 `docs/HunterSim接入清单.md` §1.5“三步接入（仿真机侧）”——旧措辞将“下 bundle”列为节点侧动作易误导；现明确为“**管理员下载并转交**（ZIP + 一次性 SCRAM 口令）→ 仿真机只做配置→ 注册/心跳才用节点服务令牌”；同步修正§1 速查表行 0′ 与 §9 验收清单同形描述。另连带订正本文 5 处过时状态措辞（行 16/63/214/253/262）：“`contract_defined`/后端代码待实现/契约就绪” → “V1.24.2 契约+代码已落地、V1.24.3 列表修复；一键开通主链路与列表并入已实机验证，mTLS 握手/回传落库/回滚/轮换/下线仍单元·fake”，与本文实态一致。
+- **待拍板（未实现，仅登记）**：若产品确实要“节点一条命令自取接入包”，需为 bundle 新增节点身份可访问的路径（放宽至 `sim_node_roles` 或新增自助端点）——属权限模型变更，需安全评审，本轮不擅改。
+
+## V1.24.4（修复：仿真端管理“下载接入包”报 500——scene-service 缺失 `server_ip` 配置字段致 `AttributeError`）
+
+Date：2026-11-05
+变更类型：修复（纯配置补全，无契约/DDL/逻辑改动、向后兼容；**需重建 scene-service 镜像并重启容器**）
+
+### 1. 现象与根因
+
+- 现象：后台「仿真端管理」列表行内点击“下载接入包”，前端报错 `Request failed with status code 500`。
+- 根因：`app/services/sim_nodes.py` 第 687 行 `_build_readme` 引用 `self._settings.server_ip`，但 `server_ip` 字段仅在 vehicle-service 的 `Settings` 中声明，scene-service 的 `Settings` 未定义该字段。Pydantic v2 访问未声明属性抛 `AttributeError`，未被全局异常处理器捕获为业务错误码，直接返回 HTTP 500。
+
+### 2. 修复项
+
+1. **补全配置字段**（`services/scene-service/app/config.py`）：新增 `server_ip: str | None = None`，与 vehicle-service 同源语义（平台对外可达 IP，接入包 README 组装注册 URL 用；未配置时回落到占位符 `<平台 IP>`）。
+2. **compose 环境变量透传**（`infra/deploy/docker-compose.yml` scene-service 段）：新增 `SERVER_IP: ${SERVER_IP:-}`，复用 `.env` 中已有的全局 `SERVER_IP` 变量。
+3. **K8s ConfigMap 补全**（`infra/k8s/services/scene-service.yaml`）：补充 `SERVER_IP: ""` 及仿真端管理相关的缺失配置项（`SIM_NODE_CERTS_DIR`、`KAFKA_CA_CERT_PATH`、`KAFKA_CA_KEY_PATH`、`APIGATEWAY_INTERNAL_URL`）。
+
+### 3. 验证
+
+- scene-service 全量 **384 passed**，无新增失败。
+- 本地实测 `Settings().server_ip` 返回 `None`，`_build_readme` 不再抛异常。
+
+### 4. 实机执行步骤
+
+```bash
+sudo -i && cd /opt/HunterCore && git pull
+dcompose() { docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env "$@"; }
+dcompose build scene-service
+dcompose up -d --force-recreate scene-service
+# 自检：容器内确认字段存在
+docker exec hunter-scene python3 -c "from app.config import Settings; print(Settings().server_ip)"
+# 前端回验：「仿真端管理」→ 已签发证书的节点行 → 点击“下载接入包”→ 应正常下载 ZIP
+```
+
+### 5. 待办
+
+- 实机回验下载接入包（含证书文件、kafka.properties、README 内容完整性）。
+

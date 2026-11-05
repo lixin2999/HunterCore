@@ -82,6 +82,8 @@ class Settings(HunterBaseConfig):
     # CA 证书与私钥路径（与 vehicle-service 使用同一套 Kafka CA；只读挂载）
     kafka_ca_cert_path: str = "/certs/ca-cert.pem"
     kafka_ca_key_path: str = "/certs/ca-key.pem"
+    # 平台对外可达 IP/域名（接入包 README 中组装注册 URL 用；None → 占位符）
+    server_ip: str | None = None
 
     # ---------- 仿真端一键开通（V1.24.2：DB→SCRAM→Topics→Cert 四步编排，对齐车辆 provisioning） ----------
     # 总开关：false 时 POST /sim-nodes 一键开通端点返回 5001（保留逐项签发/管理端点不受影响）

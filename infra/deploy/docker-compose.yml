@@ -569,6 +569,8 @@ services:
       APIGATEWAY_INTERNAL_URL: ${APIGATEWAY_INTERNAL_URL:-http://api-gateway:8080}
       KAFKA_CA_CERT_PATH: /srv/kafka-ca/ca-cert.pem
       KAFKA_CA_KEY_PATH: /srv/kafka-ca/ca-key.pem
+      # 接入包 README 组装注册 URL 用（与 vehicle-service 同源）
+      SERVER_IP: ${SERVER_IP:-}
     ports:
       - "127.0.0.1:${SCENE_SERVICE_PORT:-8081}:8081"
     volumes:
