@@ -7880,6 +7880,7 @@ python3 scripts/batch_add_scenes.py --dry-run   # 期望：[spawn] 自车出生�
 - **存量 (0,0,0) 场景**：需重新批量生成或在详情页修正坐标，否则下发即被挡；数量以 §8 ④ 的读数为准。
 - **问题 2「画面只见路面」＝ 相机挂载位置**：根因判定在 **HunterSim 侧**（`hunter_se` 资产缺失时回退全尺寸蓝图、而相机偏移仍按固定 0.40/0.30m 计算，镜头埋进车身；`sensor_configs.json` 的 mounts/pitch 为未生效的死配置），本轮按确认范围「只改 HunterCore 平台侧」**未改动、未在实机确诊**，需另行授权后按蓝图动态尺寸换算 + 配置驱动处理。**本条目不代表问题 2 已修复。**
   - 更新（V1.24.9）：平台侧已先交付缓解能力（下发载荷附 `sensor_mount_reference` 实机尺寸），但挂载点换算与消费仍在 HunterSim 侧，本待办依旧未闭环。
+  - 更新（V1.24.9 补）：已按「不修改 HunterSim」的决策给出仿真端实现方案 `docs/HunterSim传感器挂载换算方案.md`；方案不等于实现，本待办仍未闭环。
 
 ## V1.24.9（新增能力：下发附车辆蓝图几何参考 `sensor_mount_reference`——问题 2「仿真画面只见路面」的平台侧缓解）
 
@@ -7912,6 +7913,7 @@ Date：2026-11-06
 6. **不阻断原则**：表缺失、未校准、非法或未命中车型时，参考块只写 `status`（`table_uncalibrated` / `blueprint_unmatched` / `table_unavailable`）与提示、**不携带任何数字**，且不影响下发成功与否。
 7. **解析强约束**（防止表被填成半截数据）：`calibrated=true` 必须有蓝图；`extent` 必须为正有限数值；`model_to_blueprint` 指向未登记尺寸的蓝图→加载即报错；`mount_policy` 只接受 `derive_from_blueprint_bounding_box`。
 8. **契约固化**（`contracts/openapi/scene-service.yaml`）：新增 `x-hunter-simulation-flow.camera_mount_reference`（问题归属 / 数据权威 / 字段语义 / 四种状态 / 非阻断 / 尚需仿真端消费的 remaining_work）；`x-hunter-service.required_env` 补新配置键。
+9. **仿真端交付方案**（新增 `docs/HunterSim传感器挂载换算方案.md`，279 行）：按用户决策「不修改 HunterSim、只给方案」输出给仿真端的可照此实现文档——§3 锚点±余量换算规则与旧写死值的等价迁移、§4 改造清单（含 `ref.blueprint ≠ vehicle.type_id` 时以本地实测为准的回退分支）、§6 三种非 `resolved` 状态的降级策略、§7 实机自检脚本、§8 七条验收判据、§9 分工边界表。契约 `camera_mount_reference.handoff_doc` 已指向该文档。**方案≠实现**：问题 2 仍未闭环。
 
 ### 4. 为何不给具体挂载坐标
 
@@ -7981,6 +7983,7 @@ docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry impo
 ### 10. 待办
 
 - **HunterSim 侧消费未实现（问题 2 的真正修复点）**：需仿真端把相机挂载从写死 0.40/0.30m 改为按 `sensor_mount_reference.envelope_m` 换算（如车顶前视 ≈ `roof_z_m` + 相机本体高、前向 ≈ `front_edge_x_m` - 余量），并处理 `sensor_configs.json` 的 mounts/pitch 死配置。**本条目不代表问题 2 已修复。**
+  - 更新（本轮）：已按「不修改 HunterSim」的决策交付**可照此实现**的方案文档 `docs/HunterSim传感器挂载换算方案.md`（换算规则 / 改造清单 / 降级策略 / 自检脚本 / 验收判据 / 分工边界），并写入契约 `camera_mount_reference.handoff_doc`。**实现仍未开始，本待办未闭环**；该文档中的公式与默认余量均为**待实机标定的初值**（尤其 §10 列出的「参考原点同一假设」与 Y 轴左右朝向，未在真机 CARLA 上验过）。
 - **几何表未校准**：出厂为骨架，需实机执行 §8 ①；未校准前参考块只会报 `table_uncalibrated`。
 - **导出脚本未实机验证**：`get_dimension()` / `get_bounding_box()` 的轴定义按 CARLA 文档假设 x=车长、y=车宽、z=车高，首次实机采集后需人工核对量级是否与真车一致。
 - **未确诊**：本条目对问题 2 根因的描述基于日志与截图推断，未读 HunterSim 源码；若实机发现另有成因（如相机 FOV/渲染通道问题），需新开条目修正而不宜追溯修改本条目。
