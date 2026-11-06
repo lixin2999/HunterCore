@@ -341,8 +341,8 @@ async def test_run_scene_attaches_uncalibrated_reference_by_default(
     reference = scene_env.carla.created[0]["scene_config"][SENSOR_MOUNT_REFERENCE_KEY]
     assert reference["status"] == STATUS_TABLE_UNCALIBRATED, "出厂骨架即未校准状态"
     assert "dimension_m" not in reference
-    # 不影响任何既有字段
-    assert scene_env.carla.created[0]["scene_config"]["spawn_semantics"] == "absolute"
+    # 不影响任何既有字段（V1.25.0：出生点原样下发，参与者偏移不折算）
+    assert scene_env.carla.created[0]["scene_config"]["spawn_semantics"] == "relative_to_ego"
     assert scene_env.carla.created[0]["scene_config"]["map"]["spawn_point"]["x"] == pytest.approx(
         120.5
     )

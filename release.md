@@ -8156,6 +8156,8 @@ ModuleNotFoundError: No module named 'app.scene_engine.vehicle_geometry'
 | ③ **非代码缺陷** | 报错是 `No module named 'app.scene_engine.spawn_points'` 而**不是** `No module named 'app.scene_engine'` ⇒ 包能 import、只是包内缺这两个 `.py`。仓内 `services/scene-service/app/scene_engine/` 确有 `spawn_points.py`（V1.24.8）与 `vehicle_geometry.py`（V1.24.9），而 `scene_engine` 其余模块早在 10-23 已有 ⇒ 在跑的镜像构建于**两者加入之前** | `dir services/scene-service/app/scene_engine` + 报错文本形态 |
 | ③ 处置 | 重建 `scene-service` 镜像（§7 ①）。与 config 内容、挂载、`SCENE_*_PATH`、宿主/镜像 Python 版本**都无关** | — |
 
+> ⚠ **根因更正（见 V1.25.0 §2）**：本条目原推断“旧 wheel（0.9.10 前）才叫 `set_timeout`”——**实机读数已推翻**：本地 wheel = **0.9.16** 也只有 `set_timeout`、无 `set_client_timeout`。因此“旧 wheel”不是成因；且取到本节修复后采集仍会在 `get_world()` 后因客户端与 dev build 服务器（`server: 35e2d5a`）版本不一致而 `std::bad_alloc` native abort。本节的接口自适应修复本身仍有效（使脚本能跑到连接阶段），但“拿到 `calibrated=True`”在此环境结构性不可行——这正是 V1.25.0 删除平台侧出生点采集、把职责交给仿真端的直接依据。出生点相关部分（provider/表/采集脚本/`SCENE_CARLA_SPAWN_POINTS_PATH`）已在 V1.25.0 整体删除。
+
 ### 3. 修复内容
 
 1. **超时接口版本自适应**（两个脚本）：`_TIMEOUT_SETTERS = ("set_client_timeout", "set_timeout")` + `_apply_client_timeout(client, seconds)` 逐个 `getattr` 尝试，先传 `float`、抛 `TypeError` 再传 `timedelta`（覆盖只收时长对象的构建）；两者都缺返回空串并打 `[warn]`，**不阻断采集**。
@@ -8247,6 +8249,96 @@ docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry impo
 - **问题 2（画面只见路面）仍未修复**：⚠ **本条目不代表问题 2 已修复**（同 V1.24.9 §10 口径）。挂载点换算与消费在 HunterSim 侧，平台只交付依据与方案文档（`docs/HunterSim传感器挂载换算方案.md`），HunterSim 未改动，`status=resolved` 不等于画面已恢复。
 - **两个既有 L5 缺陷未修**（scene-service 25 个端点不在 `contracts/openapi/scene-service.yaml`；ota-service `/readyz` 多报 `minio`），需单开条目处理。
 - **`docs/` 不入库与「四件套同步」惯例相冲**：运维/排障文档到不了部署机，需判定是改为纳入版本控制（V0.1.1 §5 曾声称要入库）还是在交付方式上另立约定。
+
+## V1.25.0（架构反转：出生点职责由平台侧迁回仿真端）
+
+Date：2026-11-06
+变更类型：功能移除 / 架构调整（**行为反转**，故次版本号递增而非补丁号）
+
+### 1. 现场
+
+V1.24.8~V1.24.11 在平台侧建立了整套「地图可用出生点」能力（实机表 provider、G3 有效性校验、下发前拦原点返 2001、相对→绝对折算），并交付了两个宿主机采集脚本。部署机连续四轮都跑不出 `calibrated=True`。用户基于实机读数下达三条决策：
+
+1. **去掉 HunterCore 获取/维护每个地图可用点的功能**（太繁琐复杂），HunterCore 仍按原来的场景设置下发仿真（出生点写死原点也照发）；**由 HunterSim 做出生点校验**，按下发场景取有效出生坐标替换掉原点 (0,0,0)。
+2. 事实告知：**自车模型 HUNTER_SE 尚未导入 CARLA 资产蓝图库**，huntersim 上运行的 CARLA 没有 HUNTER_SE 的实车蓝图 ID。
+3. **修正完善 HunterSim 侧传感器挂载换算方案**，加入「按下发场景取有效出生坐标替换原点 (0,0,0)」的功能。
+
+### 2. 根因（含对 V1.24.11 根因的更正）
+
+- **有效车道坐标只能由实机 `world.get_map().get_spawn_points()` 得到**，平台无从凭空生成、也不得编造。而 CARLA 客户端 wheel 与服务器**必须同版本**才能正确取到 spawn points。
+- ⚠ **更正 V1.24.11 的根因推断**：当时写「旧 wheel（0.9.10 前）才叫 `set_timeout`，故那是旧 wheel」——**实机读数推翻**：本地 wheel = **0.9.16** 也只有 `set_timeout`、无 `set_client_timeout`。V1.24.11 的修复（两个名字都试 + 接口预检）本身有效，脚本因此能跑到连接阶段；但根因描述按本条为准（V1.24.11 §2 同步更正指针见故障排查指南 §19.11）。
+- **采集在真实环境根本跑不通**：部署环境服务器版本号为 `35e2d5a`（git commit hash ⇒ 源码编译的 dev build，非发布版）；0.9.16 客户端连它会先打 `WARNING: Version mismatch detected`，随即在 C++ 层 `terminate called after throwing an instance of 'std::bad_alloc'` / 核心已转储（native abort，Python 层无法捕获）。属环境结构性问题，非代码可修——这正是把职责交给仿真端的直接依据。
+- **几何表当前环境同样采不出**：HUNTER_SE 无蓝图 ⇒ `blueprint_unmatched`；dev build ⇒ 采集 native abort、表保持 `calibrated=false` ⇒ `table_uncalibrated`。二者在当前环境是**常态**，`sensor_mount_reference` 基本不会是 `resolved`，HunterSim 侧 `local_envelope()` 本地实测成为主路径。
+
+### 3. 变更内容（平台侧）
+
+**删除**：
+1. `services/scene-service/app/scene_engine/spawn_points.py`（出生点表 provider，397 行）。
+2. `services/scene-service/config/carla_spawn_points.json`（出厂空骨架）。
+3. `scripts/collect_carla_spawn_points.py`（出生点采集脚本）。
+4. `services/scene-service/app/tests/test_spawn_points.py`（29 例单测）。
+5. 配置项 `SCENE_CARLA_SPAWN_POINTS_PATH`（`app/config.py`）与两套编排、`.env.example`、K8s ConfigMap 的对应注入。
+
+**改造**：
+6. **下发链路**（`services/simulation.py`）：`_ensure_dispatchable_spawn`（拦原点 2001 + 折算）→ 新 `_dispatch_payload`，改为**场景存量值原样下发** + 打 `spawn_semantics=relative_to_ego` 标记（常量 `SPAWN_SEMANTICS_RELATIVE`）；不再调 `to_absolute_spawn_offsets`、不再拦原点。
+7. **校验门 G3**（`validators.py`）：删 `run_gates` 的 `spawn_table` 形参与 `_resolve_spawn_table`/`_spawn_point_problem`/`_coord`；G3 只校「地图非空 + 白名单 + 生成点数值有限 + `_out_of_bounds` 几何围栏（按 base+offset）」，不再判定有效车道坐标。`_out_of_bounds` 保留——它正是相对语义的体现。
+8. **生成器**（`generator.py`）：删 `spawn_table`/`_resolve_spawn_table`/`_assign_ego_spawn_point` 及 `run_gates(spawn_table=…)` 调用；`compiler.py`、`schemas/scene.py` 同步去出生点表引用。
+9. **批量脚本**（`scripts/batch_add_scenes.py`）：map 段回到 V1.24.8 之前写法 `spawn_point=_spawn(0.0, 0.0, 0.0, lane_id="lane-1")`；删 `load_spawn_table`/`check_spawn_points`/`_ego_spawn_point`、原点 ValueError、前置退出码 2。
+10. **契约**（`contracts/openapi/scene-service.yaml`）：`SpawnPoint` 描述、run 端点 2001 文案、`x-hunter-scene-config-contract.spawn_point_semantics`、`x-hunter-simulation-flow.spawn_point_dispatch` 全部改为「平台原样下发 + 仿真端替换」，环境键列表删 `SCENE_CARLA_SPAWN_POINTS_PATH`。
+11. **前端**（`SceneListView.vue` / `SceneDetailView.vue`）：出生点提示改为「可留占位原点、平台不再拦、由仿真端替换」口径。
+12. **几何表相关（`vehicle_geometry.py`、`collect_carla_vehicle_geometry.py`）保留**，但如实写明当前环境采不出、HUNTER_SE 无蓝图 ⇒ HunterSim 本地实测为主路径。
+
+**文档（主交付物，用户 item 3）**：
+13. **重写 `docs/HunterSim传感器挂载换算方案.md`** 为两部分：**第一部分（V1.25.0 新增职责）出生点有效坐标替换**——为何只能在仿真端、下发载荷语义（`relative_to_ego`）、替换算法（丢弃原点退化点 + 按 `scene_key` 稳定散列选取以可复现 + 同批分散 + 非 carla_town 不替换 + 日志留痕）、参与者偏移叠加（先替换自车、再 base+offset、yaw 相加归一 [-π,π]）、S1–S6 判据；**第二部分（V1.24.9）挂载换算**——修掉 §7 自检脚本里 `set_client_timeout`（0.9.16 只有 `set_timeout`，改为按存在性择一）、写明 `blueprint_unmatched`/`table_uncalibrated` 是当前常态 ⇒ `local_envelope()` 为主路径、更新判定表与分工表。
+
+### 4. 向后兼容
+
+- **线上数据零变化**：历史场景中占位基准本就是 (0,0,0) 时，`base + offset` 与旧折算数值完全一致。
+- ⚠ **要求仿真端补上这次加法**：`actors[].spawn_point` 语义从「平台折算好的绝对坐标（`spawn_semantics=absolute`）」变回「相对自车的偏移（`relative_to_ego`）」。若仿真端仍按旧口径不叠加，参与者会挤在原点附近。
+- **API/载荷结构不破坏**：`spawn_semantics` 与 `sensor_mount_reference` 均为纯附加字段，旧版 HunterSim 忽略即可；出生点字段的 JSON 结构未变。
+- 删除 `SCENE_CARLA_SPAWN_POINTS_PATH` 后，仍配置该键的部署不受影响（不再被读取），但应清理。
+
+### 5. 风险
+
+- ⚠ **黑屏会回归**：V1.25.0 移除下发前 2001 拦截后**平台侧已无兜底**。仿真端实现原点替换前，占位原点场景会重新黑屏（旧 V1.24.8 拦截掩盖了这一情形）。这是把职责交给仿真端的**已知代价**，必须在 HunterSim 第一部分落地后才能闭环问题 1。
+- **参与者叠加不可省**：读到 `relative_to_ego` 却不叠 base+offset ⇒ 参与者全挤在原点附近。
+- **问题 2 仍未修复**：⚠ 本条目不代表问题 2 已闭环。挂载点换算与出生点替换均在 HunterSim 侧，本仓库不代写仿真端代码。
+
+### 6. 验证（本地门禁实跑）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 新契约用例 | `pytest services/scene-service/app/tests/test_spawn_point_relative.py` | **8 passed**（原点不拦、相对偏移原样下发、`spawn_semantics=relative_to_ego`、G3 不再提实机表、已删文件不再存在） |
+| scene-service 全量 | `pytest services/scene-service` | **425 passed** |
+| 宿主机脚本兼容 | `pytest tests/test_carla_collectors_api_compat.py tests/test_host_scripts_compat.py` | collectors **7 passed** + host **10 passed**（均已去除出生点脚本部分） |
+| ruff | `ruff check scripts tests services/scene-service` | **All checks passed** |
+
+> 本地门禁只证明**平台侧不再依赖出生点表**，**不能证明仿真端已实现替换**——那需 HunterSim 侧按方案第一部分实机回验。
+
+### 7. 实机执行（部署机）
+
+- `git pull` 取回平台侧变更。
+- **重建 `scene-service` 与 `web-portal`**：`docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env build scene-service web-portal` 后 `up -d --force-recreate scene-service web-portal`。
+- 复核出生点已回到「原样下发」：对一个 `map.spawn_point=(0,0,0)` 的 `carla_town` 已发布场景执行 `POST /api/v1/scene/{scene_id}/run`，期望 **200**（不再 2001），载荷 `spawn_semantics=relative_to_ego`。
+- ⚠ 画面仍黑属预期：需 HunterSim 侧实现第一部分后才不再黑屏。
+
+### 8. 分发
+
+- 代码变更（入库）：删 4 个文件；改 `simulation.py`/`validators.py`/`generator.py`/`compiler.py`/`config.py`/`schemas/scene.py`/`fakes.py`/`test_vehicle_geometry.py`/`batch_add_scenes.py`/`collect_carla_vehicle_geometry.py`；改契约与两套编排/`.env.example`/K8s ConfigMap；改前端两个视图；新增 `test_spawn_point_relative.py`。
+- **`scene-service` 与 `web-portal` 必须重建镜像**。
+- `docs/` 仍为**忽略项**：四件套与 HunterSim 方案文档的更新**不会随 `git pull` 到达部署机**；部署机以本条目（`release.md` 入库）为依据，`docs/HunterSim传感器挂载换算方案.md` 需单独交给仿真端。
+
+### 9. 回滚
+
+- `git revert` 本轮提交即恢复 V1.24.11 的平台侧出生点表方案。但回滚**不会让实机采集跑通**（native abort 属环境结构性），也不会解决黑屏（那始终取决于仿真端）。
+
+### 10. 待办
+
+- **HunterSim 侧实现（问题 1 唯一闭环路径）**：按 `docs/HunterSim传感器挂载换算方案.md` 第一部分实现出生点替换与参与者叠加；本仓库不代写。
+- **HUNTER_SE 蓝图入库**：需将自车模型导入 CARLA 资产库并拿到实车蓝图 ID，之后几何表才可能 `resolved`；否则挂载换算长期依赖本地实测回退蓝图。
+- **问题 2 仍未修复**：`status=resolved` 不等于画面已恢复；消费与换算均在仿真端。
+- **两个既有 L5 缺陷未修**（scene-service 25 端点不在契约；ota-service `/readyz` 多报 minio），需单开条目。
+- **`docs/` 不入库与「四件套同步」惯例相冲**（延续 V1.24.11 §10）：仍未解决。
 
 
 

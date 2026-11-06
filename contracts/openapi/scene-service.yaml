@@ -19,6 +19,8 @@
 #      GET /api/v1/scene/simulations/{sim_instance_id}（进度）与 …/result（结果）查询端点，
 #      服务端无状态代理 Carla 管理 API；设计文档 12.2 节清单同步登记见 x-hunter-endpoints
 #   3) spawn_point / actor.behavior / event.trigger / event.action 内部结构未定义
+#      （spawn_point 已定稿：坐标语义见 x-hunter-scene-config-contract.spawn_point_semantics，
+#       有效性校验与占位原点替换属仿真端职责，见 x-hunter-simulation-flow.spawn_point_dispatch）
 #   4) scenes.status 含 archived，但 12.2 节无归档端点（本契约不新增）
 #   5) 场景导出返回形式（直接返回 XML 文本 / MinIO 预签名 URL）未定义；本契约按
 #      MinIO hunter-scene-assets + 预签名下载（15 分钟）
@@ -429,8 +431,10 @@ paths:
         - Carla 管理 API 不可达/超时返回 5001（依赖服务不可用）
         - 同一场景已有 `running` 实例时按 `sim_config.allow_parallel` 决定复用或 3003
         - 参数覆盖（`param_overrides`）仅覆盖 4.2.2 白名单路径，禁止新增结构字段
-        - 自车生成点落在地图原点（`map_type=carla_town`）时返回 2001：此类场景在仿真端
-          只会黑屏或只见路面，不得启动无效实例（口径见 `x-hunter-simulation-flow.spawn_point_dispatch`）
+        - 自车出生点按场景存量值**原样下发**（V1.25.0）：平台不再拦截落在地图原点的出生点
+          （旧口径：此类下发返 2001）。有效出生坐标只能由实机 CARLA 查询得到，因此坐标
+          有效性校验与占位原点替换属仿真端（HunterSim）职责；载荷只声明
+          `spawn_semantics: relative_to_ego`（口径见 `x-hunter-simulation-flow.spawn_point_dispatch`）
 
         下发链路（`SIM_DISPATCH_MODE`，见 `x-hunter-simulation-flow.node_dispatch`）：
         - `direct`（默认）：固定地址 `CARLA_MANAGEMENT_ENDPOINT`；
@@ -1427,20 +1431,18 @@ components:
         生成点（自车/参与者）。⚠ 4.2.2 节仅给出 `spawn_point` 字段名，未定义内部结构；
         本契约按 Carla transform 语义定义（位置 m + 朝向 rad），需人工确认。
 
-        **坐标语义（V1.24.8 确立，两套语义不可混淆）**：
-        - `map.spawn_point`：自车在地图坐标系下的**绝对**出生点，必须是目标地图上的**有效车道坐标**；
+        **坐标语义（V1.25.0 口径，两套语义不可混淆）**：
+        - `map.spawn_point`：自车出生点。目录模板与批量生成一律写**占位原点 (0,0,0)**，
+          它不是“待仿真消费的绝对坐标”；有效车道坐标由仿真端在下发后按地图取得并替换；
         - `actors[].spawn_point`：参与者**相对 `map.spawn_point` 的偏移**（x/y 米、yaw 弧度）；
-        - 下发仿真端时由服务端统一把参与者偏移折算为绝对坐标，并在载荷根节点打
-          `spawn_semantics: absolute` 标记（详见 x-hunter-scene-config-contract.spawn_point_semantics）。
+          平台不折算、不改写，仿真端替换自车基准后**必须把该偏移叠加到新基准**；
+        - 下发载荷根节点附 `spawn_semantics: relative_to_ego` 标记（口径详见
+          x-hunter-scene-config-contract.spawn_point_semantics）。
 
-        **有效值约束（不写入 JSON Schema 的 numeric 范围，由服务端执行）**：
-        `map_type=carla_town` 时，`map.spawn_point` 的 (x, y) 不得落在地图原点
-        （|x| ≤ `origin_tolerance_m` 且 |y| ≤ `origin_tolerance_m`）：Carla 内置城镇的世界原点
-        普遍不在路面上，自车落此会导致仿真端黑屏或画面只有路面。坐标必须取自实机出生点表
-        （`services/scene-service/config/carla_spawn_points.json`，由
-        `scripts/collect_carla_spawn_points.py` 从实机 `world.get_map().get_spawn_points()` 导出）。
-        执行位置：下发前置检查无条件拦原点（2001）；校验门 G3 在表已校准时拦原点与未命中坐标，
-        表未校准时仅在闸门说明里标记风险（避免未接实机的部署生成链路整体失效）。
+        **有效性由谁保证**：有效车道坐标只能由实机 `world.get_map().get_spawn_points()` 得到，
+        平台侧无法维护（CARLA 客户端与服务器必须同版本，而部署环境的服务器为源码编译的
+        dev build），因此自 V1.25.0 起平台不再维护出生点表、不再在 G3 判定有效性、
+        不再在下发前拦截原点。替换算法与验收判据见 `docs/HunterSim传感器挂载换算方案.md` 第二部分。
       required: [x, y, yaw]
       properties:
         x: { type: number, description: "X 坐标（m）" }
@@ -2475,9 +2477,8 @@ x-hunter-service:
     - SCENE_DUPLICATE_NAME_SUFFIX
     - SCENE_DUPLICATE_MAX_ATTEMPTS
     - SCENE_DEFAULT_VERSION
-    # ---------- CARLA 自车出生点表（V1.24.8，口径见 x-hunter-scene-config-contract.spawn_point_semantics） ----------
-    - SCENE_CARLA_SPAWN_POINTS_PATH         # 空 = 镜像内置 config/carla_spawn_points.json；表由 scripts/collect_carla_spawn_points.py 导出
     # ---------- CARLA 车辆蓝图几何表（V1.24.9，口径见 x-hunter-simulation-flow.camera_mount_reference） ----------
+    # V1.25.0：已删除 SCENE_CARLA_SPAWN_POINTS_PATH（平台不再维护地图可用出生点）
     - SCENE_CARLA_VEHICLE_GEOMETRY_PATH     # 空 = 镜像内置 config/carla_vehicle_geometry.json；表由 scripts/collect_carla_vehicle_geometry.py 导出
     # ---------- RBAC（资源域 scene：create/read/update/delete/execute） ----------
     - SCENE_READ_ROLES
@@ -2649,13 +2650,13 @@ x-hunter-scene-config-contract:
     simulation_fields: "scene_svc.scenes.config_json (JSONB，GIN 索引 idx_scenes_config_json)"
   required_all: true          # 上述字段全部必填（actors/events 允许空数组）
   spawn_point_semantics:
-    status: "已固化（V1.24.8）；原待确认项 #3 中的 spawn_point 部分"
-    stored: "map.spawn_point = 自车绝对坐标；actors[].spawn_point = 相对 map.spawn_point 的偏移"
-    dispatched: "下发载荷中 actors[].spawn_point 已折算为绝对坐标，根节点附 spawn_semantics=absolute"
-    dispatch_transform: "x/y/z += base.xyz；yaw = wrap(base.yaw + offset.yaw) 到 [-pi, pi]"
-    origin_guard: "map_type=carla_town 且自车生成点落在原点：POST /api/v1/scene/{scene_id}/run 直接 2001 挡下、不允许下发；表已校准时校验门 G3 同步拦下"
-    authority: "有效车道坐标唯一来源为实机出生点表（config/carla_spawn_points.json），平台不猜测坐标"
-    consumer_note: "仿真端若已实现基准叠加（相对语义），必须按 spawn_semantics=absolute 跳过，避免二次相加"
+    status: "已固化（V1.25.0 反转职责；原待确认项 #3 中的 spawn_point 部分）"
+    stored: "map.spawn_point = 自车出生点（目录模板为占位原点 (0,0,0)）；actors[].spawn_point = 相对 map.spawn_point 的偏移"
+    dispatched: "下发载荷原样保留上述两组值，根节点附 spawn_semantics=relative_to_ego（不做任何折算）"
+    consumer_transform: "仿真端：先按地图取有效出生坐标替换自车基准，再对每个参与者 x/y/z 叠加偏移、yaw 相加后归一到 [-pi, pi]"
+    validity_owner: "有效车道坐标的校验与替换由仿真端（HunterSim）承担；平台不维护出生点表"
+    origin_guard: "无（V1.24.8~V1.24.10 曾拦原点返 2001，V1.25.0 推翻）"
+    consumer_note: "若仿真端尚未实现替换，自车仍会落在世界原点（黑屏风险）；该风险属仿真端未实现，不属平台缺陷"
 
 x-hunter-lifecycle:
   source: "contracts/database/enums.md 第 6 节（scenes.status）+ 设计文档 12.2 节"
@@ -2716,19 +2717,22 @@ x-hunter-simulation-flow:
     - {message: "Carla 管理 API 不可达", cause: "传输层错误（DNS 不可解析 / 连接被拒）", retryable_by_config: "修地址与网络"}
     - {message: "Carla 管理 API 返回 <code>", cause: "连得通但路由/权限不对", retryable_by_config: "核对子路径（待确认 #9）"}
 
-  # ---------- V1.24.8：自车出生点有效性与下发坐标折算 ----------
+  # ---------- V1.25.0：出生点职责反转（平台原样下发，仿真端替换占位原点） ----------
   spawn_point_dispatch:
-    status: implemented
-    problem: "平台下发的 map.spawn_point 为 (0,0,0) 时，自车生成在 CARLA 内置城镇的世界原点（普遍非有效车道坐标），仿真画面黑屏或只见路面"
-    authority: "有效车道坐标只能来自实机出生点表 services/scene-service/config/carla_spawn_points.json（SCENE_CARLA_SPAWN_POINTS_PATH 可覆盖），由 scripts/collect_carla_spawn_points.py 导出；平台不猜测坐标"
-    uncalibrated_policy: "表未校准（calibrated=false 或该地图无候选点）时：不自动覆写出生点，G3 仅在闸门说明里标记原点风险（否则未接实机的部署生成链路会整体失效）"
-    gates:
-      - "生成/编译链路（表已校准）：G3 拒原点出生点，并要求命中候选点（match_tolerance_m），未命中即凭猜测填写"
-      - "生成/编译链路（表未校准）：G3 通过但在消息里标记“⚠ 出生点为地图原点、下发会被拒”"
-      - "下发链路（本端点，不区分表状态）：map_type=carla_town 且出生点落在原点（origin_tolerance_m）→ 2001，不创建实例"
-      - "批量生成脚本：表未校准或未覆盖目标城镇 → 退出码 2（不产出必黑屏的存量数据）"
-    dispatch_transform: "actors[].spawn_point 由相对偏移折算为绝对坐标（x/y/z 叠加基准，yaw 相加后归一到 [-pi, pi]），载荷根节点附 spawn_semantics=absolute；map.spawn_point 保持原值"
-    legacy_data: "存量将出生点写为 (0,0,0) 的场景：表校准后重新批量生成，或在详情页改成有效坐标后方可下发"
+    status: delegated_to_simulator
+    problem: "平台下发的 map.spawn_point 常为 (0,0,0)（目录模板占位值），自车落在 CARLA 内置城镇的世界原点会黑屏或只见路面"
+    authority: "有效出生坐标只能由实机 CARLA ``world.get_map().get_spawn_points()`` 得到；客户端与服务器必须同版本，而部署环境服务器为源码编译的 dev build，平台侧无从导出、也不得猜测坐标"
+    platform_behavior:
+      - "下发链路（本端点）：出生点与参与者偏移均按场景存量值原样下发，不折算、不拦原点"
+      - "校验链路（生成/编译/G3）：只校地图非空、白名单、生成点数值有限、几何围栏（按 base + offset）"
+      - "批量生成脚本：固定写占位原点 (0,0,0)，不再校出生点表（旧退出码 2 已取消）"
+    simulator_responsibility:
+      - "取当前地图的候选出生点，丢弃原点退化坐标，按场景稳定散列选一个（可复现）、同批实例分散放置"
+      - "把选出的坐标写为自车 transform，并把 actors[].spawn_point 偏移叠加到该基准（平台不再代算）"
+      - "hd_map / site_map 等非 carla_town 不做替换；日志记录替换前后坐标以便回查"
+    dispatch_transform: "无（相对偏移原样下发）；载荷根节点附 spawn_semantics=relative_to_ego；map.spawn_point 保持原值"
+    rejected_alternative: "V1.24.8~V1.24.10 的平台侧实机表 + G3 拦截 + 下发 2001 + 相对→绝对折算：在目标部署环境结构性做不到（采不出有效坐标），已整体删除"
+    risk: "仿真端实现替换前，原点场景仍会黑屏（旧行为回归）；平台侧已无兜底手段"
 
   # ---------- V1.24.9：传感器挂载尺寸参考（平台侧缓解；挂载换算仍在仿真端） ----------
   camera_mount_reference:
@@ -2946,8 +2950,8 @@ x-hunter-pending-confirmation:
       impact: "前端仿真面板轮询这两个端点；Carla 实例回收后历史结果不可查（如需持久化另行立项）"
     - id: 3
       question: "spawn_point / actor.behavior / event.trigger / event.action 内部结构未定义"
-      contract_decision: "按 Carla transform 与 OpenSCENARIO 条件语义给出最小结构，behavior_type/action_type 暂为字符串；spawn_point 坐标语义已固化（V1.24.8）：map.spawn_point 自车绝对、actors[].spawn_point 相对偏移，下发时折算为绝对并打 spawn_semantics=absolute；carla_town 禁止原点出生点"
-      impact: "场景编辑器字段级校验与导出实现；存量将出生点写为 (0,0,0) 的场景需按实机出生点表重新生成或修正后才能下发仿真"
+      contract_decision: "按 Carla transform 与 OpenSCENARIO 条件语义给出最小结构，behavior_type/action_type 暂为字符串；spawn_point 坐标语义已固化（V1.25.0 反转职责）：map.spawn_point 为自车出生点（目录模板为占位原点 (0,0,0)）、actors[].spawn_point 为相对偏移，下发时**不折算、不拦原点**，仅打 spawn_semantics=relative_to_ego；占位原点替换与有效性校验由仿真端（HunterSim）承担"
+      impact: "场景编辑器字段级校验与导出实现；存量将出生点写为 (0,0,0) 的场景照常下发，画面是否不再黑屏取决于仿真端是否已实现替换（见 docs/HunterSim传感器挂载换算方案.md 第一部分）"
     - id: 4
       question: "scenes.status 含 archived，但 12.2 节无归档端点"
       contract_decision: "契约不新增归档端点；lifecycle.transitions 中 published→archived 的 endpoint 为 null"

@@ -34,8 +34,8 @@ SCRIPTS_DIR = ROOT / "scripts"
 HOST_ALLOWED_THIRD_PARTY = frozenset({"carla"})
 
 #: 必须落在覆盖集合里的脚本（改名/加依赖会静默削弱门禁，故显式钉住）
+#: V1.25.0：``collect_carla_spawn_points.py`` 已随“平台不再维护地图可用点”一起删除
 MUST_BE_COVERED = (
-    "collect_carla_spawn_points.py",
     "collect_carla_vehicle_geometry.py",
 )
 

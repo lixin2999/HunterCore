@@ -541,16 +541,13 @@ services:
       SCENE_GENERATION_MAX_COUNT: ${SCENE_GENERATION_MAX_COUNT:-5000}
       SCENE_ALLOWED_MAPS: ${SCENE_ALLOWED_MAPS:-}
       SCENE_CATALOG_VERSION: ${SCENE_CATALOG_VERSION:-1.0.0}
-      # CARLA 自车出生点表（V1.24.8）：空 = 用镜像内置 /app/config/carla_spawn_points.json
-      #   合法车道坐标由 scripts/collect_carla_spawn_points.py 从实机 CARLA 导出；不重建镜像替换时，
-      #   在 docker-compose.override.yml 里挂载存放该表的目录（单文件绑定挂载遇宿主文件缺失会被
-      #   误建为空目录），并把本键指向挂载内文件；口径：表已校准后 G3 拦原点与未命中坐标，
-      #   未校准期原点仍可通过 G3（仅标注风险）但下发必返 2001、批量脚本退出码 2
-      SCENE_CARLA_SPAWN_POINTS_PATH: ${SCENE_CARLA_SPAWN_POINTS_PATH:-}
+      # （V1.25.0 删除）SCENE_CARLA_SPAWN_POINTS_PATH：平台不再维护地图可用出生点（有效坐标只能实机查），
+      #   出生点与参与者偏移按场景存量值原样下发，占位原点 (0,0,0) 的替换由仿真端（HunterSim）完成
       # CARLA 车辆蓝图几何表（V1.24.9）：空 = 用镜像内置 /app/config/carla_vehicle_geometry.json
       #   实机尺寸由 scripts/collect_carla_vehicle_geometry.py 导出；下发时据此在载荷根节点附
       #   sensor_mount_reference（供仿真端按包围盒换算传感器挂载点）；该表缺失/未校准不阻断下发，
-      #   只在参考块里标状态；不重建镜像替换时同样挂载表所在**目录**（口径同上表）
+      #   只在参考块里标状态；不重建镜像替换时挂载表所在**目录**（单文件挂载遇宿主文件缺失会
+      #   被误建为空目录），并把本键指向挂载内文件
       SCENE_CARLA_VEHICLE_GEOMETRY_PATH: ${SCENE_CARLA_VEHICLE_GEOMETRY_PATH:-}
       # 仿真下发链路模式（V1.24.0，契约 x-hunter-simulation-flow.node_dispatch）
       #   direct = 固定地址 CARLA_MANAGEMENT_ENDPOINT（默认，V1.23.7 行为）

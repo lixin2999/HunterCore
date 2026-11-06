@@ -218,7 +218,12 @@ def scene_category_for(scene_type: str) -> SceneCategory:
 # 二、4.2.2 场景配置结构（字段名不可更改）
 # =====================================================================
 class SpawnPoint(BaseModel):
-    """生成点（⚠ 4.2.2 节未定义内部结构，契约按 Carla transform 语义定义，待确认 #3）。"""
+    """生成点（⚠ 4.2.2 节未定义内部结构，契约按 Carla transform 语义定义，待确认 #3）。
+
+    语义由所在位置决定（契约 ``x-hunter-scene-config-contract.spawn_point_semantics``）：
+    ``map.spawn_point`` 是自车出生点（目录模板常为占位原点 ``(0,0,0)``，有效性校验与
+    替换由仿真端完成）；``actors[].spawn_point`` 是**相对自车出生点的偏移**，平台不折算。
+    """
 
     x: float = Field(description="X 坐标（m）")
     y: float = Field(description="Y 坐标（m）")
@@ -232,7 +237,7 @@ class SceneMap(BaseModel):
 
     map_id: str = Field(min_length=1, max_length=128, description="地图标识")
     map_type: MapType = Field(description="地图类型")
-    spawn_point: SpawnPoint = Field(description="自车生成点")
+    spawn_point: SpawnPoint = Field(description="自车出生点（目录模板常为占位原点，由仿真端校验并替换）")
 
 
 class EgoVehicle(BaseModel):
@@ -267,7 +272,7 @@ class Actor(BaseModel):
 
     actor_id: str = Field(min_length=1, max_length=64, description="场景内参与者唯一标识")
     type: ActorType = Field(description="参与者类型")
-    spawn_point: SpawnPoint = Field(description="参与者生成点")
+    spawn_point: SpawnPoint = Field(description="参与者生成点（相对自车出生点的偏移）")
     behavior: ActorBehavior = Field(description="行为编排")
 
 

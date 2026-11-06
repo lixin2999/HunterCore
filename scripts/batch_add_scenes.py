@@ -56,12 +56,13 @@
 环境变量（CLI 优先）：HUNTER_BATCH_MODE / HUNTER_BATCH_BASE_URL / HUNTER_BATCH_USER_ID /
 HUNTER_BATCH_ROLES / HUNTER_BATCH_GATEWAY_HMAC_SECRET / HUNTER_BATCH_USERNAME / HUNTER_BATCH_PASSWORD。
 
-自车出生点（V1.24.8 起强约束）
+自车出生点（V1.25.0 口径）
 --------------------------
-``map.spawn_point`` 不再写死 (0,0,0)，而是从实机出生点表
-（``services/scene-service/config/carla_spawn_points.json``，可用 ``SCENE_CARLA_SPAWN_POINTS_PATH``
-覆盖）按地图轮换指派；表未校准或目标城镇无候选点时本脚本直接退出码 2。先用
-``scripts/collect_carla_spawn_points.py`` 在 CARLA 主机上导出出生点。
+``map.spawn_point`` 保持写 (0,0,0)——这是场景目录的**占位基准**，不是待仿真消费的绝对坐标。
+平台不维护、也不猜测每个地图的有效车道坐标（那只能由实机
+``world.get_map().get_spawn_points()`` 得到）；出生点有效性校验与“把占位原点换成有效出生
+坐标”均在仿真端（HunterSim）完成，``actors[].spawn_point`` 始终为**相对自车出生点的偏移**。
+参见 ``docs/HunterSim传感器挂载换算方案.md`` 第二部分。
 
 退出码：0 全部成功（或幂等跳过）；1 存在失败项；2 参数/环境错误。
 """
@@ -529,52 +530,6 @@ def _spawn(x: float, y: float = 0.0, yaw: float = 0.0, z: float = 0.0, lane_id: 
     return {"x": round(x, 3), "y": round(y, 3), "z": round(z, 3), "yaw": round(yaw, 5), "lane_id": lane_id}
 
 
-#: 自车出生点表（与 scene-service 同一个单一事实来源：
-#: ``services/scene-service/config/carla_spawn_points.json`` 或 ``SCENE_CARLA_SPAWN_POINTS_PATH``）。
-#: 旧版把出生点一律写成 (0,0,0)，而 CARLA 内置城镇的世界原点普遍非有效车道坐标，
-#: 导致仿真端「黑屏 / 只见路面」（下发环节会无条件拦原点，表已校准后校验门 G3 也拦），故改为按实机表指派。
-_SPAWN_TABLE: Any = None
-
-
-def load_spawn_table() -> Any:
-    """加载实机出生点表（缓存；不可用时抛 ``RuntimeError``）。"""
-    global _SPAWN_TABLE
-    if _SPAWN_TABLE is None:
-        try:
-            from app.scene_engine.spawn_points import get_spawn_point_table
-
-            _SPAWN_TABLE = get_spawn_point_table()
-        except Exception as exc:
-            raise RuntimeError(f"出生点表不可用：{exc}") from exc
-    return _SPAWN_TABLE
-
-
-def check_spawn_points() -> str:
-    """前置检查：表必须已校准且覆盖全部内置城镇，否则拒绝生成（平台绝不猜坐标）。"""
-    from app.scene_engine.spawn_points import UNCALIBRATED_HINT
-
-    table = load_spawn_table()
-    missing = [name for name in MAPS if not table.usable(name)]
-    if not table.calibrated:
-        raise RuntimeError(f"出生点表未校准：{UNCALIBRATED_HINT}")
-    if missing:
-        raise RuntimeError(
-            f"出生点表缺少以下城镇的候选点：{', '.join(missing)}；"
-            f"请先把它们加入表内（{UNCALIBRATED_HINT}）"
-        )
-    return f"{table.source or 'carla_spawn_points'}（sha256={table.source_hash[:12]}）"
-
-
-def _ego_spawn_point(map_id: str, seq: int) -> dict[str, Any]:
-    """按表为该地图指派一个实机车道出生点（``seq`` 内轮转，同批场景不挤在同一位置）。"""
-    from app.scene_engine.spawn_points import pick_candidate
-
-    candidate = pick_candidate(map_id, seq, load_spawn_table())
-    if candidate is None:
-        raise RuntimeError(f"地图 {map_id} 无可指派出生点（表未覆盖该地图）")
-    return candidate.as_spawn_point()
-
-
 def _actor(aid: str, atype: str, spawn: dict[str, Any], behavior: str, **params: Any) -> dict[str, Any]:
     return {"actor_id": aid, "type": atype, "spawn_point": spawn,
             "behavior": {"behavior_type": behavior, "parameters": dict(params)}}
@@ -624,13 +579,15 @@ def _derive_criteria(stype: str, p: dict[str, float]) -> tuple[float, float]:
 
 
 def _config(
-    *, map_id: str, spawn_point: dict[str, Any], ego_speed: float, ego_steer: float,
+    *, map_id: str, ego_speed: float, ego_steer: float,
     weather: dict[str, float],
     actors: list[dict[str, Any]], events: list[dict[str, Any]], duration: float,
     min_safe: float, max_dev: float, no_collision: bool = True,
 ) -> dict[str, Any]:
     return {
-        "map": {"map_id": map_id, "map_type": "carla_town", "spawn_point": spawn_point},
+        # 出生点为目录占位基准 (0,0,0)：有效出生坐标的选取与替换由仿真端（HunterSim）完成
+        "map": {"map_id": map_id, "map_type": "carla_town",
+                "spawn_point": _spawn(0.0, 0.0, 0.0, lane_id="lane-1")},
         "ego_vehicle": {"model": EGO_MODEL, "initial_speed": round(max(0.0, ego_speed), 3),
                         "initial_steer": round(_clamp(ego_steer, -1.0, 1.0), 3)},
         "weather": weather,
@@ -959,7 +916,7 @@ def _assemble_config(stype: str, params: dict[str, float], zone: str) -> dict[st
     actors, events, steer, _token = _assembler_for(stype)(params)
     min_safe, max_dev = _derive_criteria(stype, params)
     spec = {**SHARED_PARAMS, **_params_for(stype)}
-    # 稳定的 map/出生点选型（sha256 而非内置 hash，避免 PYTHONHASHSEED 致重生成的结果不可复现）
+    # 稳定的地图选型（sha256 而非内置 hash，避免 PYTHONHASHSEED 致重生成的结果不可复现）
     digest_key = json.dumps(
         {"stype": stype, "params": {k: round(v, 2) for k, v in params.items()}},
         sort_keys=True,
@@ -967,8 +924,7 @@ def _assemble_config(stype: str, params: dict[str, float], zone: str) -> dict[st
     digest = int(hashlib.sha256(digest_key.encode("utf-8")).hexdigest()[:8], 16)
     map_id = MAPS[digest % len(MAPS)]
     return _config(
-        map_id=map_id, spawn_point=_ego_spawn_point(map_id, digest),
-        ego_speed=params.get("ego_speed", 6.0), ego_steer=steer,
+        map_id=map_id, ego_speed=params.get("ego_speed", 6.0), ego_steer=steer,
         weather=_build_weather({**spec_default_weather(spec), **params}),
         actors=actors, events=events, duration=params["duration"],
         min_safe=min_safe, max_dev=max_dev, no_collision=True,
@@ -1075,9 +1031,6 @@ def _light_validate(payload: dict[str, Any]) -> None:
     cfg = payload["config"]
     if cfg["map"]["map_type"] not in {"carla_town", "hd_map", "site_map"}:
         raise ValueError("非法 map_type")
-    ego_spawn = cfg["map"]["spawn_point"]
-    if abs(ego_spawn["x"]) <= 1.0 and abs(ego_spawn["y"]) <= 1.0:
-        raise ValueError("自车出生点落在地图原点（CARLA 内置城镇原点非有效车道坐标，仿真端会黑屏）")
     ego = cfg["ego_vehicle"]
     if ego["initial_speed"] < 0 or not -1 <= ego["initial_steer"] <= 1:
         raise ValueError("ego_vehicle 取值越界")
@@ -1585,15 +1538,6 @@ def main(argv: list[str] | None = None) -> int:
         pd = asyncio.run(publish_drafts(args))
         print(f"\n=== 补发布结果 === 已发布: {pd['published']}（幂等已发布: {pd.get('already', 0)}）  失败: {pd['failed']}")
         return 1 if pd["failed"] else 0
-
-    # 出生点前置拦截：未校准的实机表给不出有效车道坐标，此时宁可停下来报错，
-    # 也绝不回退到 (0,0,0)（否则将批量产出仿真端黑屏的场景）
-    try:
-        spawn_source = check_spawn_points()
-    except RuntimeError as exc:
-        print(f"[error] {exc}", file=sys.stderr)
-        return 2
-    print(f"[spawn] 自车出生点来源: {spawn_source}")
 
     scenes = generate_scenes(seed=args.seed, ratio=_parse_ratio(args.ratio))
     scenes = _filter_types(scenes, args.only_type)

@@ -30,9 +30,16 @@
 说明：
 - 本脚本只依赖标准库 + ``carla``，**在部署机系统 Python 3.10 上直接跑**（不用项目 .venv），因此禁用 3.11+ 才有的
   标准库写法（由 ``tests/test_host_scripts_compat.py`` 钉住）；
-- 本脚本**不预设 CARLA 小版本**：客户端超时接口在 0.9.10 前后改名（``set_timeout`` → ``set_client_timeout``），
+- 本脚本**不预设 CARLA 小版本**：客户端超时接口名在不同构建间并不一致（官方 wheel 多为
+  ``set_client_timeout``，而部署机上的自编译 wheel 自称 0.9.16 却只有 ``set_timeout``），
   两个名字都会尝试；缺少必需接口（如 ``Blueprint.get_bounding_box``）时会以 ``[error]`` + 版本不匹配提示退出，
   而不是采到一半报 AttributeError，也**不会**用推算值冒充实机包围盒（由 ``tests/test_carla_collectors_api_compat.py`` 钉住）；
+- ⚠ **客户端与服务器必须同版本**：否则 ``client.get_world()`` 可能先打 ``WARNING: Version mismatch
+  detected``，随后在 **C++ 层 ``std::bad_alloc`` 直接 abort（核心已转储）**——这不是 Python 异常，
+  本脚本无法兜住。部署环境若服务器为源码编译的 dev build（版本号是 git 提交号而非 x.y.z），
+  必须用**同一份源码构建的 carla wheel** 采集；否则本表只能保持未校准，由仿真端在本地实机取尺寸；
+- ⚠ ``--model-map`` 里的蓝图 ID 必须在实机蓝图库里真实存在。当前自车模型 ``HUNTER_SE`` **尚未导入
+  CARLA 资产蓝图库**，因此该映射暂时无解（脚本会报蓝图未匹配、退出码 1，不会编造 ID）；
 - 蓝图库是服务器级的（与当前地图无关），本脚本**不会** ``load_world``，因此在有仿真实例运行
   时采集也安全；
 - 已存在目标文件时按蓝图**增量合并**（只覆盖本次采集到的蓝图，其余保留），便于分多次采完；

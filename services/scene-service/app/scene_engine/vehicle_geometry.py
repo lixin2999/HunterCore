@@ -18,9 +18,19 @@
 
 ``mount_policy`` 只是双方约定的口径标记（挂载点由仿真端按尺寸换算），平台不自行换算。
 
-加载策略与 ``vehicle_params`` / ``carla_spawn_points`` 一致：默认读包内
+加载策略与 ``vehicle_params`` 一致：默认读包内
 ``config/carla_vehicle_geometry.json``，部署时可用 ``SCENE_CARLA_VEHICLE_GEOMETRY_PATH`` 覆盖；
 每次加载计算文件内容 SHA-256（``source_hash``）留痕。
+
+当前环境的已知约束（V1.25.0 实机读数，因此 ``local_envelope()`` 主路径属常态而非异常）
+----------------------------------------------------------------------
+- 自车模型 ``HUNTER_SE`` 尚未导入 CARLA 资产蓝图库，实机 ``get_blueprint_library()`` 里
+  没有对应蓝图 ID ⇒ 状态长期为 ``blueprint_unmatched``；
+- 采集需在装有同版本 CARLA PythonAPI 的机器上跑，而部署环境的客户端（wheel 0.9.16）与
+  服务器（源码 dev build）版本不一致，``load_world`` 会 native 崩溃 ⇒ 状态长期为
+  ``table_uncalibrated``。
+两种情况下本模块一律只报状态不给数字，换算依据由仿真端在实机本地取（``get_dimension()``
+／回退资产的包围盒），平台侧不阻断下发。
 """
 from __future__ import annotations
 

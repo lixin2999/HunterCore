@@ -320,9 +320,10 @@ watch(
           </el-col>
         </el-row>
         <p class="hint">
-          自车生成点必须是目标地图上的<strong>有效车道坐标</strong>：CARLA 内置城镇的世界原点
-          (0, 0, 0) 普遍不在路面上，落在原点的场景在仿真端会黑屏或只见路面，平台下发时会直接拒绝。
-          坐标请取自实机出生点表（由 scripts/collect_carla_spawn_points.py 导出）。
+          自车生成点可留默认原点 <strong>(0, 0, 0)</strong> 作为占位：平台按场景存量值原样下发，
+          <strong>不再维护地图可用出生点、也不再拦原点</strong>。仿真端（HunterSim）会用
+          <code>world.get_map().get_spawn_points()</code> 取到目标地图的有效车道坐标替换掉占位原点，
+          再把参与者生成点作为相对自车的偏移叠加。如需固定车道位置，可在此直接填写有效坐标。
         </p>
 
         <el-divider content-position="left">天气（Carla 参数，0–1 归一化；sun_* 为角度）</el-divider>

@@ -37,14 +37,6 @@ from app.repositories.simulations import (
     VilSessionStore,
     carla_topic_names,
 )
-from app.scene_engine.spawn_points import (
-    DEFAULT_ORIGIN_TOLERANCE_M,
-    UNCALIBRATED_HINT,
-    SpawnPointsError,
-    get_spawn_point_table,
-    is_origin_like,
-    to_absolute_spawn_offsets,
-)
 from app.scene_engine.vehicle_geometry import (
     SENSOR_MOUNT_REFERENCE_KEY,
     VehicleGeometryError,
@@ -76,6 +68,12 @@ UNBOUND_SESSION_GRACE_SECONDS = 300
 
 #: 已终态实例的内存去重上限（避免重复调度 Topic 删除；仅本进程生命周期）
 _MAX_FINALIZED_INSTANCES = 4096
+
+#: 下发载荷的出生点语义标记（契约 ``x-hunter-simulation-flow.spawn_point_dispatch``）。
+#: V1.25.0 起平台**不再维护实机出生点表、不再折算、不再拦原点**：自车出生点按场景存量值
+#: 原样下发（``(0,0,0)`` 是目录模板的占位值），``actors[].spawn_point`` 仍是**相对自车出生点
+#: 的偏移**；把占位原点换成有效车道坐标、并据此叠加参与者偏移，均是仿真端（HunterSim）的职责。
+SPAWN_SEMANTICS_RELATIVE = "relative_to_ego"
 
 
 def _forbidden_match(forbidden: frozenset[str], path: str) -> bool:
@@ -188,34 +186,17 @@ class SceneSimulationService:
             return None
 
     @staticmethod
-    def _ensure_dispatchable_spawn(config: dict[str, Any], *, scene_id: UUID) -> None:
-        """下发前硬拦落在地图原点的自车生成点。
+    def _dispatch_payload(config: dict[str, Any]) -> dict[str, Any]:
+        """构造下发载荷：场景存量值原样下发 + 出生点语义标记（V1.25.0）。
 
-        CARLA 内置城镇的世界原点普遍非有效车道坐标（空地/水面/路网外），自车落此即表现为
-        仿真端「黑屏」或「画面只有路面」——这种实例跑完也只能产出无效数据，故在下发前
-        直接拒绝而非静默改坐标（场景配置属用户资产，自动覆写会造成不预期的行为漂移）。
-        该限制只适用于 ``map_type=carla_town``：高精/园区地图的坐标空间由部署方定义。
+        历史上（V1.24.8）这里做过两件事：把参与者偏移折算成绝对坐标、以及把落在原点的
+        自车出生点拦下返 2001。两者都已推翻：平台无从得知目标地图的有效车道坐标（需实机
+        CARLA 查询），而仿真端本来就能 ``world.get_map().get_spawn_points()`` 直接拿到。
+        因此现在只打上 ``spawn_semantics=relative_to_ego`` 标记，把「选有效出生坐标 +
+        按该基准叠加参与者偏移」明确交给仿真端（实现方案见
+        ``docs/HunterSim传感器挂载换算方案.md`` 第二部分）。
         """
-        map_section = config.get("map") or {}
-        if str(map_section.get("map_type") or "") != "carla_town":
-            return
-        spawn = map_section.get("spawn_point") or {}
-        try:
-            tolerance = get_spawn_point_table().origin_tolerance_m
-        except SpawnPointsError:
-            tolerance = DEFAULT_ORIGIN_TOLERANCE_M
-        if not is_origin_like(spawn, tolerance_m=tolerance):
-            return
-        raise InvalidParameterError(
-            f"自车生成点 ({spawn.get('x', 0)}, {spawn.get('y', 0)}) 落在地图原点，CARLA 内置城镇"
-            "原点普遍非有效车道坐标，仿真端会黑屏或只见路面；请先把出生点改为目标地图上的"
-            f"有效车道坐标（{UNCALIBRATED_HINT}）",
-            details={
-                "scene_id": str(scene_id),
-                "map_id": str(map_section.get("map_id") or ""),
-                "spawn_point": dict(spawn),
-            },
-        )
+        return {**config, "spawn_semantics": SPAWN_SEMANTICS_RELATIVE}
 
     @staticmethod
     def _attach_sensor_mount_reference(payload: dict[str, Any]) -> None:
@@ -223,7 +204,7 @@ class SceneSimulationService:
 
         传感器挂载点由仿真端按蓝图实际尺寸换算，平台的职责是把换算依据（实机
         ``get_dimension()`` / ``get_bounding_box()``）随场景一起给下去。该块属纯附加信息：
-        几何表缺失/非法不拦下发（与出生点折算解耦），只写 ``table_unavailable`` 状态与原因，
+        几何表缺失/非法不拦下发，只写 ``table_unavailable`` 状态与原因，
         让仿真端回退自身查询而不是拿着空信息当尺寸。
         """
         try:
@@ -248,11 +229,8 @@ class SceneSimulationService:
         merged, applied = apply_param_overrides(
             scene.config, request.param_overrides, self._settings
         )
-        # 下发载荷统一折算：平台存的是“相对 map.spawn_point 的偏移”，而仿真端按绝对坐标
-        # 直接使用参与者出生点。历史数据基准恒为原点时两者等价，基准一改成有效车道坐标
-        # 不折算就会让全部参与者脱离自车周边（并附 spawn_semantics=absolute 标记）。
-        dispatch_config = to_absolute_spawn_offsets(merged.model_dump(mode="json"))
-        self._ensure_dispatchable_spawn(dispatch_config, scene_id=scene_id)
+        # 下发载荷：V1.25.0 起不再做相对→绝对折算、不再拦原点（见 _dispatch_payload）
+        dispatch_config = self._dispatch_payload(merged.model_dump(mode="json"))
         self._attach_sensor_mount_reference(dispatch_config)
 
         mode = request.mode

@@ -46,7 +46,7 @@ def config_payload(**overrides: Any) -> dict[str, Any]:
         "map": {
             "map_id": "Town01",
             "map_type": "carla_town",
-            # 非原点坐标：V1.24.8 起下发前会拦落在地图原点的自车生成点（仿真端会黑屏）
+            # 非原点坐标（有效值由仿真端校验/替换，V1.25.0）：用 0 会让“是否误删了原点”难以从断言里看出
             "spawn_point": {"x": 120.5, "y": 310.25, "z": 0.0, "yaw": 0.0},
         },
         "ego_vehicle": {"model": "HUNTER_SE", "initial_speed": 1.5, "initial_steer": 0.0},

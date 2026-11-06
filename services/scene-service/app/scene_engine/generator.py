@@ -33,12 +33,6 @@ from app.scene_engine.ir import (
     SceneIR,
     compile_parameters,
 )
-from app.scene_engine.spawn_points import (
-    SpawnPointsError,
-    SpawnPointTable,
-    assign_ego_spawn_point,
-    get_spawn_point_table,
-)
 from app.scene_engine.stats import (
     copula_samples,
     distribution_moments,
@@ -187,7 +181,6 @@ class SceneGenerator:
         bounds: tuple[float, float, float, float] | None = None,
         esmini: EsminiRunner | None = None,
         esmini_ratio: float = 0.0,
-        spawn_table: SpawnPointTable | None = None,
     ) -> None:
         self._max_duration = max_duration
         self._allowed_maps = allowed_maps
@@ -195,30 +188,6 @@ class SceneGenerator:
         self._bounds = bounds
         self._esmini = esmini
         self._esmini_ratio = min(max(float(esmini_ratio), 0.0), 1.0)
-        self._spawn_table = spawn_table
-        self._spawn_table_resolved = spawn_table is not None
-
-    def _resolve_spawn_table(self) -> SpawnPointTable | None:
-        """惰性加载实机出生点表；加载失败只试一次（结果交由 G3 与下发环节报错）。"""
-        if not self._spawn_table_resolved:
-            self._spawn_table_resolved = True
-            try:
-                self._spawn_table = get_spawn_point_table()
-            except SpawnPointsError:
-                self._spawn_table = None
-        return self._spawn_table
-
-    def _assign_ego_spawn_point(self, config: dict[str, Any], *, seq: int) -> None:
-        """按实机出生点表覆写“原点出生点”。
-
-        表缺失/未校准/该地图无候选点时不做任何覆写，也不在这里报错：平台不猜坐标，
-        也不能静默产出“看起来已指派、实仍为原点”的样本——原点坐标由 G3 标注风险、
-        由下发前置检查无条件拦下（2001），因此不会真被送去仿真。
-        """
-        table = self._resolve_spawn_table()
-        if table is None:
-            return
-        assign_ego_spawn_point(config, seq=seq, table=table)
 
     # ---------- 对外入口 ----------
 
@@ -263,8 +232,8 @@ class SceneGenerator:
                 gate_failures["G1"] += 1
                 continue
 
-            # 目录模板普遍把出生点写成原点：先按表指派，再进闸门（表未校准时不覆写，原点交由下发环节硬拦）
-            self._assign_ego_spawn_point(config, seq=attempts)
+            # V1.25.0：出生点保持场景存量值（目录模板普遍为占位原点），不在平台侧指派；
+            # 有效出生坐标的选取与替换由仿真端（HunterSim）在下发后完成。
 
             report = run_gates(
                 ir,
@@ -274,7 +243,6 @@ class SceneGenerator:
                 allowed_maps=self._allowed_maps,
                 vehicle=self._vehicle,
                 bounds=self._bounds,
-                spawn_table=self._spawn_table,
                 # 生成阶段按比例抽样干跑；validate/dryrun/复检全量
                 esmini=(
                     self._esmini
