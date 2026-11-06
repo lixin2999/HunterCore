@@ -27,6 +27,8 @@
     python scripts/collect_carla_spawn_points.py --out services/scene-service/config/carla_spawn_points.json
 
 说明：
+- 本脚本只依赖标准库 + ``carla``，**在部署机系统 Python 3.10 上直接跑**（不用项目 .venv），因此禁用 3.11+ 才有的
+  标准库写法（由 ``tests/test_host_scripts_compat.py`` 钉住）；
 - 逐城镇 ``load_world`` 会重置该世界，**请勿在有仿真实例运行时采集**；
 - 已存在目标文件时按城镇**增量合并**（只覆盖本次采集到的城镇，其余城镇保留），便于分多次采完；
 - ``--print`` 只打印不落盘，用于快速核对；
@@ -40,7 +42,7 @@ import argparse
 import json
 import math
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -122,7 +124,7 @@ def _merge_payload(existing: Path, collected: dict[str, list[dict[str, Any]]], *
     )
     payload["source"] = "live-carla-export"
     payload["carla_version"] = carla_version
-    payload["exported_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload["exported_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return payload
 
 

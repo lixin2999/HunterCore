@@ -7954,25 +7954,25 @@ Date：2026-11-06
 
 ```bash
 # ① 在能连 CARLA 的机器上导出蓝图尺寸（不会 load_world，可与实例共存）
-python3 scripts/collect_carla_vehicle_geometry.py --host <CARLA_IP> --port 2000 \
-  --blueprints 'vehicle.*se*' --model-map HUNTER_SE=<完整蓝图ID>
+#   命令一律单行一条（V1.24.10 约定：`\` 后留空格会被 bash 当成多余位置参数）
+python3 scripts/collect_carla_vehicle_geometry.py --host <CARLA_IP> --port 2000 --blueprints 'vehicle.*se*' --model-map HUNTER_SE=<完整蓝图ID>
 #   期望末行：calibrated=True，登记 N 个蓝图，车型映射 1 项；退出码 0
-#   先确认可用蓝图 ID：--blueprints 'vehicle.*' --print（体量大，确认后改用精确匹配）
+#   先确认可用蓝图 ID：python3 scripts/collect_carla_vehicle_geometry.py --host <CARLA_IP> --port 2000 --blueprints 'vehicle.*' --print（体量大，确认后改用精确匹配）
 
 # ② 让容器读到新表（与出生点表同法）
 cd /opt/HunterCore && git pull
-docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env \
-  build scene-service && \
-docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env \
-  up -d --force-recreate scene-service
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env build scene-service
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env up -d --force-recreate scene-service
 
 # ③ 判据：表已生效
 docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry import get_vehicle_geometry_table as g; t=g(); print(t.calibrated, sorted(t.blueprints), dict(t.model_index))"
 
 # ④ 判据：下发载荷真的带上了尺寸（看返回后的平台日志或直接看节点侧收到的 scene_config）
-docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry import build_sensor_mount_reference as b; from app.scene_engine.vehicle_geometry import get_vehicle_geometry_table as g; print(b({'ego_vehicle': {'model': 'HUNTER_SE'}}, table=g()))"
+docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry import build_sensor_mount_reference as b, get_vehicle_geometry_table as g; print(b({'ego_vehicle': {'model': 'HUNTER_SE'}}, table=g()))"
 #   期望：status='resolved' 且带 dimension_m / envelope_m
 ```
+
+> 补（V1.24.10）：本节的 ① 在 V1.24.10 前**无法跑通**——脚本用了 3.11+ 的 `datetime.UTC`，在部署机系统 Python 3.10 上崩在 import 行；已修（见 V1.24.10）。
 
 ### 9. 分发
 
@@ -7986,7 +7986,128 @@ docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry impo
   - 更新（本轮）：已按「不修改 HunterSim」的决策交付**可照此实现**的方案文档 `docs/HunterSim传感器挂载换算方案.md`（换算规则 / 改造清单 / 降级策略 / 自检脚本 / 验收判据 / 分工边界），并写入契约 `camera_mount_reference.handoff_doc`。**实现仍未开始，本待办未闭环**；该文档中的公式与默认余量均为**待实机标定的初值**（尤其 §10 列出的「参考原点同一假设」与 Y 轴左右朝向，未在真机 CARLA 上验过）。
 - **几何表未校准**：出厂为骨架，需实机执行 §8 ①；未校准前参考块只会报 `table_uncalibrated`。
 - **导出脚本未实机验证**：`get_dimension()` / `get_bounding_box()` 的轴定义按 CARLA 文档假设 x=车长、y=车宽、z=车高，首次实机采集后需人工核对量级是否与真车一致。
+  - 更新（V1.24.10）：该脚本在部署机**首次执行即崩在 import 行**（系统 Python 3.10 不认识 3.11+ 的 `datetime.UTC`），已修并钉上静态门禁；轴定义仍待实机核对。
 - **未确诊**：本条目对问题 2 根因的描述基于日志与截图推断，未读 HunterSim 源码；若实机发现另有成因（如相机 FOV/渲染通道问题），需新开条目修正而不宜追溯修改本条目。
+
+## V1.24.10（缺陷修复：宿主机采集脚本在系统 Python 3.10 上 `ImportError` —— 出生点/几何表实机校准被卡在第一步）
+
+Date：2026-11-06
+变更类型：缺陷修复（脚本兼容性）+ 新增静态回归用例；**无需重建任何镜像**（脚本在宿主机直跑），`git pull` 即生效
+
+### 1. 现场
+
+部署机实机执行（用户回报原文）：
+
+```text
+root@hunter-core-server:/opt/HunterCore# python3 scripts/collect_carla_spawn_points.py --host 192.168.122.7 --port 2000 \  --out /opt/HunterCore/config/carla_spawn_points.json
+Traceback (most recent call last):
+  File "/opt/HunterCore/scripts/collect_carla_spawn_points.py", line 43, in <module>
+    from datetime import UTC, datetime
+ImportError: cannot import name 'UTC' from 'datetime' (/usr/lib/python3.10/datetime.py)
+```
+
+影响面：V1.24.8 / V1.24.9 两张实机表（出生点、车辆几何）**在本仓库环境永远采不出来**——CI 与开发 venv 都是 Python 3.11/3.12，
+而唯一能连 CARLA 的部署机是 **Ubuntu 22.04 系统 Python 3.10**，脚本在 `import` 行即崩，连不到 CARLA 就报不了后续错误。
+这直接堵住了 V1.24.8/V1.24.9 待办里「实机校准后回填读数」那一步。
+
+### 2. 根因
+
+| 环节 | 事实 |
+|---|---|
+| 代码 | `from datetime import UTC, datetime` —— `datetime.UTC` 别名是 **Python 3.11 才加入**（3.10 只有 `datetime.timezone.utc`） |
+| 为何没被拦住 | `pytest` 全在 3.11/3.12 上跑，两个采集脚本**没有任何单元/静态用例覆盖**（它们需要 carla，历来只做人工实机验证），因此 3.11+ 写法一路绿 |
+| 触发面 | 同一缺陷同时存在于 `collect_carla_spawn_points.py` 与 `collect_carla_vehicle_geometry.py`（后者本轮新增，同一模板写成） |
+| 命令侧（非代码缺陷） | 粘贴时把多行命令的 `\` 与换行合并成 `\` + 空格 ⇒ bash 把转义空格当作额外位置参数（`\` 必须紧贴行尾）。本条只作为交付约定修正：**给用户的命令一律单行一条** |
+
+### 3. 修复内容
+
+1. **两个采集脚本改用 3.10 可用写法**：`from datetime import datetime, timezone` + `datetime.now(timezone.utc)`（导出 JSON 的 `exported_at` 格式与含义不变，仍为 `…Z` UTC）。
+2. **docstring 显式声明运行前提**：两个脚本各加一条「本脚本只依赖标准库 + `carla`，在部署机系统 Python 3.10 上直接跑（不用项目 .venv），因此禁用 3.11+ 标准库写法」，把约束写进代码旁边而不是只写在文档里。
+3. **新增静态门禁** `tests/test_host_scripts_compat.py`（12 例，无需安装 3.10）：
+   - 按 `sys.stdlib_module_names` **自动发现**「只依赖标准库（+ `carla`）」的宿主机可直跑脚本，当前覆盖 5 个：两个 `collect_carla_*`、`generate_contracts_configmap.py`、`render_k8s.py`、`run_unit_tests.py`；
+   - 禁用项表（`datetime.UTC` / `enum.StrEnum` / `asyncio.TaskGroup`·`timeout` / `itertools.batched` / `Path.walk` / `tomllib` / `typing.Self`·`TypeAliasType`·`TypeIs` / `ExceptionGroup` 等）同时校验 `from X import 成员` 与 `X.成员` 两种写法；
+   - 要求这类脚本必须 `from __future__ import annotations`（否则 `list[str] | None` 一类注解在 3.10 上运行期求值即崩）；
+   - **防空跑自检**：把本轮真实踩过的 `from datetime import UTC` 喂进判定必须命中，且修好后的写法不得再报（避免门禁把正确代码也拦下）；
+   - **发现规则失效自检**：钉住 `MUST_BE_COVERED`，若采集脚本因改名/新增第三方依赖而脱离覆盖则直接失败。
+4. **文档同步**：命令示例改为单行一条（运维手册 §3.15/§3.16）；故障排查指南新增 §19.11；部署概述 §3.2 宿主机 Python 行补兼容口径；deployment.md 验证清单新增第 28 行。
+
+### 4. 向后兼容
+
+- 脚本 CLI 参数、退出码、导出 JSON 的字段与格式**均不变**（只换 `exported_at` 的求值写法）；provider 读表逻辑不变。
+- 不改任何服务代码、无 DDL / Kafka / 契约变更、**不重建镜像**（采集脚本不在镜像内，由宿主机执行）。
+- 新增用例跑在默认 `testpaths`（含 `tests`）里，不依赖容器与 CARLA。
+
+### 5. 风险
+
+- 门禁只拦**静态可判定**的形态：实例上的新方法（如 `某Path对象.walk()`）、新增关键字参数（如 `dataclass(kw_only=)`）判不到，已在用例 docstring 里写明覆盖边界。
+- 修好 import 后仍可能卡在下一步：**`carla` wheel 的 ABI 必须对上宿主 Python**（官方 wheel 按 cp38/cp310/cp311 分发）。若系统 Python 3.10 装不到匹配 wheel，脚本会走 `[error] 未找到 carla PythonAPI`（退出码 2）分支——那是环境问题而非代码缺陷，需换同 ABI 的 wheel 或改在装有匹配 Python 的机器上采集。
+- `load_world` 型采集（出生点）会重置世界，**不能在实例运行中跑**；几何表采集不 `load_world`，可共存。
+
+### 6. 验证（本轮已做）
+
+| 项 | 结果 |
+|---|---|
+| `pytest tests/test_host_scripts_compat.py` | **12 passed**（含 5 个宿主机可直跑脚本 × 2 项 + 两项自检） |
+| 负向对照：把 `collect_carla_spawn_points.py` 改回 `datetime.UTC` 后重跑门禁 | **1 failed, 11 passed**——失败项为 `test_no_post_310_stdlib_usage[collect_carla_spawn_points.py]`，报错内容 `['from datetime import UTC（3.11+）']`；已改回复跑 **12 passed**（证明门禁不是空跑且不误拦正确代码） |
+| `pytest services/scene-service` | **446 passed**（本轮未改服务代码，零回归） |
+| `ruff check scripts tests services/scene-service` | All checks passed |
+| `pytest services/scene-service tests`（单测 + L5 集成层全量） | 529 passed、27 skipped、**2 failed 为既有缺陷**（即上述 `test_implemented_routes_subset_of_contract[scene-service]` 与 `test_readyz_reports_dependency_state[ota-service]`，见 §10；与本轮改动无关） |
+| 四件套运维文档同步 | `故障排查指南.md` §19.11（新增：七行处置表 + 五条单行取证命令）；`运维操作手册.md` §3.15 ① / §3.16 ①（采集命令改为**单行一条** + 补宿主 3.10 与 wheel ABI 口径）；`deployment.md` §10 验证清单第 **28** 行（第 27 行逐字未动）；`01-部署概述与环境要求.md` 顶部提示块 + §3.2 宿主 Python 行与 carla wheel 行 |
+| **真 Python 3.10 解释器实跑**（本轮新发现开发机可供 `py -3.10`，即 3.10.11，与部署机同源） | 两个脚本 `py -3.10 scripts/collect_carla_*.py --help` **均退出码 0 并打出 usage**（即顶部 import 已在 3.10 上真实执行通过）；不带 carla 直跑主流程时落入脚本自身的 `[error] 未找到 carla PythonAPI` 分支、**退出码 2 且无 traceback**（证明下一步按预期是环境问题而非代码问题） |
+| 负向对照（真解释器） | 将 `from datetime import UTC, datetime` 单独喂给 `py -3.10`：报 `ImportError: cannot import name 'UTC' from 'datetime' (...\Python310\lib\datetime.py)`——**与部署机报错文本逐字一致**（临时探针文件已删除，不入仓） |
+
+⚠ **实机采集读数尚未回填**：本轮已在**真 Python 3.10** 上验证 import 与参数解析、并在无 carla 环境下验证了预期错误分支，但本仓库**仍无 CARLA 服务器可连**，
+因此「`pip install carla` 在 Ubuntu 22.04 系统 Python 上可用」与「跑通到 `calibrated=True`」两项仍属待验（见 §8 与 §10）。
+
+### 7. 实机执行
+
+```bash
+# ① 先确认宿主解释器（期望 3.10.x）与 carla wheel 可用性
+python3 --version
+python3 -c "import carla; print(carla.__file__)"
+#   报 No module named carla ⇒ pip3 install carla==<与服务器同版本>（wheel 在 CARLA 安装目录 PythonAPI/carla/dist/）
+#   报 ImportError 且提示 cpXXX 不匹配 ⇒ wheel ABI 与系统 Python 不同，需换 wheel 或改在匹配 Python 的机器上采
+
+git pull   # 取本轮修复
+
+# ② 采集（单行一条，勿在 \ 后留空格；期望末行 calibrated=True，退出码 0）
+python3 scripts/collect_carla_spawn_points.py --host 192.168.122.7 --port 2000 --max-points 60 --print
+python3 scripts/collect_carla_vehicle_geometry.py --host 192.168.122.7 --port 2000 --blueprints 'vehicle.*' --print
+
+# ③ 确认参数被正确接住（--out 指仓内默认位则无需挂载；指仓外目录则必须配套挂载与环境变量）
+python3 scripts/collect_carla_spawn_points.py --host 192.168.122.7 --port 2000 --out services/scene-service/config/carla_spawn_points.json
+ls -l services/scene-service/config/carla_spawn_points.json
+
+# ④ 生效（两条路之一，详见运维手册 §3.15 ② / §3.16 ②）
+#   a) 写回仓内 config → build 并 force-recreate scene-service（默认路径，无需挂载）
+#   b) 写到仓外目录 → docker-compose.override.yml 挂**目录** + .env 指 SCENE_CARLA_SPAWN_POINTS_PATH / SCENE_CARLA_VEHICLE_GEOMETRY_PATH
+
+# ⑤ 判据：容器真读到了校准表（两行均期望 calibrated = True）
+docker exec hunter-scene python3 -c "from app.scene_engine.spawn_points import get_spawn_point_table as g; t=g(); print('spawn', t.calibrated, t.source_hash[:12], {k: len(v) for k,v in t.maps.items()})"
+docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry import get_vehicle_geometry_table as g; t=g(); print('geom', t.calibrated, sorted(t.blueprints), dict(t.model_index))"
+```
+
+> ⚠ 注意②中的 `--print` 不落盘；且 `--host 192.168.122.7` 是 **libvirt/KVM 默认虚拟网段**。若 CARLA 跑在该虚拟网段而仿真节点实际用的是另一个可达实例，采集能跑通但表里的坐标属于错的服务器——需先确认这就是节点实际使用的 CARLA 实例。
+
+### 8. 分发
+
+- `git pull` 即可；**无需重建 scene-service / web-portal**（脚本不进镜像，本轮未改服务代码）。
+- 无 DDL / Kafka / 契约 / ConfigMap 变更。
+- 新增的 `tests/test_host_scripts_compat.py` 属于默认 `testpaths`，CI 无需改动即会拦住同类回归。
+
+### 9. 回滚
+
+- 只涉及 `scripts/collect_carla_*.py` 的 import 写法与一个新用例文件；回滚方式 `git revert` 本轮提交即可，不影响任何运行时行为。
+
+### 10. 待办
+
+- **实机采集读数未回填**：本轮已在开发机的**真 Python 3.10.11** 上跑过 import / `--help` / 无 carla 分叉（见 §6），但部署机上连到**节点实际使用的** CARLA 并跑到 `calibrated=True` 的读数仍缺（§7）；如仍报错需新开条目记录实际堆栈，不得先当作已修。
+- **carla wheel 与宿主 Python ABI 匹配未验证**：`pip3 install carla` 在 Ubuntu 22.04 系统 Python 3.10 上是否可用未实测；不可用时需补「专用 venv + 对应 wheel」的采集路径到运维手册 §3.15。
+- **本轮跑 L5 层全量时发现两个既有缺陷（与本改动无关，尚未修）**：
+  - `tests/integration/test_api_contract_surface.py::test_implemented_routes_subset_of_contract[scene-service]`：25 个场景引擎端点（`/api/v1/scene/logical*`、`/generate*`、`/concrete*`、`/suites*`、`/testcases*`、`/oracles`、`/coverage/*`）**不在** `contracts/openapi/scene-service.yaml`——属契约面缺失（与「契约先行」约束相违），需补契约而非改实现；
+  - `…::test_readyz_reports_dependency_state[ota-service]`：`/readyz` 已多报 `minio` 而用例只期 `database`/`redis`，属实现与用例口径漂移（需在“补用例”与“收探针”之间先做判定）；
+  - 两项均因 L5 集成层不在常规门禁（`run_unit_tests.py`）里而长期未暴露，需单开条目处理。
+- **宿主机脚本兼容性门禁的覆盖边界**：仅静态判定模块/成员/内置名三类，实例方法与关键字参数新增判不到（见 §5）。
 
 
 

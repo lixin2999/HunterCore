@@ -28,6 +28,8 @@
     python scripts/collect_carla_vehicle_geometry.py --all-vehicles --print
 
 说明：
+- 本脚本只依赖标准库 + ``carla``，**在部署机系统 Python 3.10 上直接跑**（不用项目 .venv），因此禁用 3.11+ 才有的
+  标准库写法（由 ``tests/test_host_scripts_compat.py`` 钉住）；
 - 蓝图库是服务器级的（与当前地图无关），本脚本**不会** ``load_world``，因此在有仿真实例运行
   时采集也安全；
 - 已存在目标文件时按蓝图**增量合并**（只覆盖本次采集到的蓝图，其余保留），便于分多次采完；
@@ -42,7 +44,7 @@ import argparse
 import fnmatch
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -136,7 +138,7 @@ def _merge_payload(
     payload["model_to_blueprint"] = mapping
     payload["source"] = "live-carla-export"
     payload["carla_version"] = carla_version
-    payload["exported_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload["exported_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return payload
 
 
