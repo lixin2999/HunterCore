@@ -30,6 +30,9 @@
 说明：
 - 本脚本只依赖标准库 + ``carla``，**在部署机系统 Python 3.10 上直接跑**（不用项目 .venv），因此禁用 3.11+ 才有的
   标准库写法（由 ``tests/test_host_scripts_compat.py`` 钉住）；
+- 本脚本**不预设 CARLA 小版本**：客户端超时接口在 0.9.10 前后改名（``set_timeout`` → ``set_client_timeout``），
+  两个名字都会尝试；缺少必需接口（如 ``Blueprint.get_bounding_box``）时会以 ``[error]`` + 版本不匹配提示退出，
+  而不是采到一半报 AttributeError，也**不会**用推算值冒充实机包围盒（由 ``tests/test_carla_collectors_api_compat.py`` 钉住）；
 - 蓝图库是服务器级的（与当前地图无关），本脚本**不会** ``load_world``，因此在有仿真实例运行
   时采集也安全；
 - 已存在目标文件时按蓝图**增量合并**（只覆盖本次采集到的蓝图，其余保留），便于分多次采完；
@@ -44,7 +47,7 @@ import argparse
 import fnmatch
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +60,61 @@ MOUNT_POLICY = "derive_from_blueprint_bounding_box"
 
 def _vector3d(value: Any) -> dict[str, float]:
     return {"x": round(float(value.x), 4), "y": round(float(value.y), 4), "z": round(float(value.z), 4)}
+
+
+#: 客户端超时接口在 PythonAPI 0.9.10 前后**改名**（更早为 ``set_timeout``），写死新名会在旧 wheel 上
+#: 抛 ``AttributeError: 'Client' object has no attribute 'set_client_timeout'``（实机首发）。
+_TIMEOUT_SETTERS: tuple[str, ...] = ("set_client_timeout", "set_timeout")
+
+
+def _apply_client_timeout(client: Any, seconds: float) -> str:
+    """按当前 PythonAPI **实际提供**的接口设置 RPC 超时，返回用到的方法名（都没有则返回空串）。
+
+    部分构建只接受 ``datetime.timedelta``，故 float 抛 TypeError 时再试一次；两者都不可用
+    则不阻断采集（用 wheel 自带默认超时，并由调用侧给出警告）。
+    """
+    for name in _TIMEOUT_SETTERS:
+        setter = getattr(client, name, None)
+        if not callable(setter):
+            continue
+        for value in (float(seconds), timedelta(seconds=seconds)):
+            try:
+                setter(value)
+            except TypeError:
+                continue
+            return name
+        raise RuntimeError(f"carla.Client.{name}() 既不接受 float 也不接受 timedelta")
+    return ""
+
+
+def _missing_api(obj: Any, names: tuple[str, ...]) -> list[str]:
+    """返回 obj 上不存在的接口名——把「wheel 与服务器不同版本」变成可读错误而非中途 AttributeError。"""
+    return [name for name in names if not callable(getattr(obj, name, None))]
+
+
+def _client_version(client: Any) -> str:
+    """尽力取得本地 wheel 的版本号（旧构建无 ``get_client_version`` 时返回「未知」）。"""
+    getter = getattr(client, "get_client_version", None)
+    if not callable(getter):
+        return "未知"
+    try:
+        return str(getter())
+    except Exception:  # noqa: BLE001
+        return "未知"
+
+
+def _api_mismatch_hint(
+    missing: list[str], *, where: str, client_version: str, server_version: str
+) -> str:
+    """版本不匹配的统一处置文案（带可直接粘的 wheel 名）。"""
+    abi = f"cp{sys.version_info[0]}{sys.version_info[1]}"
+    return (
+        f"[error] 本地 carla PythonAPI（{client_version}）在 {where} 上缺少必需接口 {missing}，"
+        f"与服务器 {server_version} 不匹配。\n"
+        "        几何表需要实机包围盒，**平台不会用 dimension/2 推算值冒充**（那样会得到错的挂载边界）。\n"
+        "        请安装该服务器同版本发行包自带的 wheel（不要裸 `pip install carla`，PyPI 版本与服务器不一定对应）：\n"
+        f"        pip3 install --force-reinstall <CARLA 安装目录>/PythonAPI/carla/dist/carla-{server_version}-{abi}-*.whl"
+    )
 
 
 def _select_blueprints(blueprint_library: Any, patterns: list[str], *, all_vehicles: bool) -> list[Any]:
@@ -203,23 +261,74 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     client = carla.Client(args.host, int(args.port))
-    client.set_client_timeout(float(args.timeout))
+    try:
+        timeout_api = _apply_client_timeout(client, float(args.timeout))
+    except (AttributeError, TypeError, RuntimeError) as exc:
+        print(f"[error] 设置 CARLA 客户端超时失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
     try:
         carla_version = client.get_server_version()
-        blueprint_library = client.get_world().get_blueprint_library()
     except Exception as exc:  # noqa: BLE001
         print(
             f"[error] 无法连接 CARLA {args.host}:{args.port}：{exc}\n"
-            "        请确认服务已启动、RPC 端口可达（默认 2000）、且本机与服务器同网段。",
+            "        请确认服务已启动、RPC 端口可达（默认 2000）、且本机与服务器同网段；\n"
+            "        若错误里提到 protocol/version 不兼容，则是**本地 wheel 与服务器版本不一致**（需同版本 PythonAPI）。",
             file=sys.stderr,
         )
         return 2
-    print(f"[carla] 已连接 {args.host}:{args.port}（server {carla_version}）")
+    client_version = _client_version(client)
+    print(
+        f"[carla] 已连接 {args.host}:{args.port}"
+        f"（server {carla_version}，本地 PythonAPI {client_version}，超时接口 {timeout_api or '无'}）"
+    )
+    if not timeout_api:
+        print(
+            "[warn] 该 PythonAPI 既无 set_client_timeout 也无 set_timeout，本次将用其默认超时。",
+            file=sys.stderr,
+        )
+    missing = _missing_api(client, ("get_world",))
+    if missing:
+        print(
+            _api_mismatch_hint(missing, where="Client", client_version=client_version, server_version=carla_version),
+            file=sys.stderr,
+        )
+        return 2
+    world = client.get_world()
+    missing = _missing_api(world, ("get_blueprint_library",))
+    if missing:
+        print(
+            _api_mismatch_hint(missing, where="World", client_version=client_version, server_version=carla_version),
+            file=sys.stderr,
+        )
+        return 2
+    blueprint_library = world.get_blueprint_library()
+    missing = _missing_api(blueprint_library, ("filter",))
+    if missing:
+        print(
+            _api_mismatch_hint(
+                missing, where="BlueprintLibrary", client_version=client_version, server_version=carla_version
+            ),
+            file=sys.stderr,
+        )
+        return 2
 
     selected = _select_blueprints(blueprint_library, list(args.blueprints), all_vehicles=args.all_vehicles)
     if not selected:
         print("[error] 没有匹配到任何车辆蓝图，未写出文件", file=sys.stderr)
         return 1
+
+    missing = _missing_api(selected[0], ("get_dimension", "get_bounding_box"))
+    if missing:
+        print(
+            _api_mismatch_hint(
+                missing,
+                where=f"Blueprint（示例 {selected[0].id}）",
+                client_version=client_version,
+                server_version=carla_version,
+            ),
+            file=sys.stderr,
+        )
+        return 2
 
     requested = {entry.split("=", 1)[1].strip() for entry in args.model_map if "=" in entry}
     missing_targets = sorted(requested - {bp.id for bp in selected})

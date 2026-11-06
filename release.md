@@ -8109,5 +8109,145 @@ docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry impo
   - 两项均因 L5 集成层不在常规门禁（`run_unit_tests.py`）里而长期未暴露，需单开条目处理。
 - **宿主机脚本兼容性门禁的覆盖边界**：仅静态判定模块/成员/内置名三类，实例方法与关键字参数新增判不到（见 §5）。
 
+## V1.24.11（缺陷修复：采集脚本写死新版 PythonAPI 接口名 —— 旧 wheel 上 `AttributeError`；并澄清容器侧 `ModuleNotFoundError` 为镜像未重建）
+
+Date：2026-11-06
+变更类型：缺陷修复（脚本对 CARLA PythonAPI 版本形态的兼容）+ 新增回归用例；服务代码零改动，但**实机闭环需重建 `scene-service` 镜像**（provider 尚未上过线，见 §7/§8）
+
+### 1. 现场
+
+部署机（Ubuntu 22.04）在 `git pull` 已取到 V1.24.10（`b7a342e..5a6f353`）后的回报原文：
+
+```text
+root@hunter-core-server:/opt/HunterCore# python3 --version
+Python 3.10.12
+root@hunter-core-server:/opt/HunterCore# python3 -c "import carla; print(carla.__file__)"
+/usr/local/lib/python3.10/dist-packages/carla/__init__.py
+
+# ① V1.24.10 的 ImportError 已消失，改为崩在下一行
+python3 scripts/collect_carla_spawn_points.py --host 192.168.122.7 --port 2000 --max-points 60 --print
+  File "/opt/HunterCore/scripts/collect_carla_spawn_points.py", line 182, in main
+    client.set_client_timeout(float(args.timeout))
+AttributeError: 'Client' object has no attribute 'set_client_timeout'
+
+# ② 几何表脚本：同一接口、同一异常
+python3 scripts/collect_carla_vehicle_geometry.py --host 192.168.122.7 --port 2000 --blueprints 'vehicle.*' --print
+  File ".../collect_carla_vehicle_geometry.py", line 206, in main
+AttributeError: 'Client' object has no attribute 'set_client_timeout'
+
+# ③ 容器侧两条判据都报模块不存在
+python3 scripts/collect_carla_spawn_points.py --host 192.168.122.7 --port 2000 --out services/scene-service/config/carla_spawn_points.json
+  → 同上 AttributeError（`--out` 那条也是同一个卡点，所以 config 仍是 525 字节出厂骨架）
+docker exec hunter-scene python3 -c "from app.scene_engine.spawn_points import ..."
+ModuleNotFoundError: No module named 'app.scene_engine.spawn_points'
+docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry import ..."
+ModuleNotFoundError: No module named 'app.scene_engine.vehicle_geometry'
+```
+
+关于「宿主 3.10 / 镜像 3.12 是否有影响」：**无交叉影响**。两个脚本在宿主机直跑（不进镜像），服务代码在镜像内跑（不依赖宿主 `carla`）；宿主 3.10 只约束脚本写法（V1.24.10 已钉），镜像 3.12 只约束服务代码。③ 与 Python 版本无关（见 §2）。
+
+### 2. 根因
+
+| 环节 | 事实 | 依据 |
+|---|---|---|
+| ①② 直接成因 | 客户端超时接口在 PythonAPI **0.9.10 前后改名**：更早（含 0.9.9）为 `Client.set_timeout(self, seconds)`（默认 5 秒），其后为 `set_client_timeout(...)`。脚本写死新名 ⇒ 旧 wheel 必崩 | CARLA 官方 `python_api` 文档 0.9.9 条目 |
+| ①② 深层成因 | 该 wheel **不可能来自 `pip install carla`**：PyPI 上 `carla` 仅有 0.9.3/0.9.4/0.9.5 与 0.9.12–0.9.16，且 **Linux + cp310 的 wheel 只有 0.9.15/0.9.16 两档**。装在 `/usr/local/lib/python3.10/dist-packages/` 下 ⇒ 来自**旧 CARLA 发行包**（`pip install ./PythonAPI/carla` 或系统级安装） | PyPI `/pypi/carla/json` releases 逐项核对 |
+| ①② 为何未被拦住 | V1.24.10 的门禁只静态校验**标准库写法**；`Client` 的成员属第三方对象，不在判定面内——正是 V1.24.10 §5 写明的覆盖边界 | `tests/test_host_scripts_compat.py` 判定表 |
+| ③ **非代码缺陷** | 报错是 `No module named 'app.scene_engine.spawn_points'` 而**不是** `No module named 'app.scene_engine'` ⇒ 包能 import、只是包内缺这两个 `.py`。仓内 `services/scene-service/app/scene_engine/` 确有 `spawn_points.py`（V1.24.8）与 `vehicle_geometry.py`（V1.24.9），而 `scene_engine` 其余模块早在 10-23 已有 ⇒ 在跑的镜像构建于**两者加入之前** | `dir services/scene-service/app/scene_engine` + 报错文本形态 |
+| ③ 处置 | 重建 `scene-service` 镜像（§7 ①）。与 config 内容、挂载、`SCENE_*_PATH`、宿主/镜像 Python 版本**都无关** | — |
+
+### 3. 修复内容
+
+1. **超时接口版本自适应**（两个脚本）：`_TIMEOUT_SETTERS = ("set_client_timeout", "set_timeout")` + `_apply_client_timeout(client, seconds)` 逐个 `getattr` 尝试，先传 `float`、抛 `TypeError` 再传 `timedelta`（覆盖只收时长对象的构建）；两者都缺返回空串并打 `[warn]`，**不阻断采集**。
+2. **必需接口预检**：`_missing_api(obj, names)` + `_client_version(client)`；出生点脚本查 `Client.load_world`，几何脚本逐级查 `Client.get_world` → `World.get_blueprint_library` → `BlueprintLibrary.filter` → `Blueprint.get_dimension`/`get_bounding_box`。任一缺失即 `[error] 本地 carla PythonAPI（X）在 <层> 上缺少必需接口 [...]，与服务器 Y 不匹配` + **退出码 2**，并在文案里给出**带服务器版本号与本机 cpXXX ABI** 的 wheel 安装命令（明确写出「不要裸 `pip install carla`」）。不再中途抛裸 `AttributeError`。
+3. **一次执行即给出对版读数**：连接成功横幅改为
+   `[carla] 已连接 <host>:<port>（server X，本地 PythonAPI Y，超时接口 Z）`——把「服务器版本 / 本地 wheel 版本 / 实际用上的接口名」变成可见输出，替代原先要到崩溃才知道的隐式假设。
+4. **失败形态归因**：逐城镇（几何为逐蓝图）失败若含 `AttributeError`，在「全部采集失败」结论后追加「失败形态为 AttributeError：基本肯定是本地 wheel 与服务器 PythonAPI 不一致」，避免现场只看到 N 个条目全失败而无方向。
+5. **几何表拒绝伪造**：本地 wheel 缺 `Blueprint.get_bounding_box` 时**直接退出码 2 拒出表**，不用 `dimension/2` 推算值冒充实机包围盒——provider 侧要求 `bounding_box.center` + 正有限 `extent`，冒充实测值会得到错的挂载边界，而那正是问题 2 要量的东西。
+6. **新增回归用例** `tests/test_carla_collectors_api_compat.py`（11 例）：用 `carla` **替身模块**直接跑脚本 `main()`，覆盖「只有旧 `set_timeout`」/「两个都有（须优先新名）」/「两个都无」/「只收 `timedelta`」/「缺 `load_world`」/「`Map` 无 `get_spawn_points`」/「缺 `get_bounding_box` 拒出表」等形态；用例里服务器版本故意钉 **0.9.9**（若日后有人再写死新接口，本组必红而不是跟着 wheel 版本一起放宽），并含一条源码级钉桩禁止 `client.set_client_timeout(` 复现。
+7. **文档同步**（`docs/` 为本地文档、不入库，见 §8）：故障排查指南 §19.11 增 ④b（列本地 wheel 实际接口）与 ⑥（列容器内 provider 文件）两条取证命令与新处置行 + 新增 **§19.11.1**（容器侧 `ModuleNotFoundError` = 镜像未重建的判据与重建命令）；运维手册 §3.15 ①/§3.16 ① 各加「不预设 CARLA 小版本」条，§3.15 ③/§3.16 ③ 加 provider 缺失预告；01-部署概述 §3.2 改写 carla wheel 口径并**修正过期事实**（原文称业务服务为 Python 3.11 + distroless，实测 8 个服务与 Flink 作业均为 `python:3.12-slim`、runner 因国内 GCR 不可达已从 distroless 回退，仅 `vehicle-service` 仍 3.11-slim）；deployment.md 验证清单新增第 **29** 行。
+
+### 4. 向后兼容
+
+- 脚本 CLI 参数、退出码语义（0 成功 / 1 全失败不写文件 / 2 参数与环境问题）、导出 JSON 的字段与格式**均不变**。
+- 对**现代 wheel 行为不变**：两个接口名都在时仍优先 `set_client_timeout`；两个都没有时只是 `[warn]` 并沿用其默认超时，不阻断。
+- 不改任何服务代码、无 DDL / Kafka / OpenAPI / 契约 / ConfigMap 变更。
+- ⚠ 但 V1.24.8/V1.24.9 的两张表能力在部署机上**从未真正上线**（镜像里没 provider），因此本条目的实机闭环**依赖重建 `scene-service`**——这是环境动作而非本轮代码变更引入的接口变更。
+
+### 5. 风险
+
+- **旧 wheel 可能连 `get_bounding_box` 都没有** ⇒ 几何表仍采不出（脚本现在会明确拒绝并说明，而不是给错数）；出生点表不受此影响（只依赖 `load_world` + `Map.get_spawn_points`）。
+- 0.9.9 的 `set_timeout(seconds)` 与新版 `set_client_timeout(timedelta)` 语义并不完全等价（默认值、单位约定）；脚本按 float→timedelta 顺序尝试，两者都拒则归为 `[error] 设置 CARLA 客户端超时失败` 退 2，不静默继续。
+- 接口预检只覆盖**已列为必需的成员**；未登记的新接口需求仍可能在采集中途 `AttributeError`（现会以 `[warn] … AttributeError` + 版本不一致提示呈现，不吞异常）。
+- 根本解法是**装与服务器同版本的 wheel**（§7 ②）。本脚本改动只是让不一致变得可读，不替代对版。
+
+### 6. 验证（本轮已做）
+
+| 项 | 结果 |
+|---|---|
+| `pytest tests/test_carla_collectors_api_compat.py` | **11 passed** |
+| `pytest tests/test_carla_collectors_api_compat.py tests/test_host_scripts_compat.py` | **23 passed**（新 11 + V1.24.10 门禁 12，互不干扰） |
+| **负向对照（证明非空跑）** | 把 `collect_carla_spawn_points.py` 改回写死 `client.set_client_timeout(float(args.timeout))` 后重跑新用例：**4 failed, 7 passed**，其中 `test_spawn_old_api_set_timeout_is_used` 复现出的正是部署机那句 `'Client' object has no attribute 'set_client_timeout'`，源码级钉桩报 `collect_carla_spawn_points.py 又写死了新版接口名`；已改回并复跑 **23 passed** |
+| **真 Python 3.10.11 老 wheel 形态实跑** | 以临时探针（`py -3.10` + 只含 `set_timeout` 的 `Client` 替身）跑两个脚本的 `main()`：`interpreter=3.10.11 spawn_exit=0 geom_exit=0 timeout_calls=[120.0, 20.0]`，导出 JSON 逐项核对为 `calibrated: true`、`bounding_box` 含 `center`/`extent`、落原点坐标被丢弃、`yaw` 已折算进 `[-π, π]`（1.570796 / -2.96706）；**探针文件已删除，不入仓** |
+| `pytest tests`（单测 + L5 集成层全量） | 94 passed、27 skipped、**2 failed 为既有缺陷**（`test_implemented_routes_subset_of_contract[scene-service]`、`test_readyz_reports_dependency_state[ota-service]`，V1.24.10 §10 已登记，与本轮无关） |
+| `ruff check scripts tests services/scene-service` | All checks passed |
+| `scripts/verify_infra.py` | **20 项全 PASS**（含「K8s 文档 96 个」「Dockerfile 多阶段/非 root」） |
+| 容器侧结论核对 | `services/scene-service/app/scene_engine/` 目录列表确认 `spawn_points.py`、`vehicle_geometry.py` 在仓（故用户那两条 `ModuleNotFoundError` 只能是旧镜像），未改服务代码 |
+
+⚠ **本轮仍无 CARLA 服务器可连**：所有验证靠替身 wheel + 真 3.10 解释器完成。部署机上「真实 carla 版本号 = ?」「wheel 来自哪个发行包」「跑到 `calibrated=True`」三项**读数为零**，需在 §7 执行后回填；若仍报错请记录实际输出，本条目不预设为已修好。
+
+### 7. 实机执行
+
+```bash
+# ① 先让 provider 上线（否则 §3.15/§3.16 的容器判据必然 ModuleNotFoundError，与表内容无关）
+cd /opt/HunterCore && git pull
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env build scene-service
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env up -d --force-recreate scene-service
+
+# ② 查清真实 CARLA 版本与本地 wheel 到底提供了什么（期望：timeout 列表里至少有一个名字，core 四项全 True）
+python3 -c "import carla; c=carla.Client('127.0.0.1',2000); print('local:', getattr(c,'get_client_version',lambda:'未知')()); print('timeout:', [m for m in dir(c) if 'timeout' in m]); print('core:', {m: hasattr(c,m) for m in ('load_world','get_world','get_server_version','get_client_version')})"
+
+# ③ 取服务器版本号（期望打出 server X；X 就是 wheel 必须对齐的版本）
+python3 -c "import carla; print('server:', carla.Client('192.168.122.7',2000).get_server_version())"
+
+# ④ 对版装 wheel（<X> 用③ 的版本号；wheel 在该 CARLA 发行包 PythonAPI/carla/dist/ 下，不要裸 pip install carla）
+pip3 install --force-reinstall <CARLA安装目录>/PythonAPI/carla/dist/carla-<X>-cp310-*.whl
+
+# ⑤ 重跑采集（期望首行 `[carla] 已连接 …（server X，本地 PythonAPI Y，超时接口 Z）`，末行 calibrated=True，退出码 0）
+python3 scripts/collect_carla_spawn_points.py --host 192.168.122.7 --port 2000 --max-points 60 --out services/scene-service/config/carla_spawn_points.json
+python3 scripts/collect_carla_vehicle_geometry.py --host 192.168.122.7 --port 2000 --blueprints 'vehicle.*' --model-map HUNTER_SE=<实机确认的蓝图ID> --out services/scene-service/config/carla_vehicle_geometry.json
+
+# ⑥ 表已入仓 ⇒ 再重建一次镜像；然后查容器真读到了什么（两行均期望 calibrated = True）
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env build scene-service
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env up -d --force-recreate scene-service
+docker exec hunter-scene python3 -c "import os, app.scene_engine as e; print(sorted(n for n in os.listdir(os.path.dirname(e.__file__)) if n.endswith('.py')))"
+docker exec hunter-scene python3 -c "from app.scene_engine.spawn_points import get_spawn_point_table as g; t=g(); print('spawn', t.calibrated, t.source_hash[:12], {k: len(v) for k,v in t.maps.items()})"
+docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry import get_vehicle_geometry_table as g; t=g(); print('geom', t.calibrated, sorted(t.blueprints), dict(t.model_index))"
+```
+
+> ⚠ `192.168.122.7` 属 libvirt/KVM 默认虚拟网段。若节点实际使用的是另一个可达 CARLA 实例，②–⑤ 采到的是**那台**的坐标与蓝图，表里的值对节点无效——先确认这就是仿真节点实际使用的实例。
+
+### 8. 分发
+
+- 代码变更：`scripts/collect_carla_spawn_points.py`、`scripts/collect_carla_vehicle_geometry.py`、新增 `tests/test_carla_collectors_api_compat.py`。`git pull` 即生效（脚本在宿主机直跑，不进镜像）。
+- **`scene-service` 必须重建镜像**：`app/scene_engine/spawn_points.py`、`vehicle_geometry.py` 及两张 config 需进镜像；当前部署机上跑的是无 provider 的旧镜像，**只 pull 不 build 的话 §3.15/§3.16 判据永远报 `ModuleNotFoundError`**。
+- `docs/` 在本仓库为**忽略项**（`.gitignore` 末段「本地文档：只更新、不追踪」），故本轮的故障排查指南 §19.11/§19.11.1、运维手册 §3.15/§3.16、deployment.md 第 29 行、01-部署概述改动**不会随 `git pull` 到达部署机**；部署机侧请以本条目（`release.md` 入库）为唯一依据。
+- 无 DDL / Kafka / OpenAPI / 契约 / ConfigMap 变更；其余 7 个服务与前端无需重建。
+
+### 9. 回滚
+
+- `git revert` 本轮提交即可：只影响两个采集脚本的接口探测逻辑与一个新用例文件，不改服务行为、不改导出格式。
+- 但**回滚不会让 ③ 消失**——`ModuleNotFoundError` 属镜像版本，与脚本无关。
+
+### 10. 待办
+
+- **真实 CARLA 版本与 wheel 来源待用户回填**（§7 ②③）：本轮据 PyPI 版本面推断「该 wheel 不来自 `pip install carla`」，未拿到部署机上的实际版本号前，这只是推断而非结论。
+- **`calibrated=True` 读数仍缺**：V1.24.8/V1.24.9/V1.24.10/V1.24.11 四条连续都卡在采集前置步骤，实机表内容至今未取到一次；⑥ 之后需回填。
+- **重建镜像后需复核 provider 行为**（出生点 2001 拦截、下发载荷 `sensor_mount_reference.status`），本轮未在服务侧做任何改动也未实机验证。
+- **问题 2（画面只见路面）仍未修复**：⚠ **本条目不代表问题 2 已修复**（同 V1.24.9 §10 口径）。挂载点换算与消费在 HunterSim 侧，平台只交付依据与方案文档（`docs/HunterSim传感器挂载换算方案.md`），HunterSim 未改动，`status=resolved` 不等于画面已恢复。
+- **两个既有 L5 缺陷未修**（scene-service 25 个端点不在 `contracts/openapi/scene-service.yaml`；ota-service `/readyz` 多报 `minio`），需单开条目处理。
+- **`docs/` 不入库与「四件套同步」惯例相冲**：运维/排障文档到不了部署机，需判定是改为纳入版本控制（V0.1.1 §5 曾声称要入库）还是在交付方式上另立约定。
+
+
 
 

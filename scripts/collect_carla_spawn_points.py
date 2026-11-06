@@ -29,6 +29,9 @@
 说明：
 - 本脚本只依赖标准库 + ``carla``，**在部署机系统 Python 3.10 上直接跑**（不用项目 .venv），因此禁用 3.11+ 才有的
   标准库写法（由 ``tests/test_host_scripts_compat.py`` 钉住）；
+- 本脚本**不预设 CARLA 小版本**：客户端超时接口在 0.9.10 前后改名（``set_timeout`` → ``set_client_timeout``），
+  两个名字都会尝试；缺少必需接口时会以 ``[error]`` + 版本不匹配提示退出，而不是采到一半报 AttributeError
+  （由 ``tests/test_carla_collectors_api_compat.py`` 钉住）；
 - 逐城镇 ``load_world`` 会重置该世界，**请勿在有仿真实例运行时采集**；
 - 已存在目标文件时按城镇**增量合并**（只覆盖本次采集到的城镇，其余城镇保留），便于分多次采完；
 - ``--print`` 只打印不落盘，用于快速核对；
@@ -42,7 +45,7 @@ import argparse
 import json
 import math
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +71,47 @@ def _wrap_rad(angle_deg: float) -> float:
     """CARLA 航向角（度）→ 契约弧度，并归一到 ``[-pi, pi]``。"""
     wrapped = math.radians(float(angle_deg))
     return (wrapped + math.pi) % (2.0 * math.pi) - math.pi
+
+
+#: 客户端超时接口在 PythonAPI 0.9.10 前后**改名**（更早为 ``set_timeout``），写死新名会在旧 wheel 上
+#: 抛 ``AttributeError: 'Client' object has no attribute 'set_client_timeout'``（实机首发）。
+_TIMEOUT_SETTERS: tuple[str, ...] = ("set_client_timeout", "set_timeout")
+
+
+def _apply_client_timeout(client: Any, seconds: float) -> str:
+    """按当前 PythonAPI **实际提供**的接口设置 RPC 超时，返回用到的方法名（都没有则返回空串）。
+
+    部分构建只接受 ``datetime.timedelta``，故 float 抛 TypeError 时再试一次；两者都不可用
+    则不阻断采集（用 wheel 自带默认超时，并由调用侧给出警告）。
+    """
+    for name in _TIMEOUT_SETTERS:
+        setter = getattr(client, name, None)
+        if not callable(setter):
+            continue
+        for value in (float(seconds), timedelta(seconds=seconds)):
+            try:
+                setter(value)
+            except TypeError:
+                continue
+            return name
+        raise RuntimeError(f"carla.Client.{name}() 既不接受 float 也不接受 timedelta")
+    return ""
+
+
+def _missing_api(obj: Any, names: tuple[str, ...]) -> list[str]:
+    """返回 obj 上不存在的接口名——把「wheel 与服务器不同版本」变成可读错误而非中途 AttributeError。"""
+    return [name for name in names if not callable(getattr(obj, name, None))]
+
+
+def _client_version(client: Any) -> str:
+    """尽力取得本地 wheel 的版本号（旧构建无 ``get_client_version`` 时返回「未知」）。"""
+    getter = getattr(client, "get_client_version", None)
+    if not callable(getter):
+        return "未知"
+    try:
+        return str(getter())
+    except Exception:  # noqa: BLE001
+        return "未知"
 
 
 def _collect_town(client: Any, town_name: str, *, origin_tolerance: float) -> list[dict[str, Any]]:
@@ -179,25 +223,53 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     client = carla.Client(args.host, int(args.port))
-    client.set_client_timeout(float(args.timeout))
+    try:
+        timeout_api = _apply_client_timeout(client, float(args.timeout))
+    except (AttributeError, TypeError, RuntimeError) as exc:
+        print(f"[error] 设置 CARLA 客户端超时失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
     try:
         carla_version = client.get_server_version()
     except Exception as exc:  # noqa: BLE001
         print(
             f"[error] 无法连接 CARLA {args.host}:{args.port}：{exc}\n"
-            "        请确认服务已启动、RPC 端口可达（默认 2000）、且本机与服务器同网段。",
+            "        请确认服务已启动、RPC 端口可达（默认 2000）、且本机与服务器同网段；\n"
+            "        若错误里提到 protocol/version 不兼容，则是**本地 wheel 与服务器版本不一致**（需同版本 PythonAPI）。",
             file=sys.stderr,
         )
         return 2
-    print(f"[carla] 已连接 {args.host}:{args.port}（server {carla_version}）")
+    client_version = _client_version(client)
+    print(
+        f"[carla] 已连接 {args.host}:{args.port}"
+        f"（server {carla_version}，本地 PythonAPI {client_version}，超时接口 {timeout_api or '无'}）"
+    )
+    if not timeout_api:
+        print(
+            "[warn] 该 PythonAPI 既无 set_client_timeout 也无 set_timeout，本次将用其默认超时；"
+            "逐城镇 load_world 较慢时可能超时报错。",
+            file=sys.stderr,
+        )
+    missing = _missing_api(client, ("load_world",))
+    if missing:
+        abi = f"cp{sys.version_info[0]}{sys.version_info[1]}"
+        print(
+            f"[error] 本地 carla PythonAPI（{client_version}）缺少必需接口 {missing}，与服务器 {carla_version} 不匹配，\n"
+            f"        采到一半才报 AttributeError 即是此成因。请安装**该服务器同版本**发行包自带的 wheel\n"
+            f"        （不要裸 `pip install carla`，PyPI 上的版本号与服务器不一定对应）：\n"
+            f"        pip3 install --force-reinstall <CARLA 安装目录>/PythonAPI/carla/dist/carla-{carla_version}-{abi}-*.whl",
+            file=sys.stderr,
+        )
+        return 2
 
     collected: dict[str, list[dict[str, Any]]] = {}
     failures: list[str] = []
+    attr_failure = False
     for town_name in args.towns:
         try:
             points = _thin(_collect_town(client, town_name, origin_tolerance=args.origin_tolerance), args.max_points)
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] {town_name} 采集失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+            attr_failure = attr_failure or isinstance(exc, AttributeError)
             failures.append(town_name)
             continue
         collected[town_name] = points
@@ -205,6 +277,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not collected:
         print("[error] 全部城镇采集失败，未写出文件", file=sys.stderr)
+        if attr_failure:
+            print(
+                "        失败形态为 AttributeError：基本肯定是本地 wheel 与服务器 PythonAPI 不一致（看上一条 warn 的具体接口名）。",
+                file=sys.stderr,
+            )
         return 1
 
     try:
