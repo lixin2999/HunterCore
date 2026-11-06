@@ -37,6 +37,20 @@ from app.repositories.simulations import (
     VilSessionStore,
     carla_topic_names,
 )
+from app.scene_engine.spawn_points import (
+    DEFAULT_ORIGIN_TOLERANCE_M,
+    UNCALIBRATED_HINT,
+    SpawnPointsError,
+    get_spawn_point_table,
+    is_origin_like,
+    to_absolute_spawn_offsets,
+)
+from app.scene_engine.vehicle_geometry import (
+    SENSOR_MOUNT_REFERENCE_KEY,
+    VehicleGeometryError,
+    build_sensor_mount_reference,
+    unavailable_reference,
+)
 from app.schemas.scene import (
     SceneConfig,
     SceneRunData,
@@ -173,6 +187,51 @@ class SceneSimulationService:
         except ValueError:
             return None
 
+    @staticmethod
+    def _ensure_dispatchable_spawn(config: dict[str, Any], *, scene_id: UUID) -> None:
+        """下发前硬拦落在地图原点的自车生成点。
+
+        CARLA 内置城镇的世界原点普遍非有效车道坐标（空地/水面/路网外），自车落此即表现为
+        仿真端「黑屏」或「画面只有路面」——这种实例跑完也只能产出无效数据，故在下发前
+        直接拒绝而非静默改坐标（场景配置属用户资产，自动覆写会造成不预期的行为漂移）。
+        该限制只适用于 ``map_type=carla_town``：高精/园区地图的坐标空间由部署方定义。
+        """
+        map_section = config.get("map") or {}
+        if str(map_section.get("map_type") or "") != "carla_town":
+            return
+        spawn = map_section.get("spawn_point") or {}
+        try:
+            tolerance = get_spawn_point_table().origin_tolerance_m
+        except SpawnPointsError:
+            tolerance = DEFAULT_ORIGIN_TOLERANCE_M
+        if not is_origin_like(spawn, tolerance_m=tolerance):
+            return
+        raise InvalidParameterError(
+            f"自车生成点 ({spawn.get('x', 0)}, {spawn.get('y', 0)}) 落在地图原点，CARLA 内置城镇"
+            "原点普遍非有效车道坐标，仿真端会黑屏或只见路面；请先把出生点改为目标地图上的"
+            f"有效车道坐标（{UNCALIBRATED_HINT}）",
+            details={
+                "scene_id": str(scene_id),
+                "map_id": str(map_section.get("map_id") or ""),
+                "spawn_point": dict(spawn),
+            },
+        )
+
+    @staticmethod
+    def _attach_sensor_mount_reference(payload: dict[str, Any]) -> None:
+        """给下发载荷附车辆蓝图几何参考块（V1.24.9，问题 2「画面只见路面」的平台侧缓解）。
+
+        传感器挂载点由仿真端按蓝图实际尺寸换算，平台的职责是把换算依据（实机
+        ``get_dimension()`` / ``get_bounding_box()``）随场景一起给下去。该块属纯附加信息：
+        几何表缺失/非法不拦下发（与出生点折算解耦），只写 ``table_unavailable`` 状态与原因，
+        让仿真端回退自身查询而不是拿着空信息当尺寸。
+        """
+        try:
+            payload[SENSOR_MOUNT_REFERENCE_KEY] = build_sensor_mount_reference(payload)
+        except VehicleGeometryError as exc:
+            payload[SENSOR_MOUNT_REFERENCE_KEY] = unavailable_reference(str(exc))
+            logger.warning("vehicle_geometry_reference_failed", error=str(exc))
+
     async def run_scene(self, scene_id: UUID, payload: SceneRunRequest | None) -> SceneRunData:
         """下发场景到 CARLA 并返回实例信息（4.4 节第 1-5 步）。"""
         model = await self._scenes.load_scene_model(scene_id)
@@ -189,6 +248,12 @@ class SceneSimulationService:
         merged, applied = apply_param_overrides(
             scene.config, request.param_overrides, self._settings
         )
+        # 下发载荷统一折算：平台存的是“相对 map.spawn_point 的偏移”，而仿真端按绝对坐标
+        # 直接使用参与者出生点。历史数据基准恒为原点时两者等价，基准一改成有效车道坐标
+        # 不折算就会让全部参与者脱离自车周边（并附 spawn_semantics=absolute 标记）。
+        dispatch_config = to_absolute_spawn_offsets(merged.model_dump(mode="json"))
+        self._ensure_dispatchable_spawn(dispatch_config, scene_id=scene_id)
+        self._attach_sensor_mount_reference(dispatch_config)
 
         mode = request.mode
         vehicle_id = request.vehicle_id
@@ -284,7 +349,7 @@ class SceneSimulationService:
                 instance = await self._carla.create_instance(
                     scene_id=str(scene_id),
                     scene_name=model.scene_name,
-                    scene_config=merged.model_dump(mode="json"),
+                    scene_config=dispatch_config,
                     sim_id=sim_id,
                     mode=mode.value,
                     vehicle_id=vehicle_id,
@@ -313,7 +378,7 @@ class SceneSimulationService:
                 {
                     "sim_id": sim_id,
                     "scene_id": str(scene_id),
-                    "scene_config": merged.model_dump(mode="json"),
+                    "scene_config": dispatch_config,
                     "param_overrides": applied,
                     "mode": mode.value,
                     "vehicle_id": vehicle_id,

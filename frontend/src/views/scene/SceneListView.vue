@@ -377,6 +377,26 @@ void loadScenes()
         <el-form-item label="地图 ID">
           <el-input v-model="createForm.config.map.map_id" />
         </el-form-item>
+        <el-form-item label="自车生成点">
+          <div class="spawn">
+            <div class="spawn__row">
+              <el-input-number v-model="createForm.config.map.spawn_point.x" :step="5" controls-position="right" />
+              <el-input-number v-model="createForm.config.map.spawn_point.y" :step="5" controls-position="right" />
+              <el-input-number
+                v-model="createForm.config.map.spawn_point.yaw"
+                :min="-3.1416"
+                :max="3.1416"
+                :step="0.1"
+                controls-position="right"
+              />
+            </div>
+            <p class="hint">
+              x / y / yaw（米 / 米 / 弧度）必须是目标地图上的有效车道坐标，请取自实机出生点表；
+              落在原点 (0, 0) 的场景会被平台挡下、不允许下发（CARLA 城镇原点不在路面上，仿真画面会黑屏）。
+              详细坐标可在新建后到详情页调整。
+            </p>
+          </div>
+        </el-form-item>
         <el-form-item label="场景时长（s）">
           <el-input-number v-model="createForm.config.duration" :min="1" :max="3600" />
         </el-form-item>
@@ -428,6 +448,26 @@ void loadScenes()
 .pager {
   margin-top: 12px;
   text-align: right;
+}
+
+.spawn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+
+.spawn__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--el-text-color-secondary);
 }
 </style>
 

@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "calibrated": false,
+  "source": "pending-live-carla-export",
+  "carla_version": null,
+  "exported_at": null,
+  "mount_policy": "derive_from_blueprint_bounding_box",
+  "model_to_blueprint": {
+    "HUNTER_SE": null
+  },
+  "blueprints": {}
+}

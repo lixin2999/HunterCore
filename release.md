@@ -7685,7 +7685,9 @@ curl -m 5 -k --cert /app/data/sim-node-certs/sim-node-01/platform/client-cert.pe
 ### 5. 待办
 
 - 实机回验 mTLS 下发全链路（证书就绪 + 节点心跳学到新 IP + 下发成功）。
+  ⇒ 已由 V1.24.7 补全服务端验证跳过后实机验证通过。
 - HunterSim 侧确认已信任平台 CA（接入包内 ca-cert.pem）且允许 CN=sim-platform-sim-node-01 的客户端。
+  ⇒ 实机确认：不带客户端证书时服务端拒绝（Broken pipe），带平台证书时 200 OK。
 
 ## V1.24.7（修复：mTLS 下发报“不可达”——服务端证书验证失败“unsuitable certificate purpose”）
 
@@ -7743,8 +7745,245 @@ c.close()
 "
 ```
 
-### 5. 待办
+### 5. 实机回验记录（2026-11-05，部署机 hunter-core-server + 节点 192.168.122.111；**已验证通过**）
 
-- 实机回验下发全链路成功。
+| 项 | 结果 |
+|---|---|
+| 容器生效值 | `SIM_DISPATCH_SSL_VERIFY=false`、`SIM_DISPATCH_MTLS_ENABLED=true`、`SIM_DISPATCH_MODE=node` |
+| 平台证书 | `/app/data/sim-node-certs/sim-node-01/platform/client-cert.pem` + `client-key.pem` 存在 |
+| 节点地址学习 | 心跳刷新后 `endpoint_ip=192.168.122.111`（直连无 NAT） |
+| 容器内 mTLS 探测 | `httpx.Client(cert=..., verify=False)` → **200 OK** |
+| 后台下发 | SCN-2461-MRM-STD-L2-v3.0 点“下发仿真” → 绿色提示“仿真已下发（实例 inst-9c18806b4b3d4fa19a25f0d458374967，状态 pending）” |
+
+⇒ V1.24.7 **实机验证通过**。
+
+### 6. 待办
+
 - 后续安全加固：让 HunterSim 服务端证书由统一 CA 签发（具备 serverAuth EKU），然后回置 `SIM_DISPATCH_SSL_VERIFY=true`。
+
+## V1.24.8（修复：仿真画面黑屏 / 只见路面——平台下发的自车出生点 `map.spawn_point` 为 (0,0,0)，自车生成在 CARLA 内置城镇的世界原点）
+
+Date：2026-11-06
+变更类型：修复 + 新增能力（出生点表 provider、G3 分级校验、生成/编译注入、下发前置拦截与相对→绝对折算、批量脚本强约束、实机采集脚本、前端提示、两套编排对称注入）；**需重建 scene-service 与 web-portal 镜像**
+
+### 1. 现场
+
+- HunterSim v3.3.5 可视化：主视区几乎全黑、下方只有一条路面；HUD 自车 `x / y / z / heading / speed` **恒为 0.00**（即自车从未离开世界原点）。
+- 日志正常：`Sensor 'rgb_camera' attached at mount 'camera_front_ryb'`、`Sim sensors attached: 4`——传感器挂载流程没有报错，故不是控制链路问题。
+- 平台侧下发返回成功（V1.24.7 行为），场景状态、实例、回传链路均无异常。
+
+### 2. 根因
+
+出生点是场景配置项，平台侧每一环都没有能力判定它是否有效：
+
+| 环节 | 缺陷 |
+|---|---|
+| `scripts/batch_add_scenes.py` | `_spawn(0.0, 0.0, 0.0, …)` 写死自车出生点为原点 |
+| 场景目录 / `VALID_BASE_CONFIG` | 内置模板的 `map.spawn_point` 恒为 `(0,0,0)` |
+| 校验门 G3 | 只校验「坐标是有限数值 + 在围栏内」；原点是有限数值 ⇒ 一路放行 |
+| 前端（详情页 / 新建） | 出生点默认 0 且无任何有效性提示 |
+| 下发 | 平台存储语义为「自车绝对 + 参与者**相对**偏移」，HunterSim 按**全绝对**使用；基准恒为原点时两者恰好等价，基准一旦改成真实车道坐标，不折算会让全部参与者脱离自车周边 |
+
+CARLA 内置城镇的世界原点普遍落在空地 / 水面 / 路网外，自车生成在此即表现为黑屏或只见路面。存量约 1200 条批量场景的出生点全为原点，属同一成因。
+
+### 3. 修复内容
+
+1. **出生点表 provider**（新增 `services/scene-service/app/scene_engine/spawn_points.py`）：加载 / 解析 / 缓存（`lru_cache` + SHA-256 `source_hash`）/ 原点判定 `is_origin_like` / 表命中 `match_candidate` / 轮转指派 `pick_candidate`（表未校准一律返回 `None`）/ 相对→绝对折算 `to_absolute_spawn_offsets`（纯函数，附 `spawn_semantics=absolute` 标记）。口径对齐既有 `vehicle_params` provider。
+2. **出厂表为空骨架**（新增 `services/scene-service/config/carla_spawn_points.json`，`calibrated=false`、各城镇候选点为空）：**平台不携带任何编造坐标**，合法车道坐标只能由实机导出。
+3. **配置项** `SCENE_CARLA_SPAWN_POINTS_PATH`（`app/config.py`）：留空 = 镜像内置表；两套编排与 `.env.example` 已对称注入。
+4. **生成 / 编译链路注入**（`scene_engine/generator.py`、`scene_engine/compiler.py`）：`compile_parameters` 之后、进闸门之前按表指派自车出生点（仅覆写原点、仅 `carla_town`）；编译复检用 SHA-256 稳定序号，保证幂等。
+5. **G3 分级校验**（`scene_engine/validators.py`）：表已校准 ⇒ 原点与未命中坐标一律 FAIL；表未校准 ⇒ 只在闸门说明里标 ⚠（见 §4 口径说明）。
+6. **下发前置硬拦 + 折算**（`services/simulation.py`）：载荷先 `to_absolute_spawn_offsets` 折算，再无条件拦原点（`InvalidParameterError` → HTTP 422 / code 2001，不创建实例，避免黑屏空跑）。
+7. **批量脚本强约束**（`scripts/batch_add_scenes.py`）：出生点改取表值（按稳定摘要轮换指派），跑前校验表已校准且覆盖全部目标城镇，否则退出码 2；轻校验同样拦原点。
+8. **实机采集脚本**（新增 `scripts/collect_carla_spawn_points.py`）：`world.get_map().get_spawn_points()` → 丢弃原点退化坐标 → 等间隔抽稀 → 按城镇增量合并 → 导出并把 `calibrated` 置 `true`；未装 carla wheel 时退出码 2 并给出安装指引。
+9. **前端提示校正**（`SceneDetailView.vue` / `SceneListView.vue`）：出生点输入语义说明、参与者偏移为相对量提示、新建对话框可填 x/y/yaw。
+10. **契约固化**（`contracts/openapi/scene-service.yaml`）：`SpawnPoint` 描述补坐标语义与有效值约束；新增 `x-hunter-scene-config-contract.spawn_point_semantics` 与 `x-hunter-simulation-flow.spawn_point_dispatch`；runScene 规则补原点 → 2001；待确认项 #3 的 spawn_point 部分回填。
+
+### 4. 为什么不把 G3 改成「一律拒原点」
+
+首轮实现就是无条件拒原点，结果 48 例单测失败——任何**没接实机 CARLA**（表未校准）的部署上整条生成链路会直接失效，这比黑屏更严重。因此定下分级口径：
+
+- G3：表已校准才有资格判定「未命中即凭猜测」，此时拦原点与未命中坐标；未校准只标风险；
+- 下发环节：**不区分表状态**，无条件拦原点（这是能确定判定的位置）；
+- 批量脚本：要求表已校准，否则不产出必黑屏的存量数据。
+
+### 5. 向后兼容与影响面
+
+- API 请求/响应结构不变；`map.spawn_point` 字段语义不变（自车绝对），只是新增有效性约束。
+- 下发载荷新增根节点 `spawn_semantics: "absolute"` 与参与者绝对坐标——**仿真端若已实现基准叠加，必须按该标记跳过，否则二次相加**（契约已登记）。
+- ⚠ 存量把出生点写成 `(0,0,0)` 的 `carla_town` 场景：不会因 G3 复检被批量拦下（表未校准），但**下发会被 2001 挡下**，需按 §8 校准表后重新批量生成，或在详情页改成有效坐标。
+- `hd_map` / 园区地图不受影响（坐标空间由部署方定义，不套用内置城镇表）。
+
+### 6. 风险
+
+- 出生点表未校准期间，非原点但同样无效的坐标仍无法被平台判定（G3 只标 ⚠）——只有校准后才能给出「未命中即拒」的强约束。
+- 下发折算依赖「参与者为相对偏移」这一既有实现口径；若后续改为绝对存储，需同步撤掉折算，否则参与者坐标会被叠加两次。
+- `spawn_semantics` 标记需 HunterSim 侧配合解释；当前 HunterSim 按绝对使用，与折算结果一致。
+
+### 7. 验证（本轮已做）
+
+| 项 | 结果 |
+|---|---|
+| 新增单测 `app/tests/test_spawn_points.py` | 29 例通过（表加载/解析/非法载荷参数化/配置路径/哈希/原点判定/指派/折算/G3 分级/生成与编译注入/下发拦截/下发折算） |
+| `pytest services/scene-service` | **413 passed** |
+| `python scripts/run_unit_tests.py` | 各服务全绿；`common/python` 与 `flink-jobs` 各 1 例失败为**既有缺陷**（DDL 表清单未含 `scene_svc.sim_node_registry`；`data-analytics.yaml` 的 `x-hunter-kafka.consumes` 条目缺 `topic` 键），与本次改动无关 |
+| `ruff check` | All checks passed |
+| YAML / JSON 可解析 | `contracts/openapi/scene-service.yaml`、`config/carla_spawn_points.json`、两套编排文件均解析通过 |
+| `python scripts/verify_infra.py` | 全部 PASS（含两套编排的环境变量注入对称性，以及 scene-service ConfigMap 键与 `hunter_common.config` 的对称校验） |
+| `npm run type-check`（`vue-tsc --noEmit -p tsconfig.json`） | 退出码 0、**0 error**（覆盖 `SceneDetailView.vue` / `SceneListView.vue` 的出生点与参与者偏移改动） |
+
+⚠ **端到端实机验证未完成**：出生点表尚未按实机 CARLA 校准，「校准后下发坐标有效、画面不再黑屏」这一条只有代码与单测证据，**没有实机读数**（见 §10 待办）。
+
+### 8. 实机执行步骤
+
+```bash
+# ① 在能连到 CARLA 的机器上采集实机出生点（需与节点同版本的 carla PythonAPI；平台容器内没有 carla）
+pip install carla==<与服务器一致的版本号>
+python3 scripts/collect_carla_spawn_points.py --host <CARLA_IP> --port 2000 \
+  --out /opt/HunterCore/config/carla_spawn_points.json
+#   期望末行：calibrated=True，覆盖 N 个城镇；退出码 0
+
+# ② 部署机让平台读到新表（二选一）
+#   a) 把采集结果放回仓库 config 后重建镜像（默认路径，无需挂载）
+cd /opt/HunterCore && git pull
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env \
+  build scene-service && \
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env \
+  up -d --force-recreate scene-service web-portal
+#   b) 不重建镜像：在 docker-compose.override.yml 挂载表所在**目录**（勿单文件挂载），
+#      并置 SCENE_CARLA_SPAWN_POINTS_PATH=/app/data/carla-spawn/carla_spawn_points.json
+
+# ③ 校验表真的生效
+docker exec hunter-scene python3 -c \
+  'from app.scene_engine.spawn_points import get_spawn_point_table as g; t=g(); print(t.source, t.source_hash[:12], t.calibrated, {k: len(v) for k, v in t.maps.items()})'
+
+# ④ 看存量原点场景规模，并验证下发拦截仍然生效（校准前预期 422 / code=2001）
+docker exec hunter-postgres psql -U hunter -d hunter_core -c "select count(*) from scene_svc.scenes where config_json->'map'->>'map_type'='carla_town' and coalesce((config_json->'map'->'spawn_point'->>'x')::numeric,0) between -1 and 1 and coalesce((config_json->'map'->'spawn_point'->>'y')::numeric,0) between -1 and 1;"
+
+# ⑤ 校准后：批量脚本重生成（或详情页改坐标）→ 下发 → HunterSim 里自车 x/y 应为非 0 的有效车道坐标
+python3 scripts/batch_add_scenes.py --dry-run   # 期望：[spawn] 自车出生点来源: live-carla-export（sha256=…）
+```
+
+### 9. 分发
+
+- 必须重建：`scene-service`（provider + 闸门 + 下发 + 包内默认表随 `COPY config` 进镜像）、`web-portal`（前端提示与新建对话框）。
+- 契约变更（`contracts/openapi/scene-service.yaml`）**无需**重新渲染 K8s 契约 ConfigMap：
+  `scripts/generate_contracts_configmap.py` 只打包 `contracts/kafka`（topics / consumer-groups / schemas），
+  openapi 属设计期单一事实来源、不进镜像也不挂载（本轮已核实：生成的
+  `infra/k8s/base/03-configmap-contracts.yaml` 内容与改动前字节一致）。
+- 无 DDL 变更、无新增 Kafka Topic、无新增服务。
+
+### 10. 待办
+
+- **出生点表未校准**：出厂表为空骨架，需实机执行 `scripts/collect_carla_spawn_points.py` 并回填（§8 ①）；校准前平台不会自动产出有效坐标，原点场景下发一律 2001。
+- **端到端实机回验未做**：校准后需实测「下发自车坐标非 0 / 画面不再黑屏 / 参与者围绕自车」，回填本节验证表。
+- **存量 (0,0,0) 场景**：需重新批量生成或在详情页修正坐标，否则下发即被挡；数量以 §8 ④ 的读数为准。
+- **问题 2「画面只见路面」＝ 相机挂载位置**：根因判定在 **HunterSim 侧**（`hunter_se` 资产缺失时回退全尺寸蓝图、而相机偏移仍按固定 0.40/0.30m 计算，镜头埋进车身；`sensor_configs.json` 的 mounts/pitch 为未生效的死配置），本轮按确认范围「只改 HunterCore 平台侧」**未改动、未在实机确诊**，需另行授权后按蓝图动态尺寸换算 + 配置驱动处理。**本条目不代表问题 2 已修复。**
+  - 更新（V1.24.9）：平台侧已先交付缓解能力（下发载荷附 `sensor_mount_reference` 实机尺寸），但挂载点换算与消费仍在 HunterSim 侧，本待办依旧未闭环。
+
+## V1.24.9（新增能力：下发附车辆蓝图几何参考 `sensor_mount_reference`——问题 2「仿真画面只见路面」的平台侧缓解）
+
+Date：2026-11-06
+变更类型：新增能力（车辆几何表 provider + 实机导出脚本 + 下发载荷附加参考块 + 契约与两套编排对称注入）；**需重建 scene-service 镜像**；不改变任何现有字段与错误码
+
+### 1. 现场与定位
+
+- V1.24.8 修的是「自车落在世界原点」，表现为**画面几乎全黑**；现场另一类观感是**画面不黑、但下半屏只看到一条路面**（HUD 自车坐标已非 0）。
+- 日志线索：`Sensor 'rgb_camera' attached at mount 'camera_front_ryb'`、`Sim sensors attached: 4` —— 挂载流程本身不报错，因此不是链路故障，而是**挂载坐标与车辆实际外形不匹配**（镜头埋进车身或贴地）。
+- 根因归属：**HunterSim 侧**。平台不渲染画面、不决定挂载点；本轮按用户决策先做**平台侧缓解**——把换算所需的实机尺寸随场景下发，使仿真端有条件按蓝图实际外形自行换算。
+- ⚠ 该根因判定依据是截图与日志线索，**未读 HunterSim 源码、未在实机确诊**（见 §10）。
+
+### 2. 平台侧此前为什么给不出依据
+
+| 环节 | 缺陷 |
+|---|---|
+| `config/vehicle_params.json` | 只有运动学能力（轴距/转角/制动/车速），**不含长宽高与包围盒** |
+| `SceneConfig.ego_vehicle` | 只有 `model / initial_speed / initial_steer`，无几何字段（契约 4.2.2 字段名不可改） |
+| 下发载荷 | 只有场景参数，仿真端拿不到「平台侧认为的车辆尺寸」，只能沿用写死的 0.40/0.30m 偏移 |
+| 实机数据 | CARLA 蓝图的 `get_dimension()` / `get_bounding_box()` 从未被采集，平台也没有导出工具 |
+
+### 3. 修复内容
+
+1. **车辆几何表 provider**（新增 `services/scene-service/app/scene_engine/vehicle_geometry.py`）：加载 / 解析 / SHA-256 `source_hash` / `lru_cache` / 车型→蓝图解析 / 包围盒边界推导。口径对齐 `vehicle_params` 与 `carla_spawn_points`。
+2. **出厂表为空骨架**（新增 `services/scene-service/config/carla_vehicle_geometry.json`，`calibrated=false`、`blueprints={}`、`model_to_blueprint` 的值为 `null`）：**平台不携带编造尺寸，也不替部署方猜蓝图 ID**。
+3. **实机导出脚本**（新增 `scripts/collect_carla_vehicle_geometry.py`）：按 ID/通配筛选 `vehicle.*` 蓝图 → 导出 `dimension` + `bounding_box(center/extent)` → 增量合并 → 可选 `--model-map MODEL=蓝图ID`；不 `load_world`，**可在有实例运行时采集**；未匹配到蓝图时不写出并返退出码 1/2。
+4. **配置项** `SCENE_CARLA_VEHICLE_GEOMETRY_PATH`（`app/config.py`）：留空 = 镜像内置表；compose / K8s ConfigMap / `.env.example` 已对称注入；`docker-compose.override.yml.example` 补上“与出生点表同一目录挂载”的热替换注释。
+5. **下发注入**（`services/simulation.py`）：载荷根节点附 `sensor_mount_reference`（`dimension_m` / `bounding_box_m` / `envelope_m` + 出处哈希），按 `ego_vehicle.model` 经「显式映射 → 蓝图 ID 归一化 → 展示名归一化」解析。
+6. **不阻断原则**：表缺失、未校准、非法或未命中车型时，参考块只写 `status`（`table_uncalibrated` / `blueprint_unmatched` / `table_unavailable`）与提示、**不携带任何数字**，且不影响下发成功与否。
+7. **解析强约束**（防止表被填成半截数据）：`calibrated=true` 必须有蓝图；`extent` 必须为正有限数值；`model_to_blueprint` 指向未登记尺寸的蓝图→加载即报错；`mount_policy` 只接受 `derive_from_blueprint_bounding_box`。
+8. **契约固化**（`contracts/openapi/scene-service.yaml`）：新增 `x-hunter-simulation-flow.camera_mount_reference`（问题归属 / 数据权威 / 字段语义 / 四种状态 / 非阻断 / 尚需仿真端消费的 remaining_work）；`x-hunter-service.required_env` 补新配置键。
+
+### 4. 为何不给具体挂载坐标
+
+平台只给**边界**（`front_edge_x_m` / `rear_edge_x_m` / `side_edge_y_m` / `roof_z_m` / `bottom_z_m`），不给挂载点：
+
+- 挂载点 = 边界 ± 相机本体余量，后者属仿真端传感器模型的私有参数，平台无从得知；
+- CARLA 局部 Y 轴左右朝向在不同渲染框架下的解释不同，平台只给对称量（`side_edge_y_m`）不做臆断；
+- 若平台直接下发挂载坐标，就与本轮要修的「写死偏移」犯了同一类型的错。
+
+### 5. 向后兼容与影响面
+
+- API 请求/响应结构不变；`SceneConfig` 存储结构不变（参考块只在**下发载荷**构造，库内 `config_json` 不包含它）。
+- 下发载荷新增根节点 `sensor_mount_reference`：对不读该字段的旧版 HunterSim 完全无影响（附加信息）；已有 `spawn_semantics` 等字段不变。
+- 未校准期（出厂默认）行为与 V1.24.8 完全一致，只是参考块多一个 `status: table_uncalibrated`。
+- 无 DDL 变更、无 Kafka 变更、无新增服务、无新增错误码。
+
+### 6. 风险
+
+- 参考块只解决「依据缺失」，不解决「依据未被消费」：若仿真端仍用写死偏移，画面不会有任何变化。
+- 车型→蓝图映射是部署方手工登记的（`--model-map`）；填错蓝图会把仿真端引向错误尺寸（平台只能保证“蓝图已采集”而不能保证“选对了车”）。
+- `lru_cache` 按路径缓存：换了表文件不重启不生效（与出生点表同一口径）。
+
+### 7. 验证（本轮已做）
+
+| 项 | 结果 |
+|---|---|
+| 新增单测 `app/tests/test_vehicle_geometry.py` | 33 例通过（骨架无编造数据/哈希跟踪字节/10 例非法载荷/三级解析与归一化/包围盒边界算术/四种参考块状态均不携带数字/下发附加与不阻断） |
+| `pytest services/scene-service` | **446 passed**（V1.24.8 后 413 → 新增 33；旧用例零失败，证明载荷多一个根节点不影响既有断言） |
+| `ruff check services/scene-service scripts` | All checks passed |
+| YAML / JSON 可解析 | `contracts/openapi/scene-service.yaml`、`config/carla_vehicle_geometry.json`、两套编排文件均解析通过 |
+| `python scripts/verify_infra.py` | 全部 PASS |
+| 契约 ConfigMap 无需重渲染 | 已实跑 `generate_contracts_configmap.py`，产物字节与 HEAD 一致（该 ConfigMap 只打包 `contracts/kafka`） |
+| 四件套运维文档同步 | `故障排查指南.md` §19.10（新）、`运维操作手册.md` §3.16（新）、`deployment.md` §9 要点 + §10 验证清单第 27 行、`01-部署概述与环境要求.md` §3.2 工具表 + env 表新键 |
+
+⚠ **未做实机验证**：本仓库环境无 CARLA 服务器，导出脚本未跑过实机；且未读 HunterSim 源码，因此“下发已携带尺寸”只有单测证据，“画面因此恢复正常”尚无读数。
+
+### 8. 实机执行步骤
+
+```bash
+# ① 在能连 CARLA 的机器上导出蓝图尺寸（不会 load_world，可与实例共存）
+python3 scripts/collect_carla_vehicle_geometry.py --host <CARLA_IP> --port 2000 \
+  --blueprints 'vehicle.*se*' --model-map HUNTER_SE=<完整蓝图ID>
+#   期望末行：calibrated=True，登记 N 个蓝图，车型映射 1 项；退出码 0
+#   先确认可用蓝图 ID：--blueprints 'vehicle.*' --print（体量大，确认后改用精确匹配）
+
+# ② 让容器读到新表（与出生点表同法）
+cd /opt/HunterCore && git pull
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env \
+  build scene-service && \
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env \
+  up -d --force-recreate scene-service
+
+# ③ 判据：表已生效
+docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry import get_vehicle_geometry_table as g; t=g(); print(t.calibrated, sorted(t.blueprints), dict(t.model_index))"
+
+# ④ 判据：下发载荷真的带上了尺寸（看返回后的平台日志或直接看节点侧收到的 scene_config）
+docker exec hunter-scene python3 -c "from app.scene_engine.vehicle_geometry import build_sensor_mount_reference as b; from app.scene_engine.vehicle_geometry import get_vehicle_geometry_table as g; print(b({'ego_vehicle': {'model': 'HUNTER_SE'}}, table=g()))"
+#   期望：status='resolved' 且带 dimension_m / envelope_m
+```
+
+### 9. 分发
+
+- 必须重建：`scene-service`（provider + 下发注入 + 包内骨架表随 `COPY config` 进镜像）。
+- 前端无需重建（本轮未改前端）；但若同时分发 V1.24.8，`web-portal` 仍需重建。
+- 无 DDL / Kafka / 服务新增；契约变更无需重渲染 `hunter-contracts` ConfigMap（只打包 `contracts/kafka`）。
+
+### 10. 待办
+
+- **HunterSim 侧消费未实现（问题 2 的真正修复点）**：需仿真端把相机挂载从写死 0.40/0.30m 改为按 `sensor_mount_reference.envelope_m` 换算（如车顶前视 ≈ `roof_z_m` + 相机本体高、前向 ≈ `front_edge_x_m` - 余量），并处理 `sensor_configs.json` 的 mounts/pitch 死配置。**本条目不代表问题 2 已修复。**
+- **几何表未校准**：出厂为骨架，需实机执行 §8 ①；未校准前参考块只会报 `table_uncalibrated`。
+- **导出脚本未实机验证**：`get_dimension()` / `get_bounding_box()` 的轴定义按 CARLA 文档假设 x=车长、y=车宽、z=车高，首次实机采集后需人工核对量级是否与真车一致。
+- **未确诊**：本条目对问题 2 根因的描述基于日志与截图推断，未读 HunterSim 源码；若实机发现另有成因（如相机 FOV/渲染通道问题），需新开条目修正而不宜追溯修改本条目。
+
+
 

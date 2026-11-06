@@ -25,6 +25,14 @@ from pydantic import ValidationError
 from app.models.scene_engine import Avoidability, CriticalityLevel, RarityZone, RiskLevel
 from app.scene_engine.esmini import EsminiRunner
 from app.scene_engine.ir import SceneIR, is_finite_number
+from app.scene_engine.spawn_points import (
+    UNCALIBRATED_HINT,
+    SpawnPointsError,
+    SpawnPointTable,
+    get_spawn_point_table,
+    is_origin_like,
+    match_candidate,
+)
 from app.scene_engine.stats import chi2_sf, mahalanobis_d2, rarity_zone
 from app.scene_engine.vehicle_params import VehicleParams, get_vehicle_params
 from app.schemas.scene import SceneConfig, ensure_scene_type
@@ -242,6 +250,68 @@ def _number_or_none(value: Any) -> float | None:
     return number if is_finite_number(number) else None
 
 
+def _resolve_spawn_table(
+    spawn_table: SpawnPointTable | None,
+) -> tuple[SpawnPointTable | None, str | None]:
+    """取出生点表；表文件缺失/非法时返回缺陷描述（不静默降级为“无表”）。"""
+    if spawn_table is not None:
+        return spawn_table, None
+    try:
+        return get_spawn_point_table(), None
+    except SpawnPointsError as exc:
+        return None, f"G3: 出生点表不可用：{exc}"
+
+
+def _coord(spawn: dict[str, Any], key: str) -> float:
+    """取出生点分量（非数值按 0 处理，仅用于拼消息）。"""
+    return _number_or_none(spawn.get(key)) or 0.0
+
+
+def _spawn_point_problem(
+    map_section: dict[str, Any], map_id: str, spawn: dict[str, Any], table: SpawnPointTable
+) -> tuple[str | None, str]:
+    """G3 出生点有效性：返回 ``(缺陷描述, 附加说明)``。
+
+    分级口径（V1.24.8）：
+    - 仅对 ``map_type=carla_town`` 生效：内置城镇的坐标空间由 CARLA 决定，原点普遍非有效
+      车道坐标（自车落此即仿真端「黑屏 / 只见路面」）；高精/园区地图坐标由部署方定义，不套用；
+    - 表已校准且该地图有候选点 ⇒ 平台完全有能力给出有效坐标，因此原点和未命中坐标一律 FAIL；
+    - 表未校准 ⇒ 平台无从判定任意坐标是否有效，不在这里硬拦（否则未接实机的部署上整条
+      生成链路会直接失效）：只在说明里标记原点风险。硬拦在下发环节：原点出生点的场景
+      不会被下发到仿真（``services.simulation`` 返回 2001），批量脚本则要求表必须已校准。
+    """
+    if str(map_section.get("map_type") or "") != "carla_town":
+        return None, ""
+    origin = is_origin_like(spawn, tolerance_m=table.origin_tolerance_m)
+    coordinate = f"({_coord(spawn, 'x'):.1f}, {_coord(spawn, 'y'):.1f})"
+    if table.usable(map_id):
+        if origin:
+            return (
+                (
+                    f"G3: 自车生成点 {coordinate} 落在地图原点，CARLA 内置城镇原点普遍非有效车道"
+                    f"坐标（空地/水面/路网外），仿真端将呈现黑屏或只见路面；地图 {map_id!r} 已有 "
+                    f"{len(table.candidates(map_id))} 个实机出生点可指派"
+                ),
+                "",
+            )
+        if match_candidate(map_id, spawn, table) is None:
+            return (
+                (
+                    f"G3: 自车生成点 {coordinate} 未命中地图 {map_id!r} 的实机出生点表（"
+                    f"{len(table.candidates(map_id))} 个候选点，容差 "
+                    f"{table.match_tolerance_m:.1f}m），疑为凭猜测填写"
+                ),
+                "",
+            )
+        return None, f"；出生点命中实机表（{table.source or 'carla_spawn_points'}）"
+    if origin:
+        return None, (
+            f"；⚠ 自车生成点 {coordinate} 为地图原点（非有效车道坐标，下发仿真会被拒绝）："
+            f"{UNCALIBRATED_HINT}"
+        )
+    return None, f"；{UNCALIBRATED_HINT}"
+
+
 def _check_kinematics(
     ir: SceneIR,
     values: dict[str, float | str],
@@ -272,6 +342,7 @@ def run_gates(
     vehicle: VehicleParams | None = None,
     bounds: tuple[float, float, float, float] | None = None,
     esmini: EsminiRunner | None = None,
+    spawn_table: SpawnPointTable | None = None,
 ) -> ValidationReport:
     """执行 G1-G7（G8 由生成器在批级追加；物理能力取 vehicle_params）。"""
     resolved_vehicle = vehicle or get_vehicle_params()
@@ -290,7 +361,7 @@ def run_gates(
     problem = _check_parameter_values(ir, values) or _check_constraints(ir, values)
     report.add("G2", problem is None, problem or "参数范围与约束满足")
 
-    # G3 地图：非空、白名单（配置）、生成点有限 + 几何围栏
+    # G3 地图：非空、白名单（配置）、生成点有限 + 几何围栏 + 出生点有效性（实机表）
     map_section = config.get("map") or {}
     map_id = str(map_section.get("map_id", ""))
     spawn = map_section.get("spawn_point") or {}
@@ -298,15 +369,25 @@ def run_gates(
         _number_or_none(spawn.get(key)) is not None for key in ("x", "y", "z", "yaw")
     )
     out_of_bounds = _out_of_bounds(config, bounds)
-    map_ok = bool(map_id) and spawn_ok and out_of_bounds is None and (
-        allowed_maps is None or map_id in allowed_maps
+    table, table_problem = _resolve_spawn_table(spawn_table)
+    spawn_problem, spawn_note = table_problem, ""
+    if spawn_problem is None and table is not None and spawn_ok:
+        spawn_problem, spawn_note = _spawn_point_problem(map_section, map_id, spawn, table)
+    map_ok = (
+        bool(map_id)
+        and spawn_ok
+        and out_of_bounds is None
+        and spawn_problem is None
+        and (allowed_maps is None or map_id in allowed_maps)
     )
-    if map_ok:
-        map_message = f"地图 {map_id!r} 有效"
+    if spawn_problem is not None:
+        map_message = spawn_problem
     elif out_of_bounds is not None:
         map_message = out_of_bounds
+    elif map_ok:
+        map_message = f"地图 {map_id!r} 有效{spawn_note}"
     else:
-        map_message = f"地图 {map_id!r} 不在允许集合或生成点非法"
+        map_message = f"地图 {map_id!r} 不在允许集合或生成点非法{spawn_note}"
     report.add("G3", map_ok, map_message)
 
     # G4 阿克曼运动学（轴距/最大转角取车端 vehicle_params）

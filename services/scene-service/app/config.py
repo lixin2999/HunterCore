@@ -140,6 +140,12 @@ class Settings(HunterBaseConfig):
     scene_map_bounds: str = ""
     # 车端车辆参数文件（vehicle_params 导出）；空 = 使用包内 config/vehicle_params.json
     scene_vehicle_params_path: str = ""
+    # CARLA 出生点表文件（实机 get_spawn_points 导出，V1.24.8）；
+    # 空 = 使用包内 config/carla_spawn_points.json（内置默认未校准，仅拦截原点出生点）
+    scene_carla_spawn_points_path: str = ""
+    # CARLA 车辆蓝图几何表（实机 get_dimension / get_bounding_box 导出，V1.24.9）；
+    # 空 = 使用包内 config/carla_vehicle_geometry.json（内置默认未校准，下发时只标状态、不给尺寸）
+    scene_carla_vehicle_geometry_path: str = ""
     # esmini 干跑（G5）：可执行文件/命令前缀；空 = 未部署，G5 标记 skipped（不计失败）
     scene_esmini_bin: str = ""
     scene_esmini_timeout_seconds: float = 10.0

@@ -46,7 +46,8 @@ def config_payload(**overrides: Any) -> dict[str, Any]:
         "map": {
             "map_id": "Town01",
             "map_type": "carla_town",
-            "spawn_point": {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+            # 非原点坐标：V1.24.8 起下发前会拦落在地图原点的自车生成点（仿真端会黑屏）
+            "spawn_point": {"x": 120.5, "y": 310.25, "z": 0.0, "yaw": 0.0},
         },
         "ego_vehicle": {"model": "HUNTER_SE", "initial_speed": 1.5, "initial_steer": 0.0},
         "weather": dict(_DEFAULT_WEATHER),

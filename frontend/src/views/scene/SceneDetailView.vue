@@ -319,6 +319,11 @@ watch(
             </el-form-item>
           </el-col>
         </el-row>
+        <p class="hint">
+          自车生成点必须是目标地图上的<strong>有效车道坐标</strong>：CARLA 内置城镇的世界原点
+          (0, 0, 0) 普遍不在路面上，落在原点的场景在仿真端会黑屏或只见路面，平台下发时会直接拒绝。
+          坐标请取自实机出生点表（由 scripts/collect_carla_spawn_points.py 导出）。
+        </p>
 
         <el-divider content-position="left">天气（Carla 参数，0–1 归一化；sun_* 为角度）</el-divider>
         <el-row :gutter="12">
@@ -374,6 +379,10 @@ watch(
               </el-button>
             </div>
           </template>
+          <p class="hint">
+            参与者的 x/y/yaw 是<strong>相对自车生成点的偏移</strong>（米 / 弧度）；下发仿真时平台会把它们换算成绝对地图
+            坐标，因此修改自车生成点不会改变参与者与自车的相对关系。
+          </p>
           <el-table :data="form.config.actors" size="small" empty-text="暂无参与者">
             <el-table-column label="ID" width="120">
               <template #default="{ row }">

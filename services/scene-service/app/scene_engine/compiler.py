@@ -7,12 +7,20 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 from dataclasses import dataclass
 from typing import Any
 
 from app.scene_engine.esmini import EsminiRunner
 from app.scene_engine.ir import SceneIR, compile_parameters
+from app.scene_engine.spawn_points import (
+    SpawnPointsError,
+    SpawnPointTable,
+    assign_ego_spawn_point,
+    get_spawn_point_table,
+)
 from app.scene_engine.stats import distribution_quantile, sample_distribution
 from app.scene_engine.validators import ValidationReport, run_gates
 from app.scene_engine.vehicle_params import VehicleParams
@@ -57,6 +65,12 @@ def default_values(ir: SceneIR) -> dict[str, float | str]:
     return values
 
 
+def _spawn_seq(ir: SceneIR, values: dict[str, float | str]) -> int:
+    """稳定的出生点指派序号（同一逻辑场景 + 同一组参数永远命中同一候选点，复检幂等）。"""
+    payload = json.dumps({"id": ir.logical_id, "values": values}, sort_keys=True, default=str)
+    return int(hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8], 16)
+
+
 def compile_scene(
     ir: SceneIR,
     values: dict[str, float | str],
@@ -66,9 +80,19 @@ def compile_scene(
     vehicle: VehicleParams | None = None,
     bounds: tuple[float, float, float, float] | None = None,
     esmini: EsminiRunner | None = None,
+    spawn_table: SpawnPointTable | None = None,
 ) -> Compilation:
-    """编译并执行 G1-G7；不抛异常，由调用方决定是否拒绝。"""
+    """编译并执行 G1-G7（进闸门前先按出生点表覆写原点）；不抛异常，由调用方决定是否拒绝。"""
     config = compile_parameters(ir, values)
+    table = spawn_table
+    if table is None:
+        try:
+            table = get_spawn_point_table()
+        except SpawnPointsError:
+            table = None
+    if table is not None:
+        # 目录模板普遍把出生点写成原点（仿真端因此黑屏）：仅覆写原点，人工有效坐标一律保留
+        assign_ego_spawn_point(config, seq=_spawn_seq(ir, values), table=table)
     report = run_gates(
         ir,
         values,
@@ -78,6 +102,7 @@ def compile_scene(
         vehicle=vehicle,
         bounds=bounds,
         esmini=esmini,
+        spawn_table=table,
     )
     return Compilation(ir=ir, values=dict(values), config=config, report=report)
 
@@ -91,6 +116,7 @@ def render_scene(
     vehicle: VehicleParams | None = None,
     bounds: tuple[float, float, float, float] | None = None,
     esmini: EsminiRunner | None = None,
+    spawn_table: SpawnPointTable | None = None,
 ) -> Compilation:
     """编译并要求全部闸门通过（否则抛 ``GateFailure``）。"""
     compilation = compile_scene(
@@ -101,6 +127,7 @@ def render_scene(
         vehicle=vehicle,
         bounds=bounds,
         esmini=esmini,
+        spawn_table=spawn_table,
     )
     if not compilation.passed:
         raise GateFailure(compilation.report)

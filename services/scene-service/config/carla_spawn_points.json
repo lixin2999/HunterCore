@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "calibrated": false,
+  "source": "pending-live-carla-export",
+  "carla_version": null,
+  "exported_at": null,
+  "origin_tolerance_m": 1.0,
+  "match_tolerance_m": 2.0,
+  "maps": {
+    "Town01": { "spawn_points": [] },
+    "Town02": { "spawn_points": [] },
+    "Town03": { "spawn_points": [] },
+    "Town04": { "spawn_points": [] },
+    "Town05": { "spawn_points": [] },
+    "Town06": { "spawn_points": [] },
+    "Town07": { "spawn_points": [] },
+    "Town10HD_Opt": { "spawn_points": [] }
+  }
+}

@@ -71,6 +71,21 @@ data:
   SCENE_GENERATION_MAX_COUNT: "5000"
   SCENE_ALLOWED_MAPS: ""          # 空 = 不限制（G3）；按开放区域收紧时填逗号分隔地图 ID
   SCENE_CATALOG_VERSION: "1.0.0"   # 与 scene_engine.catalog.CATALOG_VERSION 一致性由测试钉住
+  # CARLA 自车出生点表（V1.24.8）：空串 = 用镜像内置 /app/config/carla_spawn_points.json
+  #   有数据源的合法车道坐标由 scripts/collect_carla_spawn_points.py 导出，替换方式二选一：
+  #     ① 更新仓库内 config 文件后重建镜像（默认路径，无需挂载）
+  #     ② 把表放进 ConfigMap 并挂载，本键指向挂载后的文件路径（不重建镜像即可更新，改完需滚动重启）
+  #   ⚠ 口径：表已校准后 G3 拦原点与未命中坐标；表未校准（calibrated=false，出厂默认）时
+  #     G3 仅在闸门说明里标⚠（否则未接实机的部署上整条生成链路都会失效），硬拦在下发（原点 → 2001）
+  #     与批量脚本（退出码 2）
+  SCENE_CARLA_SPAWN_POINTS_PATH: ""
+  # CARLA 车辆蓝图几何表（V1.24.9）：空串 = 用镜像内置 /app/config/carla_vehicle_geometry.json
+  #   实机尺寸（get_dimension / get_bounding_box）由 scripts/collect_carla_vehicle_geometry.py 导出，
+  #   替换方式同上表（重建镜像，或放进 ConfigMap 挂载后本键指向挂载路径 + 滚动重启）
+  #   生效链：下发载荷根节点附 sensor_mount_reference，供仿真端按包围盒换算传感器挂载点；
+  #   表未校准/未命中车型时参考块只标状态、不携带任何数字（平台不编造尺寸）
+  #   ⚠ 该表缺失或非法不阻断下发；挂载点换算本身属 HunterSim 侧，平台侧仍仅为缓解
+  SCENE_CARLA_VEHICLE_GEOMETRY_PATH: ""
   # RBAC（资源域 scene：create/read/update/delete/execute）
   SCENE_READ_ROLES: "admin,analyst,operator"
   SCENE_WRITE_ROLES: "admin,operator"
