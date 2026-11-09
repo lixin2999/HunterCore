@@ -17,8 +17,11 @@ import {
   addSuiteItems,
   createSuite,
   createTestCase,
+  deriveSuites,
+  deriveTestCases,
   diffSuite,
   getSuite,
+  listLogicalScenarios,
   listOracles,
   listSuiteBaselines,
   listSuites,
@@ -36,7 +39,11 @@ import {
 import { PERMISSIONS } from '@/constants/permissions'
 import type {
   Baseline,
+  CaseDerivationData,
+  CaseDerivationRequest,
   OracleData,
+  RarityZone,
+  SuiteDerivationData,
   SuiteDetail,
   SuiteDiffData,
   SuiteItem,
@@ -215,6 +222,85 @@ const caseStepsText = computed(() =>
 function openCaseDetail(row: TestCase): void {
   caseDetail.value = row
   caseDetailVisible.value = true
+}
+
+/* =====================================================================
+ * 一·补充、按场景类型派生（语义契约驱动）
+ * ===================================================================== */
+const zoneOptions: RarityZone[] = ['Z1', 'Z2', 'Z3', 'Z4']
+const deriveVisible = ref(false)
+const deriveSubmitting = ref(false)
+const deriveForm = reactive({
+  scene_types: [] as string[],
+  zones: [...zoneOptions] as string[],
+  include_concrete: true,
+})
+const sceneTypeOptions = ref<Array<{ value: string; label: string }>>([])
+const caseDeriveResult = ref<CaseDerivationData | null>(null)
+const suiteDeriveResult = ref<SuiteDerivationData | null>(null)
+
+async function loadSceneTypeOptions(): Promise<void> {
+  if (sceneTypeOptions.value.length) {
+    return
+  }
+  try {
+    const data = await listLogicalScenarios({ include_catalog: true, limit: 200 })
+    const seen = new Map<string, string>()
+    for (const row of data.items) {
+      if (!seen.has(row.scene_type)) {
+        seen.set(row.scene_type, `${row.scene_type}（${row.logical_id}）`)
+      }
+    }
+    sceneTypeOptions.value = [...seen.entries()].map(([value, label]) => ({ value, label }))
+  } catch {
+    // 目录加载失败不阻断派生：留空即覆盖全部可合成类型
+  }
+}
+
+function openDeriveDialog(): void {
+  caseDeriveResult.value = null
+  suiteDeriveResult.value = null
+  deriveVisible.value = true
+  void loadSceneTypeOptions()
+}
+
+async function runDerive(mode: 'cases' | 'suites', dryRun = false): Promise<void> {
+  deriveSubmitting.value = true
+  try {
+    const payload: CaseDerivationRequest = {
+      scene_types: deriveForm.scene_types,
+      zones: (deriveForm.zones.length ? deriveForm.zones : undefined) as RarityZone[] | undefined,
+      include_concrete: deriveForm.include_concrete,
+      dry_run: dryRun,
+    }
+    if (mode === 'cases') {
+      const data = await deriveTestCases(payload)
+      caseDeriveResult.value = data
+      suiteDeriveResult.value = null
+      ElMessage.success(
+        dryRun
+          ? `预览：将派生 ${data.planned} 条用例（已存在 ${data.skipped} 条）`
+          : `派生用例：新增 ${data.created} 条，跳过 ${data.skipped} 条`,
+      )
+      if (!dryRun) {
+        await loadTestCases()
+      }
+    } else {
+      const data = await deriveSuites(payload)
+      suiteDeriveResult.value = data
+      caseDeriveResult.value = null
+      ElMessage.success(
+        `派生测试集：新建 ${data.created} 个，更新 ${data.updated} 个，跳过 ${data.skipped} 个`,
+      )
+      if (!dryRun) {
+        await loadSuites()
+      }
+    }
+  } catch (error) {
+    ElMessage.error(errorMessage(error, '派生失败'))
+  } finally {
+    deriveSubmitting.value = false
+  }
 }
 
 /* =====================================================================
@@ -444,9 +530,12 @@ onMounted(() => {
           <template #header>
             <div class="card-header">
               <span>测试用例（ISO 34505）</span>
-              <el-button v-permission="PERMISSIONS.sceneCreate" type="primary" size="small" @click="openCaseDialog">
-                新建用例
-              </el-button>
+              <div>
+                <el-button size="small" @click="openDeriveDialog">按类型派生</el-button>
+                <el-button v-permission="PERMISSIONS.sceneCreate" type="primary" size="small" @click="openCaseDialog">
+                  新建用例
+                </el-button>
+              </div>
             </div>
           </template>
 
@@ -512,9 +601,12 @@ onMounted(() => {
           <template #header>
             <div class="card-header">
               <span>测试集与基线</span>
-              <el-button v-permission="PERMISSIONS.sceneCreate" type="primary" size="small" @click="suiteCreateVisible = true">
-                新建测试集
-              </el-button>
+              <div>
+                <el-button size="small" @click="openDeriveDialog">派生测试集</el-button>
+                <el-button v-permission="PERMISSIONS.sceneCreate" type="primary" size="small" @click="suiteCreateVisible = true">
+                  新建测试集
+                </el-button>
+              </div>
             </div>
           </template>
 
@@ -789,6 +881,99 @@ onMounted(() => {
         </el-table-column>
       </el-table>
     </el-dialog>
+
+    <!-- ========================= 按类型派生 ========================= -->
+    <el-dialog v-model="deriveVisible" title="按场景类型派生用例 / 测试集" width="760px">
+      <el-form label-width="110px">
+        <el-form-item label="场景类型">
+          <el-select
+            v-model="deriveForm.scene_types"
+            multiple
+            filterable
+            clearable
+            placeholder="留空 = 目录内全部可合成类型"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="option in sceneTypeOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="稀有分区">
+          <el-checkbox-group v-model="deriveForm.zones">
+            <el-checkbox v-for="zone in zoneOptions" :key="zone" :value="zone">{{ zone }}</el-checkbox>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item label="测试集条目">
+          <el-checkbox v-model="deriveForm.include_concrete">纳入具体场景（每分区最多 3 条）</el-checkbox>
+        </el-form-item>
+      </el-form>
+
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="用例编号 = TC-{逻辑场景ID}-{分区}，重复派生自动跳过；测试集名 = 自动派生-{scene_type}，已锁定则跳过。"
+      />
+
+      <template v-if="caseDeriveResult">
+        <el-divider content-position="left">用例派生结果</el-divider>
+        <div class="derive-summary">
+          新增 <b>{{ caseDeriveResult.created }}</b> 条，跳过 <b>{{ caseDeriveResult.skipped }}</b> 条，
+          预览 <b>{{ caseDeriveResult.planned }}</b> 条
+        </div>
+        <el-table :data="caseDeriveResult.cases" size="small" max-height="260">
+          <el-table-column prop="case_key" label="用例编号" width="170" />
+          <el-table-column prop="scene_type" label="场景类型" min-width="150" show-overflow-tooltip />
+          <el-table-column prop="zone" label="分区" width="70" />
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <el-tag
+                :type="row.status === 'created' ? 'success' : row.status === 'planned' ? 'warning' : 'info'"
+                size="small"
+              >
+                {{ row.status }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="reason" label="说明" min-width="160" show-overflow-tooltip />
+        </el-table>
+      </template>
+
+      <template v-if="suiteDeriveResult">
+        <el-divider content-position="left">测试集派生结果</el-divider>
+        <div class="derive-summary">
+          新建 <b>{{ suiteDeriveResult.created }}</b> 个，更新 <b>{{ suiteDeriveResult.updated }}</b> 个，
+          跳过 <b>{{ suiteDeriveResult.skipped }}</b> 个
+        </div>
+        <el-table :data="suiteDeriveResult.suites" size="small" max-height="260">
+          <el-table-column prop="name" label="测试集" min-width="200" show-overflow-tooltip />
+          <el-table-column prop="scene_type" label="场景类型" min-width="150" show-overflow-tooltip />
+          <el-table-column prop="item_count" label="条目" width="70" />
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <el-tag
+                :type="row.status === 'created' || row.status === 'updated' ? 'success' : row.status === 'planned' ? 'warning' : 'info'"
+                size="small"
+              >
+                {{ row.status }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="reason" label="说明" min-width="200" show-overflow-tooltip />
+        </el-table>
+      </template>
+
+      <template #footer>
+        <el-button @click="deriveVisible = false">关闭</el-button>
+        <el-button :loading="deriveSubmitting" @click="runDerive('cases', true)">预览用例</el-button>
+        <el-button type="primary" :loading="deriveSubmitting" @click="runDerive('cases')">派生用例</el-button>
+        <el-button type="success" :loading="deriveSubmitting" @click="runDerive('suites')">派生测试集</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -842,5 +1027,11 @@ onMounted(() => {
 .mono {
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 12px;
+}
+
+.derive-summary {
+  margin: 8px 0 10px;
+  font-size: 13px;
+  color: var(--el-text-color-regular);
 }
 </style>

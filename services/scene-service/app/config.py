@@ -155,7 +155,7 @@ class Settings(HunterBaseConfig):
     # 批量复检并发上限（含编译与 esmini 子进程，属阻塞操作 → 线程池限流）
     scene_validate_concurrency: int = 4
     # 内置 IR 目录版本（与 scene_engine.catalog.CATALOG_VERSION 一致性由测试钉住）
-    scene_catalog_version: str = "1.0.1"
+    scene_catalog_version: str = "1.1.0"
 
     # ---------- RBAC（网关注入 X-Roles；资源域 scene，契约 securitySchemes.bearerAuth） ----------
     scene_read_roles: str = "admin,analyst,operator"

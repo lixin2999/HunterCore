@@ -72,6 +72,7 @@ import type {
 } from '@/types/engine'
 import { HunterApiError } from '@/utils/error-code'
 import { formatDateTimeString, formatNumber } from '@/utils/format'
+import { sceneTypeLabel } from '@/utils/scene-display'
 
 /** 当前 Tab（逻辑 / 生成 / 具体 / 覆盖） */
 const activeTab = ref('logical')
@@ -530,9 +531,35 @@ function handleFillGap(gap: CoverageGap): void {
   generateForm.count = Math.min(Math.max(gap.deficit, 1), 500)
   generateForm.profile = coverageProfile.value
   generateForm.strategy = 'distribution'
-  overridesText.value = JSON.stringify({ target_zone: gap.zone }, null, 2)
+  // 零场景缺口先补基线样本（不限定稀有分区），分区缺口才带 target_zone
+  overridesText.value =
+    gap.kind === 'zero_scenes' ? '{}' : JSON.stringify({ target_zone: gap.zone }, null, 2)
   activeTab.value = 'generate'
 }
+
+/** 类型 × 分区矩阵行（按具体场景数降序，未产出的类型排在后） */
+const coverageTypeRows = computed(() => {
+  const typeCounts = coverage.value?.type_counts ?? {}
+  return Object.keys(typeCounts)
+    .map((sceneType) => ({
+      sceneType,
+      label: sceneTypeLabel(sceneType),
+      total: typeCounts[sceneType] ?? 0,
+    }))
+    .sort((left, right) => right.total - left.total || left.sceneType.localeCompare(right.sceneType))
+})
+
+/** 类型 × 分区单元计数（0 在模板里显示为 -） */
+function coverageZoneCount(sceneType: string, zone: string): number {
+  return coverage.value?.type_zone_counts?.[sceneType]?.[zone] ?? 0
+}
+
+/** 角色维度覆盖（语义契约声明的角色 → 覆盖到的具体场景数） */
+const coverageRoleRows = computed(() =>
+  Object.entries(coverage.value?.role_counts ?? {})
+    .map(([role, count]) => ({ role, count }))
+    .sort((left, right) => right.count - left.count || left.role.localeCompare(right.role)),
+)
 
 /* =====================================================================
  * 生命周期
@@ -975,13 +1002,44 @@ onBeforeUnmount(stopPolling)
           <div class="hint matrix">风险矩阵：{{ coverage?.risk_matrix_applied ? '已应用（稀有度 × 临界度）' : '未应用' }}</div>
         </el-card>
 
+        <el-row :gutter="12">
+          <el-col :span="15">
+            <el-card v-loading="coverageLoading" shadow="never" class="block">
+              <template #header><span>场景类型 × 稀有分区矩阵</span></template>
+              <el-table :data="coverageTypeRows" size="small" empty-text="暂无具体场景">
+                <el-table-column prop="label" label="场景类型" min-width="160" show-overflow-tooltip />
+                <el-table-column prop="total" label="合计" width="80" fixed="left" />
+                <el-table-column v-for="zone in ['Z1', 'Z2', 'Z3', 'Z4']" :key="zone" :label="zone" width="80">
+                  <template #default="{ row }">{{ coverageZoneCount(row.sceneType, zone) || '-' }}</template>
+                </el-table-column>
+              </el-table>
+            </el-card>
+          </el-col>
+          <el-col :span="9">
+            <el-card v-loading="coverageLoading" shadow="never" class="block">
+              <template #header><span>角色维度覆盖（语义必需参与者）</span></template>
+              <el-table :data="coverageRoleRows" size="small" empty-text="暂无角色覆盖">
+                <el-table-column prop="role" label="角色" min-width="140" show-overflow-tooltip />
+                <el-table-column prop="count" label="覆盖场景数" width="110" />
+              </el-table>
+            </el-card>
+          </el-col>
+        </el-row>
+
         <el-card v-loading="coverageLoading" shadow="never">
           <template #header>
-            <span>覆盖盲区（按 {{ GENERATION_PROFILE_LABELS[coverageProfile] }} 配额计算 Z3/Z4 缺口）</span>
+            <span>覆盖盲区（零场景基线 + 按 {{ GENERATION_PROFILE_LABELS[coverageProfile] }} 配额计算的 Z3/Z4 缺口）</span>
           </template>
           <el-table :data="coverageGaps" size="small" empty-text="当前剖面下无缺口">
             <el-table-column prop="logical_id" label="逻辑场景" width="140" />
             <el-table-column prop="name" label="名称" min-width="180" show-overflow-tooltip />
+            <el-table-column label="缺口类型" width="120">
+              <template #default="{ row }">
+                <el-tag :type="row.kind === 'zero_scenes' ? 'danger' : 'warning'" size="small">
+                  {{ row.kind === 'zero_scenes' ? '零具体场景' : '分区配额' }}
+                </el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="分区" width="120">
               <template #default="{ row }">
                 <el-tag :type="RARITY_ZONE_TAG_TYPES[row.zone] ?? 'info'" size="small">
@@ -1173,6 +1231,30 @@ onBeforeUnmount(stopPolling)
             :closable="false"
             show-icon
           />
+          <el-alert
+            v-if="(renderResult.execution?.unsupported?.length ?? 0) > 0"
+            class="notice"
+            type="error"
+            :closable="false"
+            show-icon
+            title="执行映射存在未支持项（仿真端无法完整执行）"
+          >
+            <ul class="execution-list">
+              <li v-for="item in renderResult.execution.unsupported" :key="item">{{ item }}</li>
+            </ul>
+          </el-alert>
+          <el-alert
+            v-else-if="(renderResult.execution?.warnings?.length ?? 0) > 0"
+            class="notice"
+            type="warning"
+            :closable="false"
+            show-icon
+            title="执行映射告警"
+          >
+            <ul class="execution-list">
+              <li v-for="item in renderResult.execution.warnings" :key="item">{{ item }}</li>
+            </ul>
+          </el-alert>
           <el-table :data="renderResult.gates" size="small" class="sub-table">
             <el-table-column prop="gate" label="门" width="70" />
             <el-table-column label="结果" width="80">
@@ -1192,6 +1274,15 @@ onBeforeUnmount(stopPolling)
 </template>
 
 <style scoped>
+.notice {
+  margin-top: 8px;
+}
+
+.execution-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
 .scene-generator {
   padding: 4px;
 }

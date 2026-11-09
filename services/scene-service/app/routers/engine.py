@@ -36,6 +36,8 @@ from app.schemas.engine import (
     BaselineListResponse,
     BatchValidateRequest,
     BatchValidateResponse,
+    CaseDerivationRequest,
+    CaseDerivationResponse,
     CatalogSyncData,
     CatalogSyncResponse,
     ConcreteRenderResponse,
@@ -66,7 +68,9 @@ from app.schemas.engine import (
     OracleListResponse,
     PublishData,
     RenderData,
+    SceneSemanticsListResponse,
     SuiteCreateRequest,
+    SuiteDerivationResponse,
     SuiteDiffResponse,
     SuiteItemsRequest,
     SuiteListData,
@@ -426,6 +430,19 @@ async def render_concrete_scenario(
 
 
 @router.get(
+    "/semantics",
+    operation_id="listSceneSemantics",
+    response_model=SceneSemanticsListResponse,
+    summary="场景语义契约摘要（各类型目标/判据/角色/事件/参数）",
+)
+async def list_scene_semantics_endpoint(
+    _user_id: Annotated[str, Depends(require_read_permission)],
+) -> SceneSemanticsListResponse:
+    data = SceneEngineService.scene_semantics()
+    return SceneSemanticsListResponse(data=data, request_id=trace_request_id())
+
+
+@router.get(
     "/oracles",
     operation_id="listOracles",
     response_model=OracleListResponse,
@@ -477,6 +494,23 @@ async def create_test_case(
 ) -> TestCaseResponse:
     data = await service.create_testcase(request, user_id)
     return TestCaseResponse(data=data, request_id=trace_request_id())
+
+
+# ⚠ 必须声明在 ``/testcases/{test_case_id}`` 之前（路径顺序决定匹配）
+@router.post(
+    "/testcases/derive",
+    operation_id="deriveTestCases",
+    response_model=CaseDerivationResponse,
+    summary="按场景类型×分区派生测试用例（case_key 幂等；dry_run 只预览）",
+    responses={**COMMON_ERRORS},
+)
+async def derive_test_cases(
+    request: CaseDerivationRequest,
+    service: Annotated[SceneEngineService, Depends(get_engine_service)],
+    _user_id: Annotated[str, Depends(require_write_permission)],
+) -> CaseDerivationResponse:
+    data = await service.derive_testcases(request)
+    return CaseDerivationResponse(data=data, request_id=trace_request_id())
 
 
 @router.get(
@@ -533,6 +567,23 @@ async def create_scenario_suite(
 ) -> SuiteResponse:
     data = await service.create_suite(request, user_id)
     return SuiteResponse(data=data, request_id=trace_request_id())
+
+
+# ⚠ 必须声明在 ``/suites/{suite_id}`` 之前（路径顺序决定匹配）
+@router.post(
+    "/suites/derive",
+    operation_id="deriveScenarioSuites",
+    response_model=SuiteDerivationResponse,
+    summary="按场景类型派生测试集（一类型一集；draft 幂等补齐，锁定则跳过）",
+    responses={**COMMON_ERRORS},
+)
+async def derive_scenario_suites(
+    request: CaseDerivationRequest,
+    service: Annotated[SceneEngineService, Depends(get_engine_service)],
+    _user_id: Annotated[str, Depends(require_write_permission)],
+) -> SuiteDerivationResponse:
+    data = await service.derive_suites(request)
+    return SuiteDerivationResponse(data=data, request_id=trace_request_id())
 
 
 @router.get(

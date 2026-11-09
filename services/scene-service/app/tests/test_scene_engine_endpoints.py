@@ -69,11 +69,11 @@ async def _generate(client: AsyncClient, *, count: int = 6, seed: int = 20261023
 # 一、逻辑场景
 # =====================================================================
 async def test_list_logical_returns_catalog(client: AsyncClient, scene_env: object) -> None:
-    """未同步 DB 时目录兜底：17 个内置逻辑场景全部可见。"""
+    """未同步 DB 时目录兜底：46 个内置逻辑场景（17 手写 + 29 语义合成）全部可见。"""
     resp = await client.get(f"{SCENE_BASE}/logical", headers=ADMIN_HEADERS)
     assert resp.status_code == 200
     data = _data(resp)
-    assert data["total"] == len(CATALOG) == 17
+    assert data["total"] == len(CATALOG) == 46
     assert {item["logical_id"] for item in data["items"]} == {ir.logical_id for ir in CATALOG}
     assert all(item["origin"] == "catalog" for item in data["items"])
     assert all(item["version"] == CATALOG_VERSION for item in data["items"])
@@ -125,13 +125,22 @@ async def test_list_logical_versions_includes_catalog(client: AsyncClient) -> No
     assert len(data["items"][0]["content_hash"]) == 64
 
 
-async def test_validate_logical_runs_seven_gates(client: AsyncClient) -> None:
-    """静态校验返回 G1-G7 明细与判据存在性。"""
+async def test_validate_logical_runs_all_gates(client: AsyncClient) -> None:
+    """静态校验返回 G1-G7 + G9 明细与判据存在性。"""
     resp = await client.post(f"{SCENE_BASE}/logical/LS-INT-001/validate", headers=ADMIN_HEADERS)
     assert resp.status_code == 200
     data = _data(resp)
     assert data["passed"] is True, data["failures"]
-    assert [gate["gate"] for gate in data["gates"]] == ["G1", "G2", "G3", "G4", "G5", "G6", "G7"]
+    assert [gate["gate"] for gate in data["gates"]] == [
+        "G1",
+        "G2",
+        "G3",
+        "G4",
+        "G5",
+        "G6",
+        "G7",
+        "G9",
+    ]
     assert all(gate["passed"] for gate in data["gates"])
     assert data["oracle_found"] is True
     assert data["parameter_defaults"]["v0"] > 0
@@ -149,7 +158,7 @@ async def test_dryrun_applies_overrides_and_renders_config(client: AsyncClient) 
     assert data["values"]["v0"] == 0.4
     assert data["passed"] is True, data["failures"]
     assert {"map", "ego_vehicle", "actors"} <= set(data["scene_config"])
-    assert len(data["gates"]) == 7
+    assert len(data["gates"]) == 8
 
 
 async def test_dryrun_rejects_unknown_parameter(client: AsyncClient) -> None:
@@ -249,7 +258,7 @@ async def test_generate_task_lifecycle(client: AsyncClient, scene_env: object) -
     )
     assert rendered["passed"] is True
     assert {"map", "ego_vehicle"} <= set(rendered["scene_config"])
-    assert len(rendered["gates"]) == 7
+    assert len(rendered["gates"]) == 8
 
     detail = _data(await client.get(f"{SCENE_BASE}/concrete/{scenario_ids[0]}", headers=ADMIN_HEADERS))
     assert detail["param_values"]
@@ -324,6 +333,23 @@ async def test_generate_rejects_unknown_overrides(client: AsyncClient) -> None:
 # =====================================================================
 # 三、判据 / 测试用例
 # =====================================================================
+async def test_scene_semantics_catalog(client: AsyncClient) -> None:
+    """语义契约摘要：覆盖 46 类可合成类型，角色/判据/变体/时长齐全。"""
+    resp = await client.get(f"{SCENE_BASE}/semantics", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    data = _data(resp)
+    assert data["taxonomy_version"]
+    assert data["total"] == len(data["items"]) == 46
+    ghost = next(item for item in data["items"] if item["scene_type"] == "occluded_pedestrian")
+    assert ghost["oracle_ref"] == "oracle.safety.no_collision/v1"
+    roles = {role["role"]: role for role in ghost["roles"]}
+    assert roles["dart_out_pedestrian"]["type"] == "pedestrian"
+    assert roles["dart_out_pedestrian"]["behavior_type"] == "occluded_dash"
+    assert roles["dart_out_pedestrian"]["required"] is True
+    assert set(ghost["required_roles"]) == {"dart_out_pedestrian", "occluder"}
+    assert ghost["variants"] and ghost["duration"] and ghost["params"]
+
+
 async def test_oracles_catalog(client: AsyncClient) -> None:
     """判据目录：代码即事实来源，返回版本化 ref。"""
     resp = await client.get(f"{SCENE_BASE}/oracles", headers=ADMIN_HEADERS)
@@ -517,22 +543,46 @@ async def test_coverage_overview_empty(client: AsyncClient) -> None:
     assert data["zone_ratio"] == {}
     assert data["risk_counts"] == {}
     assert data["risk_matrix_applied"] is True
+    assert data["type_counts"] == {}
+    assert data["type_zone_counts"] == {}
+    assert data["role_counts"] == {}
 
 
-async def test_coverage_gaps_returns_deficits(client: AsyncClient) -> None:
-    """盲区按剖面配额计算缺口：Z3 目标 25 > Z4 目标 5，排序后 Z3 在前。"""
+async def test_coverage_gaps_returns_zero_scene_deficits(client: AsyncClient) -> None:
+    """空库时每个逻辑场景只报「零具体场景」缺口（Z1 基线 1 条）。"""
     resp = await client.get(
         f"{SCENE_BASE}/coverage/gaps", headers=ADMIN_HEADERS, params={"profile": "exploration"}
     )
     assert resp.status_code == 200
     data = _data(resp)
     assert data["profile"] == "exploration"
-    assert len(data["items"]) == len(CATALOG) * 2 == 34
+    assert len(data["items"]) == len(CATALOG) == 46
+    assert {item["kind"] for item in data["items"]} == {"zero_scenes"}
     first = data["items"][0]
-    assert first["zone"] == "Z3"
-    assert first["target"] == 25 and first["deficit"] == 25
+    assert first["zone"] == "Z1"
+    assert first["count"] == 0 and first["target"] == 1 and first["deficit"] == 1
     assert "/api/v1/scene/generate" in first["recommendation"]
-    assert data["items"][-1]["zone"] == "Z4"
+
+
+async def test_coverage_gaps_reports_zone_deficit_and_type_counts(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """有具体场景后：该类型不再报零场景缺口，改为 Z3/Z4 配额缺口，并按类型/角色聚合。"""
+    await _generate(client, count=6, seed=20261109)
+    data = _data(
+        await client.get(
+            f"{SCENE_BASE}/coverage/gaps", headers=ADMIN_HEADERS, params={"profile": "exploration"}
+        )
+    )
+    baseline = [item for item in data["items"] if item["logical_id"] == "LS-BAS-001"]
+    assert baseline, data["items"][:3]
+    assert {item["kind"] for item in baseline} == {"zone_deficit"}
+    assert {item["zone"] for item in baseline} <= {"Z3", "Z4"}
+
+    overview = _data(await client.get(f"{SCENE_BASE}/coverage/overview", headers=ADMIN_HEADERS))
+    assert overview["type_counts"] == {"straight_cruise": 6}
+    assert overview["type_zone_counts"]["straight_cruise"]
+    assert overview["role_counts"] == {"background": 6, "lead": 6}
 
 
 async def test_coverage_rejects_unknown_profile(client: AsyncClient) -> None:

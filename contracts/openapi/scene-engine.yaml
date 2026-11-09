@@ -79,7 +79,7 @@ x-hunter-service:
         group: scene-service-analytics-result
 
 x-hunter-endpoints:
-  # 22 个端点（与 services/scene-service/app/routers/engine.py 一一对应）
+  # 25 个端点（与 services/scene-service/app/routers/engine.py 一一对应）
   logical: [listLogicalScenarios, syncLogicalScenarioCatalog, getLogicalScenario,
             listLogicalScenarioVersions, validateLogicalScenario, dryRunLogicalScenario,
             publishLogicalScenario]
@@ -87,9 +87,9 @@ x-hunter-endpoints:
                cancelGenerationTask]
   concrete: [listConcreteScenarios, batchValidateConcreteScenarios, getConcreteScenario,
              renderConcreteScenario]
-  oracle: [listOracles, listTestCases, createTestCase, getTestCase]
+  oracle: [listSceneSemantics, listOracles, listTestCases, createTestCase, getTestCase, deriveTestCases]
   suite: [listScenarioSuites, createScenarioSuite, getScenarioSuite, addScenarioSuiteItems,
-          lockScenarioSuite, diffScenarioSuite, listScenarioSuiteBaselines]
+          lockScenarioSuite, diffScenarioSuite, listScenarioSuiteBaselines, deriveScenarioSuites]
   coverage: [getCoverageOverview, listCoverageGaps]
 
 paths:
@@ -465,6 +465,21 @@ paths:
   # ===================================================================
   # 四、判据 / 测试用例
   # ===================================================================
+  /api/v1/scene/semantics:
+    get:
+      tags: [scene-engine-oracle]
+      summary: 场景语义契约摘要（目标/判据/角色/事件/子场景/参数/时长/天气）
+      description: 只读视图，取自 contracts/scene-taxonomy.yaml::scene_semantics；前端「语义自检」区块与校验脚本据此比对必需角色。
+      operationId: listSceneSemantics
+      responses:
+        "200":
+          description: 语义契约列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SceneSemanticsListResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
   /api/v1/scene/oracles:
     get:
       tags: [scene-engine-oracle]
@@ -528,6 +543,31 @@ paths:
         "422": { $ref: "#/components/responses/ValidationFailed" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/scene/testcases/derive:
+    post:
+      tags: [scene-engine-oracle]
+      summary: 按场景类型×分区派生测试用例（case_key 幂等；dry_run 只预览）
+      description: >
+        `case_key = TC-{logical_id}-{zone}`；已存在则跳过不报错。objective 取语义契约，
+        oracle_ref / platforms / 参数区间取 IR，timeout = 场景时长 + 60s。
+        `scene_types` 省略时覆盖目录内全部可合成类型。
+      operationId: deriveTestCases
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CaseDerivationRequest" }
+      responses:
+        "200":
+          description: 派生结果（created/skipped/planned + 逐条状态）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CaseDerivationResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /api/v1/scene/testcases/{test_case_id}:
     get:
       tags: [scene-engine-oracle]
@@ -586,6 +626,31 @@ paths:
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/scene/suites/derive:
+    post:
+      tags: [scene-engine-suite]
+      summary: 按场景类型派生测试集（一类型一集；draft 幂等补齐，锁定则跳过）
+      description: >
+        测试集名 `自动派生-{scene_type}`。条目 = 各分区已派生用例（case_key）+ 每分区最多 3 条
+        具体场景（`include_concrete=false` 时只加用例）；名称已存在且为 draft 时幂等补齐条目（updated），
+        已锁定/归档时整集跳过并回报原因（skipped）。
+      operationId: deriveScenarioSuites
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CaseDerivationRequest" }
+      responses:
+        "200":
+          description: 派生结果（created/updated/skipped/planned + 逐集状态）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SuiteDerivationResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "422": { $ref: "#/components/responses/ValidationFailed" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -1273,7 +1338,8 @@ components:
             scene_config: { type: object }
     RenderResult:
       type: object
-      required: [scenario_id, logical_id, content_hash, scene_config, gates, passed]
+      required:
+        [scenario_id, logical_id, content_hash, scene_config, gates, passed, execution]
       properties:
         scenario_id: { type: string, format: uuid }
         logical_id: { type: string }
@@ -1283,6 +1349,16 @@ components:
           type: array
           items: { $ref: "#/components/schemas/GateItem" }
         passed: { type: boolean }
+        execution: { $ref: "#/components/schemas/ExecutionReport" }
+    ExecutionReport:
+      type: object
+      description: >-
+        CARLA/OpenSCENARIO 执行映射自检：无标准等价物的行为/动作/触发必须显式列出，
+        ``unsupported`` 非空表示该场景无法被仿真端完整执行。
+      required: [unsupported, warnings]
+      properties:
+        unsupported: { type: array, items: { type: string } }
+        warnings: { type: array, items: { type: string } }
     BatchValidateRequest:
       type: object
       additionalProperties: false
@@ -1311,7 +1387,72 @@ components:
           type: array
           items: { $ref: "#/components/schemas/BatchValidateItem" }
 
-    # ---------- 判据 / 测试用例 ----------
+    # ---------- 判据 / 测试用例 / 场景语义 ----------
+    SceneSemanticsRole:
+      type: object
+      required: [role, type, count, behavior_type, min_count, required]
+      properties:
+        role: { type: string, example: dart_out_pedestrian }
+        type: { type: string, example: pedestrian }
+        count: { type: string, example: "1", description: 参数表达式原文 }
+        behavior_type: { type: string, example: occluded_dash }
+        parameters: { type: object, additionalProperties: true }
+        min_count: { type: integer, minimum: 0 }
+        required: { type: boolean }
+    SceneSemanticsEvent:
+      type: object
+      required: [type, condition_type]
+      properties:
+        type: { type: string, example: pedestrian_crossing }
+        condition_type: { type: string, example: relative_distance }
+        action_type: { type: string, example: emergency_stop }
+    SceneSemanticsVariant:
+      type: object
+      required: [key, label]
+      properties:
+        key: { type: string }
+        label: { type: string }
+        sub: { type: string }
+    SceneSemanticsParam:
+      type: object
+      required: [name, mean, std, low, high]
+      properties:
+        name: { type: string }
+        mean: { type: number }
+        std: { type: number }
+        low: { type: number }
+        high: { type: number }
+        unit: { type: string }
+        discrete: { type: boolean }
+        risk: { type: integer }
+    SceneSemantics:
+      type: object
+      required: [scene_type, objective, oracle_ref, required_events, roles, required_roles,
+                 events, variants, params, duration, weather]
+      properties:
+        scene_type: { type: string, example: occluded_pedestrian }
+        objective: { type: string }
+        oracle_ref: { type: string, example: oracle.safety.no_collision/v1 }
+        required_events: { type: boolean }
+        roles:
+          type: array
+          items: { $ref: "#/components/schemas/SceneSemanticsRole" }
+        required_roles:
+          type: array
+          items: { type: string }
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/SceneSemanticsEvent" }
+        variants:
+          type: array
+          items: { $ref: "#/components/schemas/SceneSemanticsVariant" }
+        params:
+          type: array
+          items: { $ref: "#/components/schemas/SceneSemanticsParam" }
+        duration: { type: string, description: 时长表达式原文 }
+        weather:
+          type: object
+          additionalProperties: { type: string }
     Oracle:
       type: object
       required: [oracle_ref, name, kind, description, metric, operator, threshold, platforms, timeout_seconds]
@@ -1467,10 +1608,74 @@ components:
         removed: { type: array, items: { type: string } }
         changed: { type: array, items: { type: string } }
 
+    # ---------- 用例 / 测试集自动派生 ----------
+    CaseDerivationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        scene_types:
+          type: array
+          maxItems: 64
+          description: 场景类型；省略（空数组）则覆盖目录内全部可合成类型
+          items: { type: string, maxLength: 64 }
+        zones:
+          type: array
+          minItems: 1
+          maxItems: 4
+          default: [Z1, Z2, Z3, Z4]
+          items: { $ref: "#/components/schemas/RarityZone" }
+        include_concrete: { type: boolean, default: true }
+        dry_run: { type: boolean, default: false }
+    DerivedCase:
+      type: object
+      required: [case_key, logical_id, scene_type, zone, name, status]
+      properties:
+        case_key: { type: string, description: "TC-{logical_id}-{zone}" }
+        logical_id: { type: string }
+        scene_type: { type: string }
+        zone: { $ref: "#/components/schemas/RarityZone" }
+        name: { type: string }
+        status: { type: string, enum: [created, skipped, planned] }
+        test_case_id: { type: string, format: uuid, nullable: true }
+        reason: { type: string, nullable: true }
+    CaseDerivation:
+      type: object
+      required: [created, skipped, planned, cases]
+      properties:
+        created: { type: integer }
+        skipped: { type: integer }
+        planned: { type: integer }
+        cases:
+          type: array
+          items: { $ref: "#/components/schemas/DerivedCase" }
+    DerivedSuite:
+      type: object
+      required: [name, scene_type, item_count, status]
+      properties:
+        suite_id: { type: string, format: uuid, nullable: true }
+        name: { type: string, description: "自动派生-{scene_type}" }
+        scene_type: { type: string }
+        item_count: { type: integer }
+        status: { type: string, enum: [created, updated, skipped, planned] }
+        reason: { type: string, nullable: true }
+    SuiteDerivation:
+      type: object
+      required: [created, updated, skipped, planned, suites]
+      properties:
+        created: { type: integer }
+        updated: { type: integer }
+        skipped: { type: integer }
+        planned: { type: integer }
+        suites:
+          type: array
+          items: { $ref: "#/components/schemas/DerivedSuite" }
+
     # ---------- 覆盖分析 ----------
     CoverageOverview:
       type: object
-      required: [total, zone_counts, zone_ratio, risk_counts, risk_matrix_applied]
+      required:
+        [total, zone_counts, zone_ratio, risk_counts, risk_matrix_applied,
+         type_counts, type_zone_counts, role_counts]
       properties:
         logical_id: { type: string, nullable: true }
         total: { type: integer }
@@ -1484,9 +1689,23 @@ components:
           type: object
           additionalProperties: { type: integer }
         risk_matrix_applied: { type: boolean }
+        type_counts:
+          type: object
+          description: 按场景类型（logical_id → scene_type 聚合）的具体场景数
+          additionalProperties: { type: integer }
+        type_zone_counts:
+          type: object
+          description: 场景类型 × 稀有分区矩阵（类型 → 分区 → 数量）
+          additionalProperties:
+            type: object
+            additionalProperties: { type: integer }
+        role_counts:
+          type: object
+          description: 按语义契约声明的交通参与者角色统计具体场景数
+          additionalProperties: { type: integer }
     CoverageGap:
       type: object
-      required: [logical_id, name, zone, count, target, deficit, recommendation]
+      required: [logical_id, name, zone, count, target, deficit, kind, recommendation]
       properties:
         logical_id: { type: string }
         name: { type: string }
@@ -1494,6 +1713,12 @@ components:
         count: { type: integer }
         target: { type: integer }
         deficit: { type: integer }
+        kind:
+          type: string
+          description: >-
+            zero_scenes = 该逻辑场景尚无任何具体场景（先补基线样本）；
+            zone_deficit = 稀有分区配额缺口
+          enum: [zero_scenes, zone_deficit]
         recommendation: { type: string }
 
     # ---------- 响应包装（具体/用例/测试集/覆盖） ----------
@@ -1543,6 +1768,20 @@ components:
                   type: array
                   items: { $ref: "#/components/schemas/Oracle" }
                 total: { type: integer }
+    SceneSemanticsListResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [items, total, taxonomy_version]
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/SceneSemantics" }
+                total: { type: integer }
+                taxonomy_version: { type: string, example: "1.0" }
     TestCaseListResponse:
       allOf:
         - $ref: "#/components/schemas/ApiResponse"
@@ -1585,6 +1824,18 @@ components:
         - type: object
           properties:
             data: { $ref: "#/components/schemas/SuiteDetail" }
+    CaseDerivationResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/CaseDerivation" }
+    SuiteDerivationResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiResponse"
+        - type: object
+          properties:
+            data: { $ref: "#/components/schemas/SuiteDerivation" }
     SuiteLockResponse:
       allOf:
         - $ref: "#/components/schemas/ApiResponse"

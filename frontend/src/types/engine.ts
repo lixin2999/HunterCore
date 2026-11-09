@@ -239,6 +239,13 @@ export interface ConcreteListQuery {
 
 export type ConcreteListData = PageData<ConcreteScenarioSummary>
 
+export interface ExecutionReport {
+  /** 无标准 OpenSCENARIO/CARLA 等价物的行为/动作/触发 */
+  unsupported: string[]
+  /** 可执行但不完整的组合 */
+  warnings: string[]
+}
+
 export interface RenderData {
   scenario_id: string
   logical_id: string
@@ -246,6 +253,7 @@ export interface RenderData {
   scene_config: SceneConfig
   gates: GateItem[]
   passed: boolean
+  execution: ExecutionReport
 }
 
 export interface BatchValidateItem {
@@ -392,6 +400,52 @@ export interface Baseline {
 
 export type SuiteListData = PageData<SuiteSummary>
 
+/* ---------------------------- 用例 / 测试集派生 ---------------------------- */
+
+export interface CaseDerivationRequest {
+  /** 场景类型；省略（空数组）覆盖目录内全部可合成类型 */
+  scene_types?: string[]
+  /** 稀有度分区，默认 Z1-Z4 */
+  zones?: RarityZone[]
+  include_concrete?: boolean
+  dry_run?: boolean
+}
+
+export interface DerivedCase {
+  case_key: string
+  logical_id: string
+  scene_type: string
+  zone: RarityZone
+  name: string
+  status: 'created' | 'skipped' | 'planned'
+  test_case_id?: string | null
+  reason?: string | null
+}
+
+export interface CaseDerivationData {
+  created: number
+  skipped: number
+  planned: number
+  cases: DerivedCase[]
+}
+
+export interface DerivedSuite {
+  suite_id?: string | null
+  name: string
+  scene_type: string
+  item_count: number
+  status: 'created' | 'updated' | 'skipped' | 'planned'
+  reason?: string | null
+}
+
+export interface SuiteDerivationData {
+  created: number
+  updated: number
+  skipped: number
+  planned: number
+  suites: DerivedSuite[]
+}
+
 /* ---------------------------- 覆盖分析 ---------------------------- */
 
 export interface CoverageOverview {
@@ -401,6 +455,12 @@ export interface CoverageOverview {
   zone_ratio: Record<string, number>
   risk_counts: Record<string, number>
   risk_matrix_applied: boolean
+  /** 按场景类型（logical_id → scene_type 聚合）的具体场景数 */
+  type_counts: Record<string, number>
+  /** 场景类型 × 稀有分区矩阵（类型 → 分区 → 数量） */
+  type_zone_counts: Record<string, Record<string, number>>
+  /** 按语义契约声明的角色统计具体场景数 */
+  role_counts: Record<string, number>
 }
 
 export interface CoverageGap {
@@ -410,10 +470,73 @@ export interface CoverageGap {
   count: number
   target: number
   deficit: number
+  /** zero_scenes = 该逻辑场景尚无具体场景；zone_deficit = 稀有分区配额缺口 */
+  kind: 'zero_scenes' | 'zone_deficit'
   recommendation: string
 }
 
 export interface CoverageGapListData {
   profile: string
   items: CoverageGap[]
+}
+
+/* ---------------------------- 场景语义契约（只读） ---------------------------- */
+
+/** 参与者角色语义（count 为参数表达式原文） */
+export interface SceneRoleSemantics {
+  role: string
+  type: string
+  count: string
+  behavior_type: string
+  parameters: Record<string, unknown>
+  min_count: number
+  required: boolean
+}
+
+/** 事件语义 */
+export interface SceneEventSemantics {
+  type: string
+  condition_type: string
+  action_type: string
+}
+
+/** 子场景（variant）语义 */
+export interface SceneVariantSemantics {
+  key: string
+  label: string
+  sub: string
+}
+
+/** 参数分布语义 */
+export interface SceneParamSemantics {
+  name: string
+  mean: number
+  std: number
+  low: number
+  high: number
+  unit: string
+  discrete: boolean
+  risk: number
+}
+
+/** 单类型语义契约摘要 */
+export interface SceneSemantics {
+  scene_type: string
+  objective: string
+  oracle_ref: string
+  required_events: boolean
+  roles: SceneRoleSemantics[]
+  required_roles: string[]
+  events: SceneEventSemantics[]
+  variants: SceneVariantSemantics[]
+  params: SceneParamSemantics[]
+  duration: string
+  weather: Record<string, string>
+}
+
+export interface SceneSemanticsListData {
+  items: SceneSemantics[]
+  total: number
+  /** contracts/scene-taxonomy.yaml::version */
+  taxonomy_version: string
 }

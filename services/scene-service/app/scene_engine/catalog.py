@@ -1,23 +1,30 @@
 """内置逻辑场景目录（IR 目录，HUNTER SE 专项包 + 通用场景族）。
 
-目录是代码资产（与 47 个场景模板、``contracts/scene-taxonomy.yaml`` 对齐）：
+目录是代码资产（与 46 个可合成场景类型、``contracts/scene-taxonomy.yaml`` 对齐）：
 - 每个逻辑场景 = IR（参数分布 + 相关 + 约束 + 绑定 + 判据引用），不含具体参数值；
 - 参数取值由生成器按策略采样，编译时经 ``bindings`` 落到 ``SceneConfig`` 字段；
 - ``service.sync_catalog`` 按 ``content_hash`` 幂等入库，IR 变更自动升版本。
 
-覆盖范围（V1.23.1，17 个）：
+来源分工（单一事实来源）：
+- 本文件保留 17 个手写 IR（``logical_id`` 稳定，避免已发布版本漂移）；
+  其 ``base_config`` 的参与者/事件/天气/时长同样由 ``catalog_semantics`` 从语义契约实例化，
+  不再手写一份平行事实源；
+- 其余 29 个类型由 ``app/scene_engine/catalog_semantics.py`` 按语义契约合成（V1.1.0 起）。
+
+覆盖范围（17 个手写）：
 - BASIC 5：直线巡航 / 弯道 / 跟车 / 变道 / 窄路会车；
 - INTERACTIVE 4：前车切入 / 行人横穿 / 鬼探头 / 路口会车；
 - CORNER_CASE 4：紧急制动 / 障碍物突现 / 儿童追球 / 窄通道脱困（SP-GEO-01）；
 - ENVIRONMENT 2：雨天 / 夜间；
 - HUNTER SE 专项 2：低电量安全停车（SP-PWR-01）/ 窄通道转弯（SP-GEO-02）。
 
-⚠ 新增/修改逻辑场景只改本文件：DDL 无变更、无需迁移；发布需 ``POST /api/v1/scene/logical/sync``。
+⚠ 新增/修改逻辑场景只改本文件与语义契约：DDL 无变更、无需迁移；发布需 ``POST /api/v1/scene/logical/sync``。
 """
 from __future__ import annotations
 
 from typing import Any
 
+from app.scene_engine.catalog_semantics import CATALOG_SEMANTICS, semantic_base_config
 from app.scene_engine.ir import (
     BindingIR,
     ConstraintIR,
@@ -29,73 +36,13 @@ from app.scene_engine.ir import (
 )
 
 # =====================================================================
-# 构造助手（保证 base_config 满足 SceneConfig 全字段约束）
+# 构造助手（语义契约实例化 + IR 字段约束）
 # =====================================================================
 
 
-def _spawn(x: float = 0.0, y: float = 0.0, z: float = 0.0, yaw: float = 0.0) -> dict[str, Any]:
-    return {"x": x, "y": y, "z": z, "yaw": yaw, "lane_id": None}
-
-
-def _weather(
-    *,
-    cloudiness: float = 20.0,
-    rain: float = 0.0,
-    wetness: float = 0.0,
-    fog: float = 0.0,
-    wind: float = 5.0,
-    sun_azimuth: float = 180.0,
-    sun_altitude: float = 45.0,
-) -> dict[str, Any]:
-    return {
-        "cloudiness": cloudiness,
-        "rain": rain,
-        "wetness": wetness,
-        "fog": fog,
-        "wind": wind,
-        "sun_azimuth": sun_azimuth,
-        "sun_altitude": sun_altitude,
-    }
-
-
-def _actor(
-    actor_id: str,
-    actor_type: str,
-    *,
-    x: float,
-    y: float = 0.0,
-    yaw: float = 0.0,
-    behavior_type: str,
-    parameters: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return {
-        "actor_id": actor_id,
-        "type": actor_type,
-        "spawn_point": _spawn(x, y, 0.0, yaw),
-        "behavior": {"behavior_type": behavior_type, "parameters": parameters or {}},
-    }
-
-
-def _event(
-    event_id: str,
-    event_type: str,
-    *,
-    condition: str,
-    condition_type: str,
-    trigger_parameters: dict[str, Any] | None = None,
-    action_type: str,
-    action_parameters: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return {
-        "event_id": event_id,
-        "type": event_type,
-        "trigger": {
-            "condition": condition,
-            "condition_type": condition_type,
-            "parameters": trigger_parameters or {},
-        },
-        "action": {"action_type": action_type, "parameters": action_parameters or {}},
-    }
+def _semantic_config(scene_type: str, **overrides: Any) -> dict[str, Any]:
+    """base_config 由语义契约合成（角色/事件/天气/时长同源，可覆盖 ego/时长/判据）。"""
+    return semantic_base_config(scene_type, **overrides)
 
 
 def _criteria(
@@ -108,33 +55,6 @@ def _criteria(
         "max_speed_deviation": max_speed_deviation,
         "no_collision": no_collision,
         "min_safe_distance": min_safe_distance,
-    }
-
-
-def _config(
-    *,
-    ego_speed: float,
-    ego_model: str = "HUNTER_SE",
-    ego_steer: float = 0.0,
-    actors: list[dict[str, Any]] | None = None,
-    events: list[dict[str, Any]] | None = None,
-    weather: dict[str, Any] | None = None,
-    criteria: dict[str, Any] | None = None,
-    duration: float = 30.0,
-    map_id: str = "Town04",
-) -> dict[str, Any]:
-    return {
-        "map": {"map_id": map_id, "map_type": "carla_town", "spawn_point": _spawn()},
-        "ego_vehicle": {
-            "model": ego_model,
-            "initial_speed": ego_speed,
-            "initial_steer": ego_steer,
-        },
-        "weather": weather or _weather(),
-        "actors": actors or [],
-        "events": events or [],
-        "success_criteria": criteria or _criteria(),
-        "duration": duration,
     }
 
 
@@ -267,7 +187,7 @@ def _straight_cruise() -> SceneIR:
             BindingIR(path="ego_vehicle.initial_speed", expr="v0"),
             BindingIR(path="duration", expr="max(20, min(60, d_free / max(v0, 1)))"),
         ],
-        base_config=_config(ego_speed=0.3, duration=40.0),
+        base_config=_semantic_config("straight_cruise", ego_speed=0.3, duration=40.0),
         oracle_ref="oracle.task.speed_tracking/v1",
         criticality=CriticalityIR(speed_param="v0"),
         tags=["baseline", "longitudinal"],
@@ -294,7 +214,7 @@ def _curve_driving() -> SceneIR:
             BindingIR(path="ego_vehicle.initial_speed", expr="v0"),
             BindingIR(path="ego_vehicle.initial_steer", expr="steer"),
         ],
-        base_config=_config(ego_speed=0.3, ego_steer=0.08, duration=30.0),
+        base_config=_semantic_config("curve_driving", ego_speed=0.3, ego_steer=0.08, duration=30.0),
         oracle_ref="oracle.comfort.accel/v1",
         criticality=CriticalityIR(speed_param="v0"),
         tags=["lateral", "comfort"],
@@ -320,9 +240,9 @@ def _car_following() -> SceneIR:
             BindingIR(path="actors[0].behavior.parameters.target_speed", expr="v1"),
             BindingIR(path="duration", expr="max(20, min(90, gap * 3))"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "car_following",
             ego_speed=0.3,
-            actors=[_actor("lead", "vehicle", x=2.5, behavior_type="constant_velocity", parameters={"target_speed": 0.6})],
             duration=60.0,
             criteria=_criteria(min_safe_distance=0.5),
         ),
@@ -350,9 +270,9 @@ def _lane_change() -> SceneIR:
             BindingIR(path="actors[0].spawn_point.x", expr="gap_adj"),
             BindingIR(path="actors[0].behavior.parameters.target_speed", expr="v_adj"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "lane_change",
             ego_speed=0.3,
-            actors=[_actor("adjacent", "vehicle", x=6.0, y=3.5, behavior_type="constant_velocity", parameters={"target_speed": 0.8})],
             duration=30.0,
         ),
         oracle_ref="oracle.safety.no_collision/v1",
@@ -381,9 +301,9 @@ def _narrow_road_meeting() -> SceneIR:
             BindingIR(path="actors[0].behavior.parameters.target_speed", expr="v_on"),
             BindingIR(path="success_criteria.min_safe_distance", expr="max(0.2, w - 2.4)"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "narrow_road_meeting",
             ego_speed=0.3,
-            actors=[_actor("oncoming", "vehicle", x=6.0, y=0.6, yaw=3.141592653589793, behavior_type="constant_velocity", parameters={"target_speed": 0.6})],
             duration=40.0,
             criteria=_criteria(min_safe_distance=0.5),
         ),
@@ -420,23 +340,12 @@ def _cut_in() -> SceneIR:
         bindings=[
             BindingIR(path="ego_vehicle.initial_speed", expr="v0"),
             BindingIR(path="actors[0].spawn_point.x", expr="gap + 1.0"),
-            BindingIR(path="actors[0].behavior.parameters.target_speed", expr="v_lead"),
+            BindingIR(path="actors[0].behavior.parameters.cut_in_speed", expr="v_lead"),
             BindingIR(path="events[0].trigger.parameters.value", expr="gap"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "cut_in",
             ego_speed=0.3,
-            actors=[_actor("cutter", "vehicle", x=2.0, y=3.5, behavior_type="cut_in", parameters={"target_speed": 0.6})],
-            events=[
-                _event(
-                    "cut-in",
-                    "cut_in",
-                    condition="relative_distance <= gap",
-                    condition_type="relative_distance",
-                    trigger_parameters={"value": 1.5, "rule": "<="},
-                    action_type="lane_change",
-                    action_parameters={"target_lane": "current"},
-                )
-            ],
             duration=30.0,
         ),
         oracle_ref="oracle.safety.min_distance/v1",
@@ -464,20 +373,9 @@ def _pedestrian_crossing() -> SceneIR:
             BindingIR(path="actors[0].behavior.parameters.crossing_speed", expr="v_ped"),
             BindingIR(path="events[0].trigger.parameters.value", expr="d_ped"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "pedestrian_crossing",
             ego_speed=0.3,
-            actors=[_actor("ped", "pedestrian", x=3.0, y=6.0, behavior_type="cross_road", parameters={"crossing_speed": 1.2})],
-            events=[
-                _event(
-                    "ped-cross",
-                    "pedestrian_crossing",
-                    condition="distance to crossing <= d_ped",
-                    condition_type="distance",
-                    trigger_parameters={"value": 3.0, "rule": "<="},
-                    action_type="emergency_stop",
-                    action_parameters={"deceleration": 1.5},
-                )
-            ],
             duration=30.0,
             criteria=_criteria(min_safe_distance=0.5),
         ),
@@ -504,9 +402,9 @@ def _occluded_pedestrian() -> SceneIR:
             BindingIR(path="actors[0].spawn_point.x", expr="d_occ"),
             BindingIR(path="actors[0].behavior.parameters.crossing_speed", expr="v_ped"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "occluded_pedestrian",
             ego_speed=0.3,
-            actors=[_actor("occluded-ped", "pedestrian", x=3.0, y=5.0, behavior_type="occluded_dash", parameters={"crossing_speed": 1.6})],
             duration=25.0,
             criteria=_criteria(min_safe_distance=0.4),
         ),
@@ -534,9 +432,9 @@ def _intersection_meeting() -> SceneIR:
             BindingIR(path="actors[0].spawn_point.x", expr="d_meet"),
             BindingIR(path="actors[0].behavior.parameters.target_speed", expr="v_other"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "intersection_meeting",
             ego_speed=0.3,
-            actors=[_actor("crosser", "vehicle", x=5.0, y=8.0, yaw=-1.5707963267948966, behavior_type="forward", parameters={"target_speed": 0.6})],
             duration=30.0,
         ),
         oracle_ref="oracle.safety.no_collision/v1",
@@ -566,11 +464,11 @@ def _emergency_braking() -> SceneIR:
         bindings=[
             BindingIR(path="ego_vehicle.initial_speed", expr="v0"),
             BindingIR(path="actors[0].spawn_point.x", expr="gap + 1.0"),
-            BindingIR(path="actors[0].behavior.parameters.deceleration", expr="a_lead"),
+            BindingIR(path="events[0].action.parameters.deceleration", expr="a_lead"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "emergency_braking",
             ego_speed=0.3,
-            actors=[_actor("braking-lead", "vehicle", x=2.0, behavior_type="emergency_brake", parameters={"deceleration": 1.0})],
             duration=25.0,
             criteria=_criteria(min_safe_distance=0.4),
         ),
@@ -596,20 +494,9 @@ def _obstacle_appearance() -> SceneIR:
             BindingIR(path="actors[0].spawn_point.x", expr="d_obs"),
             BindingIR(path="events[0].trigger.parameters.value", expr="d_obs"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "obstacle_appearance",
             ego_speed=0.3,
-            actors=[_actor("obstacle", "other", x=2.0, behavior_type="static", parameters={"object_kind": "box"})],
-            events=[
-                _event(
-                    "obstacle-appear",
-                    "obstacle_appearance",
-                    condition="distance to obstacle <= d_obs",
-                    condition_type="distance",
-                    trigger_parameters={"value": 2.0, "rule": "<="},
-                    action_type="visibility",
-                    action_parameters={"parameters": "visible"},
-                )
-            ],
             duration=25.0,
             criteria=_criteria(min_safe_distance=0.3),
         ),
@@ -636,9 +523,9 @@ def _child_chasing_ball() -> SceneIR:
             BindingIR(path="actors[0].spawn_point.x", expr="d_child"),
             BindingIR(path="actors[0].behavior.parameters.crossing_speed", expr="v_child"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "child_chasing_ball",
             ego_speed=0.3,
-            actors=[_actor("child", "pedestrian", x=3.0, y=5.0, behavior_type="child_chase_ball", parameters={"crossing_speed": 1.6})],
             duration=25.0,
             criteria=_criteria(min_safe_distance=0.3),
         ),
@@ -673,11 +560,12 @@ def _narrow_corridor_escape() -> SceneIR:
             BindingIR(path="actors[0].behavior.parameters.width", expr="w_obs"),
             BindingIR(path="success_criteria.min_safe_distance", expr="max(0.2, w - w_obs)"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "stationary_obstacle",
             ego_speed=0.3,
-            actors=[_actor("block", "other", x=1.3, behavior_type="static", parameters={"object_kind": "barrier", "width": 0.6})],
             duration=40.0,
             criteria=_criteria(min_safe_distance=0.2),
+            actor_extra={0: {"width": 0.6}},
         ),
         oracle_ref="oracle.geometry.clearance/v1",
         criticality=CriticalityIR(speed_param="v0", gap_param="d0", d_margin=0.2),
@@ -715,7 +603,7 @@ def _rainy_cruise() -> SceneIR:
             BindingIR(path="weather.fog", expr="fog"),
             BindingIR(path="weather.cloudiness", expr="max(60, rain)"),
         ],
-        base_config=_config(ego_speed=10.0, duration=40.0, weather=_weather(cloudiness=80.0, rain=60.0, wetness=60.0, fog=10.0)),
+        base_config=_semantic_config("rainy", ego_speed=10.0, duration=40.0),
         oracle_ref="oracle.task.speed_tracking/v1",
         criticality=CriticalityIR(speed_param="v0"),
         tags=["weather", "rain", "low_friction"],
@@ -741,7 +629,7 @@ def _night_driving() -> SceneIR:
             BindingIR(path="weather.sun_altitude", expr="sun_altitude"),
             BindingIR(path="weather.cloudiness", expr="cloudiness"),
         ],
-        base_config=_config(ego_speed=2.8, duration=40.0, weather=_weather(cloudiness=40.0, sun_altitude=-15.0)),
+        base_config=_semantic_config("night", ego_speed=2.8, duration=40.0),
         oracle_ref="oracle.safety.no_collision/v1",
         criticality=CriticalityIR(speed_param="v0"),
         tags=["weather", "night", "illumination"],
@@ -775,21 +663,12 @@ def _low_battery_stop() -> SceneIR:
             BindingIR(path="events[0].trigger.parameters.value", expr="d_station"),
             BindingIR(path="duration", expr="max(30, min(180, d_station / max(v0, 1)))"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "minimal_risk_manoeuvre",
             ego_speed=2.5,
-            events=[
-                _event(
-                    "soc-guard",
-                    "emergency_brake",
-                    condition="remaining range < d_station",
-                    condition_type="parameter_value",
-                    trigger_parameters={"parameter_name": "soc", "value": 0.15, "rule": "<="},
-                    action_type="degrade_control",
-                    action_parameters={"soc": 0.15, "fallback": "minimal_risk_stop"},
-                )
-            ],
             duration=90.0,
             criteria=_criteria(max_speed_deviation=1.5, min_safe_distance=0.5),
+            event_extra={0: {"soc": 0.15}},
         ),
         oracle_ref="oracle.energy.soc_reserve/v1",
         criticality=CriticalityIR(speed_param="v0"),
@@ -816,7 +695,8 @@ def _narrow_turn() -> SceneIR:
             BindingIR(path="ego_vehicle.initial_steer", expr="steer"),
             BindingIR(path="success_criteria.min_safe_distance", expr="max(0.2, w - 1.2)"),
         ],
-        base_config=_config(
+        base_config=_semantic_config(
+            "uturn",
             ego_speed=0.4,
             ego_steer=0.4,
             duration=60.0,
@@ -829,7 +709,7 @@ def _narrow_turn() -> SceneIR:
     )
 
 
-#: 内置目录（顺序稳定：同步/列表按此顺序可读）
+#: 内置目录（17 个手写 IR + 29 个语义合成 IR；顺序稳定：同步/列表按此顺序可读）
 CATALOG: tuple[SceneIR, ...] = (
     _straight_cruise(),
     _curve_driving(),
@@ -848,13 +728,13 @@ CATALOG: tuple[SceneIR, ...] = (
     _night_driving(),
     _low_battery_stop(),
     _narrow_turn(),
-)
+) + CATALOG_SEMANTICS
 
 #: logical_id → IR（生成接口按 ID 检索）
 CATALOG_BY_ID: dict[str, SceneIR] = {ir.logical_id: ir for ir in CATALOG}
 
 #: 目录版本（IR 语义变更时递增；用于同步日志与文档追溯）
-CATALOG_VERSION = "1.0.1"
+CATALOG_VERSION = "1.1.0"
 
 
 def get_ir(logical_id: str, version: str | None = None) -> SceneIR | None:

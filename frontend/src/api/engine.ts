@@ -9,6 +9,8 @@ import { request } from './request'
 import type {
   Baseline,
   BatchValidateData,
+  CaseDerivationData,
+  CaseDerivationRequest,
   CatalogSyncData,
   ConcreteListData,
   ConcreteListQuery,
@@ -24,7 +26,9 @@ import type {
   OracleListData,
   PublishData,
   RenderData,
+  SceneSemanticsListData,
   SuiteCreateRequest,
+  SuiteDerivationData,
   SuiteDetail,
   SuiteDiffData,
   SuiteItemInput,
@@ -171,6 +175,11 @@ export function batchValidateConcreteScenarios(scenarioIds: string[]): Promise<B
 
 /* ------------------------------ 判据 / 测试用例 ------------------------------ */
 
+/** 场景语义契约摘要（GET /api/v1/scene/semantics；只读，语义自检用） */
+export function listSceneSemantics(): Promise<SceneSemanticsListData> {
+  return request<SceneSemanticsListData>({ url: '/scene/semantics', method: 'get' })
+}
+
 /** 判据目录（GET /api/v1/scene/oracles） */
 export function listOracles(): Promise<OracleListData> {
   return request<OracleListData>({ url: '/scene/oracles', method: 'get' })
@@ -191,6 +200,17 @@ export function getTestCase(testCaseId: string): Promise<TestCase> {
   return request<TestCase>({ url: `/scene/testcases/${testCaseId}`, method: 'get' })
 }
 
+/** 按场景类型×分区派生用例（POST /api/v1/scene/testcases/derive；case_key 幂等） */
+export function deriveTestCases(
+  payload: CaseDerivationRequest = {},
+): Promise<CaseDerivationData> {
+  return request<CaseDerivationData>({
+    url: '/scene/testcases/derive',
+    method: 'post',
+    data: payload,
+  })
+}
+
 /* ------------------------------ 测试集 / 基线 ------------------------------ */
 
 /** 测试集列表（GET /api/v1/scene/suites） */
@@ -208,6 +228,17 @@ export function createSuite(payload: SuiteCreateRequest): Promise<SuiteDetail> {
 /** 测试集详情（GET /api/v1/scene/suites/{suite_id}，含条目） */
 export function getSuite(suiteId: string): Promise<SuiteDetail> {
   return request<SuiteDetail>({ url: `/scene/suites/${suiteId}`, method: 'get' })
+}
+
+/** 按场景类型派生测试集（POST /api/v1/scene/suites/derive；锁定则跳过） */
+export function deriveSuites(
+  payload: CaseDerivationRequest = {},
+): Promise<SuiteDerivationData> {
+  return request<SuiteDerivationData>({
+    url: '/scene/suites/derive',
+    method: 'post',
+    data: payload,
+  })
 }
 
 /** 加条目（POST /api/v1/scene/suites/{suite_id}/items；锁定后 3003） */

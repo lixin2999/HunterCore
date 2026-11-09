@@ -48,7 +48,8 @@ HunterCore/
 ├── contracts/                 # 接口契约（先定义后实现，单一事实来源）
 │   ├── openapi/               # REST API OpenAPI 3.0 YAML
 │   ├── kafka/                 # Kafka Topic 定义 YAML + JSON Schema
-│   └── database/              # 数据库 DDL SQL + ER 关系说明
+│   ├── database/              # 数据库 DDL SQL + ER 关系说明
+│   └── scene-taxonomy.yaml    # 场景受控字典 + 语义契约（v1.1：48 类型 / 46 可合成，含角色·事件·参数区间）
 ├── services/                  # 后端微服务（每服务独立目录/独立部署/独立数据库 schema）
 │   ├── api-gateway/           # 8080 统一接入 / JWT 鉴权 / 限流熔断 / 路由转发
 │   ├── scene-service/         # 8081 场景生成
@@ -132,7 +133,7 @@ services/{service-name}/
 | 模块 | 服务 | 端口 | 网关路由前缀 |
 |------|------|------|--------------|
 | API 网关 | api-gateway | 8080 | 统一入口（全部 `/api/v1/**`，JWT 鉴权 + 五级限流） |
-| 场景生成 | scene-service | 8081 | `/api/v1/scene/**` |
+| 场景生成 | scene-service | 8081 | `/api/v1/scene/**`（CRUD + 场景引擎：`/logical` `/generate` `/testcases` `/suites` `/semantics` 等） |
 | 数据采集 | data-collector | 8082 | `/api/v1/data/**` |
 | 数据分析 | data-analytics | 8083 | `/api/v1/analytics/**` |
 | OTA 管理 | ota-service | 8084 | `/api/v1/ota/**` |
@@ -141,6 +142,8 @@ services/{service-name}/
 | 数据消费解析与处理 | ingest-platform | 8089 | 未入网关路由表（服务未纳入部署编排；REST 供内部查询/导出：`/api/v1/bags|clips|tasks|artifacts|datasets|agents|commands`，V1.20.0；审查 P0/P1 整改见 V1.20.1/V1.20.2，功能遗漏汇总剩余（§12.3 DLT replay）见 V1.20.3） |
 
 ## 快速开始
+
+> **版本要点（V1.26.0）**：场景库由「模板拼装」改为**语义契约驱动**（`contracts/scene-taxonomy.yaml` v1.1：48 类型 / 46 可合成），参与者按角色命名（`occluder-1`、`dart_out_pedestrian-1`…）并在**入库与下发双侧**做语义闸门（缺必需角色 → 422/`2001`），现场「`actors=1/1` 看不到行人」与「批量场景内容雷同」由此根治；同时新增用例/测试集自动派生、CARLA 执行映射与 `scripts/verify_scene_semantics.py` 自检，存量库重建见 `release.md` V1.26.0 §6。
 
 > **版本要点（V1.21.0）**：① 运营看板重构为**深色科技风三层信息架构**（KPI 发光带 + 动态图表 + 单车抽屉钻取，仅看板页、不改全局主题）；② 远程操控视频改 **SRS WHEP 拉流**架构（车端 RTMP 推流→ SRS → 浏览器 WHEP，消除“信令连接异常”，环境变量 `RC_SRS_WHEP_URL`/`RC_SRS_WHIP_URL` 等，见 `docs/deployment.md` §15）；③ **新增内置车辆模拟器** `tools/vehicle-simulator/`（端到端可演示/自测）；④ dev `/ws` 代理修正到 remote-control:8085；⑤ 车辆详情新增数据采集 Agent Topic 预览（V1.20.0 `vehicle.bag.*`/`vehicle.agent.*`）。变更详情与验证口径见 `release.md` V1.21.0。
 
@@ -356,7 +359,8 @@ REST 接口契约集中在 `contracts/openapi/`，遵循「先契约、后实现
 | 契约 | 覆盖范围 | 状态 |
 |------|----------|------|
 | `api-gateway.yaml` | 统一认证（登录 / 刷新 / 登录态查询 / 注销）+ 运维探针（`/healthz`、`/readyz`、`/metrics`）+ 路由表 / 五级限流 / WebSocket / 审计日志 / 错误码映射扩展字段 | ✅ |
-| `scene-service.yaml` | 场景库 CRUD（10 端点，12.2 节）+ 4.2.1 分类体系 / 4.2.2 配置结构 / 4.3 导出 / 4.4 下发 / 4.5 实车提取扩展字段 | ✅ 契约 + 实现（服务端口 8081；100 项测试） |
+| `scene-service.yaml` | 场景库 CRUD（10 端点，12.2 节）+ 4.2.1 分类体系 / 4.2.2 配置结构 / 4.3 导出 / 4.4 下发 / 4.5 实车提取扩展字段 | ✅ 契约 + 实现（服务端口 8081；511 项测试） |
+| `scene-engine.yaml` | 场景引擎（25 端点）：逻辑目录同步 / 异步批量生成与任务进度 / 用例与测试集派生 / 语义契约查询 / 配置校验 | ✅ 契约 + 实现（18 项契约测试） |
 | `data-collector.yaml` | 数据采集（7 端点：遥测查询 / 事件查询与确认 / 文件清单与预签名上传）+ 5.3.3 遥测结构 / 5.4 预处理 / 5.5 上传流程扩展字段 | ✅ |
 | `data-analytics.yaml` | 数据分析（8 端点：报告列表/详情/生成、看板、感知与控制评估、场景覆盖率、Corner Case）+ 6.2 实时作业 / 6.3 离线作业 / 6.4 挖掘 / 6.5 报告扩展字段 | ✅ |
 | `ota-service.yaml` | OTA 管理（15 端点：版本仓库 CRUD/发布/废弃、升级任务 CRUD/start|pause|resume|cancel|rollback、升级记录）+ 8/9 章 DDL 与 Kafka 对齐 + 版本上传两步式 / 灰度批次 / 发布校验扩展字段 | ✅ |
@@ -365,8 +369,10 @@ REST 接口契约集中在 `contracts/openapi/`，遵循「先契约、后实现
 ```bash
 # 契约校验（29 项，无需运行服务）
 pytest services/api-gateway/app/tests/test_openapi_contract.py -q
-# 场景服务契约校验（29 项，无需运行服务）
+# 场景服务契约校验（30 项，无需运行服务）
 cd services/scene-service && pytest app/tests/test_scene_contract.py -q
+# 场景引擎契约校验（18 项：25 个端点 operationId ↔ 实现，无需运行服务）
+cd services/scene-service && pytest app/tests/test_scene_engine_contract.py -q
 # 数据采集契约校验（30 项，无需运行服务）
 cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q
 # 数据分析契约校验（32 项，无需运行服务）
@@ -495,8 +501,10 @@ python scripts/verify_test_layer.py
 | 存储契约单元测试 | `pytest common/python/tests/test_storage_contracts.py -q`（Redis Key / MinIO Bucket ↔ 服务声明 ↔ 初始化脚本，9 项） |
 | 接口契约校验 | `pytest services/api-gateway/app/tests/test_openapi_contract.py -q`（OpenAPI ↔ 实现 ↔ K8s 清单，29 项） |
 | 网关认证/限流/转发测试 | `pytest services/api-gateway -q`（登录/刷新轮换防重放/注销幂等/会话强依赖/限流维度/代理转发与熔断，66 项） |
-| 场景契约校验 | `cd services/scene-service && pytest app/tests/test_scene_contract.py -q`（契约 ↔ 设计文档 4 章/12.2 节 ↔ DDL ↔ Kafka ↔ K8s，29 项） |
-| 场景服务实现测试 | `cd services/scene-service && pytest -q`（端点/服务层/消费者/健康探针 100 项；含错误码 1001/1002/2001/2002/3001/3002/3003/5001 分支） |
+| 场景契约校验 | `cd services/scene-service && pytest app/tests/test_scene_contract.py -q`（契约 ↔ 设计文档 4 章/12.2 节 ↔ DDL ↔ Kafka ↔ K8s，30 项） |
+| 场景引擎契约校验 | `cd services/scene-service && pytest app/tests/test_scene_engine_contract.py -q`（25 个引擎端点 operationId ↔ 实现 ↔ OpenAPI，18 项） |
+| 场景服务实现测试 | `cd services/scene-service && pytest -q`（端点/服务层/引擎/消费者/健康探针 511 项；含错误码 1001/1002/2001/2002/3001/3002/3003/5001 分支） |
+| 场景语义自检 | `python scripts/verify_scene_semantics.py --base-url http://localhost:8081 --mode direct --user-id <admin> --roles admin`（46/46 类型 [ok]、EXIT=0；`--from-file` 可离线核对 dry-run 产物） |
 | 数据采集契约校验 | `cd services/data-collector && pytest app/tests/test_data_collector_contract.py -q`（契约 ↔ 设计文档 5 章 ↔ DDL ↔ Kafka ↔ K8s，30 项） |
 | 数据采集链路测试 | `cd services/data-collector && pytest -q`（114 项：契约 + 健康探针 + FileService（含 SHA-256 内容校验回归）/ EventService / TelemetryService + 5.4 预处理流水线 + 批量入库 + 车辆读模型 + 三路消费者） |
 | 契约 ConfigMap 一致性 | `python scripts/generate_contracts_configmap.py --check`（运行时 Schema 校验依赖的 `hunter-contracts` 与 `contracts/kafka` 一致） |
@@ -531,7 +539,7 @@ python scripts/verify_test_layer.py
 
 ## 文档
 
-- `docs/`：设计文档索引与开发文档（含 `deployment.md`：部署指南——镜像构建 / K8s 清单 / 版本变量 / HPA-PDB / 验证清单；`frontend-portal.md`：前端模块设计、鉴权与权限、远程操控实现要点、回归清单）
+- `docs/`：设计文档索引与开发文档（含 `deployment.md`：部署指南——镜像构建 / K8s 清单 / 版本变量 / HPA-PDB / 验证清单 / §18 场景库语义化重建；`场景库使用手册.md`：场景库语义与用法——详情语义卡 / 3D 预览 / 用例与测试集派生 / 下发核对与 `2001` 报错处理；`frontend-portal.md`：前端模块设计、鉴权与权限、远程操控实现要点、回归清单）
 - `frontend/README.md`：前端快速开始、环境变量、页面与契约端点映射、待确认项
 - `contracts/`：接口契约（数据库 DDL/ER/受控词表 + Redis Key / MinIO 对象存储契约、Kafka Topic 清单/消费者组/11 个消息 JSON Schema 已完成；OpenAPI 已完成 api-gateway / scene-service / data-collector / data-analytics / ota-service / remote-control，六个服务契约齐备）
 - `release.md`：版本变更记录

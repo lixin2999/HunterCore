@@ -37,6 +37,7 @@ from app.repositories.simulations import (
     VilSessionStore,
     carla_topic_names,
 )
+from app.scene_engine.semantics import check_scene_semantics
 from app.scene_engine.vehicle_geometry import (
     SENSOR_MOUNT_REFERENCE_KEY,
     VehicleGeometryError,
@@ -199,6 +200,28 @@ class SceneSimulationService:
         return {**config, "spawn_semantics": SPAWN_SEMANTICS_RELATIVE}
 
     @staticmethod
+    def _require_semantics(scene_type: str, payload: dict[str, Any]) -> None:
+        """下发前语义闸门：与入库/发布校验同源，缺失角色转 2001 并列出缺口。"""
+        problems = check_scene_semantics(scene_type, payload)
+        if not problems:
+            return
+        missing = [problem.role for problem in problems if problem.role]
+        logger.warning(
+            "scene_semantics_blocked_dispatch",
+            scene_type=scene_type,
+            missing_roles=missing,
+            codes=sorted({problem.code for problem in problems}),
+        )
+        raise InvalidParameterError(
+            f"场景内容不满足 {scene_type} 的语义要求，已阻止下发：" + problems[0].message,
+            details={
+                "scene_type": scene_type,
+                "missing_roles": missing,
+                "problems": [problem.to_dict() for problem in problems],
+            },
+        )
+
+    @staticmethod
     def _attach_sensor_mount_reference(payload: dict[str, Any]) -> None:
         """给下发载荷附车辆蓝图几何参考块（V1.24.9，问题 2「画面只见路面」的平台侧缓解）。
 
@@ -232,6 +255,8 @@ class SceneSimulationService:
         # 下发载荷：V1.25.0 起不再做相对→绝对折算、不再拦原点（见 _dispatch_payload）
         dispatch_config = self._dispatch_payload(merged.model_dump(mode="json"))
         self._attach_sensor_mount_reference(dispatch_config)
+        # 下发前语义复检：缺必需参与者角色直接 2001（否则仿真端只能看到 1 辆车却“下发成功”）
+        self._require_semantics(str(model.scene_type), dispatch_config)
 
         mode = request.mode
         vehicle_id = request.vehicle_id

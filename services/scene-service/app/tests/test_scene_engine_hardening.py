@@ -29,6 +29,7 @@ from app.models.scene_engine import (
     SuiteStatus,
 )
 from app.repositories.engine import CONCRETE_DEFERRED, _is_unique_violation
+from app.scene_engine.carla_execution import check_executable
 from app.scene_engine.catalog import CATALOG_BY_ID, CATALOG_VERSION
 from app.scene_engine.compiler import default_values
 from app.scene_engine.esmini import EsminiRunner, build_xosc
@@ -75,13 +76,29 @@ VALID_BASE_CONFIG: dict[str, Any] = {
     },
     "actors": [
         {
-            "actor_id": "lead",
+            # 角色名与行为需与 straight_cruise 语义契约一致（G9 语义完整性）
+            "actor_id": "lead-1",
             "type": "vehicle",
             "spawn_point": {"x": 6.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
-            "behavior": {"behavior_type": "constant_velocity", "parameters": {}},
+            "behavior": {"behavior_type": "lane_follow", "parameters": {"target_speed": 0.3}},
         }
     ],
-    "events": [],
+    "events": [
+        {
+            "event_id": "ev-1",
+            "type": "emergency_brake",
+            "trigger": {
+                "condition": "自车与前车时距低于安全阈值",
+                "condition_type": "time_headway",
+                "parameters": {
+                    "value": 2.0,
+                    "rule": "<",
+                    "relative_distance_type": "longitudinal",
+                },
+            },
+            "action": {"action_type": "hold_speed", "parameters": {"target_speed": 0.3}},
+        }
+    ],
     "success_criteria": {
         "max_speed_deviation": 1.0,
         "no_collision": True,
@@ -282,6 +299,69 @@ def test_build_xosc_renders_pedestrian_entity_and_stop_trigger() -> None:
     assert '<Vehicle name="ego"' in xosc
     assert 'SimulationTimeCondition value="12.500"' in xosc
     assert 'filepath="road.xodr"' in xosc
+
+
+def test_build_xosc_emits_standard_trigger_action_and_controller() -> None:
+    """事件映射为 OSC 标准 StartTrigger/Action，行为映射为 Controller（不再空跑）。"""
+    config = json.loads(json.dumps(VALID_BASE_CONFIG))
+    config["duration"] = 18.0
+    config["actors"] = [
+        {
+            "actor_id": "lead-1",
+            "type": "vehicle",
+            "spawn_point": {"x": 8.0, "y": 0.0, "z": 0.0, "yaw": 0.0},
+            "behavior": {"behavior_type": "lane_follow", "parameters": {"target_speed": 2.0}},
+        },
+        {
+            "actor_id": "ped-1",
+            "type": "pedestrian",
+            "spawn_point": {"x": 10.0, "y": -4.0, "z": 0.0, "yaw": 1.5708},
+            "behavior": {"behavior_type": "sudden_cross", "parameters": {"crossing_speed": 1.4}},
+        },
+    ]
+    config["events"] = [
+        {
+            "event_id": "ev-brake",
+            "type": "emergency_brake",
+            "trigger": {
+                "condition": "与前车时距低于阈值",
+                "condition_type": "time_headway",
+                "parameters": {"value": 1.2, "rule": "<"},
+            },
+            "action": {"action_type": "emergency_stop", "parameters": {"deceleration": 6.5}},
+        }
+    ]
+    xosc = build_xosc(config)
+    assert '<Controller name="hunter-lane_follow-controller"/>' in xosc
+    assert '<Controller name="hunter-sudden_cross-controller"/>' in xosc
+    assert "<StartTrigger>" in xosc
+    assert "TimeHeadwayCondition" in xosc and 'rule="lessThan"' in xosc
+    assert "<SpeedActionTarget>" in xosc and '<AbsoluteTargetSpeed value="0.000"/>' in xosc
+    assert 'SimulationTimeCondition value="18.000"' in xosc
+    assert "<Weather cloudiness=" in xosc
+
+
+def test_check_executable_flags_unsupported_combinations() -> None:
+    """无标准等价物的动作/触发必须显式上报，不得静默当直行。"""
+    config = json.loads(json.dumps(VALID_BASE_CONFIG))
+    config["events"] = [
+        {
+            "event_id": "ev-x",
+            "type": "collision",
+            "trigger": {
+                "condition": "自定义值",
+                "condition_type": "user_defined_value",
+                "parameters": {"value": 1},
+            },
+            "action": {"action_type": "degrade_control", "parameters": {}},
+        }
+    ]
+    report = check_executable(config)
+    assert report.executable is False
+    joined = "\n".join(report.unsupported)
+    assert "degrade_control" in joined
+    assert "user_defined_value" in joined
+    assert check_executable(VALID_BASE_CONFIG).unsupported == ()
 
 
 # =====================================================================

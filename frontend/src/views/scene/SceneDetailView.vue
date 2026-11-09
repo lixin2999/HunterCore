@@ -14,6 +14,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
+import { listSceneSemantics } from '@/api/engine'
 import { exportScenes, getScene, publishScene, runScene, updateScene } from '@/api/scene'
 import ScenePreview from '@/components/three/ScenePreview.vue'
 import {
@@ -25,11 +26,18 @@ import {
 } from '@/constants'
 import { PERMISSIONS } from '@/constants/permissions'
 import { useUserStore } from '@/stores/user'
+import type { SceneSemantics } from '@/types/engine'
 import type { Scene, SceneConfig, SceneUpsertRequest } from '@/types/scene'
 import { HunterApiError } from '@/utils/error-code'
 import { downloadByUrl } from '@/utils/hash'
 import { formatBytes, formatDateTimeString } from '@/utils/format'
 import { sceneCreatorLabel } from '@/utils/scene-display'
+import {
+  auditSceneRoles,
+  missingRequiredRoles,
+  nextRoleOrdinal,
+  roleActorSuggestion,
+} from '@/utils/scene-semantics'
 
 const route = useRoute()
 const router = useRouter()
@@ -61,6 +69,33 @@ const form = reactive<SceneUpsertRequest>({
 
 /** 3D 预览用配置（保存前即预览当前表单） */
 const previewConfig = computed<SceneConfig>(() => form.config)
+
+/* ------------------------------ 语义自检（G9） ------------------------------ */
+/** 场景类型 → 语义契约（进程内缓存，失败不阻断详情页） */
+const semanticsByType = ref<Record<string, SceneSemantics>>({})
+const taxonomyVersion = ref('')
+const currentSemantics = computed<SceneSemantics | undefined>(
+  () => semanticsByType.value[form.scene_type],
+)
+const roleAudit = computed(() => auditSceneRoles(form.config, currentSemantics.value))
+const missingRoles = computed(() => missingRequiredRoles(roleAudit.value.rows))
+
+async function loadSemantics(): Promise<void> {
+  if (Object.keys(semanticsByType.value).length) {
+    return
+  }
+  try {
+    const data = await listSceneSemantics()
+    semanticsByType.value = Object.fromEntries(
+      data.items.map((item) => [item.scene_type, item]),
+    )
+    taxonomyVersion.value = data.taxonomy_version
+  } catch {
+    // 语义目录不可用时不阻断详情页（仅隐藏自检区块）
+  }
+}
+
+void loadSemantics()
 
 const actorTypeOptions = Object.entries(ACTOR_TYPE_LABELS).map(([value, label]) => ({ value, label }))
 const mapTypeOptions = Object.entries(MAP_TYPE_LABELS).map(([value, label]) => ({ value, label }))
@@ -96,6 +131,25 @@ async function loadScene(): Promise<void> {
 
 /* --------------------------- 参与者 / 事件编辑 --------------------------- */
 function addActor(): void {
+  // 优先按当前类型的语义契约补齐缺失角色（actor_id = {role}-{序号}，供后端回溯）
+  const semantics = currentSemantics.value
+  if (semantics) {
+    const target = semantics.roles.find((role) => {
+      const row = roleAudit.value.rows.find((item) => item.role === role.role)
+      return row !== undefined && row.status !== 'ok'
+    })
+    if (target) {
+      const ordinal = nextRoleOrdinal(form.config.actors, target.role)
+      form.config.actors.push(roleActorSuggestion(target, ordinal))
+      return
+    }
+    const first = semantics.roles.find((role) => role.required) ?? semantics.roles[0]
+    if (first) {
+      const ordinal = nextRoleOrdinal(form.config.actors, first.role)
+      form.config.actors.push(roleActorSuggestion(first, ordinal))
+      return
+    }
+  }
   const index = form.config.actors.length + 1
   form.config.actors.push({
     actor_id: `actor_${index}`,
@@ -103,6 +157,22 @@ function addActor(): void {
     spawn_point: { x: 10, y: 0, z: 0, yaw: 0 },
     behavior: { behavior_type: 'cruise', parameters: {} },
   })
+}
+
+/** 一次性补齐全部缺失/不足的必需角色（跳过已有实例）。 */
+function fillMissingRoles(): void {
+  for (const row of missingRoles.value) {
+    const role = currentSemantics.value?.roles.find((item) => item.role === row.role)
+    if (!role) {
+      continue
+    }
+    const lacking = Math.max(role.min_count, 1) - row.actual
+    for (let i = 0; i < lacking; i += 1) {
+      const ordinal = nextRoleOrdinal(form.config.actors, role.role)
+      form.config.actors.push(roleActorSuggestion(role, ordinal))
+    }
+  }
+  ElMessage.success('已按语义契约补齐缺失角色（请确认参与者生成点/参数）')
 }
 
 function removeActor(index: number): void {
@@ -275,6 +345,63 @@ watch(
       </el-col>
     </el-row>
 
+    <el-card v-if="currentSemantics" shadow="never" class="scene-detail__card">
+      <template #header>
+        <div class="detail__header">
+          <span>语义自检（G9：必需角色 vs 当前参与者）</span>
+          <div class="detail__actions">
+            <el-tag :type="missingRoles.length ? 'danger' : 'success'" size="small">
+              {{ missingRoles.length ? `缺 ${missingRoles.length} 个必需角色` : '必需角色齐全' }}
+            </el-tag>
+            <el-button
+              v-permission="PERMISSIONS.sceneUpdate"
+              size="small"
+              :disabled="!editable || !missingRoles.length"
+              @click="fillMissingRoles"
+            >
+              补齐缺失角色
+            </el-button>
+          </div>
+        </div>
+      </template>
+      <p class="hint">测试目的：{{ currentSemantics.objective }}</p>
+      <el-descriptions :column="4" size="small" border class="semantics-meta">
+        <el-descriptions-item label="判据">{{ currentSemantics.oracle_ref }}</el-descriptions-item>
+        <el-descriptions-item label="必需事件">
+          {{ currentSemantics.required_events ? '是（当前 ' + form.config.events.length + ' 个）' : '否' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="子场景">{{ currentSemantics.variants.length }} 个</el-descriptions-item>
+        <el-descriptions-item label="契约版本">{{ taxonomyVersion || '-' }}</el-descriptions-item>
+      </el-descriptions>
+      <el-table :data="roleAudit.rows" size="small" class="semantics-table">
+        <el-table-column prop="role" label="角色" min-width="170" />
+        <el-table-column label="类型 / 行为" min-width="200">
+          <template #default="{ row }">{{ row.type }} / {{ row.behavior }}</template>
+        </el-table-column>
+        <el-table-column label="必须" width="70">
+          <template #default="{ row }">{{ row.required ? '是' : '否' }}</template>
+        </el-table-column>
+        <el-table-column prop="minCount" label="最少" width="70" />
+        <el-table-column prop="actual" label="实际" width="70" />
+        <el-table-column label="状态" width="90">
+          <template #default="{ row }">
+            <el-tag :type="row.status === 'ok' ? 'success' : 'danger'" size="small">
+              {{ row.status === 'ok' ? '覆盖' : row.status === 'missing' ? '缺失' : '不足' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="参与者 ID" min-width="180">
+          <template #default="{ row }">{{ row.actorIds.join(', ') || '-' }}</template>
+        </el-table-column>
+      </el-table>
+      <p v-if="roleAudit.unmatched.length" class="hint">
+        未匹配角色的参与者（可能是背景车等扩展）：{{ roleAudit.unmatched.map((actor) => `${actor.actor_id}(${actor.type})`).join(', ') }}
+      </p>
+      <p class="hint">
+        角色判据与后端 G9 闸门同源（按 actor_id 回溯，类型/行为必须一致）；缺失必需角色的场景入库/下发会被拦下。
+      </p>
+    </el-card>
+
     <el-card shadow="never" header="场景参数（config_json）" class="scene-detail__card">
       <el-form :model="form.config" label-width="130px" :disabled="!editable">
         <el-divider content-position="left">地图与自车</el-divider>
@@ -383,6 +510,7 @@ watch(
           <p class="hint">
             参与者的 x/y/yaw 是<strong>相对自车生成点的偏移</strong>（米 / 弧度）；下发仿真时平台会把它们换算成绝对地图
             坐标，因此修改自车生成点不会改变参与者与自车的相对关系。
+            「添加参与者」会优先按当前场景类型的语义契约补齐缺失角色（actor_id = 角色-序号）。
           </p>
           <el-table :data="form.config.actors" size="small" empty-text="暂无参与者">
             <el-table-column label="ID" width="120">
@@ -498,6 +626,14 @@ watch(
   margin: 8px 0 0;
   font-size: 12px;
   color: var(--el-text-color-secondary);
+}
+
+.semantics-meta {
+  margin-top: 8px;
+}
+
+.semantics-table {
+  margin-top: 8px;
 }
 </style>
 

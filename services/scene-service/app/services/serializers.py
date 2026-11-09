@@ -1,10 +1,12 @@
 """场景导出序列化（4.3 节）：Carla ScenarioRunner XML 与 OpenSCENARIO 1.2。
 
-⚠ 契约待确认项 #3/#6：``events[].trigger/action`` 内部结构设计文档未定义 —— 导出时把
-``condition``/``parameters`` 与 ``action_type``/``parameters`` 原样写入扩展节点（``x-hunter-*``），
-不做语义映射臆造（避免生成假 OpenSCENARIO 语义）；OpenSCENARIO 1.2 产物在根节点写入
-``x-scenario-version``（契约 x-hunter-export.formats）。批量导出为「单文件集」
-（多场景合并入同一文件，待确认 #6）。
+2026-11 语义化改造：
+- ``events[].action.action_type`` / ``trigger.condition_type`` 经
+  ``app.scene_engine.carla_execution`` 映射为 OpenSCENARIO 1.2 标准元素；
+- 无标准等价物的组合不伪造语义，以 ``x-hunter-*`` 注释保留原始自由结构，
+  并在具体场景渲染结果 ``execution`` 中显式报告（见 ``check_executable``）；
+- OpenSCENARIO 1.2 产物在根节点写入 ``x-scenario-version``（契约
+  x-hunter-export.formats）；批量导出为「单文件集」（多场景合并入同一文件）。
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 from xml.sax.saxutils import escape, quoteattr
 
+from app.scene_engine.carla_execution import BEHAVIOR_MAP, action_lines, condition_lines
 from app.schemas.scene import (
     EXPORT_EXTENSION_BY_FORMAT,
     Scene,
@@ -233,9 +236,12 @@ def _osc_ego_entity(config: SceneConfig, pad: str) -> list[str]:
 
 
 def _osc_actor_entity(actor: Any, pad: str) -> list[str]:
-    """参与者实体（按 type 映射 Vehicle / Pedestrian / MiscObject）。"""
+    """参与者实体（按 type 映射 Vehicle / Pedestrian / MiscObject，附行为控制器）。"""
     category_attr, tag = _osc_entity_tag(str(actor.type.value))
-    return [
+    behavior_type = str(actor.behavior.behavior_type)
+    mapping = BEHAVIOR_MAP.get(behavior_type)
+    controller = f"hunter-{behavior_type}-controller" if mapping else None
+    lines = [
         f"{pad}    <ScenarioObject name={quoteattr(actor.actor_id)}>",
         (
             f"{pad}      <{tag} name={quoteattr(actor.actor_id)} "
@@ -246,8 +252,11 @@ def _osc_actor_entity(actor: Any, pad: str) -> list[str]:
             f'<Dimensions width="1" length="1" height="2"/></BoundingBox>'
         ),
         f"{pad}      </{tag}>",
-        f"{pad}    </ScenarioObject>",
     ]
+    if controller:
+        lines.append(f"{pad}      <Controller name={quoteattr(controller)}/>")
+    lines.append(f"{pad}    </ScenarioObject>")
+    return lines
 
 
 def _osc_entity_tag(actor_type: str) -> tuple[str, str]:
@@ -260,12 +269,14 @@ def _osc_entity_tag(actor_type: str) -> tuple[str, str]:
 
 
 def _osc_storyboard(scene: Scene, pad: str) -> list[str]:
-    """Storyboard：Init 初始位姿 + Story/Act/ManeuverGroup/Event + StopTrigger。
+    """Storyboard：Init 初始位姿/天气 + Story/Act/ManeuverGroup/Event + StopTrigger。
 
-    事件触发与动作为自由结构（设计文档未定义），以 ``x-hunter-*`` 扩展元素原样承载。
+    事件触发与动作经 ``carla_execution`` 映射为 OpenSCENARIO 1.2 标准元素；
+    自由结构以 ``x-hunter-*`` 注释保留，便于现场追溯。
     """
     config = scene.config
     point = config.map.spawn_point
+    actor_refs = [actor.actor_id for actor in config.actors]
     lines = [
         f"{pad}  <Storyboard>",
         f"{pad}    <Init>",
@@ -279,8 +290,29 @@ def _osc_storyboard(scene: Scene, pad: str) -> list[str]:
                 actor.actor_id, spawn.x, spawn.y, spawn.z, spawn.yaw, pad, "        "
             )
         )
+    weather = config.weather
     lines.extend(
         [
+            f"{pad}        <GlobalAction>",
+            f"{pad}          <EnvironmentAction>",
+            f'{pad}            <Environment name="hunter-weather">',
+            (
+                f'{pad}              <TimeOfDay dateTime="2026-01-01T12:00:00" '
+                'animation="false"/>'
+            ),
+            (
+                f'{pad}              <Weather cloudiness="{_num(weather.cloudiness)}" '
+                f'rainfall="{_num(weather.rain)}" fog="{_num(weather.fog)}" '
+                f'snowfall="0.0" sunAzimuth="{_num(weather.sun_azimuth)}" '
+                f'sunElevation="{_num(weather.sun_altitude)}" temperature="20.0"/>'
+            ),
+            (
+                f"{pad}              <!-- x-hunter-weather wetness={_num(weather.wetness)} "
+                f'wind={_num(weather.wind)} -->'
+            ),
+            f"{pad}            </Environment>",
+            f"{pad}          </EnvironmentAction>",
+            f"{pad}        </GlobalAction>",
             f"{pad}      </Actions>",
             f"{pad}    </Init>",
             f"{pad}    <Story name={quoteattr(scene.scene_name)}>",
@@ -299,15 +331,25 @@ def _osc_storyboard(scene: Scene, pad: str) -> list[str]:
         ]
     )
     for event in config.events:
-        lines.extend(_osc_event(event, pad))
+        lines.extend(_osc_event(event, pad, actor_refs=actor_refs))
     lines.extend(
         [
             f"{pad}          </Maneuver>",
             f"{pad}        </ManeuverGroup>",
-            f"{pad}        <StopTrigger/>",
             f"{pad}      </Act>",
             f"{pad}    </Story>",
-            f"{pad}    <StopTrigger/>",
+            f"{pad}    <StopTrigger>",
+            f"{pad}      <ConditionGroup>",
+            f'{pad}        <Condition name="stop" delay="0" conditionEdge="none">',
+            f"{pad}          <ByValueCondition>",
+            (
+                f'{pad}            <SimulationTimeCondition value="{_num(config.duration)}" '
+                'rule="greaterThan"/>'
+            ),
+            f"{pad}          </ByValueCondition>",
+            f"{pad}        </Condition>",
+            f"{pad}      </ConditionGroup>",
+            f"{pad}    </StopTrigger>",
             f"{pad}  </Storyboard>",
         ]
     )
@@ -334,26 +376,42 @@ def _osc_teleport(
     ]
 
 
-def _osc_event(event: Any, pad: str) -> list[str]:
-    """事件节点（触发条件/动作自由结构经 x-hunter-* 扩展元素原样导出）。"""
-    return [
-        f"{pad}            <Event name={quoteattr(event.event_id)} priority=\"overwrite\">",
-        f"{pad}              <Action name={quoteattr(event.action.action_type)}>",
-        f"{pad}                <PrivateAction>",
-        (
-            f"{pad}                  <x-hunter-trigger type={quoteattr(event.type.value)} "
-            f"condition={quoteattr(event.trigger.condition)} "
-            f"parameters={_params(event.trigger.parameters)}/>"
-        ),
-        (
-            f"{pad}                  <x-hunter-action "
-            f"action_type={quoteattr(event.action.action_type)} "
-            f"parameters={_params(event.action.parameters)}/>"
-        ),
-        f"{pad}                </PrivateAction>",
-        f"{pad}              </Action>",
-        f"{pad}            </Event>",
+def _osc_event(event: Any, pad: str, *, actor_refs: Sequence[str] = ()) -> list[str]:
+    """事件节点：真实 ``StartTrigger`` + 映射后的 Action（自由参数以注释保留）。"""
+    event_pad = f"{pad}            "
+    body_pad = f"{pad}              "
+    lines = [
+        f'{event_pad}<Event name={quoteattr(event.event_id)} priority="overwrite">',
+        f'{event_pad}  <Action name={quoteattr(event.action.action_type)}>',
+        f"{event_pad}    <PrivateAction>",
     ]
+    for line in action_lines(event.action.action_type, event.action.parameters):
+        lines.append(f"{body_pad}  {line}")
+    lines.append(
+        f"{body_pad}  <!-- x-hunter-action "
+        f"action_type={quoteattr(event.action.action_type)} "
+        f"parameters={_params(event.action.parameters)} -->"
+    )
+    lines.append(f"{event_pad}    </PrivateAction>")
+    lines.append(f"{event_pad}  </Action>")
+    lines.append(f"{event_pad}  <StartTrigger>")
+    lines.append(f"{event_pad}    <ConditionGroup>")
+    for line in condition_lines(
+        condition_type=event.trigger.condition_type,
+        parameters=event.trigger.parameters,
+        name=f"{event.event_id}-trigger",
+        actor_refs=list(actor_refs),
+    ):
+        lines.append(f"{body_pad}  {line}")
+    lines.append(
+        f"{body_pad}  <!-- x-hunter-trigger type={quoteattr(event.type.value)} "
+        f"condition={quoteattr(event.trigger.condition)} "
+        f"parameters={_params(event.trigger.parameters)} -->"
+    )
+    lines.append(f"{event_pad}    </ConditionGroup>")
+    lines.append(f"{event_pad}  </StartTrigger>")
+    lines.append(f"{event_pad}</Event>")
+    return lines
 
 
 __all__ = ["file_name_for", "render_export_document"]

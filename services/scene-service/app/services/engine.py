@@ -35,6 +35,7 @@ from app.models.scene_engine import (
     GenerationStrategy,
     GenerationTaskStatus,
     LogicalScenarioStatus,
+    RarityZone,
     SuiteItemType,
     SuiteStatus,
     TestCaseStatus,
@@ -47,6 +48,7 @@ from app.repositories.engine import (
     SuiteRepository,
     TestCaseRepository,
 )
+from app.scene_engine.carla_execution import check_executable
 from app.scene_engine.catalog import CATALOG, CATALOG_BY_ID, CATALOG_VERSION
 from app.scene_engine.compiler import compile_scene, default_values
 from app.scene_engine.esmini import EsminiRunner
@@ -56,16 +58,21 @@ from app.scene_engine.generator import (
     SceneGenerator,
     ensure_overrides_shape,
 )
-from app.scene_engine.ir import IR_VERSION, SceneIR
+from app.scene_engine.ir import IR_VERSION, ParameterIR, SceneIR
 from app.scene_engine.oracles import ORACLE_BY_REF, list_oracles
+from app.scene_engine.semantics import build_duration, list_semantics, semantics_for, taxonomy
 from app.scene_engine.validators import ir_content_hash
 from app.scene_engine.vehicle_params import VehicleParams, get_vehicle_params
 from app.schemas.engine import (
     BatchValidateData,
     BatchValidateItem,
+    CaseDerivationData,
+    CaseDerivationRequest,
     CoverageGapData,
     CoverageGapListData,
     CoverageOverviewData,
+    DerivedCaseData,
+    DerivedSuiteData,
     DryRunData,
     GateItem,
     GenerateRequest,
@@ -73,8 +80,11 @@ from app.schemas.engine import (
     LogicalScenarioSummary,
     LogicalVersionSummary,
     PublishData,
+    SceneSemanticsData,
+    SceneSemanticsListData,
     SuiteCreateRequest,
     SuiteData,
+    SuiteDerivationData,
     SuiteDetailData,
     SuiteDiffData,
     SuiteItemData,
@@ -92,6 +102,26 @@ logger = get_logger("app.services.engine")
 SYSTEM_CREATOR = "system"
 #: 生成任务进度回写的最小间隔（百分比）
 PROGRESS_STEP = 0.1
+#: 自动派生测试集的名称前缀（按场景类型一集）
+DERIVED_SUITE_PREFIX = "自动派生-"
+#: 自动派生测试集时每分区纳入的具体场景上限
+DERIVED_CONCRETE_PER_ZONE = 3
+#: 派生用例的固定执行步骤（生成 → 渲染 → 下发 → 断言 → 归档）
+DERIVED_CASE_STEPS: tuple[tuple[str, str], ...] = (
+    ("generate", "按目标分区生成具体场景（strategy=distribution）"),
+    ("render", "渲染 SceneConfig 并跑 G1-G9 闸门，确认语义完整"),
+    ("dispatch", "下发仿真端，核对参与者数量/行为与触发条件"),
+    ("assert", "按 oracle_ref 判定结果并记录指标"),
+    ("archive", "归档产物与结论，必要时更新基线"),
+)
+#: 测试用例平台取值 → IR 允许模式（vil_safe 为具体场景标记，不参与映射）
+_MODE_TO_PLATFORM: dict[str, str] = {
+    "simulation": "simulation",
+    "replay": "replay",
+    "sil": "sil",
+    "vil": "vil",
+    "hil": "hil",
+}
 
 
 class GenerationCanceled(Exception):
@@ -600,6 +630,7 @@ class SceneEngineService:
             raise ResourceNotFoundError("具体场景不存在", details={"scenario_id": str(scenario_id)})
         ir = await self._ir_or_none(row.logical_id, row.logical_version)
         if ir is None:
+            execution = check_executable(dict(row.scene_config or {}))
             return {
                 "scenario_id": row.scenario_id,
                 "logical_id": row.logical_id,
@@ -607,6 +638,7 @@ class SceneEngineService:
                 "scene_config": dict(row.scene_config or {}),
                 "gates": [],
                 "passed": bool(row.scene_config),
+                "execution": execution.to_dict(),
             }
         values = dict(row.param_values or {})
         compilation = compile_scene(
@@ -630,6 +662,7 @@ class SceneEngineService:
                 for item in compilation.report.gates
             ],
             "passed": compilation.passed,
+            "execution": check_executable(compilation.config).to_dict(),
         }
 
     async def batch_validate(self, scenario_ids: Sequence[UUID]) -> BatchValidateData:
@@ -712,6 +745,14 @@ class SceneEngineService:
     def oracles() -> list[dict[str, Any]]:
         return list_oracles()
 
+    @staticmethod
+    def scene_semantics() -> SceneSemanticsListData:
+        """全部场景类型的语义契约摘要（只读；前端语义自检与脚本核对共用）。"""
+        items = [SceneSemanticsData(**item) for item in list_semantics()]
+        return SceneSemanticsListData(
+            items=items, total=len(items), taxonomy_version=taxonomy().version
+        )
+
     async def create_testcase(self, request: TestCaseCreateRequest, user_id: str) -> TestCaseData:
         """创建测试用例（判据/逻辑场景必须存在，case_key 唯一）。"""
         del user_id  # 用例表未预留 created_by 列（审计由应用日志承载）
@@ -743,6 +784,80 @@ class SceneEngineService:
         except IntegrityError as exc:  # pragma: no cover - 仓储已转 3002
             raise InvalidParameterError("测试用例创建失败", details={"case_key": request.case_key}) from exc
         return self._testcase_dict(row)
+
+    async def derive_testcases(self, request: CaseDerivationRequest) -> CaseDerivationData:
+        """按场景类型 × 稀有度分区派生测试用例（``case_key`` 幂等，已存在则跳过）。
+
+        判定事实来源：语义契约（objective）、IR（oracle_ref / allowed_modes / 参数区间），
+        因此新增场景类型无需再手写用例模板。
+        """
+        targets = self._derivation_targets(request.scene_types)
+        items: list[DerivedCaseData] = []
+        created = skipped = planned = 0
+        for ir in targets:
+            semantics = semantics_for(ir.scene_type)
+            objective = (semantics.objective if semantics is not None else ir.description)[:500]
+            duration = build_duration(semantics) if semantics is not None else 30.0
+            for zone in request.zones:
+                case_key = _derived_case_key(ir.logical_id, zone)
+                name = f"{ir.name}-{zone.value}"[:128]
+                existing = await self._testcases.get_by_key(case_key)
+                if existing is not None:
+                    skipped += 1
+                    items.append(
+                        DerivedCaseData(
+                            case_key=case_key,
+                            logical_id=ir.logical_id,
+                            scene_type=ir.scene_type,
+                            zone=zone,
+                            name=name,
+                            status="skipped",
+                            test_case_id=existing.test_case_id,
+                            reason="case_key 已存在",
+                        )
+                    )
+                    continue
+                if request.dry_run:
+                    planned += 1
+                    items.append(
+                        DerivedCaseData(
+                            case_key=case_key,
+                            logical_id=ir.logical_id,
+                            scene_type=ir.scene_type,
+                            zone=zone,
+                            name=name,
+                            status="planned",
+                        )
+                    )
+                    continue
+                row = await self._testcases.create(
+                    case_key=case_key,
+                    name=name,
+                    logical_id=ir.logical_id,
+                    logical_version=(await self._load_ir(ir.logical_id))[1],
+                    scenario_id=None,
+                    objective=objective or ir.name,
+                    preconditions=self._derived_preconditions(ir, zone),
+                    steps=self._derived_steps(),
+                    platforms=_derived_platforms(ir),
+                    oracle_ref=ir.oracle_ref,
+                    timeout_seconds=max(60, min(3600, round(duration) + 60)),
+                    tags=["derived", ir.scene_type, zone.value],
+                    status=TestCaseStatus.DRAFT.value,
+                )
+                created += 1
+                items.append(
+                    DerivedCaseData(
+                        case_key=case_key,
+                        logical_id=ir.logical_id,
+                        scene_type=ir.scene_type,
+                        zone=zone,
+                        name=name,
+                        status="created",
+                        test_case_id=row.test_case_id,
+                    )
+                )
+        return CaseDerivationData(created=created, skipped=skipped, planned=planned, cases=items)
 
     async def list_testcases(
         self,
@@ -789,6 +904,102 @@ class SceneEngineService:
         if row is None:
             raise ResourceNotFoundError("测试集不存在", details={"suite_id": str(suite_id)})
         return await self._suite_detail(row)
+
+    async def derive_suites(self, request: CaseDerivationRequest) -> SuiteDerivationData:
+        """按场景类型派生测试集（``自动派生-{scene_type}`` 一类型一集，draft 幂等补齐条目）。
+
+        条目 = 各分区已派生用例（case_key）+ 每分区最多
+        ``DERIVED_CONCRETE_PER_ZONE`` 条具体场景；已锁定/归档的测试集跳过并回报原因。
+        """
+        targets = self._derivation_targets(request.scene_types)
+        entries: list[DerivedSuiteData] = []
+        created = updated = skipped = planned = 0
+        for ir in targets:
+            name = f"{DERIVED_SUITE_PREFIX}{ir.scene_type}"[:128]
+            existing = await self._suites.get_by_name(name)
+            if existing is not None and _enum_value(existing.status) != SuiteStatus.DRAFT.value:
+                skipped += 1
+                entries.append(
+                    DerivedSuiteData(
+                        suite_id=existing.suite_id,
+                        name=name,
+                        scene_type=ir.scene_type,
+                        status="skipped",
+                        reason=f"测试集已{_enum_value(existing.status)}，条目已冻结",
+                    )
+                )
+                continue
+            items = await self._derived_suite_items(ir, request.zones, request.include_concrete)
+            if not items:
+                skipped += 1
+                entries.append(
+                    DerivedSuiteData(
+                        suite_id=existing.suite_id if existing is not None else None,
+                        name=name,
+                        scene_type=ir.scene_type,
+                        status="skipped",
+                        reason="无语例/具体场景可加入（先调用 /testcases/derive 或生成具体场景）",
+                    )
+                )
+                continue
+            if request.dry_run:
+                planned += 1
+                entries.append(
+                    DerivedSuiteData(
+                        suite_id=existing.suite_id if existing is not None else None,
+                        name=name,
+                        scene_type=ir.scene_type,
+                        item_count=len(items),
+                        status="planned",
+                    )
+                )
+                continue
+            if existing is None:
+                semantics = semantics_for(ir.scene_type)
+                objective = semantics.objective if semantics is not None else ir.description
+                row = await self._suites.create(
+                    name=name,
+                    description=f"由场景类型 {ir.scene_type} 自动派生（{objective}）"[:500],
+                    status=SuiteStatus.DRAFT.value,
+                )
+                suite_id = row.suite_id
+            else:
+                suite_id = existing.suite_id
+            outcome = await self._suites.add_items_if_draft(suite_id, items)
+            if outcome != "ok":
+                skipped += 1
+                entries.append(
+                    DerivedSuiteData(
+                        suite_id=suite_id,
+                        name=name,
+                        scene_type=ir.scene_type,
+                        status="skipped",
+                        reason=f"条目写入失败（{outcome}）",
+                    )
+                )
+                continue
+            if existing is None:
+                created += 1
+                status_value = "created"
+            else:
+                updated += 1
+                status_value = "updated"
+            entries.append(
+                DerivedSuiteData(
+                    suite_id=suite_id,
+                    name=name,
+                    scene_type=ir.scene_type,
+                    item_count=len(items),
+                    status=status_value,
+                )
+            )
+        return SuiteDerivationData(
+            created=created,
+            updated=updated,
+            skipped=skipped,
+            planned=planned,
+            suites=entries,
+        )
 
     async def add_suite_items(
         self, suite_id: UUID, request: SuiteItemsRequest
@@ -969,13 +1180,64 @@ class SceneEngineService:
             zone: (round(count / total, 4) if total else 0.0)
             for zone, count in zone_counts.items()
         }
+        type_counts, type_zone_counts, role_counts = await self._aggregate_by_type()
+        if logical_id is not None:
+            type_counts = {
+                scene_type: count
+                for scene_type, count in type_counts.items()
+                if scene_type in self._types_of({logical_id})
+            }
+            type_zone_counts = {
+                scene_type: zones
+                for scene_type, zones in type_zone_counts.items()
+                if scene_type in type_counts
+            }
+            role_counts = self._role_counts_for(type_counts)
         return CoverageOverviewData(
             logical_id=logical_id,
             total=total,
             zone_counts=zone_counts,
             zone_ratio=ratio,
             risk_counts=risk_counts,
+            type_counts=type_counts,
+            type_zone_counts=type_zone_counts,
+            role_counts=role_counts,
         )
+
+    async def _aggregate_by_type(
+        self,
+    ) -> tuple[dict[str, int], dict[str, dict[str, int]], dict[str, int]]:
+        """一次查全量 (logical_id, zone) 计数，按目录 ``logical_id → scene_type`` 聚合。"""
+        grouped = await self._concrete.zone_counts_by_logical()
+        type_counts: dict[str, int] = {}
+        type_zone_counts: dict[str, dict[str, int]] = {}
+        for (logical_id_key, zone), count in grouped.items():
+            ir = CATALOG_BY_ID.get(logical_id_key)
+            scene_type = ir.scene_type if ir is not None else logical_id_key
+            type_counts[scene_type] = type_counts.get(scene_type, 0) + int(count)
+            zones = type_zone_counts.setdefault(scene_type, {})
+            zones[zone] = zones.get(zone, 0) + int(count)
+        return type_counts, type_zone_counts, self._role_counts_for(type_counts)
+
+    @staticmethod
+    def _types_of(logical_ids: set[str]) -> set[str]:
+        return {
+            CATALOG_BY_ID[logical_id].scene_type
+            for logical_id in logical_ids
+            if logical_id in CATALOG_BY_ID
+        }
+
+    @staticmethod
+    def _role_counts_for(type_counts: Mapping[str, int]) -> dict[str, int]:
+        """按语义契约声明的角色统计具体场景数（角色维度覆盖）。"""
+        role_counts: dict[str, int] = {}
+        for scene_type, count in type_counts.items():
+            semantics = semantics_for(scene_type)
+            if semantics is None:
+                continue
+            for role in semantics.roles:
+                role_counts[role.role] = role_counts.get(role.role, 0) + int(count)
+        return role_counts
 
     async def coverage_gaps(self, profile: str = GenerationProfile.EXPLORATION.value) -> CoverageGapListData:
         """覆盖盲区：按剖面目标配额与已产出的 Z3/Z4 数量计算缺口。"""
@@ -991,6 +1253,25 @@ class SceneEngineService:
                 if logical_id == ir.logical_id
             }
             total = sum(counts.values())
+            if total == 0:
+                # 类型零具体场景：先补基线样本，再谈分区配额（否则盲区报告会被配额噪声淹没）
+                items.append(
+                    CoverageGapData(
+                        logical_id=ir.logical_id,
+                        name=ir.name,
+                        zone=RarityZone.Z1,
+                        count=0,
+                        target=1,
+                        deficit=1,
+                        kind="zero_scenes",
+                        recommendation=(
+                            f"POST /api/v1/scene/generate strategy=distribution "
+                            f"profile={profile} count=1（{ir.scene_type} 尚无具体场景）"
+                        ),
+                    )
+                )
+                # 基线样本优先：零场景时不再叠加分区配额噪声
+                continue
             base = max(total, 50)
             for zone in ("Z3", "Z4"):
                 target = round(base * ratios.get(zone, 0.0))
@@ -1005,6 +1286,7 @@ class SceneEngineService:
                         count=current,
                         target=target,
                         deficit=target - current,
+                        kind="zone_deficit",
                         recommendation=(
                             f"POST /api/v1/scene/generate strategy=distribution "
                             f"profile={profile} overrides.target_zone={zone} "
@@ -1014,6 +1296,82 @@ class SceneEngineService:
                 )
         items.sort(key=lambda item: (-item.deficit, item.logical_id))
         return CoverageGapListData(profile=profile, items=items[:100])
+
+    # =================================================================
+    # 内部：用例 / 测试集自动派生
+    # =================================================================
+
+    @staticmethod
+    def _derivation_targets(scene_types: Sequence[str]) -> list[SceneIR]:
+        """派生目标 IR（按请求顺序去重；省略 ``scene_types`` 时取全部有语义契约的类型）。"""
+        available = {ir.scene_type: ir for ir in CATALOG}
+        if not scene_types:
+            return [ir for ir in CATALOG if semantics_for(ir.scene_type) is not None]
+        wanted = list(dict.fromkeys(scene_types))
+        unknown = [scene_type for scene_type in wanted if scene_type not in available]
+        if unknown:
+            raise InvalidParameterError(
+                f"场景类型不可派生: {', '.join(unknown)}",
+                details={"scene_types": unknown},
+            )
+        return [available[scene_type] for scene_type in wanted]
+
+    @staticmethod
+    def _derived_preconditions(ir: SceneIR, zone: RarityZone) -> dict[str, Any]:
+        """前置条件：目标分区 + 参数区间（由 IR 边缘分布推导）。"""
+        intervals: dict[str, list[float]] = {}
+        for parameter in ir.parameters:
+            interval = _parameter_interval(parameter)
+            if interval is not None:
+                intervals[parameter.name] = interval
+        return {
+            "logical_id": ir.logical_id,
+            "scene_type": ir.scene_type,
+            "zone": zone.value,
+            "parameters": intervals,
+        }
+
+    @staticmethod
+    def _derived_steps() -> list[dict[str, Any]]:
+        return [
+            {"index": index + 1, "action": action, "note": note}
+            for index, (action, note) in enumerate(DERIVED_CASE_STEPS)
+        ]
+
+    async def _derived_suite_items(
+        self, ir: SceneIR, zones: Sequence[RarityZone], include_concrete: bool
+    ) -> list[dict[str, Any]]:
+        """测试集条目：已派生用例（case_key）+ 每分区最多 N 条具体场景。"""
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _append(item_id: str, item_type: str, ref_id: str) -> None:
+            if item_id in seen:
+                return
+            seen.add(item_id)
+            items.append(
+                {"item_id": item_id, "item_type": item_type, "ref_id": ref_id, "weight": 1.0}
+            )
+
+        for zone in zones:
+            case_key = _derived_case_key(ir.logical_id, zone)
+            if await self._testcases.get_by_key(case_key) is not None:
+                _append(case_key, SuiteItemType.TEST_CASE.value, case_key)
+            if not include_concrete:
+                continue
+            rows, _ = await self._concrete.list_page(
+                page=1,
+                page_size=DERIVED_CONCRETE_PER_ZONE,
+                logical_id=ir.logical_id,
+                rarity_zone=zone.value,
+            )
+            for row in rows:
+                _append(
+                    f"{zone.value}-{row.scenario_id}",
+                    SuiteItemType.CONCRETE_SCENARIO.value,
+                    str(row.scenario_id),
+                )
+        return items
 
     # =================================================================
     # 内部：IR 读取 / 持久化 / 序列化
@@ -1245,6 +1603,53 @@ class SceneEngineService:
             "create_time": getattr(row, "create_time", None),
             "update_time": getattr(row, "update_time", None),
         }
+
+
+def _derived_case_key(logical_id: str, zone: RarityZone) -> str:
+    """派生用例编号：``TC-{LOGICAL_ID}-{ZONE}``（满足 CASE_KEY_PATTERN）。"""
+    return f"TC-{logical_id}-{zone.value}"
+
+
+def _derived_platforms(ir: SceneIR) -> list[str]:
+    """由 IR 允许模式推导用例平台（``vil_safe`` 存在时追加 ``vil``）。"""
+    platforms: list[str] = []
+    for mode in ir.allowed_modes:
+        platform = _MODE_TO_PLATFORM.get(mode)
+        if platform is not None and platform not in platforms:
+            platforms.append(platform)
+    if "vil_safe" in ir.allowed_modes and "vil" not in platforms:
+        platforms.append("vil")
+    return platforms or ["simulation"]
+
+
+def _parameter_interval(parameter: ParameterIR) -> list[float] | None:
+    """参数取值区间（写入用例前置条件；未知分布返回 None）。"""
+    distribution = parameter.distribution
+    params = distribution.params
+    if distribution.kind == "categorical":
+        values = [
+            float(item["value"])
+            for item in params.get("choices") or []
+            if isinstance(item.get("value"), (int, float))
+            and not isinstance(item.get("value"), bool)
+        ]
+        return [min(values), max(values)] if values else None
+    if distribution.kind == "gmm":
+        components = params.get("components") or []
+        lows = [float(item["low"]) for item in components if "low" in item]
+        highs = [float(item["high"]) for item in components if "high" in item]
+        if lows and highs:
+            return [round(min(lows), 3), round(max(highs), 3)]
+        return None
+    if "low" in params and "high" in params:
+        return [round(float(params["low"]), 3), round(float(params["high"]), 3)]
+    if distribution.kind == "normal":
+        mean = float(params.get("mean", 0.0))
+        std = float(params.get("std", 1.0))
+        return [round(mean - 3 * std, 3), round(mean + 3 * std, 3)]
+    if distribution.kind == "beta":
+        return [0.0, 1.0]
+    return None
 
 
 __all__ = ["SceneEngineService", "suite_hash"]

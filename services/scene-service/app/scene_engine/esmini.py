@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape, quoteattr
 
+from app.scene_engine.carla_execution import BEHAVIOR_MAP, action_lines, condition_lines
+
 #: esmini 输出保留的最大字符数（防止日志/接口响应膨胀）
 OUTPUT_LIMIT = 600
 
@@ -64,25 +66,32 @@ def _number(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _vehicle_entity(name: str, pedestrian: bool) -> str:
+def _vehicle_entity(name: str, pedestrian: bool, controller: str | None = None) -> str:
+    controller_xml = (
+        f"\n        <Controller name={quoteattr(controller)}/>" if controller else ""
+    )
     if pedestrian:
         return (
             f'<Pedestrian name={quoteattr(name)} model="walker" mass="60" '
             'pedestrianCategory="pedestrian">\n'
-            '        <BoundingBox dimensions width="0.5" length="0.4" height="1.7"/>\n'
-            "        <Properties/>\n"
+            '        <BoundingBox><Center x="0" y="0" z="0"/>'
+            '<Dimensions width="0.5" length="0.4" height="1.7"/></BoundingBox>\n'
+            "        <Properties/>"
+            f"{controller_xml}\n"
             "      </Pedestrian>"
         )
     return (
         f'<Vehicle name={quoteattr(name)} vehicleCategory="car">\n'
-        '        <BoundingBox dimensions width="0.7" length="1.2" height="1.0"/>\n'
+        '        <BoundingBox><Center x="0" y="0" z="0"/>'
+        '<Dimensions width="0.7" length="1.2" height="1.0"/></BoundingBox>\n'
         "        <Axles>\n"
         '          <FrontAxle maxSteering="0.384" wheelDiameter="0.3" trackWidth="0.6" '
         'positionX="0.23" positionZ="0.15"/>\n'
         '          <RearAxle maxSteering="0" wheelDiameter="0.3" trackWidth="0.6" '
         'positionX="-0.23" positionZ="0.15"/>\n'
         "        </Axles>\n"
-        "        <Properties/>\n"
+        "        <Properties/>"
+        f"{controller_xml}\n"
         "      </Vehicle>"
     )
 
@@ -107,16 +116,93 @@ def _spawn(config: Mapping[str, Any], section: Mapping[str, Any]) -> tuple[float
     )
 
 
+def _weather_block(weather: Mapping[str, Any], pad: str) -> list[str]:
+    """天气 → OpenSCENARIO ``Environment``（雨/雾/云/日照直接映射，湿度与风写入注释）。"""
+    if not weather:
+        return []
+    cloudiness = _number(weather.get("cloudiness"))
+    rain = _number(weather.get("rain"))
+    fog = _number(weather.get("fog"))
+    azimuth = _number(weather.get("sun_azimuth"))
+    altitude = _number(weather.get("sun_altitude"))
+    wetness = _number(weather.get("wetness"))
+    wind = _number(weather.get("wind"))
+    return [
+        f"{pad}<GlobalAction>",
+        f"{pad}  <EnvironmentAction>",
+        f"{pad}    <Environment name=\"hunter-weather\">",
+        f'{pad}      <TimeOfDay dateTime="2026-01-01T12:00:00" animation="false"/>',
+        (
+            f'{pad}      <Weather cloudiness="{cloudiness:.1f}" rainfall="{rain:.1f}" '
+            f'fog="{fog:.1f}" snowfall="0.0" sunAzimuth="{azimuth:.1f}" '
+            f'sunElevation="{altitude:.1f}" temperature="20.0"/>'
+        ),
+        f"{pad}      <!-- x-hunter-weather wetness={wetness:.1f} wind={wind:.1f} -->",
+        f"{pad}    </Environment>",
+        f"{pad}  </EnvironmentAction>",
+        f"{pad}</GlobalAction>",
+    ]
+
+
+def _initial_speed(actor: Mapping[str, Any]) -> float | None:
+    """参与者初始速度（取行为参数中的速度键；无则不出 SpeedAction）。"""
+    parameters = (actor.get("behavior") or {}).get("parameters") or {}
+    for key in ("target_speed", "speed", "initial_speed", "crossing_speed"):
+        if parameters.get(key) is not None:
+            return max(_number(parameters[key]), 0.0)
+    return None
+
+
+def _event_block(
+    event: Mapping[str, Any],
+    *,
+    index: int,
+    ego_name: str,
+    actor_refs: list[str],
+    pad: str,
+) -> list[str]:
+    """单个事件：真实 ``StartTrigger`` + 映射后的 Action（未映射保留扩展注释）。"""
+    event_id = str(event.get("event_id") or f"event_{index}")
+    trigger = event.get("trigger") or {}
+    action = event.get("action") or {}
+    lines = [f'{pad}<Event name={quoteattr(event_id)} priority="overwrite">']
+    lines.append(
+        f"{pad}  <Action name={quoteattr(str(action.get('action_type') or 'action'))}>"
+    )
+    lines.append(f"{pad}    <PrivateAction>")
+    action_body = action_lines(str(action.get("action_type") or ""), action.get("parameters") or {})
+    lines.extend(f"{pad}      {line}" for line in action_body)
+    lines.append(f"{pad}    </PrivateAction>")
+    lines.append(f"{pad}  </Action>")
+    lines.append(f"{pad}  <StartTrigger>")
+    lines.append(f"{pad}    <ConditionGroup>")
+    condition_body = condition_lines(
+        condition_type=trigger.get("condition_type"),
+        parameters=trigger.get("parameters") or {},
+        name=f"{event_id}-trigger",
+        ego_ref=ego_name,
+        actor_refs=actor_refs,
+    )
+    lines.extend(f"{pad}      {line}" for line in condition_body)
+    lines.append(f"{pad}    </ConditionGroup>")
+    lines.append(f"{pad}  </StartTrigger>")
+    lines.append(f"{pad}</Event>")
+    return lines
+
+
 def build_xosc(config: Mapping[str, Any], *, road_file: str = "road.xodr") -> str:
-    """SceneConfig → 最小合法 OpenSCENARIO 1.2（初始位姿 + 自车初速）。"""
+    """SceneConfig → OpenSCENARIO 1.2（初始位姿/速度/天气 + 事件触发与动作）。"""
     ego = config.get("ego_vehicle") or {}
     actors = list(config.get("actors") or [])
+    events = list(config.get("events") or [])
+    weather = config.get("weather") or {}
     duration = max(_number(config.get("duration"), 1.0), 0.1)
 
     entities: list[str] = []
     init_actions: list[str] = []
     ego_name = str(ego.get("actor_id") or "ego")
     ego_speed = max(_number(ego.get("initial_speed"), 0.0), 0.0)
+    actor_refs: list[str] = []
 
     entities.append(_vehicle_entity(ego_name, False))
     ex, ey, ez, eyaw = _spawn(config, {})
@@ -126,21 +212,93 @@ def build_xosc(config: Mapping[str, Any], *, road_file: str = "road.xodr") -> st
         f"{_world_position(ex, ey, ez, eyaw)}</TeleportAction></PrivateAction>\n"
         "        </Private>"
     )
+    init_actions.append(
+        f'<Private entityRef={quoteattr(ego_name)}>\n'
+        "          <PrivateAction><LongitudinalAction><SpeedAction>\n"
+        '            <SpeedActionDynamics dynamicsShape="step" value="0" '
+        'dynamicsDimension="time"/>\n'
+        "            <SpeedActionTarget>"
+        f'<AbsoluteTargetSpeed value="{ego_speed:.3f}"/>'
+        "</SpeedActionTarget>\n"
+        "          </SpeedAction></LongitudinalAction></PrivateAction>\n"
+        "        </Private>"
+    )
     for index, actor in enumerate(actors):
         name = str(actor.get("actor_id") or f"actor_{index}")
         actor_type = str(actor.get("type") or actor.get("actor_type") or "").lower()
         pedestrian = "pedestrian" in actor_type or "vru" in actor_type
+        behavior = actor.get("behavior") or {}
+        behavior_type = str(behavior.get("behavior_type") or "")
+        mapping = BEHAVIOR_MAP.get(behavior_type)
+        controller = f"hunter-{behavior_type}-controller" if mapping else None
         ax, ay, az, ayaw = _spawn(config, actor)
-        entities.append(_vehicle_entity(name, pedestrian))
+        actor_refs.append(name)
+        entities.append(_vehicle_entity(name, pedestrian, controller))
         init_actions.append(
             f'<Private entityRef={quoteattr(name)}>\n'
             "          <PrivateAction><TeleportAction>"
             f"{_world_position(ax, ay, az, ayaw)}</TeleportAction></PrivateAction>\n"
             "        </Private>"
         )
+        speed = _initial_speed(actor)
+        if speed is not None and not pedestrian:
+            init_actions.append(
+                f'<Private entityRef={quoteattr(name)}>\n'
+                "          <PrivateAction><LongitudinalAction><SpeedAction>\n"
+                '            <SpeedActionDynamics dynamicsShape="step" value="0" '
+                'dynamicsDimension="time"/>\n'
+                "            <SpeedActionTarget>"
+                f'<AbsoluteTargetSpeed value="{speed:.3f}"/>'
+                "</SpeedActionTarget>\n"
+                "          </SpeedAction></LongitudinalAction></PrivateAction>\n"
+                "        </Private>"
+            )
 
     entity_xml = "\n      ".join(entities)
     init_xml = "\n        ".join(init_actions)
+    init_weather = "\n        ".join(_weather_block(weather, "        "))
+    event_xml = "\n".join(
+        line
+        for index, event in enumerate(events)
+        for line in _event_block(
+            event, index=index, ego_name=ego_name, actor_refs=actor_refs, pad="            "
+        )
+    )
+    if not events:
+        # 无事件时保留一个「保持初速」事件，保证 Maneuver 非空且干跑可推进
+        event_xml = "\n".join(
+            [
+                '            <Event name="hold" priority="overwrite">',
+                '              <Action name="speed">',
+                "                <PrivateAction>",
+                "                  <LongitudinalAction>",
+                "                    <SpeedAction>",
+                (
+                    '                      <SpeedActionDynamics dynamicsShape="step" value="0" '
+                    'dynamicsDimension="time"/>'
+                ),
+                "                      <SpeedActionTarget>",
+                f'                        <AbsoluteTargetSpeed value="{ego_speed:.3f}"/>',
+                "                      </SpeedActionTarget>",
+                "                    </SpeedAction>",
+                "                  </LongitudinalAction>",
+                "                </PrivateAction>",
+                "              </Action>",
+                "              <StartTrigger>",
+                "                <ConditionGroup>",
+                '                  <Condition name="hold-start" delay="0" conditionEdge="none">',
+                "                    <ByValueCondition>",
+                '                      <SimulationTimeCondition value="0" rule="greaterThan"/>',
+                "                    </ByValueCondition>",
+                "                  </Condition>",
+                "                </ConditionGroup>",
+                "              </StartTrigger>",
+                "            </Event>",
+            ]
+        )
+    actor_ref_xml = "\n            ".join(
+        f'<EntityRef entityRef={quoteattr(ref)}/>' for ref in [ego_name, *actor_refs]
+    )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <OpenSCENARIO>
   <FileHeader revMajor="1" revMinor="2" date="{datetime.now(UTC).date().isoformat()}"
@@ -157,30 +315,17 @@ def build_xosc(config: Mapping[str, Any], *, road_file: str = "road.xodr") -> st
     <Init>
       <Actions>
         {init_xml}
+        {init_weather}
       </Actions>
     </Init>
     <Story name="g5">
       <Act name="act">
         <ManeuverGroup maximumExecutionCount="1" name="group">
           <Actors selectTriggeringEntities="false">
-            <EntityRef entityRef={quoteattr(ego_name)}/>
+            {actor_ref_xml}
           </Actors>
           <Maneuver name="maneuver">
-            <Event name="run" priority="overwrite">
-              <Action name="speed">
-                <PrivateAction>
-                  <LongitudinalAction>
-                    <SpeedAction>
-                      <SpeedActionDynamics dynamicsShape="step" value="0"
-                                           dynamicsDimension="time"/>
-                      <SpeedActionTarget>
-                        <AbsoluteTargetSpeed value="{ego_speed:.3f}"/>
-                      </SpeedActionTarget>
-                    </SpeedAction>
-                  </LongitudinalAction>
-                </PrivateAction>
-              </Action>
-            </Event>
+{event_xml}
           </Maneuver>
         </ManeuverGroup>
         <StartTrigger>

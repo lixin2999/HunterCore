@@ -27,6 +27,7 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.repositories.cache import SceneDetailCache
 from app.repositories.scenes import SceneRepository
+from app.scene_engine.semantics import check_scene_semantics
 from app.schemas.scene import (
     Scene,
     SceneConfig,
@@ -119,7 +120,7 @@ class SceneService:
 
     async def create_scene(self, payload: SceneCreateRequest, *, user_id: str) -> Scene:
         """创建场景（status=draft、creator=网关注入用户、version 默认 1.0.0；重名 3002）。"""
-        self._validate_config(payload.config)
+        self._validate_config(payload.scene_type, payload.config)
         creator = self._as_uuid(user_id, field="X-User-Id")
         if await self._repository.name_taken(payload.scene_name):
             raise ResourceAlreadyExistsError(
@@ -141,7 +142,7 @@ class SceneService:
         self, scene_id: UUID, payload: SceneUpdateRequest, *, user_id: str
     ) -> Scene:
         """全量更新场景（仅 draft 可编辑 → 否则 3003；重名 3002；写后失效缓存）。"""
-        self._validate_config(payload.config)
+        self._validate_config(payload.scene_type, payload.config)
         model = await self._load_model(scene_id)
         if model.status not in EDITABLE_STATES:
             raise ResourceStateConflictError(
@@ -203,8 +204,8 @@ class SceneService:
                 f"场景状态为 {model.status}，仅 draft 可发布",
                 details={"scene_id": str(scene_id), "status": str(model.status)},
             )
-        # 发布前再次做一次 4.2.2 结构完整性校验（契约 publishScene 规则）
-        self._validate_config(self._parse_stored_config(model))
+        # 发布前再次做一次 4.2.2 结构完整性 + 语义完整性校验（契约 publishScene 规则）
+        self._validate_config(str(model.scene_type), self._parse_stored_config(model))
         version = self._resolve_publish_version(payload, current=str(model.version))
         published = await self._repository.set_status(
             scene_id, status=SceneStatus.PUBLISHED, version=version
@@ -305,13 +306,29 @@ class SceneService:
                 "场景配置数据非法", details={"scene_id": str(model.scene_id)}
             ) from exc
 
-    def _validate_config(self, config: SceneConfig) -> None:
-        """写入/发布前的附加校验：时长上限（契约未定义上限，经配置环境变量化 → 2001）。"""
+    def _validate_config(self, scene_type: str, config: SceneConfig) -> None:
+        """写入/发布前的附加校验：时长上限 + 语义完整性（G9 同源）→ 2001。
+
+        语义完整性拦截「类型要求行人/遮挡物，但 config 只有 1 辆前车」的场景落库：
+        这类内容一旦发布就会在下发时静默退化成“仿真端看不到交通参与者”。
+        ``custom``/实车回放等无合成语义的类型不受必需角色约束。
+        """
         limit = self._settings.scene_duration_max_seconds
         if config.duration > limit:
             raise InvalidParameterError(
                 f"场景时长超过上限 {limit}s", details={"duration": config.duration, "limit": limit}
             )
+        problems = check_scene_semantics(scene_type, config.model_dump(mode="json"))
+        if not problems:
+            return
+        raise InvalidParameterError(
+            f"场景内容不满足 {scene_type} 的语义要求：" + problems[0].message,
+            details={
+                "scene_type": scene_type,
+                "missing_roles": [problem.role for problem in problems if problem.role],
+                "problems": [problem.to_dict() for problem in problems],
+            },
+        )
 
     def _scoped_creator(
         self, *, user_id: str, roles: frozenset[str], requested: UUID | None

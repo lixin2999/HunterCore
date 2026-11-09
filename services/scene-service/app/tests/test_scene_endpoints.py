@@ -126,7 +126,8 @@ async def test_create_scene_returns_draft_with_server_fields(
     client: AsyncClient, scene_env: object
 ) -> None:
     """创建成功 201：status=draft、creator=网关注入用户、version 默认 1.0.0。"""
-    resp = await client.post(SCENE_BASE, headers=ADMIN_HEADERS, json=create_payload())
+    payload = create_payload()
+    resp = await client.post(SCENE_BASE, headers=ADMIN_HEADERS, json=payload)
     assert resp.status_code == 201
     data = _assert_envelope(resp.json())["data"]
     assert data["status"] == "draft"  # type: ignore[index]
@@ -141,7 +142,14 @@ async def test_create_scene_returns_draft_with_server_fields(
         "success_criteria",
         "duration",
     }
-    assert data["config"]["weather"]["sun_altitude"] == 45.0  # type: ignore[index]
+    # 服务端不改写场景内容（天气/参与者原样入库，由语义契约决定而非硬编码）
+    assert data["config"]["weather"] == payload["config"]["weather"]  # type: ignore[index]
+    assert [actor["actor_id"] for actor in data["config"]["actors"]] == [  # type: ignore[index]
+        actor["actor_id"] for actor in payload["config"]["actors"]
+    ]
+    assert [event["event_id"] for event in data["config"]["events"]] == [  # type: ignore[index]
+        event["event_id"] for event in payload["config"]["events"]
+    ]
 
 
 async def test_create_scene_conflict_returns_3002(client: AsyncClient, scene_env: object) -> None:
@@ -211,16 +219,32 @@ def _valid_event(
 async def test_create_scene_accepts_extended_dictionary_type(
     client: AsyncClient, scene_env: object
 ) -> None:
-    """合法新类型（鬼探头）随字典扩充即可入库；actors/events 受控值也可入库（201）。"""
-    config = config_payload(actors=[_valid_actor()], events=[_valid_event()])
-    resp = await client.post(
-        SCENE_BASE,
-        headers=ADMIN_HEADERS,
-        json=create_payload("鬼探头场景", scene_type="occluded_pedestrian", config=config),
-    )
+    """合法新类型（鬼探头）随字典扩充即可入库；语义参与者/事件随内容一并入库（201）。"""
+    raw = create_payload("鬼探头场景", scene_type="occluded_pedestrian")
+    resp = await client.post(SCENE_BASE, headers=ADMIN_HEADERS, json=raw)
     assert resp.status_code == 201
     data = _assert_envelope(resp.json())["data"]
     assert data["scene_type"] == "occluded_pedestrian"  # type: ignore[index]
+    actor_ids = {actor["actor_id"] for actor in data["config"]["actors"]}  # type: ignore[index]
+    # 语义契约要求「行人 + 遮挡物」同时在场（防“下发成功但只有 1 个参与者”）
+    assert any(actor_id.startswith("dart_out_pedestrian") for actor_id in actor_ids)
+    assert any(actor_id.startswith("occluder") for actor_id in actor_ids)
+
+
+async def test_create_scene_rejects_missing_required_roles(
+    client: AsyncClient, scene_env: object
+) -> None:
+    """语义缺失（鬼探头缺行人/遮挡物）→ 422 + code=2001，响应列出缺口角色。"""
+    config = config_payload(scene_type="occluded_pedestrian", actors=[_valid_actor()])
+    resp = await client.post(
+        SCENE_BASE,
+        headers=ADMIN_HEADERS,
+        json=create_payload("鬼探头缺角色", scene_type="occluded_pedestrian", config=config),
+    )
+    assert resp.status_code == 422
+    body = _assert_envelope(resp.json(), code=2001)
+    # 错误消息直接指出缺失的角色（细节仅进日志，响应体保持五字段）
+    assert "dart_out_pedestrian" in str(body["message"])
 
 
 async def test_create_scene_rejects_scene_type_outside_dictionary(

@@ -94,7 +94,7 @@ class LogicalVersionListResponse(ApiResponse[LogicalVersionListData]):
 
 
 class GateItem(BaseModel):
-    gate: str = Field(description="G1-G8")
+    gate: str = Field(description="G1-G7 与 G9（G8 为批级去重，由生成器回填）")
     passed: bool
     message: str
     skipped: bool = Field(
@@ -115,7 +115,7 @@ class ValidationReportData(BaseModel):
 
 
 class LogicalValidationResponse(ApiResponse[ValidationReportData]):
-    """逻辑场景校验响应（G1-G7 静态校验）。"""
+    """逻辑场景校验响应（G1-G7 + G9 静态校验）。"""
 
 
 class DryRunRequest(BaseModel):
@@ -270,6 +270,13 @@ class ConcreteScenarioResponse(ApiResponse[ConcreteScenarioDetail]):
     """具体场景详情响应。"""
 
 
+class ExecutionReportData(BaseModel):
+    """可执行性自检（映射后的未支持组合与告警，空列表表示全量可执行）。"""
+
+    unsupported: list[str] = Field(default_factory=list, description="无标准等价物的行为/动作/触发")
+    warnings: list[str] = Field(default_factory=list, description="可执行但不完整的组合")
+
+
 class RenderData(BaseModel):
     scenario_id: UUID
     logical_id: str
@@ -277,6 +284,9 @@ class RenderData(BaseModel):
     scene_config: dict[str, Any]
     gates: list[GateItem]
     passed: bool
+    execution: ExecutionReportData = Field(
+        default_factory=ExecutionReportData, description="CARLA/OpenSCENARIO 执行映射自检"
+    )
 
 
 class ConcreteRenderResponse(ApiResponse[RenderData]):
@@ -506,6 +516,79 @@ class SuiteDiffResponse(ApiResponse[SuiteDiffData]):
 
 
 # =====================================================================
+# 五·补充、用例 / 测试集自动派生
+# =====================================================================
+
+
+class CaseDerivationRequest(BaseModel):
+    """按场景类型批量派生用例/测试集。
+
+    ``scene_types`` 省略（空数组）时覆盖目录内全部可合成类型；``dry_run`` 只预览不落库。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scene_types: list[str] = Field(
+        default_factory=list, max_length=64, description="场景类型；省略则覆盖全部可合成类型"
+    )
+    zones: list[RarityZone] = Field(
+        default_factory=lambda: [RarityZone.Z1, RarityZone.Z2, RarityZone.Z3, RarityZone.Z4],
+        min_length=1,
+        max_length=4,
+        description="稀有度分区（默认 Z1-Z4）",
+    )
+    include_concrete: bool = Field(default=True, description="测试集是否纳入具体场景条目")
+    dry_run: bool = Field(default=False, description="true 时只返回计划，不落库")
+
+
+class DerivedCaseData(BaseModel):
+    """单条派生用例结果（created / skipped / planned）。"""
+
+    case_key: str
+    logical_id: str
+    scene_type: str
+    zone: RarityZone
+    name: str
+    status: Literal["created", "skipped", "planned"]
+    test_case_id: UUID | None = None
+    reason: str | None = None
+
+
+class CaseDerivationData(BaseModel):
+    created: int
+    skipped: int
+    planned: int = 0
+    cases: list[DerivedCaseData] = Field(default_factory=list)
+
+
+class CaseDerivationResponse(ApiResponse[CaseDerivationData]):
+    """用例派生响应。"""
+
+
+class DerivedSuiteData(BaseModel):
+    """单个测试集派生结果（created / updated / skipped / planned）。"""
+
+    suite_id: UUID | None = None
+    name: str
+    scene_type: str
+    item_count: int = 0
+    status: Literal["created", "updated", "skipped", "planned"]
+    reason: str | None = None
+
+
+class SuiteDerivationData(BaseModel):
+    created: int
+    updated: int = 0
+    skipped: int = 0
+    planned: int = 0
+    suites: list[DerivedSuiteData] = Field(default_factory=list)
+
+
+class SuiteDerivationResponse(ApiResponse[SuiteDerivationData]):
+    """测试集派生响应。"""
+
+
+# =====================================================================
 # 六、覆盖分析
 # =====================================================================
 
@@ -517,6 +600,12 @@ class CoverageOverviewData(BaseModel):
     zone_ratio: dict[str, float] = Field(default_factory=dict)
     risk_counts: dict[str, int] = Field(default_factory=dict)
     risk_matrix_applied: bool = True
+    #: 按场景类型（由目录 logical_id → scene_type 聚合）的具体场景数
+    type_counts: dict[str, int] = Field(default_factory=dict)
+    #: 场景类型 × 稀有度分区矩阵（前端覆盖面板的类型矩阵）
+    type_zone_counts: dict[str, dict[str, int]] = Field(default_factory=dict)
+    #: 按语义必需角色统计的具体场景数（角色维度覆盖）
+    role_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class CoverageOverviewResponse(ApiResponse[CoverageOverviewData]):
@@ -531,6 +620,8 @@ class CoverageGapData(BaseModel):
     target: int
     deficit: int
     recommendation: str
+    #: 缺口类型：``zero_scenes``（该类型零具体场景）/ ``zone_deficit``（分区配额不足）
+    kind: str = "zone_deficit"
 
 
 class CoverageGapListData(BaseModel):
@@ -542,6 +633,79 @@ class CoverageGapListResponse(ApiResponse[CoverageGapListData]):
     """覆盖盲区响应（按剖面目标配额计算缺口）。"""
 
 
+# =====================================================================
+# 七、场景语义契约（只读）
+# =====================================================================
+
+
+class SceneRoleSemanticsData(BaseModel):
+    """参与者角色语义（``count`` 为参数表达式，前端按需展示原文）。"""
+
+    role: str
+    type: str
+    count: str
+    behavior_type: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    min_count: int = 1
+    required: bool = False
+
+
+class SceneEventSemanticsData(BaseModel):
+    """事件语义（触发条件/动作取自受控字典）。"""
+
+    type: str
+    condition_type: str
+    action_type: str = ""
+
+
+class SceneVariantSemanticsData(BaseModel):
+    """子场景（variant）语义摘要。"""
+
+    key: str
+    label: str
+    sub: str = ""
+
+
+class SceneParamSemanticsData(BaseModel):
+    """参数分布语义（截断正态口径）。"""
+
+    name: str
+    mean: float
+    std: float
+    low: float
+    high: float
+    unit: str = ""
+    discrete: bool = False
+    risk: int = 0
+
+
+class SceneSemanticsData(BaseModel):
+    """单类型语义契约摘要（前端语义自检区块 / 校验脚本共用）。"""
+
+    scene_type: str
+    objective: str
+    oracle_ref: str
+    required_events: bool
+    roles: list[SceneRoleSemanticsData] = Field(default_factory=list)
+    required_roles: list[str] = Field(default_factory=list)
+    events: list[SceneEventSemanticsData] = Field(default_factory=list)
+    variants: list[SceneVariantSemanticsData] = Field(default_factory=list)
+    params: list[SceneParamSemanticsData] = Field(default_factory=list)
+    duration: str
+    weather: dict[str, str] = Field(default_factory=dict)
+
+
+class SceneSemanticsListData(BaseModel):
+    items: list[SceneSemanticsData]
+    total: int
+    #: 受控字典版本（contracts/scene-taxonomy.yaml::version）
+    taxonomy_version: str
+
+
+class SceneSemanticsListResponse(ApiResponse[SceneSemanticsListData]):
+    """场景语义契约目录响应（只读）。"""
+
+
 __all__ = [
     "BaselineData",
     "BaselineListData",
@@ -550,6 +714,9 @@ __all__ = [
     "BatchValidateItem",
     "BatchValidateRequest",
     "BatchValidateResponse",
+    "CaseDerivationData",
+    "CaseDerivationRequest",
+    "CaseDerivationResponse",
     "CatalogSyncData",
     "CatalogSyncResponse",
     "ConcreteRenderResponse",
@@ -563,8 +730,11 @@ __all__ = [
     "CoverageGapListResponse",
     "CoverageOverviewData",
     "CoverageOverviewResponse",
+    "DerivedCaseData",
+    "DerivedSuiteData",
     "DryRunData",
     "DryRunRequest",
+    "ExecutionReportData",
     "GateItem",
     "GenerateRequest",
     "GenerationTaskData",
@@ -587,8 +757,17 @@ __all__ = [
     "OracleListResponse",
     "PublishData",
     "RenderData",
+    "SceneEventSemanticsData",
+    "SceneParamSemanticsData",
+    "SceneRoleSemanticsData",
+    "SceneSemanticsData",
+    "SceneSemanticsListData",
+    "SceneSemanticsListResponse",
+    "SceneVariantSemanticsData",
     "SuiteCreateRequest",
     "SuiteData",
+    "SuiteDerivationData",
+    "SuiteDerivationResponse",
     "SuiteDetailData",
     "SuiteDiffData",
     "SuiteDiffResponse",

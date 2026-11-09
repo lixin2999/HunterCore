@@ -3,28 +3,36 @@
 ⚠ 契约待确认项 #11：模板数据来源（内置静态清单 / DB 表 / MinIO 资源）设计文档未定义；
 本实现采用「内置静态清单」——不新增 DB 表、不引入运维依赖，模板 config 即 4.2.2 结构，
 可直接作为 ``POST /api/v1/scene`` 的 config 提交。人工确认来源后仅需替换本模块数据源。
+
+参与者/事件/天气/时长**不再逐类型手写**，而是由 ``contracts/scene-taxonomy.yaml::scene_semantics``
+语义契约实例化（与 ``scripts/batch_add_scenes.py``、场景引擎目录、用例派生共用同一份事实来源），
+因此「新增受控类型只需补语义」即可一键创建模板，且不会退化成「1 辆前车」的分类兜底：
+鬼探头场景天然含行人 + 遮挡物、儿童追球场景天然含儿童 + 球，模板同样受 G9 语义完整性闸门约束。
+``custom``（人工自定义）无语义契约，保留最小可编辑骨架。
 ``real_vehicle_replay``（4.5 节自动提取产物）无预置模板，故不在模板清单与分类筛选枚举中。
 """
 from __future__ import annotations
 
-from typing import Any
-
 from hunter_common.logging import get_logger
 
 from app.config import Settings
+from app.scene_engine.semantics import (
+    build_actors,
+    build_duration,
+    build_ego,
+    build_events,
+    build_weather,
+    require_semantics,
+    semantics_for,
+)
 from app.schemas.scene import (
     SCENE_TYPE_LABELS,
     SCENE_TYPES_BY_TEMPLATE_CATEGORY,
     Actor,
-    ActorBehavior,
-    ActorType,
     EgoVehicle,
     MapType,
     SceneConfig,
     SceneEvent,
-    SceneEventAction,
-    SceneEventTrigger,
-    SceneEventType,
     SceneMap,
     SceneTemplate,
     SceneTemplateCategory,
@@ -40,7 +48,7 @@ logger = get_logger("app.services.templates")
 _DEFAULT_MAP_ID = "Town01"
 #: 车端基线车型（HUNTER SE）
 _DEFAULT_EGO_MODEL = "HUNTER_SE"
-#: 晴天基准天气（Carla WeatherParameters 语义）
+#: 晴天基准天气（Carla WeatherParameters 语义；仅 custom 骨架使用）
 _CLEAR_WEATHER: dict[str, float] = {
     "cloudiness": 0.0,
     "rain": 0.0,
@@ -52,280 +60,53 @@ _CLEAR_WEATHER: dict[str, float] = {
 }
 
 
-def _actor(
-    actor_id: str,
-    actor_type: ActorType,
-    x: float,
-    y: float,
-    yaw: float,
-    behavior_type: str,
-    **params: Any,
-) -> Actor:
-    """构造模板参与者（behavior.parameters 为自由结构，与 4.2.2 一致）。"""
-    return Actor(
-        actor_id=actor_id,
-        type=actor_type,
-        spawn_point=SpawnPoint(x=x, y=y, yaw=yaw),
-        behavior=ActorBehavior(behavior_type=behavior_type, parameters=dict(params)),
+def _default_map() -> SceneMap:
+    """模板地图段（出生点为目录占位基准 (0,0,0)，有效坐标由仿真端选取）。"""
+    return SceneMap(
+        map_id=_DEFAULT_MAP_ID,
+        map_type=MapType.CARLA_TOWN,
+        spawn_point=SpawnPoint(x=0.0, y=0.0, yaw=0.0, lane_id="lane-1"),
     )
 
 
-def _event(
-    event_id: str,
-    event_type: SceneEventType,
-    condition: str,
-    action_type: str,
-    **action_params: Any,
-) -> SceneEvent:
-    """构造模板事件（trigger.condition 为条件标识，action.parameters 为自由结构）。"""
-    return SceneEvent(
-        event_id=event_id,
-        type=event_type,
-        trigger=SceneEventTrigger(condition=condition, parameters={"source": "template"}),
-        action=SceneEventAction(action_type=action_type, parameters=dict(action_params)),
-    )
+def _criteria() -> SuccessCriteria:
+    """成功判据保守默认值（供场景编辑器二次调整）。"""
+    return SuccessCriteria(max_speed_deviation=0.5, no_collision=True, min_safe_distance=3.0)
 
 
-def _weather(**overrides: float) -> Weather:
-    """按覆盖值构造天气段（未覆盖字段取晴天基准，7 字段全部必填）。"""
-    return Weather(**{**_CLEAR_WEATHER, **overrides})
-
-
-def _config(
-    *,
-    speed: float,
-    steer: float,
-    actors: list[Actor],
-    events: list[SceneEvent],
-    duration: float,
-    weather: Weather | None = None,
-) -> SceneConfig:
-    """构造模板配置（成功判据取保守默认值，供场景编辑器二次调整）。"""
+def _semantics_config(scene_type: str) -> SceneConfig:
+    """按语义契约实例化模板配置（参与者角色×数量 / 事件 / 天气 / 时长 / 自车）。"""
+    semantics = require_semantics(scene_type)
     return SceneConfig(
-        map=SceneMap(
-            map_id=_DEFAULT_MAP_ID,
-            map_type=MapType.CARLA_TOWN,
-            spawn_point=SpawnPoint(x=0.0, y=0.0, yaw=0.0, lane_id="lane-1"),
-        ),
-        ego_vehicle=EgoVehicle(
-            model=_DEFAULT_EGO_MODEL, initial_speed=speed, initial_steer=steer
-        ),
-        weather=weather or _weather(),
-        actors=actors,
-        events=events,
-        success_criteria=SuccessCriteria(
-            max_speed_deviation=0.5, no_collision=True, min_safe_distance=3.0
-        ),
-        duration=duration,
+        map=_default_map(),
+        ego_vehicle=EgoVehicle(**build_ego(semantics, model=_DEFAULT_EGO_MODEL)),
+        weather=Weather(**build_weather(semantics)),
+        actors=[Actor.model_validate(item) for item in build_actors(semantics)],
+        events=[SceneEvent.model_validate(item) for item in build_events(semantics)],
+        success_criteria=_criteria(),
+        duration=build_duration(semantics),
     )
 
 
-def _lead_vehicle(x: float, yaw: float = 0.0, speed: float = 1.0) -> Actor:
-    """前车（跟车/切入/变道模板复用）。"""
-    return _actor(
-        "lead-vehicle", ActorType.VEHICLE, x, 0.0, yaw, "lane_follow", target_speed=speed
+def _custom_config() -> SceneConfig:
+    """人工自定义模板：无语义契约，保留最小可编辑骨架（不代猜参与者）。"""
+    return SceneConfig(
+        map=_default_map(),
+        ego_vehicle=EgoVehicle(model=_DEFAULT_EGO_MODEL, initial_speed=8.0, initial_steer=0.0),
+        weather=Weather(**_CLEAR_WEATHER),
+        actors=[],
+        events=[],
+        success_criteria=_criteria(),
+        duration=30.0,
     )
-
-
-def _generic_config(scene_type: str) -> SceneConfig:
-    """通用模板：为无专属清单的受控字典类型生成最小可跑配置（按分类叠加天气/参与者）。
-
-    保证“取消固定枚举”后每个新类型仍可一键创建（config 直接可提交 POST /scene）。
-    """
-    from app.schemas.scene import scene_category_for
-
-    category = scene_category_for(scene_type).value
-    weather: dict[str, float] = {}
-    actors: list[Actor] = []
-    events: list[SceneEvent] = []
-    if category == "environment":
-        weather = {
-            "rainy": {"cloudiness": 90.0, "rain": 80.0, "wetness": 70.0},
-            "night": {"sun_altitude": -10.0, "sun_azimuth": 180.0},
-            "foggy": {"cloudiness": 60.0, "fog": 60.0, "wetness": 30.0},
-            "backlight": {"sun_azimuth": 90.0, "sun_altitude": 10.0},
-            "snowy": {"cloudiness": 85.0, "wetness": 40.0, "fog": 25.0, "sun_altitude": 20.0},
-            "icy": {"cloudiness": 70.0, "wetness": 55.0, "sun_altitude": 15.0},
-            "haze": {"cloudiness": 55.0, "fog": 45.0},
-            "dusk_dawn": {"sun_altitude": 6.0, "sun_azimuth": 270.0},
-        }.get(scene_type, weather)
-        actors = [_lead_vehicle(15.0)]
-    elif category == "interactive":
-        actors = [_lead_vehicle(20.0)]
-        events = [_event("ev-interaction", SceneEventType.CUT_IN, "ego.position.x > 18", "speed_change", target_speed=1.0)]
-    elif category == "corner_case":
-        actors = [_actor("obstacle", ActorType.OTHER, 12.0, 0.5, 0.0, "static")]
-        events = [_event("ev-corner", SceneEventType.EMERGENCY_BRAKE, "ttc < 1.8", "emergency_stop")]
-    else:  # basic / custom
-        actors = [_lead_vehicle(18.0)] if category == "basic" else []
-    return _config(speed=1.2, steer=0.0, actors=actors, events=events, duration=30.0, weather=_weather(**weather))
 
 
 def _build_config(scene_type: str) -> SceneConfig:
-    """按场景类型构造模板配置：专属清单优先，其余受控字典类型回落通用模板。"""
-    builder = _CONFIG_BUILDERS.get(scene_type)
-    if builder is not None:
-        return builder()
-    return _generic_config(scene_type)
+    """按场景类型构造模板配置：全部由语义契约驱动，仅 ``custom`` 走空骨架。"""
+    if scene_type == "custom":
+        return _custom_config()
+    return _semantics_config(scene_type)
 
-
-#: 类型 → 模板配置构造器（受控字典专属清单部分；未列出的类型由 _generic_config 兜底，均不含 real_vehicle_replay）
-_CONFIG_BUILDERS: dict[str, Any] = {
-    "straight_cruise": lambda: _config(
-        speed=1.5, steer=0.0, actors=[], events=[], duration=30.0
-    ),
-    "curve_driving": lambda: _config(
-        speed=1.2, steer=0.2, actors=[], events=[], duration=30.0
-    ),
-    "car_following": lambda: _config(
-        speed=1.5, steer=0.0, actors=[_lead_vehicle(10.0)], events=[], duration=30.0
-    ),
-    "lane_change": lambda: _config(
-        speed=1.5,
-        steer=0.0,
-        actors=[_lead_vehicle(15.0)],
-        events=[
-            _event(
-                "ev-lane-change", SceneEventType.CUT_IN, "ego.position.x > 10", "lane_change",
-                target_lane="right",
-            )
-        ],
-        duration=25.0,
-    ),
-    "cut_in": lambda: _config(
-        speed=1.5,
-        steer=0.0,
-        actors=[
-            _actor(
-                "cut-in-vehicle", ActorType.VEHICLE, 20.0, 3.5, 0.0, "cut_in", target_lane="ego_lane"
-            )
-        ],
-        events=[
-            _event(
-                "ev-cut-in", SceneEventType.CUT_IN, "ego.position.x > 25", "speed_change",
-                target_speed=1.0,
-            )
-        ],
-        duration=30.0,
-    ),
-    "pedestrian_crossing": lambda: _config(
-        speed=1.0,
-        steer=0.0,
-        actors=[
-            _actor(
-                "crossing-pedestrian", ActorType.PEDESTRIAN, 25.0, -4.0, 1.5708, "cross_road",
-                crossing_speed=1.2,
-            )
-        ],
-        events=[
-            _event("ev-ped-crossing", SceneEventType.PEDESTRIAN_CROSSING, "ego.position.x > 20", "stop")
-        ],
-        duration=30.0,
-    ),
-    "intersection_meeting": lambda: _config(
-        speed=1.0,
-        steer=0.0,
-        actors=[
-            _lead_vehicle(30.0),
-            _actor(
-                "cross-vehicle", ActorType.VEHICLE, 35.0, -8.0, 1.5708, "lane_follow",
-                target_speed=1.0,
-            ),
-        ],
-        events=[],
-        duration=30.0,
-    ),
-    "construction_detour": lambda: _config(
-        speed=1.0,
-        steer=0.0,
-        actors=[_actor("construction-barrier", ActorType.OTHER, 15.0, 2.5, 0.0, "static")],
-        events=[
-            _event(
-                "ev-construction-detour", SceneEventType.OBSTACLE_APPEARANCE,
-                "ego.position.x > 10", "lane_change", target_lane="left",
-            )
-        ],
-        duration=30.0,
-    ),
-    "rainy": lambda: _config(
-        speed=1.0,
-        steer=0.0,
-        actors=[],
-        events=[],
-        duration=30.0,
-        weather=_weather(cloudiness=90.0, rain=80.0, wetness=70.0, fog=10.0, wind=20.0),
-    ),
-    "night": lambda: _config(
-        speed=1.0,
-        steer=0.0,
-        actors=[],
-        events=[],
-        duration=30.0,
-        weather=_weather(sun_altitude=-10.0, sun_azimuth=180.0),
-    ),
-    "foggy": lambda: _config(
-        speed=0.8,
-        steer=0.0,
-        actors=[],
-        events=[],
-        duration=30.0,
-        weather=_weather(cloudiness=60.0, fog=60.0, wetness=30.0),
-    ),
-    "backlight": lambda: _config(
-        speed=1.0,
-        steer=0.0,
-        actors=[],
-        events=[],
-        duration=30.0,
-        weather=_weather(sun_azimuth=90.0, sun_altitude=10.0),
-    ),
-    "emergency_braking": lambda: _config(
-        speed=1.5,
-        steer=0.0,
-        actors=[_lead_vehicle(15.0)],
-        events=[
-            _event("ev-emergency-brake", SceneEventType.EMERGENCY_BRAKE, "ttc < 1.5", "emergency_stop")
-        ],
-        duration=20.0,
-    ),
-    "obstacle_appearance": lambda: _config(
-        speed=1.5,
-        steer=0.0,
-        actors=[_actor("sudden-obstacle", ActorType.OTHER, 12.0, 0.5, 0.0, "static")],
-        events=[
-            _event(
-                "ev-obstacle-appearance", SceneEventType.OBSTACLE_APPEARANCE,
-                "ego.position.x > 8", "emergency_stop",
-            )
-        ],
-        duration=20.0,
-    ),
-    "sensor_failure": lambda: _config(
-        speed=1.0,
-        steer=0.0,
-        actors=[],
-        events=[_event("ev-sensor-failure", SceneEventType.SENSOR_FAILURE, "ego.position.x > 10", "stop")],
-        duration=20.0,
-    ),
-    "multi_vehicle_mixed": lambda: _config(
-        speed=1.2,
-        steer=0.0,
-        actors=[
-            _lead_vehicle(10.0),
-            _actor("adjacent-vehicle", ActorType.VEHICLE, 18.0, 3.5, 0.0, "lane_follow", target_speed=1.0),
-            _actor("crossing-pedestrian", ActorType.PEDESTRIAN, 22.0, -4.0, 1.5708, "cross_road"),
-            _actor("roadside-object", ActorType.OTHER, 28.0, 4.5, 0.0, "static"),
-        ],
-        events=[
-            _event(
-                "ev-mixed-cut-in", SceneEventType.CUT_IN, "ego.position.x > 20", "speed_change",
-                target_speed=0.5,
-            )
-        ],
-        duration=40.0,
-    ),
-    "custom": lambda: _config(speed=1.0, steer=0.0, actors=[], events=[], duration=30.0),
-}
 
 #: 模板清单顺序（受控字典分类顺序；实车回放无预置模板故排除）
 _TEMPLATE_TYPES: tuple[str, ...] = tuple(
@@ -333,6 +114,17 @@ _TEMPLATE_TYPES: tuple[str, ...] = tuple(
     for types in SCENE_TYPES_BY_TEMPLATE_CATEGORY.values()
     for scene_type in types
 )
+
+#: 需语义契约的模板类型（custom 为人工骨架，不受契约约束）
+_SEMANTIC_TEMPLATE_TYPES: frozenset[str] = frozenset(_TEMPLATE_TYPES) - {"custom"}
+_MISSING_SEMANTICS: list[str] = sorted(
+    scene_type for scene_type in _SEMANTIC_TEMPLATE_TYPES if semantics_for(scene_type) is None
+)
+if _MISSING_SEMANTICS:  # 新增类型忘写语义时启动即失败，而非静默退化
+    raise RuntimeError(
+        "以下模板类型缺少 scene_semantics 语义契约（请在 contracts/scene-taxonomy.yaml 补齐）："
+        + ", ".join(_MISSING_SEMANTICS)
+    )
 
 
 class SceneTemplateService:
@@ -364,11 +156,16 @@ class SceneTemplateService:
     def _build_template(scene_type: str) -> SceneTemplate:
         """构造单个模板（template_id 命名 tpl-{scene_type}，config 可直提创建接口）。"""
         label = SCENE_TYPE_LABELS[scene_type]
+        semantics = semantics_for(scene_type)
+        objective = semantics.objective if semantics is not None else "人工自定义场景"
         return SceneTemplate(
             template_id=f"tpl-{scene_type}",
             template_name=f"{label}模板",
             scene_type=scene_type,
-            description=f"4.2.1 节预置{label}场景模板（config 可直接作为创建场景请求的 config）",
+            description=(
+                f"4.2.1 节预置{label}场景模板：{objective}"
+                "（config 可直接作为创建场景请求的 config；参与者/事件由语义契约生成）"
+            ),
             config=_build_config(scene_type),
         )
 

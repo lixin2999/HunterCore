@@ -19,7 +19,7 @@
 # 加载：hunter_common.scene_taxonomy（定位顺序：SCENE_TAXONOMY_FILE → 向上查找
 #   contracts/scene-taxonomy.yaml；容器内由 ./contracts 只读挂载或镜像内置提供）。
 # =====================================================================
-version: "1.0"
+version: "1.1"
 source: "场景生成器与场景管理详细设计文档 §4.2.1 分类体系 + GB/T 47025—2026 覆盖面"
 status: confirmed_extensible
 note: "本文件为可扩展受控字典；categories[].types 的并集等于 scene_types 全集"
@@ -268,3 +268,1034 @@ action_parameter_keys:
   - expression
   - parameters
   - source
+
+# =====================================================================
+# 场景语义契约（scene_semantics / 单一事实来源）
+# ---------------------------------------------------------------------
+# 目的：把「该场景类型需要哪些交通参与者、什么行为、什么触发与判据、什么天气」抽成
+#   一份事实来源，供批量生成器（scripts/batch_add_scenes.py）、模板服务
+#   （app/services/templates.py）、场景引擎目录（app/scene_engine/catalog_semantics.py）、
+#   用例派生（app/services/engine.py）共用，并在入库/发布/下发前做语义闸门（G9），
+#   杜绝「类型写对了但实际只有 1 辆前车」的静默退化。
+#
+# 结构：
+#   scene_event_types          场景事件类型受控值（4.2.2 events[].type，7 值）
+#   scene_semantics_defaults   全类型共享参数分布 / 天气表达式 / 时长 / 自车初始转向
+#   scene_semantics.<type>     46 个可合成类型（custom、real_vehicle_replay 除外）
+#     objective        测试目的（写入场景描述与用例 objective）
+#     oracle_ref       判据引用（必须存在于 scene_engine/oracles.py 目录）
+#     required_events  是否必须至少含 1 个事件（缺省 true）
+#     params           类型专属参数分布（mean/std/low/high/risk/discrete/unit/kind）
+#     variants         2~4 个可辨识子场景（key/label/sub/force/overrides/weather）
+#     roles            参与者角色（role/type/count/spawn{}/behavior_type/parameters{}/required/min_count）
+#     events           事件模板（type/condition_type/condition/parameters{}/action_type/action_parameters{}）
+#     weather          天气表达式覆盖（可选，键同 Weather 7 字段）
+#     duration         时长表达式（可选，缺省取默认 duration）
+#     ego_steer        自车初始转向表达式（可选，缺省 0）
+#     constraints      采样可行性约束（left/op/right/message，可选）
+#
+# 表达式口径：只允许数字、参数名、i（角色实例序号）与 + - * / ** () min max abs round；
+#   参数名必须落在「本类型 params ∪ scene_semantics_defaults.params」内，否则加载期报错。
+# 受控值口径：behavior_type / action_type / condition_type / event.type / 参数键
+#   必须取自本文件上方的受控字典，越界在加载期报错。
+# 角色缺省：count 求值取整后为 0 表示该参与者不出现（用于子场景按需增减参与者）。
+# 表达：{"select": [取值列表], "index": 表达式} 表示按索引从受控列表取值（如传感器名/物体种类）。
+# =====================================================================
+scene_event_types:
+  - collision
+  - cut_in
+  - pedestrian_crossing
+  - emergency_brake
+  - manual_takeover
+  - sensor_failure
+  - obstacle_appearance
+
+scene_semantics_defaults:
+  params:
+    rain: {mean: 12, std: 26, low: 0, high: 100, risk: 1, unit: percent}
+    fog: {mean: 8, std: 18, low: 0, high: 100, risk: 1, unit: percent}
+    wind: {mean: 15, std: 25, low: 0, high: 100, risk: 1, unit: percent}
+    sun_alt: {mean: 40, std: 35, low: -25, high: 90, risk: -1, unit: deg}
+    sun_az: {mean: 120, std: 100, low: 0, high: 360, risk: 0, unit: deg}
+    duration: {mean: 80, std: 45, low: 30, high: 300, risk: 0, unit: s}
+  weather:
+    cloudiness: "min(100, rain * 0.7 + fog * 0.4 + 10)"
+    rain: rain
+    wetness: "min(100, rain * 0.9)"
+    fog: fog
+    wind: wind
+    sun_azimuth: sun_az
+    sun_altitude: "min(90, max(-90, sun_alt))"
+  duration: duration
+  ego_steer: "0.0"
+
+scene_semantics:
+  # ==================== basic（基础场景 12） ====================
+  straight_cruise:
+    objective: 验证直线路段的车道保持、目标车速跟踪与纵向舒适性
+    oracle_ref: oracle.task.speed_tracking/v1
+    params:
+      ego_speed: {mean: 16, std: 7, low: 2, high: 24, risk: 1, unit: m/s}
+      lead_gap: {mean: 45, std: 20, low: 20, high: 90, risk: -1, unit: m}
+      has_lead: {mean: 0.5, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: low_speed, label: 低速巡航, sub: LOW, force: {ego_speed: 6, has_lead: 0}}
+      - {key: high_speed, label: 高速巡航, sub: HIGH, force: {ego_speed: 20, has_lead: 0}}
+      - {key: cruise_stop, label: 巡航跟停, sub: STP, force: {ego_speed: 12, has_lead: 1}}
+    roles:
+      - {role: background, type: vehicle, count: "1", spawn: {x: lead_gap + 25, y: 3.5, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.9}, required: false}
+      - {role: lead, type: vehicle, count: "round(has_lead)", spawn: {x: lead_gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.85}, required: false}
+    events:
+      - {type: emergency_brake, condition_type: time_headway, condition: 自车与前车时距低于安全阈值, parameters: {value: 2.0, rule: "<", relative_distance_type: longitudinal}, action_type: hold_speed, action_parameters: {target_speed: ego_speed * 0.9}}
+
+  curve_driving:
+    objective: 验证弯道下的横纵向耦合控制、曲率适应与目标车速跟踪
+    oracle_ref: oracle.task.speed_tracking/v1
+    params:
+      ego_speed: {mean: 6, std: 2.2, low: 2, high: 11, risk: 1, unit: m/s}
+      steer_mag: {mean: 0.5, std: 0.28, low: 0.1, high: 0.95, risk: 1}
+      side: {mean: 1, std: 1, low: -1, high: 1, risk: 0}
+      oncoming_gap: {mean: 55, std: 20, low: 25, high: 110, risk: 0, unit: m}
+    variants:
+      - {key: gentle, label: 缓弯, sub: GEN, force: {steer_mag: 0.25}}
+      - {key: sharp, label: 急弯, sub: SHP, force: {steer_mag: 0.75}}
+      - {key: hairpin, label: 掉头弯, sub: HRP, force: {steer_mag: 0.92, ego_speed: 4}}
+    roles:
+      - {role: oncoming, type: vehicle, count: "1", spawn: {x: oncoming_gap, y: -3.5, yaw: 3.14159}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.8}, required: false}
+    events:
+      - {type: emergency_brake, condition_type: acceleration, condition: 横向加速度逼近轮胎附着上限, parameters: {value: 3.0 + steer_mag * 3, rule: ">"}, action_type: speed_limit, action_parameters: {target_speed: "max(2, ego_speed * 0.85)"}}
+    ego_steer: side * steer_mag
+
+  car_following:
+    objective: 验证稳态跟车与跟停时的车距控制及前车加减速响应
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 14, std: 6, low: 4, high: 24, risk: 1, unit: m/s}
+      gap: {mean: 16, std: 7, low: 6, high: 32, risk: -1, unit: m}
+      lead_ratio: {mean: 0.85, std: 0.12, low: 0.5, high: 1.05, risk: 0}
+      has_dense: {mean: 0.4, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: steady, label: 稳态跟车, sub: STY, force: {gap: 20}}
+      - {key: dense, label: 密集车流跟车, sub: DNS, force: {gap: 10, has_dense: 1}}
+      - {key: lead_varies, label: 前车加减速, sub: LVV, force: {lead_ratio: 0.55}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * lead_ratio}, required: true, min_count: 1}
+      - {role: dense_follower, type: vehicle, count: "round(has_dense)", spawn: {x: gap + 12, y: 3.5, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.9}, required: false}
+    events:
+      - {type: emergency_brake, condition_type: time_headway, condition: 前车急减速时机距跌破安全阈值, parameters: {value: 1.5, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 3 + ego_speed * 0.15}}
+    constraints:
+      - {left: gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  lane_change:
+    objective: 验证指令变道的目标车道选择、横向轨迹平滑与目标道后车安全
+    oracle_ref: oracle.geometry.clearance/v1
+    params:
+      ego_speed: {mean: 12, std: 6, low: 4, high: 22, risk: 1, unit: m/s}
+      lat: {mean: 3.5, std: 0.4, low: 3.0, high: 4.2, risk: 0, unit: m}
+      complete_in: {mean: 5, std: 1.6, low: 3, high: 9, risk: -1, unit: s}
+      target_ratio: {mean: 1.05, std: 0.12, low: 0.8, high: 1.3, risk: 0}
+      side_idx: {mean: 1, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: left, label: 左变道, sub: LFT, force: {side_idx: 0}}
+      - {key: right, label: 右变道, sub: RGT, force: {side_idx: 1}}
+      - {key: overtake, label: 超车变道, sub: OVT, force: {side_idx: 0, target_ratio: 1.25}}
+      - {key: continuous, label: 连续变道, sub: CTL, force: {complete_in: 3.2}}
+    roles:
+      - {role: target_gap, type: vehicle, count: "1", spawn: {x: 18, y: (side_idx * 2 - 1) * lat, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * target_ratio}, required: true, min_count: 1}
+      - {role: behind, type: vehicle, count: "1", spawn: {x: -8, y: (side_idx * 2 - 1) * lat, yaw: 0.0}, behavior_type: constant_velocity, parameters: {target_speed: ego_speed * 1.1}, required: false}
+    events:
+      - {type: cut_in, condition_type: traveled_distance, condition: 自车行驶预告距离后执行变道, parameters: {value: 10.0, rule: ">"}, action_type: lane_change, action_parameters: {target_lane: {select: [right, left], index: side_idx}, complete_in: complete_in}}
+      - {type: cut_in, condition_type: traveled_distance, condition: 变道完成后回正至车道中心, parameters: {value: 30.0, rule: ">"}, action_type: lane_offset, action_parameters: {target_lane: ego_lane}}
+
+  overtaking:
+    objective: 验证借对向车道超车时的目标识别、超车时机决策与回归本车道
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 14, std: 5, low: 6, high: 24, risk: 1, unit: m/s}
+      lead_speed: {mean: 8, std: 3, low: 3, high: 14, risk: -1, unit: m/s}
+      lead_gap: {mean: 24, std: 8, low: 12, high: 45, risk: -1, unit: m}
+      oncoming_gap: {mean: 90, std: 30, low: 45, high: 160, risk: -1, unit: m}
+      oncoming_speed: {mean: 12, std: 4, low: 6, high: 20, risk: 1, unit: m/s}
+    variants:
+      - {key: standard, label: 常规超车, sub: STD, force: {oncoming_gap: 90}}
+      - {key: tight, label: 对向车逼近超车, sub: TGT, force: {oncoming_gap: 45, ego_speed: 20, lead_speed: 6}}
+      - {key: queue, label: 长车队超车, sub: QUE, force: {lead_gap: 14, lead_speed: 5}}
+    roles:
+      - {role: slow_lead, type: vehicle, count: "1", spawn: {x: lead_gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: lead_speed}, required: true, min_count: 1}
+      - {role: oncoming, type: vehicle, count: "1", spawn: {x: oncoming_gap, y: -3.5, yaw: 3.14159}, behavior_type: lane_follow, parameters: {target_speed: oncoming_speed}, required: true, min_count: 1}
+    events:
+      - {type: cut_in, condition_type: relative_distance, condition: 与慢车前向净距小于超车阈值, parameters: {value: lead_gap * 0.6, rule: "<", relative_distance_type: longitudinal}, action_type: lane_change, action_parameters: {target_lane: left, complete_in: 4.5}}
+      - {type: collision, condition_type: time_to_collision, condition: 与对向车 TTC 低于阈值时放弃超车回本道, parameters: {value: 2.0, rule: "<"}, action_type: lane_change, action_parameters: {target_lane: right, complete_in: 3.0}}
+    constraints:
+      - {left: lead_gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  ramp_merge:
+    objective: 验证匝道汇入主路时的目标识别、间隙选择与合流速度匹配
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 12, std: 4, low: 6, high: 20, risk: 1, unit: m/s}
+      main_speed: {mean: 16, std: 5, low: 8, high: 26, risk: 1, unit: m/s}
+      main_gap: {mean: 26, std: 9, low: 12, high: 50, risk: -1, unit: m}
+      has_dense: {mean: 0.4, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: free, label: 自由汇入, sub: FRE, force: {main_gap: 40}}
+      - {key: dense, label: 密集车流汇入, sub: DNS, force: {main_gap: 12, has_dense: 1}}
+      - {key: yield, label: 让行汇入, sub: YLD, force: {main_gap: 8}}
+    roles:
+      - {role: main_lead, type: vehicle, count: "1", spawn: {x: main_gap, y: -3.5, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: main_speed}, required: true, min_count: 1}
+      - {role: main_follower, type: vehicle, count: "round(has_dense)", spawn: {x: main_gap - 15, y: -3.5, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: main_speed * 1.1}, required: false}
+    events:
+      - {type: cut_in, condition_type: relative_distance, condition: 主路车辆净距不足时先让行, parameters: {value: main_gap * 0.5, rule: "<", relative_distance_type: longitudinal}, action_type: yield, action_parameters: {target_speed: "max(2, main_speed * 0.6)"}}
+      - {type: cut_in, condition_type: relative_distance, condition: 间隙满足后加速合流, parameters: {value: main_gap * 0.8, rule: ">=", relative_distance_type: longitudinal}, action_type: lane_change, action_parameters: {target_lane: right, complete_in: 5.0}}
+    constraints:
+      - {left: main_gap, op: ">=", right: ego_speed * 0.6 + 3, message: 汇入前净距不足简化制动距离}
+
+  ramp_exit:
+    objective: 验证匝道汇出前的车道选择、限速遵循与出口曲率适应
+    oracle_ref: oracle.task.speed_tracking/v1
+    params:
+      ego_speed: {mean: 20, std: 5, low: 10, high: 28, risk: 1, unit: m/s}
+      exit_gap: {mean: 120, std: 40, low: 60, high: 220, risk: 0, unit: m}
+      target_ratio: {mean: 0.65, std: 0.1, low: 0.45, high: 0.85, risk: 0}
+      following_gap: {mean: 18, std: 6, low: 8, high: 35, risk: -1, unit: m}
+    variants:
+      - {key: early, label: 提前减速汇出, sub: ERL, force: {target_ratio: 0.5}}
+      - {key: late, label: 临出口连续变道, sub: LTE, force: {exit_gap: 70, target_ratio: 0.8}}
+      - {key: blocked, label: 出口排队减速, sub: BLK, force: {following_gap: 8}}
+    roles:
+      - {role: exit_traffic, type: vehicle, count: "1", spawn: {x: following_gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * target_ratio}, required: false}
+      - {role: through_traffic, type: vehicle, count: "1", spawn: {x: exit_gap * 0.5, y: 3.5, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 1.05}, required: false}
+    events:
+      - {type: cut_in, condition_type: relative_distance, condition: 距出口小于预告距离时切换至出口车道, parameters: {value: exit_gap * 0.4, rule: "<", relative_distance_type: longitudinal}, action_type: lane_change, action_parameters: {target_lane: right, complete_in: 6.0}}
+      - {type: emergency_brake, condition_type: relative_distance, condition: 出口排队时按目标比例减速, parameters: {value: following_gap, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 2 + ego_speed * 0.08}}
+
+  tunnel_driving:
+    objective: 验证隧道内明暗过渡、限速保持与前车跟驰的安全裕度
+    oracle_ref: oracle.task.speed_tracking/v1
+    params:
+      ego_speed: {mean: 16, std: 4, low: 8, high: 24, risk: 1, unit: m/s}
+      gap: {mean: 24, std: 8, low: 12, high: 45, risk: -1, unit: m}
+      light_drop: {mean: 0.7, std: 0.2, low: 0.3, high: 1, risk: 0}
+    variants:
+      - {key: steady, label: 隧道稳态跟车, sub: STY, force: {gap: 30}}
+      - {key: entry, label: 隧道入口明暗突变, sub: ENT, force: {light_drop: 0.95}}
+      - {key: exit, label: 隧道出口强光致盲, sub: EXT, force: {light_drop: 0.35}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.9}, required: true, min_count: 1}
+    events:
+      - {type: obstacle_appearance, condition_type: reach_position, condition: 进入隧道明暗过渡段, parameters: {value: light_drop * 40, rule: ">"}, action_type: speed_limit, action_parameters: {target_speed: "min(ego_speed, 18)"}}
+      - {type: sensor_failure, condition_type: simulation_time, condition: 出口强光导致视觉降级, parameters: {value: duration * 0.6, rule: ">"}, action_type: degrade_control, action_parameters: {sensor: camera_front, fault: glare_saturation, fallback: hold_lane}}
+    weather:
+      rain: rain * 0.2
+
+  roundabout:
+    objective: 验证环岛入口让行、间隙选择与环道内巡航
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 7, std: 2.5, low: 3, high: 12, risk: 1, unit: m/s}
+      n_circ: {mean: 2, std: 1, low: 1, high: 4, discrete: true}
+      circ_speed: {mean: 6, std: 2, low: 3, high: 10, risk: 1, unit: m/s}
+      entry_gap: {mean: 18, std: 6, low: 8, high: 35, risk: -1, unit: m}
+    variants:
+      - {key: free, label: 空档进入环岛, sub: FRE, force: {entry_gap: 30, n_circ: 1}}
+      - {key: busy, label: 环道车流密集, sub: BSY, force: {n_circ: 4, entry_gap: 10}}
+      - {key: yield, label: 入口让行等待, sub: YLD, force: {entry_gap: 6, circ_speed: 8}}
+    roles:
+      - {role: circulating, type: vehicle, count: "round(n_circ)", spawn: {x: entry_gap + i * 9, y: 8 - i * 1.5, yaw: 1.5708}, behavior_type: lane_follow, parameters: {target_speed: circ_speed}, required: true, min_count: 1}
+    events:
+      - {type: cut_in, condition_type: relative_distance, condition: 环道车辆距离入口不足时让行, parameters: {value: entry_gap * 0.6, rule: "<", relative_distance_type: euclidean}, action_type: yield, action_parameters: {target_speed: "max(1, ego_speed * 0.5)"}}
+
+  narrow_road_meeting:
+    objective: 验证窄路会车的横向余量保持与让行决策
+    oracle_ref: oracle.geometry.clearance/v1
+    params:
+      ego_speed: {mean: 6, std: 2, low: 2, high: 12, risk: 1, unit: m/s}
+      clearance: {mean: 0.8, std: 0.4, low: 0.3, high: 1.8, risk: -1, unit: m}
+      yield_first: {mean: 0.5, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: pass_slow, label: 低速会车通过, sub: PSL, force: {clearance: 1.4, ego_speed: 4}}
+      - {key: tight, label: 极限余量会车, sub: TGT, force: {clearance: 0.35}}
+      - {key: yield, label: 一方让行倒车, sub: YLD, force: {yield_first: 1, clearance: 0.5}}
+    roles:
+      - {role: oncoming, type: vehicle, count: "1", spawn: {x: 30, y: clearance, yaw: 3.14159}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * (1 - yield_first)}, required: true, min_count: 1}
+    events:
+      - {type: emergency_brake, condition_type: relative_distance, condition: 与对向车横向余量小于安全阈值, parameters: {value: clearance, rule: "<", relative_distance_type: lateral}, action_type: yield, action_parameters: {target_speed: "max(0, ego_speed * 0.4)"}}
+
+  uturn:
+    objective: 验证掉头过程中的对向车流避让、转弯半径与轨迹连续性
+    oracle_ref: oracle.geometry.clearance/v1
+    params:
+      ego_speed: {mean: 5, std: 2, low: 2, high: 9, risk: 1, unit: m/s}
+      oncoming_gap: {mean: 45, std: 15, low: 20, high: 90, risk: -1, unit: m}
+      oncoming_speed: {mean: 10, std: 3, low: 5, high: 18, risk: 1, unit: m/s}
+      steer_mag: {mean: 0.9, std: 0.06, low: 0.7, high: 0.98, risk: 0}
+    variants:
+      - {key: free, label: 空档掉头, sub: FRE, force: {oncoming_gap: 80}}
+      - {key: conflict, label: 对向车逼近掉头, sub: CFT, force: {oncoming_gap: 22}}
+      - {key: narrow, label: 窄口三点掉头, sub: NAR, force: {steer_mag: 0.98, ego_speed: 2.5}}
+    roles:
+      - {role: oncoming, type: vehicle, count: "1", spawn: {x: oncoming_gap, y: 0.0, yaw: 3.14159}, behavior_type: lane_follow, parameters: {target_speed: oncoming_speed}, required: false}
+    events:
+      - {type: collision, condition_type: time_to_collision, condition: 对向车 TTC 低于阈值时暂停掉头等待, parameters: {value: 3.0, rule: "<"}, action_type: stop, action_parameters: {target_speed: 0.0}}
+    ego_steer: -steer_mag
+
+  parking:
+    objective: 验证车位识别、泊入轨迹规划与最终位姿精度
+    oracle_ref: oracle.geometry.clearance/v1
+    params:
+      ego_speed: {mean: 2, std: 0.8, low: 0.5, high: 4, risk: 1, unit: m/s}
+      slot_width: {mean: 2.6, std: 0.3, low: 2.2, high: 3.2, risk: -1, unit: m}
+      n_parked: {mean: 2, std: 1, low: 1, high: 4, discrete: true}
+      aisle: {mean: 6, std: 1.2, low: 4, high: 9, risk: 0, unit: m}
+    variants:
+      - {key: vertical, label: 垂直车位泊入, sub: VER, force: {slot_width: 2.8}}
+      - {key: tight, label: 窄车位泊入, sub: TGT, force: {slot_width: 2.25}}
+      - {key: parallel, label: 侧方车位泊入, sub: PAR, force: {slot_width: 6.5, aisle: 5}}
+    roles:
+      - {role: parked_row, type: vehicle, count: "round(n_parked)", spawn: {x: 6 + i * 3, y: slot_width + 0.9, yaw: 1.5708}, behavior_type: static, parameters: {}, required: false}
+      - {role: parked_opposite, type: vehicle, count: "1", spawn: {x: -3, y: -(slot_width + 0.9), yaw: 1.5708}, behavior_type: static, parameters: {}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: reach_position, condition: 接近目标车位入口时切换泊车轨迹, parameters: {value: aisle, rule: "<"}, action_type: follow_trajectory, action_parameters: {waypoint: target_slot, road_id: parking_lot}}
+
+  # ==================== interactive（交互与冲突 10） ====================
+  cut_in:
+    objective: 验证邻道车辆切入时的目标识别、时距评估与减速避让
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 18, std: 5, low: 10, high: 24, risk: 1, unit: m/s}
+      cut_gap: {mean: 28, std: 8, low: 15, high: 42, risk: -1, unit: m}
+      lat: {mean: 3.5, std: 0.5, low: 2.5, high: 4.5, risk: -1, unit: m}
+      aggressiveness: {mean: 2.0, std: 1.3, low: 0.5, high: 5.0, risk: 1}
+      side: {mean: 1, std: 1, low: -1, high: 1, risk: 0}
+      has_second: {mean: 0.3, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: normal, label: 邻道常规切入, sub: NRM, force: {aggressiveness: 1.2, cut_gap: 30}}
+      - {key: aggressive, label: 激进加塞, sub: AGG, force: {aggressiveness: 4.0, cut_gap: 18}}
+      - {key: truck, label: 大车切入, sub: TRK, force: {aggressiveness: 1.8, cut_gap: 26, lat: 4.2}}
+      - {key: double, label: 连续两次切入, sub: DBL, force: {has_second: 1, cut_gap: 22}}
+    roles:
+      - {role: cut_in_vehicle, type: vehicle, count: "1", spawn: {x: cut_gap, y: side * lat, yaw: 0.0}, behavior_type: cut_in, parameters: {target_lane: ego_lane, cut_in_speed: aggressiveness}, required: true, min_count: 1}
+      - {role: lead, type: vehicle, count: "1", spawn: {x: cut_gap + 15, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.85}, required: false}
+      - {role: second_cut, type: vehicle, count: "round(has_second)", spawn: {x: cut_gap + 12, y: -side * lat, yaw: 0.0}, behavior_type: cut_in, parameters: {target_lane: ego_lane, cut_in_speed: aggressiveness * 0.9}, required: false}
+    events:
+      - {type: cut_in, condition_type: relative_distance, condition: 邻道车与前向净距降至切入阈值, parameters: {value: cut_gap * 0.5, rule: "<", relative_distance_type: longitudinal}, action_type: speed_change, action_parameters: {target_speed: ego_speed * 0.6}}
+      - {type: collision, condition_type: time_to_collision, condition: 切入后 TTC 低于安全阈值, parameters: {value: 2.2, rule: "<"}, action_type: brake, action_parameters: {deceleration: 4 + aggressiveness}}
+    constraints:
+      - {left: cut_gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  cut_out:
+    objective: 验证前车突然切出后的静止目标识别与紧急避撞
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 16, std: 5, low: 8, high: 24, risk: 1, unit: m/s}
+      lead_gap: {mean: 22, std: 7, low: 12, high: 40, risk: -1, unit: m}
+      hidden_gap: {mean: 18, std: 6, low: 8, high: 32, risk: -1, unit: m}
+      reveal_time: {mean: 2.5, std: 1.0, low: 1, high: 5, risk: -1, unit: s}
+      obstacle_kind: {mean: 0, std: 1, low: 0, high: 2, discrete: true}
+    variants:
+      - {key: reveal_static, label: 切出后暴露静止事故车, sub: RVS, force: {hidden_gap: 16, obstacle_kind: 0}}
+      - {key: reveal_debris, label: 切出后暴露遗洒物, sub: RVD, force: {hidden_gap: 12, reveal_time: 1.6, obstacle_kind: 1}}
+      - {key: late_reveal, label: 贴车切出, sub: LTR, force: {lead_gap: 12, hidden_gap: 10}}
+    roles:
+      - {role: lead_cutout, type: vehicle, count: "1", spawn: {x: lead_gap, y: 0.0, yaw: 0.0}, behavior_type: cut_out, parameters: {target_lane: left, complete_in: reveal_time}, required: true, min_count: 1}
+      - {role: hidden_obstacle, type: other, count: "1", spawn: {x: lead_gap + hidden_gap, y: 0.0, yaw: 0.0}, behavior_type: static, parameters: {object_kind: {select: [accident_vehicle, debris, road_barrier], index: obstacle_kind}}, required: true, min_count: 1}
+    events:
+      - {type: cut_in, condition_type: relative_distance, condition: 前车切出后暴露前方静止目标, parameters: {value: lead_gap, rule: "<", relative_distance_type: longitudinal}, action_type: emergency_stop, action_parameters: {deceleration: 6.0}}
+      - {type: collision, condition_type: time_to_collision, condition: 与静止目标 TTC 低于制动所需阈值, parameters: {value: 2.0, rule: "<"}, action_type: brake, action_parameters: {deceleration: 7.5}}
+    constraints:
+      - {left: lead_gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  pedestrian_crossing:
+    objective: 验证无信号斑马线行人横穿的感知、让行与制动
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 6, std: 2.6, low: 2, high: 11, risk: 1, unit: m/s}
+      n_ped: {mean: 2, std: 1.3, low: 1, high: 5, risk: 1, discrete: true}
+      ped_speed: {mean: 1.6, std: 0.6, low: 0.8, high: 2.6, risk: 1, unit: m/s}
+      cross_dist: {mean: 22, std: 7, low: 10, high: 36, risk: -1, unit: m}
+      group: {mean: 0.3, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: crosswalk, label: 斑马线成人过街, sub: CWK, force: {cross_dist: 24, n_ped: 1}}
+      - {key: child, label: 儿童快速横穿, sub: CHD, force: {ped_speed: 2.4, cross_dist: 16}}
+      - {key: elder, label: 老人慢速横穿, sub: ELD, force: {ped_speed: 0.9, cross_dist: 20}}
+      - {key: group, label: 群体过街, sub: GRP, force: {group: 1, n_ped: 4}}
+    roles:
+      - {role: crossing_pedestrian, type: pedestrian, count: "round(n_ped)", spawn: {x: cross_dist + i * 1.5, y: -6.0 - i * 0.6, yaw: 1.5708}, behavior_type: cross_road, parameters: {crossing_speed: ped_speed + i * 0.1}, required: true, min_count: 1}
+      - {role: waiting_pedestrian, type: pedestrian, count: "round(group)", spawn: {x: cross_dist + 4, y: -4.5, yaw: 1.5708}, behavior_type: hesitation_stop, parameters: {crossing_speed: 0.4}, required: false}
+    events:
+      - {type: pedestrian_crossing, condition_type: relative_distance, condition: 行人与自车纵向距离降至横穿触发阈值, parameters: {value: cross_dist - 5, rule: "<", relative_distance_type: longitudinal}, action_type: stop, action_parameters: {min_safe_distance: 2.0}}
+    constraints:
+      - {left: cross_dist, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  occluded_pedestrian:
+    objective: 验证鬼探头场景下遮挡后方行人的暴露、感知延迟与紧急制动
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 8, std: 2.5, low: 3, high: 14, risk: 1, unit: m/s}
+      cross_dist: {mean: 22, std: 7, low: 10, high: 36, risk: -1, unit: m}
+      occluder_gap: {mean: 4, std: 1.5, low: 2, high: 8, risk: 1, unit: m}
+      ped_speed: {mean: 2.0, std: 0.6, low: 1.0, high: 3.0, risk: 1, unit: m/s}
+      occluder_kind: {mean: 0, std: 1, low: 0, high: 2, discrete: true}
+      night_rain: {mean: 0, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: parked_van, label: 遮挡车后窜出, sub: PVN, force: {occluder_kind: 0, occluder_gap: 4, cross_dist: 18}}
+      - {key: building_corner, label: 建筑转角窜出, sub: BCR, force: {occluder_kind: 2, occluder_gap: 2.5, cross_dist: 14}}
+      - {key: night_rain, label: 夜间雨天遮挡窜出, sub: NRN, force: {night_rain: 1, occluder_kind: 1, cross_dist: 12}}
+    roles:
+      - {role: dart_out_pedestrian, type: pedestrian, count: "1", spawn: {x: cross_dist, y: -5.0, yaw: 1.5708}, behavior_type: occluded_dash, parameters: {crossing_speed: ped_speed}, required: true, min_count: 1}
+      - {role: occluder, type: other, count: "1", spawn: {x: cross_dist - occluder_gap, y: -3.2, yaw: 0.0}, behavior_type: static, parameters: {object_kind: {select: [parked_vehicle, bus_stop_shelter, building_corner], index: occluder_kind}}, required: true, min_count: 1}
+      - {role: second_pedestrian, type: pedestrian, count: "round(night_rain)", spawn: {x: cross_dist + 6, y: -5.5, yaw: 1.5708}, behavior_type: sudden_cross, parameters: {crossing_speed: ped_speed * 0.8}, required: false}
+    events:
+      - {type: pedestrian_crossing, condition_type: relative_distance, condition: 行人暴露后与自车纵向距离降至阈值, parameters: {value: cross_dist - 8, rule: "<", relative_distance_type: longitudinal}, action_type: emergency_stop, action_parameters: {deceleration: 6.5}}
+      - {type: collision, condition_type: time_to_collision, condition: 行人 TTC 低于紧急制动阈值, parameters: {value: 1.6, rule: "<"}, action_type: brake, action_parameters: {deceleration: 8.0}}
+    weather:
+      rain: "max(rain, night_rain * 45)"
+      fog: "max(fog, night_rain * 25)"
+      sun_altitude: "min(90, max(-90, sun_alt - night_rain * 60))"
+    constraints:
+      - {left: cross_dist, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  intersection_meeting:
+    objective: 验证信号路口对向/横向来车的目标排序、通行权判断与通过时机
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 6, std: 2.2, low: 3, high: 11, risk: 1, unit: m/s}
+      cross_speed: {mean: 6.5, std: 2.4, low: 3, high: 11, risk: 1, unit: m/s}
+      cross_dist: {mean: 30, std: 9, low: 15, high: 52, risk: -1, unit: m}
+      has_opposite: {mean: 0.6, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: green_straight, label: 绿灯直行会车, sub: GRN, force: {cross_dist: 34}}
+      - {key: left_conflict, label: 左转对向冲突, sub: LFT, force: {has_opposite: 1, cross_dist: 24}}
+      - {key: uncontrolled, label: 无信号路口, sub: UNC, force: {cross_dist: 18, cross_speed: 8}}
+    roles:
+      - {role: cross_vehicle, type: vehicle, count: "2", spawn: {x: cross_dist, y: -8 + i * 16, yaw: 1.5708 - i * 3.14159}, behavior_type: forward, parameters: {target_speed: cross_speed * (1 - i * 0.1)}, required: true, min_count: 1}
+      - {role: opposite_vehicle, type: vehicle, count: "round(has_opposite)", spawn: {x: cross_dist + 15, y: 0.0, yaw: 3.14159}, behavior_type: lane_follow, parameters: {target_speed: cross_speed}, required: false}
+    events:
+      - {type: collision, condition_type: relative_distance, condition: 进入路口前横向冲突车距阈值, parameters: {value: cross_dist * 0.4, rule: "<", relative_distance_type: euclidean}, action_type: traffic_light, action_parameters: {phase: green, state: hold}}
+      - {type: cut_in, condition_type: time_to_collision, condition: 横向来车 TTC 低于阈值时让行, parameters: {value: 2.5, rule: "<"}, action_type: yield, action_parameters: {target_speed: "max(1, cross_speed * 0.5)"}}
+
+  unprotected_turn:
+    objective: 验证无保护左转时对向直行车流的间隙判断与转弯轨迹控制
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 5, std: 1.8, low: 2, high: 9, risk: 1, unit: m/s}
+      oncoming_speed: {mean: 11, std: 3, low: 6, high: 18, risk: 1, unit: m/s}
+      oncoming_gap: {mean: 35, std: 12, low: 15, high: 70, risk: -1, unit: m}
+      n_oncoming: {mean: 2, std: 1, low: 1, high: 4, discrete: true}
+      steer_mag: {mean: 0.6, std: 0.1, low: 0.4, high: 0.85, risk: 0}
+    variants:
+      - {key: gap_pass, label: 间隙充足左转, sub: GAP, force: {oncoming_gap: 60, n_oncoming: 1}}
+      - {key: gap_wait, label: 等待间隙左转, sub: WAI, force: {oncoming_gap: 20}}
+      - {key: heavy_flow, label: 对向大流量左转, sub: HVY, force: {n_oncoming: 4, oncoming_speed: 14}}
+    roles:
+      - {role: oncoming_straight, type: vehicle, count: "round(n_oncoming)", spawn: {x: oncoming_gap + i * 18, y: -3.5, yaw: 3.14159}, behavior_type: forward, parameters: {target_speed: oncoming_speed}, required: true, min_count: 1}
+    events:
+      - {type: cut_in, condition_type: time_to_collision, condition: 对向直行车 TTC 低于左转安全阈值时停车让行, parameters: {value: 3.0, rule: "<"}, action_type: stop, action_parameters: {min_safe_distance: 3.0}}
+      - {type: collision, condition_type: time_to_collision, condition: 对向车 TTC 高于阈值后左转通过, parameters: {value: 4.5, rule: ">"}, action_type: speed_change, action_parameters: {target_speed: ego_speed, target_time: 4.0}}
+    ego_steer: steer_mag
+
+  construction_detour:
+    objective: 验证施工区域锥桶与作业车的识别、绕行轨迹与借道安全
+    oracle_ref: oracle.geometry.clearance/v1
+    params:
+      ego_speed: {mean: 6, std: 2.2, low: 3, high: 10, risk: 1, unit: m/s}
+      n_bar: {mean: 3, std: 1.4, low: 2, high: 6, risk: 1, discrete: true}
+      bar_dist: {mean: 16, std: 6, low: 8, high: 30, risk: -1, unit: m}
+      has_worker: {mean: 0.5, std: 0.5, low: 0, high: 1, discrete: true}
+      has_oncoming: {mean: 0.4, std: 0.5, low: 0, high: 1, discrete: true}
+      is_night: {mean: 0.3, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: cones, label: 锥桶导改, sub: CNS}
+      - {key: work_vehicle, label: 施工车辆占道, sub: WVH, force: {has_worker: 1, bar_dist: 14}}
+      - {key: borrow_lane, label: 借道绕行, sub: BRW, force: {has_oncoming: 1, bar_dist: 12}}
+      - {key: night_work, label: 夜间施工, sub: NGW, force: {has_worker: 1, is_night: 1}}
+    roles:
+      - {role: barrier, type: other, count: "round(n_bar)", spawn: {x: bar_dist + i * 4, y: 1.8, yaw: 0.0}, behavior_type: static, parameters: {object_kind: construction}, required: true, min_count: 2}
+      - {role: worker_vehicle, type: vehicle, count: "1", spawn: {x: bar_dist + n_bar * 4 + 8, y: 3.5, yaw: 0.0}, behavior_type: static, parameters: {vehicle_kind: truck}, required: false}
+      - {role: worker_pedestrian, type: pedestrian, count: "round(has_worker)", spawn: {x: bar_dist + 3, y: 2.2, yaw: 0.0}, behavior_type: static, parameters: {crossing_speed: 0.6}, required: false}
+      - {role: oncoming, type: vehicle, count: "round(has_oncoming)", spawn: {x: bar_dist + 20, y: -3.5, yaw: 3.14159}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.8}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 与锥桶阵纵向距离降至绕行触发阈值, parameters: {value: bar_dist - 6, rule: "<", relative_distance_type: longitudinal}, action_type: lane_change, action_parameters: {target_lane: left, complete_in: 6.0}}
+      - {type: collision, condition_type: relative_distance, condition: 借道时对向车纵向距离不足则回本道, parameters: {value: 15.0, rule: "<", relative_distance_type: longitudinal}, action_type: lane_offset, action_parameters: {target_lane: ego_lane}}
+    weather:
+      sun_altitude: "min(90, max(-90, sun_alt - is_night * 55))"
+    constraints:
+      - {left: bar_dist, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  cyclist_interaction:
+    objective: 验证非机动车横向穿越与并行时的间距保持及让行
+    oracle_ref: oracle.geometry.clearance/v1
+    params:
+      ego_speed: {mean: 8, std: 3, low: 3, high: 15, risk: 1, unit: m/s}
+      cyclist_speed: {mean: 4, std: 1.2, low: 2, high: 7, risk: 1, unit: m/s}
+      lateral_gap: {mean: 1.6, std: 0.6, low: 0.6, high: 3.0, risk: -1, unit: m}
+      cross_dist: {mean: 26, std: 8, low: 12, high: 45, risk: -1, unit: m}
+      n_cyclist: {mean: 1, std: 1, low: 1, high: 3, discrete: true}
+    variants:
+      - {key: parallel, label: 同向并行通过, sub: PRL, force: {lateral_gap: 2.4}}
+      - {key: cross_front, label: 非机动车横穿, sub: CRF, force: {cross_dist: 16, cyclist_speed: 5}}
+      - {key: group, label: 非机动车群, sub: GRP, force: {n_cyclist: 3, lateral_gap: 1.0}}
+    roles:
+      - {role: cyclist, type: other, count: "round(n_cyclist)", spawn: {x: cross_dist + i * 3, y: lateral_gap + i * 0.8, yaw: 0.0}, behavior_type: forward, parameters: {vehicle_kind: bicycle, target_speed: cyclist_speed}, required: true, min_count: 1}
+    events:
+      - {type: cut_in, condition_type: relative_distance, condition: 与非机动车横向间距低于安全阈值时减速让行, parameters: {value: lateral_gap, rule: "<", relative_distance_type: lateral}, action_type: speed_change, action_parameters: {target_speed: ego_speed * 0.5}}
+
+  queue_creep:
+    objective: 验证拥堵蠕行工况下的启停平顺性、时距保持与加塞响应
+    oracle_ref: oracle.task.speed_tracking/v1
+    params:
+      ego_speed: {mean: 2, std: 1.2, low: 0.5, high: 5, risk: 1, unit: m/s}
+      queue_gap: {mean: 6, std: 2, low: 3, high: 12, risk: -1, unit: m}
+      n_queue: {mean: 3, std: 1, low: 2, high: 5, discrete: true}
+      stop_cycle: {mean: 12, std: 4, low: 6, high: 22, risk: 0, unit: s}
+    variants:
+      - {key: steady_creep, label: 稳态蠕行, sub: STY, force: {queue_gap: 8}}
+      - {key: stop_go, label: 走走停停, sub: SGO, force: {stop_cycle: 6}}
+      - {key: cut_in_queue, label: 排队被加塞, sub: CUQ, force: {queue_gap: 4, n_queue: 4}}
+    roles:
+      - {role: queue_vehicle, type: vehicle, count: "round(n_queue)", spawn: {x: queue_gap * (i + 1), y: 0.0, yaw: 0.0}, behavior_type: creep, parameters: {target_speed: ego_speed, target_dist: queue_gap}, required: true, min_count: 1}
+      - {role: side_intruder, type: vehicle, count: "1", spawn: {x: queue_gap * 2, y: 3.5, yaw: 0.0}, behavior_type: aggressive_merge, parameters: {target_lane: ego_lane, cut_in_speed: ego_speed * 1.2}, required: false}
+    events:
+      - {type: emergency_brake, condition_type: time_headway, condition: 前车停止时距低于蠕行阈值, parameters: {value: 1.0, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 2.0}}
+      - {type: cut_in, condition_type: simulation_time, condition: 周期性恢复蠕行, parameters: {value: stop_cycle, rule: ">"}, action_type: speed_change, action_parameters: {target_speed: ego_speed, target_time: 3.0}}
+
+  wrong_way_encounter:
+    objective: 验证对向逆行车辆占道时的识别、减速与避让空间选择
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 12, std: 4, low: 5, high: 20, risk: 1, unit: m/s}
+      wrong_way_speed: {mean: 9, std: 3, low: 4, high: 16, risk: 1, unit: m/s}
+      encounter_gap: {mean: 60, std: 20, low: 25, high: 110, risk: -1, unit: m}
+      lateral_offset: {mean: 1.8, std: 0.8, low: 0.5, high: 3.2, risk: 0}
+    variants:
+      - {key: head_on, label: 迎面逆行占道, sub: HON, force: {lateral_offset: 1.2, encounter_gap: 50}}
+      - {key: overtake_wrong, label: 借道超车逆行, sub: OWV, force: {lateral_offset: 2.6, encounter_gap: 35}}
+      - {key: late_detect, label: 弯道后突然遭遇, sub: LTD, force: {encounter_gap: 25, wrong_way_speed: 12}}
+    roles:
+      - {role: wrong_way_vehicle, type: vehicle, count: "1", spawn: {x: encounter_gap, y: -lateral_offset, yaw: 3.14159}, behavior_type: borrow_oncoming, parameters: {target_speed: wrong_way_speed}, required: true, min_count: 1}
+    events:
+      - {type: collision, condition_type: time_to_collision, condition: 与逆行车辆 TTC 低于避险阈值, parameters: {value: 2.5, rule: "<"}, action_type: speed_change, action_parameters: {target_speed: "max(0, ego_speed * 0.3)"}}
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 选择右侧空间避让, parameters: {value: lateral_offset * 10, rule: "<", relative_distance_type: longitudinal}, action_type: lane_offset, action_parameters: {target_lane: right}}
+
+  # ==================== environment（环境与光照 8） ====================
+  rainy:
+    objective: 验证雨天湿滑路面下的感知降级、制动距离延长与跟车安全
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 6, std: 2.4, low: 2, high: 11, risk: 1, unit: m/s}
+      rain: {mean: 72, std: 24, low: 25, high: 100, risk: 1, unit: percent}
+      fog: {mean: 18, std: 15, low: 0, high: 60, risk: 1, unit: percent}
+      gap: {mean: 18, std: 6, low: 8, high: 35, risk: -1, unit: m}
+    variants:
+      - {key: light, label: 小雨, sub: LGT, force: {rain: 35, fog: 5}}
+      - {key: downpour, label: 暴雨, sub: DNP, force: {rain: 95, fog: 25}}
+      - {key: rain_fog, label: 雨雾叠加, sub: RFG, force: {rain: 78, fog: 55}}
+      - {key: standing_water, label: 积水路面, sub: STW, force: {rain: 88}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.8}, required: true, min_count: 1}
+    events:
+      - {type: emergency_brake, condition_type: time_to_collision, condition: 湿滑路面 TTC 低于延长后的制动阈值, parameters: {value: "max(1.2, 2.8 - ego_speed * 0.03)", rule: "<"}, action_type: brake, action_parameters: {deceleration: 3 + rain * 0.02}}
+    weather:
+      rain: "max(25, rain)"
+      wetness: "min(100, max(45, rain * 0.95))"
+    constraints:
+      - {left: gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  night:
+    objective: 验证低照度/无路灯条件下的目标识别、灯光使用与行人避让
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 6, std: 2.4, low: 2, high: 11, risk: 1, unit: m/s}
+      sun_alt: {mean: -20, std: 10, low: -45, high: 2, risk: -1, unit: deg}
+      n_ped: {mean: 1, std: 1.0, low: 0, high: 3, discrete: true}
+      gap: {mean: 22, std: 7, low: 10, high: 40, risk: -1, unit: m}
+      streetlight: {mean: 0.5, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: pure, label: 纯夜间, sub: PUR, force: {n_ped: 0, sun_alt: -25}}
+      - {key: night_ped, label: 夜间行人, sub: NPE, force: {n_ped: 2}}
+      - {key: no_streetlight, label: 路灯缺失, sub: NOS, force: {streetlight: 0, sun_alt: -40}}
+      - {key: oncoming_beam, label: 对向远光, sub: HBM, force: {sun_alt: -30}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.85}, required: false}
+      - {role: pedestrian_in_dark, type: pedestrian, count: "round(n_ped)", spawn: {x: gap + 8 + i * 2, y: -4.0, yaw: 1.5708}, behavior_type: cross_road, parameters: {crossing_speed: 1.2}, required: false}
+      - {role: oncoming_beam, type: vehicle, count: "1", spawn: {x: 45, y: -3.5, yaw: 3.14159}, behavior_type: lane_follow, parameters: {target_speed: ego_speed}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 低照度下目标首次可识别距离, parameters: {value: 12 + streetlight * 10, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 2.5}}
+      - {type: pedestrian_crossing, condition_type: relative_distance, condition: 夜间行人进入灯光照射区, parameters: {value: gap + 10, rule: "<", relative_distance_type: longitudinal}, action_type: yield, action_parameters: {target_speed: "max(0, ego_speed * 0.4)"}}
+    weather:
+      sun_altitude: "min(2, sun_alt)"
+      cloudiness: "min(100, max(20, 60 - streetlight * 20))"
+
+  foggy:
+    objective: 验证浓雾低能见度下的目标发现距离、限速与安全停车
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 4, std: 1.6, low: 2, high: 8, risk: 1, unit: m/s}
+      fog: {mean: 82, std: 16, low: 45, high: 100, risk: 1, unit: percent}
+      vis_dist: {mean: 14, std: 6, low: 6, high: 32, risk: -1, unit: m}
+    variants:
+      - {key: light_fog, label: 轻雾, sub: LFG, force: {fog: 55, vis_dist: 26}}
+      - {key: dense, label: 浓雾低能见度, sub: DFG, force: {fog: 92, vis_dist: 9}}
+      - {key: patchy, label: 团雾突现, sub: PTC, force: {fog: 78, vis_dist: 12}}
+    roles:
+      - {role: lead_emerge, type: vehicle, count: "1", spawn: {x: vis_dist, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.7}, required: true, min_count: 1}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 目标在雾区边缘首次被发现, parameters: {value: vis_dist, rule: "<", relative_distance_type: longitudinal}, action_type: emergency_stop, action_parameters: {deceleration: 4.0}}
+    weather:
+      fog: "max(45, fog)"
+      rain: rain * 0.3
+    constraints:
+      - {left: vis_dist, op: ">=", right: ego_speed * 0.6 + 3, message: 能见度不足简化制动距离}
+
+  backlight:
+    objective: 验证强光逆光下的相机过曝、目标检测降级与避撞
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 6, std: 2.2, low: 2, high: 11, risk: 1, unit: m/s}
+      sun_alt: {mean: 5, std: 4, low: -2, high: 16, risk: 1, unit: deg}
+      sun_az: {mean: 100, std: 40, low: 60, high: 140, risk: 0, unit: deg}
+      gap: {mean: 20, std: 6, low: 10, high: 38, risk: -1, unit: m}
+    variants:
+      - {key: sunrise, label: 日出逆光, sub: SRI, force: {sun_alt: 6, sun_az: 90}}
+      - {key: sunset, label: 日落逆光, sub: SSS, force: {sun_alt: 4, sun_az: 270}}
+      - {key: tunnel_exit, label: 隧道出口强光, sub: TEX, force: {sun_alt: 3, gap: 14}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.9}, required: true, min_count: 1}
+      - {role: roadside_sign, type: other, count: "1", spawn: {x: gap + 4, y: 3.0, yaw: 0.0}, behavior_type: static, parameters: {object_kind: sign}, required: false}
+    events:
+      - {type: sensor_failure, condition_type: relative_distance, condition: 逆光导致前视相机过曝, parameters: {value: gap + 10, rule: "<", relative_distance_type: longitudinal}, action_type: degrade_control, action_parameters: {sensor: camera_front, fault: glare_saturation, fallback: hold_lane}}
+      - {type: emergency_brake, condition_type: relative_distance, condition: 前车在逆光下尾部可识别距离, parameters: {value: gap * 0.6, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 3.0}}
+    weather:
+      sun_altitude: "min(20, sun_alt)"
+      sun_azimuth: sun_az
+      rain: rain * 0.2
+
+  snowy:
+    objective: 验证雪天低能见度与低附着路面下的感知、制动与跟车安全
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 5, std: 2, low: 2, high: 10, risk: 1, unit: m/s}
+      snow: {mean: 0.5, std: 0.3, low: 0.1, high: 1.0, risk: 1}
+      fog: {mean: 35, std: 20, low: 20, high: 80, risk: 1, unit: percent}
+      sun_alt: {mean: -2, std: 10, low: -25, high: 15, risk: -1, unit: deg}
+      gap: {mean: 20, std: 6, low: 10, high: 38, risk: -1, unit: m}
+    variants:
+      - {key: light_snow, label: 小雪巡航, sub: LSN, force: {snow: 0.25}}
+      - {key: heavy_snow, label: 大雪低能见度, sub: HSN, force: {snow: 0.95, fog: 60}}
+      - {key: snow_follow, label: 积雪跟车, sub: SFL, force: {snow: 0.7, gap: 14}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.75}, required: true, min_count: 1}
+    events:
+      - {type: emergency_brake, condition_type: time_to_collision, condition: 雪面低附着下 TTC 低于安全阈值, parameters: {value: "max(1.5, 3.2 - snow)", rule: "<"}, action_type: brake, action_parameters: {deceleration: 2.5}}
+    weather:
+      rain: 0.0
+      cloudiness: "min(100, max(85, 78 + snow * 22))"
+      wetness: "min(100, max(60, 55 + snow * 45))"
+      fog: "max(20, fog)"
+      sun_altitude: "min(15, max(-90, sun_alt))"
+    constraints:
+      - {left: gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  icy:
+    objective: 验证结冰路面低附着下的制动距离延长、打滑与轨迹保持
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 5, std: 2, low: 2, high: 9, risk: 1, unit: m/s}
+      ice_level: {mean: 0.6, std: 0.3, low: 0.2, high: 1.0, risk: 1}
+      sun_alt: {mean: 10, std: 15, low: -20, high: 35, risk: -1, unit: deg}
+      gap: {mean: 22, std: 7, low: 10, high: 40, risk: -1, unit: m}
+    variants:
+      - {key: mild_ice, label: 局部结冰, sub: MIC, force: {ice_level: 0.3}}
+      - {key: black_ice, label: 黑冰路面, sub: BIC, force: {ice_level: 0.95, gap: 14}}
+      - {key: bridge_ice, label: 桥面结冰, sub: BRI, force: {ice_level: 0.8, sun_alt: -5}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.7}, required: true, min_count: 1}
+    events:
+      - {type: emergency_brake, condition_type: time_to_collision, condition: 低附着路面 TTC 低于安全阈值时缓制动, parameters: {value: "max(1.8, 3.6 - ice_level)", rule: "<"}, action_type: brake, action_parameters: {deceleration: 1.5}}
+      - {type: collision, condition_type: offroad, condition: 打滑越出车道时回正, parameters: {value: 0.5, rule: ">"}, action_type: lane_offset, action_parameters: {target_lane: ego_lane}}
+    weather:
+      rain: rain * 0.3
+      wetness: "min(100, max(50, 40 + ice_level * 60))"
+      cloudiness: "min(100, max(60, 55 + ice_level * 40))"
+      sun_altitude: "min(10, max(-90, sun_alt))"
+    constraints:
+      - {left: gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  haze:
+    objective: 验证霾低能见度下的目标识别衰减与安全距离策略
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 6, std: 2, low: 2, high: 12, risk: 1, unit: m/s}
+      fog: {mean: 55, std: 15, low: 30, high: 80, risk: 1, unit: percent}
+      vis_dist: {mean: 25, std: 8, low: 12, high: 45, risk: -1, unit: m}
+      pm: {mean: 0.6, std: 0.3, low: 0.1, high: 1.0, risk: 1}
+    variants:
+      - {key: mild_haze, label: 轻度霾, sub: MHZ, force: {pm: 0.3, vis_dist: 36}}
+      - {key: heavy_haze, label: 重度霾, sub: HHZ, force: {pm: 0.9, vis_dist: 16}}
+      - {key: haze_traffic, label: 霾天车流, sub: HTF, force: {pm: 0.7, vis_dist: 20}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: vis_dist, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.8}, required: true, min_count: 1}
+      - {role: side_traffic, type: vehicle, count: "1", spawn: {x: vis_dist + 12, y: 3.5, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 霾中目标首次明确可识别, parameters: {value: vis_dist, rule: "<", relative_distance_type: longitudinal}, action_type: speed_limit, action_parameters: {target_speed: "min(ego_speed, 10)"}}
+    weather:
+      fog: "max(30, fog)"
+      cloudiness: "min(100, max(40, 45 + pm * 40))"
+      wetness: "min(100, max(10, 15 + pm * 20))"
+    constraints:
+      - {left: vis_dist, op: ">=", right: ego_speed * 0.6 + 3, message: 能见度不足简化制动距离}
+
+  dusk_dawn:
+    objective: 验证黄昏/黎明低太阳高度角下的照度突变、开灯时机与目标识别
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 7, std: 2.5, low: 3, high: 14, risk: 1, unit: m/s}
+      sun_alt: {mean: -1, std: 6, low: -12, high: 10, risk: -1, unit: deg}
+      gap: {mean: 20, std: 6, low: 10, high: 38, risk: -1, unit: m}
+      n_ped: {mean: 1, std: 0.8, low: 0, high: 3, discrete: true}
+    variants:
+      - {key: dusk, label: 黄昏时分, sub: DSK, force: {sun_alt: -4}}
+      - {key: dawn, label: 黎明逆光, sub: DWN, force: {sun_alt: 2}}
+      - {key: twilight_ped, label: 暮色行人, sub: TWP, force: {n_ped: 2, sun_alt: -6}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.9}, required: true, min_count: 1}
+      - {role: pedestrian, type: pedestrian, count: "round(n_ped)", spawn: {x: gap + 6 + i * 2, y: -4.2, yaw: 1.5708}, behavior_type: cross_road, parameters: {crossing_speed: 1.3}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 照度突变导致目标对比度下降, parameters: {value: gap * 0.8, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 2.5}}
+    weather:
+      sun_altitude: "min(10, max(-90, sun_alt))"
+      cloudiness: "min(100, max(30, 50 + fog * 0.2))"
+
+  # ==================== corner_case（极端与失效 16） ====================
+  emergency_braking:
+    objective: 验证前车紧急制动下的 AEB 触发时机、制动强度与最小安全距离
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 16, std: 6, low: 8, high: 24, risk: 1, unit: m/s}
+      gap: {mean: 13, std: 5, low: 6, high: 24, risk: -1, unit: m}
+      decel: {mean: 6, std: 2.2, low: 3, high: 9.5, risk: 1, unit: m/s^2}
+      ttc: {mean: 1.6, std: 0.8, low: 0.8, high: 3.2, risk: -1, unit: s}
+      has_obstacle: {mean: 0.3, std: 0.5, low: 0, high: 1, discrete: true}
+      has_ped: {mean: 0.3, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: lead_aeb, label: 前车急刹 AEB, sub: AEB, force: {has_obstacle: 0, has_ped: 0}}
+      - {key: obstacle_trigger, label: 障碍触发急刹, sub: OBS, force: {has_obstacle: 1, has_ped: 0}}
+      - {key: ped_trigger, label: 行人触发急刹, sub: PED, force: {has_obstacle: 0, has_ped: 1, gap: 14}}
+      - {key: wet_high_speed, label: 高速湿滑近距离急刹, sub: WHS, force: {ego_speed: 22, gap: 9}}
+    roles:
+      - {role: lead_hard_brake, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.5}, required: true, min_count: 1}
+      - {role: aeb_obstacle, type: other, count: "round(has_obstacle)", spawn: {x: gap + 4, y: 0.3, yaw: 0.0}, behavior_type: static, parameters: {object_kind: debris}, required: false}
+      - {role: aeb_pedestrian, type: pedestrian, count: "round(has_ped)", spawn: {x: gap + 3, y: -2.5, yaw: 1.5708}, behavior_type: sudden_cross, parameters: {crossing_speed: 1.8}, required: false}
+    events:
+      - {type: emergency_brake, condition_type: time_to_collision, condition: 碰撞时间低于 AEB 触发阈值, parameters: {value: ttc, rule: "<"}, action_type: emergency_stop, action_parameters: {deceleration: decel}}
+    constraints:
+      - {left: gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  obstacle_appearance:
+    objective: 验证前方静/动态障碍物突现时的感知、决策与紧急避让
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 9, std: 4, low: 3, high: 18, risk: 1, unit: m/s}
+      appear_x: {mean: 15, std: 5, low: 8, high: 24, risk: -1, unit: m}
+      kind_idx: {mean: 2, std: 1.6, low: 0, high: 4, discrete: true}
+      has_occluder: {mean: 0.3, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: cargo, label: 掉落货物, sub: CRG, force: {kind_idx: 3}}
+      - {key: debris, label: 碎片轮胎, sub: DEB, force: {kind_idx: 1}}
+      - {key: animal, label: 动物窜出, sub: ANM, force: {kind_idx: 2, has_occluder: 1}}
+      - {key: lead_stop, label: 前车急停暴露障碍, sub: LSP, force: {appear_x: 12}}
+    roles:
+      - {role: sudden_obstacle, type: other, count: "1", spawn: {x: appear_x, y: 0.4, yaw: 0.0}, behavior_type: static, parameters: {object_kind: {select: [cone, tyre, animal, fallen_load, road_barrier], index: kind_idx}}, required: true, min_count: 1}
+      - {role: occluder, type: vehicle, count: "round(has_occluder)", spawn: {x: appear_x - 6, y: 3.2, yaw: 0.0}, behavior_type: static, parameters: {vehicle_kind: van}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 障碍物进入可识别距离, parameters: {value: appear_x - 4, rule: "<", relative_distance_type: longitudinal}, action_type: emergency_stop, action_parameters: {deceleration: 6.0}}
+    constraints:
+      - {left: appear_x, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  sensor_failure:
+    objective: 验证传感器黑帧/点云丢失/幽灵回波下的降级策略与安全停车
+    oracle_ref: oracle.localization.degraded/v1
+    params:
+      ego_speed: {mean: 6, std: 2.4, low: 2, high: 11, risk: 1, unit: m/s}
+      fail_x: {mean: 11, std: 5, low: 4, high: 22, risk: -1, unit: m}
+      sensor_idx: {mean: 2, std: 1.4, low: 0, high: 4, discrete: true}
+      fault_idx: {mean: 2, std: 1.4, low: 0, high: 4, discrete: true}
+      cascade: {mean: 0.2, std: 0.4, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: camera_black, label: 相机黑帧, sub: CAM, force: {sensor_idx: 0, fault_idx: 0}}
+      - {key: lidar_dropout, label: 激光雷达点云丢失, sub: LDR, force: {sensor_idx: 1, fault_idx: 1}}
+      - {key: radar_ghost, label: 雷达幽灵回波, sub: RDG, force: {sensor_idx: 2, fault_idx: 2}}
+      - {key: gnss_lost, label: GNSS 失锁, sub: GNS, force: {sensor_idx: 4, fault_idx: 3}}
+      - {key: cascade, label: 多传感器级联失效, sub: CSC, force: {cascade: 1, fail_x: 6}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: fail_x + 10, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.8}, required: false}
+    events:
+      - {type: sensor_failure, condition_type: traveled_distance, condition: 行驶到传感器失效点, parameters: {value: fail_x, rule: ">"}, action_type: degrade_control, action_parameters: {sensor: {select: [camera_front, lidar_top, radar_front, camera_rear, gnss], index: sensor_idx}, fault: {select: [black_frame, point_dropout, ghost_return, freeze, denied], index: fault_idx}, fallback: limp_home}}
+      - {type: sensor_failure, condition_type: traveled_distance, condition: 多传感器级联失效后进入最小风险状态, parameters: {value: fail_x + 6, rule: ">"}, action_type: degrade_control, action_parameters: {sensor: radar_front, fault: denied, fallback: minimal_risk_manoeuvre}}
+    constraints:
+      - {left: fail_x, op: ">=", right: ego_speed * 0.6 + 3, message: 失效点距不足简化制动距离}
+
+  multi_vehicle_mixed:
+    objective: 验证多车混行（机动车+行人+路侧物体）下的目标优先级与安全通行
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 6, std: 2.4, low: 2, high: 11, risk: 1, unit: m/s}
+      n_v: {mean: 5, std: 1.6, low: 3, high: 7, discrete: true}
+      n_p: {mean: 2, std: 1.2, low: 1, high: 4, discrete: true}
+      spread: {mean: 7, std: 3, low: 3, high: 14, risk: 1, unit: m}
+      school: {mean: 0.3, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: roundabout, label: 环岛混行, sub: RDB, force: {n_v: 5}}
+      - {key: school_zone, label: 学校区域, sub: SCH, force: {school: 1, n_p: 3}}
+      - {key: construction_zone, label: 施工区混行, sub: CNZ, force: {n_p: 3}}
+      - {key: peak_dense, label: 高峰密集车流, sub: PKD, force: {n_v: 7, spread: 4}}
+    roles:
+      - {role: mixed_vehicle, type: vehicle, count: "round(n_v)", spawn: {x: spread + i * 6, y: 3.5 - (i - 2 * round(i / 2)) * 7, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * (0.8 + i * 0.05)}, required: true, min_count: 3}
+      - {role: mixed_pedestrian, type: pedestrian, count: "round(n_p)", spawn: {x: spread * 2 + i * 2, y: -6.0 - i, yaw: 1.5708}, behavior_type: cross_road, parameters: {crossing_speed: 1.4}, required: true, min_count: 1}
+      - {role: roadside_object, type: other, count: "1", spawn: {x: spread * 3 + 10, y: 4.5, yaw: 0.0}, behavior_type: static, parameters: {object_kind: bin}, required: false}
+    events:
+      - {type: cut_in, condition_type: relative_distance, condition: 混行车流中邻道车辆切入, parameters: {value: spread * 2, rule: "<", relative_distance_type: longitudinal}, action_type: speed_change, action_parameters: {target_speed: ego_speed * 0.5}}
+      - {type: pedestrian_crossing, condition_type: relative_distance, condition: 行人横穿进入冲突区, parameters: {value: spread * 3 + 6, rule: "<", relative_distance_type: longitudinal}, action_type: yield, action_parameters: {min_safe_distance: 3.0}}
+
+  stationary_obstacle:
+    objective: 验证车道内静止障碍物的发现、绕行决策与横向安全余量
+    oracle_ref: oracle.geometry.clearance/v1
+    params:
+      ego_speed: {mean: 10, std: 3.5, low: 4, high: 18, risk: 1, unit: m/s}
+      obstacle_x: {mean: 30, std: 10, low: 15, high: 60, risk: -1, unit: m}
+      lateral: {mean: 0.4, std: 0.3, low: 0, high: 1.0, risk: 0}
+      kind_idx: {mean: 2, std: 1.4, low: 0, high: 4, discrete: true}
+    variants:
+      - {key: broken_vehicle, label: 故障抛锚车, sub: BRK, force: {kind_idx: 0, obstacle_x: 35}}
+      - {key: road_works, label: 路中施工围挡, sub: RWK, force: {kind_idx: 1, lateral: 0.8}}
+      - {key: blocked_lane, label: 完全堵道, sub: BLK, force: {kind_idx: 2, obstacle_x: 20}}
+    roles:
+      - {role: stationary_obstacle, type: other, count: "1", spawn: {x: obstacle_x, y: lateral, yaw: 0.0}, behavior_type: static, parameters: {object_kind: {select: [broken_vehicle, road_barrier, container, tyre, bin], index: kind_idx}}, required: true, min_count: 1}
+      - {role: follow_vehicle, type: vehicle, count: "1", spawn: {x: obstacle_x + 20, y: 3.5, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.9}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 静止障碍物进入绕行决策距离, parameters: {value: obstacle_x * 0.6, rule: "<", relative_distance_type: longitudinal}, action_type: lane_change, action_parameters: {target_lane: left, complete_in: 5.0}}
+    constraints:
+      - {left: obstacle_x, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  debris_spillage:
+    objective: 验证路面遗洒物（多碎片）识别、可通行性判断与减速通过
+    oracle_ref: oracle.geometry.clearance/v1
+    params:
+      ego_speed: {mean: 12, std: 4, low: 5, high: 20, risk: 1, unit: m/s}
+      n_debris: {mean: 4, std: 2, low: 2, high: 8, discrete: true}
+      debris_x: {mean: 26, std: 9, low: 12, high: 50, risk: -1, unit: m}
+      spread_y: {mean: 1.6, std: 0.8, low: 0.4, high: 3.0, risk: 0}
+      kind_idx: {mean: 0, std: 1, low: 0, high: 2, discrete: true}
+    variants:
+      - {key: scattered, label: 散落碎片, sub: SCT, force: {kind_idx: 0, n_debris: 5}}
+      - {key: large_object, label: 大体积掉落物, sub: LGO, force: {kind_idx: 1, n_debris: 2, debris_x: 18}}
+      - {key: slippery_spill, label: 湿滑遗洒物, sub: SLP, force: {kind_idx: 2, spread_y: 2.6}}
+    roles:
+      - {role: debris, type: other, count: "round(n_debris)", spawn: {x: debris_x + i * 2.5, y: (i - 2) * spread_y, yaw: 0.0}, behavior_type: static, parameters: {object_kind: {select: [fallen_load, tyre, gravel, liquid, container], index: i + kind_idx}}, required: true, min_count: 2}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 遗洒物进入可通行判断距离, parameters: {value: debris_x * 0.5, rule: "<", relative_distance_type: longitudinal}, action_type: speed_change, action_parameters: {target_speed: ego_speed * 0.5}}
+      - {type: collision, condition_type: relative_distance, condition: 无法绕行时减速直行通过, parameters: {value: debris_x * 0.25, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 3.0}}
+    constraints:
+      - {left: debris_x, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  animal_crossing:
+    objective: 验证动物突然窜入车道的识别、减速与避让策略
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 10, std: 4, low: 3, high: 20, risk: 1, unit: m/s}
+      animal_x: {mean: 24, std: 8, low: 10, high: 45, risk: -1, unit: m}
+      animal_speed: {mean: 3.5, std: 1.5, low: 1.0, high: 7.0, risk: 1, unit: m/s}
+      animal_kind: {mean: 0, std: 1, low: 0, high: 2, discrete: true}
+    variants:
+      - {key: dog_dash, label: 狗突然窜出, sub: DOG, force: {animal_kind: 0, animal_speed: 5.0}}
+      - {key: deer_cross, label: 大型动物横穿, sub: DER, force: {animal_kind: 1, animal_x: 18}}
+      - {key: herd, label: 群畜穿行, sub: HRD, force: {animal_kind: 2, animal_speed: 2.0}}
+    roles:
+      - {role: animal, type: other, count: "1", spawn: {x: animal_x, y: -4.5, yaw: 1.5708}, behavior_type: sudden_cross, parameters: {animal_kind: {select: [dog, deer, cattle], index: animal_kind}, crossing_speed: animal_speed}, required: true, min_count: 1}
+    events:
+      - {type: pedestrian_crossing, condition_type: relative_distance, condition: 动物进入车道且距自车低于阈值, parameters: {value: animal_x - 6, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 4.5}}
+    constraints:
+      - {left: animal_x, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  door_opening:
+    objective: 验证路侧停车开门瞬间的非机动车/行人冲突避让
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 7, std: 2.5, low: 3, high: 14, risk: 1, unit: m/s}
+      door_x: {mean: 20, std: 7, low: 10, high: 38, risk: -1, unit: m}
+      lateral: {mean: 2.4, std: 0.6, low: 1.5, high: 3.4, risk: -1, unit: m}
+      n_parked: {mean: 2, std: 1, low: 1, high: 4, discrete: true}
+      has_cyclist: {mean: 0.4, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: door_open, label: 路边突然开门, sub: DOR, force: {lateral: 2.2}}
+      - {key: cyclist_hit, label: 开门撞倒非机动车, sub: CYH, force: {has_cyclist: 1, lateral: 2.0}}
+      - {key: bus_door, label: 公交上下客开门, sub: BSD, force: {n_parked: 1, lateral: 3.2}}
+    roles:
+      - {role: parked_vehicle, type: vehicle, count: "round(n_parked)", spawn: {x: door_x + i * 8, y: lateral, yaw: 0.0}, behavior_type: door_open, parameters: {vehicle_kind: car}, required: true, min_count: 1}
+      - {role: exiting_person, type: pedestrian, count: "1", spawn: {x: door_x, y: lateral - 0.9, yaw: 1.5708}, behavior_type: boarding, parameters: {crossing_speed: 1.0}, required: true, min_count: 1}
+      - {role: cyclist, type: other, count: "round(has_cyclist)", spawn: {x: door_x + 4, y: lateral - 1.6, yaw: 3.14159}, behavior_type: forward, parameters: {vehicle_kind: bicycle, target_speed: 4.0}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 车门开启形成横向障碍, parameters: {value: door_x - 5, rule: "<", relative_distance_type: longitudinal}, action_type: lane_offset, action_parameters: {target_lane: left}}
+    constraints:
+      - {left: door_x, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  child_chasing_ball:
+    objective: 验证儿童追球场景下小球先入车道、儿童随后冲出的连锁风险应对
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 7, std: 2.5, low: 3, high: 13, risk: 1, unit: m/s}
+      cross_dist: {mean: 20, std: 6, low: 10, high: 34, risk: -1, unit: m}
+      child_speed: {mean: 2.6, std: 0.8, low: 1.4, high: 4.0, risk: 1, unit: m/s}
+      n_child: {mean: 1, std: 1, low: 1, high: 3, discrete: true}
+      ball_ahead: {mean: 3, std: 1.5, low: 1, high: 6, risk: 0, unit: m}
+    variants:
+      - {key: roadside_dash, label: 路边追球冲出, sub: RSD, force: {cross_dist: 18, child_speed: 3.0}}
+      - {key: ball_first, label: 球先滚入车道, sub: BLF, force: {ball_ahead: 6, cross_dist: 22}}
+      - {key: multi_child, label: 多儿童追逐, sub: MTC, force: {n_child: 3, cross_dist: 14}}
+    roles:
+      - {role: child, type: pedestrian, count: "round(n_child)", spawn: {x: cross_dist + i * 2.0, y: -5.5 - i * 0.8, yaw: 1.5708}, behavior_type: child_chase_ball, parameters: {crossing_speed: child_speed}, required: true, min_count: 1}
+      - {role: ball, type: other, count: "1", spawn: {x: cross_dist - ball_ahead, y: -1.5, yaw: 0.0}, behavior_type: static, parameters: {object_kind: ball}, required: true, min_count: 1}
+      - {role: guardian, type: pedestrian, count: "round(n_child)", spawn: {x: cross_dist + 6, y: -6.5, yaw: 1.5708}, behavior_type: hesitation_stop, parameters: {crossing_speed: 0.6}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 小球滚入车道触发首次告警, parameters: {value: cross_dist - ball_ahead, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 3.0}}
+      - {type: pedestrian_crossing, condition_type: relative_distance, condition: 儿童冲入车道时紧急停车, parameters: {value: cross_dist - 5, rule: "<", relative_distance_type: longitudinal}, action_type: emergency_stop, action_parameters: {deceleration: 7.0}}
+    constraints:
+      - {left: cross_dist, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  aggressive_cut_in:
+    objective: 验证激进加塞博弈下的跟驰距离保持与礼让/不让行策略
+    oracle_ref: oracle.safety.min_distance/v1
+    params:
+      ego_speed: {mean: 16, std: 4, low: 8, high: 22, risk: 1, unit: m/s}
+      cut_gap: {mean: 14, std: 5, low: 6, high: 24, risk: -1, unit: m}
+      lat: {mean: 3.2, std: 0.4, low: 2.4, high: 4.0, risk: 0}
+      aggressiveness: {mean: 4.0, std: 0.8, low: 2.5, high: 5.0, risk: 1}
+      has_second: {mean: 0.4, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: squeeze, label: 贴身加塞, sub: SQZ, force: {cut_gap: 8, aggressiveness: 4.6}}
+      - {key: forced_merge, label: 强行并道, sub: FMG, force: {cut_gap: 12}}
+      - {key: double_cut, label: 连续加塞, sub: DBL, force: {has_second: 1, cut_gap: 10}}
+    roles:
+      - {role: aggressive_vehicle, type: vehicle, count: "1", spawn: {x: cut_gap, y: -lat, yaw: 0.0}, behavior_type: aggressive_merge, parameters: {target_lane: ego_lane, cut_in_speed: aggressiveness}, required: true, min_count: 1}
+      - {role: second_vehicle, type: vehicle, count: "round(has_second)", spawn: {x: cut_gap + 9, y: lat, yaw: 0.0}, behavior_type: aggressive_merge, parameters: {target_lane: ego_lane, cut_in_speed: aggressiveness * 0.9}, required: false}
+    events:
+      - {type: cut_in, condition_type: time_to_collision, condition: 加塞车 TTC 低于阈值时减速礼让, parameters: {value: 2.0, rule: "<"}, action_type: brake, action_parameters: {deceleration: 3.5}}
+    constraints:
+      - {left: cut_gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  accident_scene:
+    objective: 验证事故现场（事故车+散落物+围观人员）的绕行与安全通过
+    oracle_ref: oracle.geometry.clearance/v1
+    params:
+      ego_speed: {mean: 8, std: 3, low: 3, high: 15, risk: 1, unit: m/s}
+      scene_x: {mean: 32, std: 10, low: 15, high: 60, risk: -1, unit: m}
+      n_accident: {mean: 2, std: 1, low: 1, high: 3, discrete: true}
+      n_bystander: {mean: 2, std: 1, low: 0, high: 4, discrete: true}
+      has_oncoming: {mean: 0.4, std: 0.5, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: two_car, label: 双车事故, sub: TWC, force: {n_accident: 2}}
+      - {key: multi_car, label: 多车连撞, sub: MTC, force: {n_accident: 3, n_bystander: 3}}
+      - {key: night_accident, label: 夜间事故现场, sub: NAC, force: {has_oncoming: 1}}
+    roles:
+      - {role: accident_vehicle, type: vehicle, count: "round(n_accident)", spawn: {x: scene_x + i * 5, y: (i - 2 * round(i / 2)) * 2.2, yaw: 0.3 - i * 0.6}, behavior_type: static, parameters: {vehicle_kind: car}, required: true, min_count: 1}
+      - {role: bystander, type: pedestrian, count: "round(n_bystander)", spawn: {x: scene_x - 4 + i * 2, y: -3.0 - i * 1.2, yaw: 1.5708}, behavior_type: static, parameters: {crossing_speed: 0.3}, required: false}
+      - {role: oncoming, type: vehicle, count: "round(has_oncoming)", spawn: {x: scene_x + 20, y: -3.5, yaw: 3.14159}, behavior_type: lane_follow, parameters: {target_speed: ego_speed}, required: false}
+    events:
+      - {type: obstacle_appearance, condition_type: relative_distance, condition: 事故现场进入绕行决策距离, parameters: {value: scene_x * 0.6, rule: "<", relative_distance_type: longitudinal}, action_type: lane_change, action_parameters: {target_lane: left, complete_in: 5.5}}
+      - {type: collision, condition_type: relative_distance, condition: 对向有车时降速通过, parameters: {value: scene_x * 0.3, rule: "<", relative_distance_type: longitudinal}, action_type: speed_limit, action_parameters: {target_speed: 5.0}}
+    weather:
+      sun_altitude: "min(90, max(-90, sun_alt - has_oncoming * 55))"
+    constraints:
+      - {left: scene_x, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}
+
+  degraded_localization:
+    objective: 验证定位漂移/地图失配下的横向控制降级与安全靠边停车
+    oracle_ref: oracle.localization.degraded/v1
+    params:
+      ego_speed: {mean: 10, std: 3, low: 4, high: 18, risk: 1, unit: m/s}
+      drift_x: {mean: 12, std: 4, low: 4, high: 26, risk: -1, unit: m}
+      drift_m: {mean: 1.2, std: 0.6, low: 0.3, high: 2.8, risk: 1, unit: m}
+      gap: {mean: 25, std: 8, low: 12, high: 45, risk: -1, unit: m}
+    variants:
+      - {key: drift, label: 定位横向漂移, sub: DRF, force: {drift_m: 2.0}}
+      - {key: map_mismatch, label: 高精地图失配, sub: MMS, force: {drift_x: 8}}
+      - {key: tunnel_lost, label: 隧道内短时失锁, sub: TLS, force: {drift_m: 0.6}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.85}, required: false}
+    events:
+      - {type: sensor_failure, condition_type: traveled_distance, condition: 定位漂移量超过阈值, parameters: {value: drift_x, rule: ">"}, action_type: degrade_control, action_parameters: {sensor: gnss, fault: position_drift, fallback: hold_lane}}
+      - {type: emergency_brake, condition_type: traveled_distance, condition: 降级后进入安全靠边停车, parameters: {value: drift_x + 30, rule: ">"}, action_type: stop, action_parameters: {min_safe_distance: 5.0}}
+
+  comms_failure:
+    objective: 验证通信中断时的云控指令保持、降级运行与人工接管
+    oracle_ref: oracle.localization.degraded/v1
+    params:
+      ego_speed: {mean: 12, std: 4, low: 5, high: 20, risk: 1, unit: m/s}
+      loss_x: {mean: 15, std: 5, low: 5, high: 30, risk: -1, unit: m}
+      loss_time: {mean: 6, std: 3, low: 2, high: 15, risk: -1, unit: s}
+      gap: {mean: 22, std: 7, low: 10, high: 40, risk: -1, unit: m}
+    variants:
+      - {key: short_loss, label: 短时通信中断, sub: SLS, force: {loss_time: 3}}
+      - {key: long_loss, label: 长时通信中断, sub: LLS, force: {loss_time: 15}}
+      - {key: takeover, label: 中断后人工接管, sub: MTO, force: {loss_time: 8}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.9}, required: false}
+    events:
+      - {type: sensor_failure, condition_type: traveled_distance, condition: 车云链路中断, parameters: {value: loss_x, rule: ">"}, action_type: degrade_control, action_parameters: {sensor: v2x, fault: link_lost, fallback: hold_lane}}
+      - {type: manual_takeover, condition_type: simulation_time, condition: 中断超过阈值请求接管, parameters: {value: loss_time, rule: ">"}, action_type: manual_takeover, action_parameters: {complete_in: 3.0}}
+
+  actuator_failure:
+    objective: 验证制动/转向执行器故障后的降级控制与最小风险停车
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 12, std: 4, low: 5, high: 20, risk: 1, unit: m/s}
+      fail_x: {mean: 12, std: 4, low: 4, high: 26, risk: -1, unit: m}
+      gap: {mean: 26, std: 8, low: 12, high: 45, risk: -1, unit: m}
+      actuator_idx: {mean: 0, std: 1, low: 0, high: 1, discrete: true}
+    variants:
+      - {key: brake_fail, label: 制动执行器卡滞, sub: BRF, force: {actuator_idx: 0}}
+      - {key: steer_fail, label: 转向执行器失效, sub: STF, force: {actuator_idx: 1}}
+      - {key: throttle_stuck, label: 油门卡滞, sub: THS, force: {fail_x: 6}}
+    roles:
+      - {role: lead, type: vehicle, count: "1", spawn: {x: gap, y: 0.0, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * 0.8}, required: true, min_count: 1}
+    events:
+      - {type: sensor_failure, condition_type: traveled_distance, condition: 执行器故障被诊断, parameters: {value: fail_x, rule: ">"}, action_type: degrade_control, action_parameters: {sensor: {select: [brake_actuator, steering_actuator], index: actuator_idx}, fault: stuck, fallback: minimal_risk_manoeuvre}}
+      - {type: emergency_brake, condition_type: simulation_time, condition: 降级后执行最小风险停车, parameters: {value: 5.0, rule: ">"}, action_type: emergency_stop, action_parameters: {deceleration: 2.5}}
+
+  driver_incapacitation:
+    objective: 验证驾驶员失能后的接管检测、最小风险策略与安全停车
+    oracle_ref: oracle.safety.no_collision/v1
+    params:
+      ego_speed: {mean: 15, std: 4, low: 6, high: 22, risk: 1, unit: m/s}
+      detect_time: {mean: 6, std: 2.5, low: 2, high: 14, risk: -1, unit: s}
+      lane_drift: {mean: 1.4, std: 0.6, low: 0.4, high: 3.0, risk: 1, unit: m}
+      n_vehicle: {mean: 2, std: 1, low: 1, high: 3, discrete: true}
+    variants:
+      - {key: sudden_syncope, label: 突发失去意识, sub: SSC, force: {detect_time: 3}}
+      - {key: slow_drift, label: 缓慢晕厥偏驶, sub: SLD, force: {lane_drift: 2.6}}
+      - {key: highway_mrm, label: 高速路失能停车, sub: HWM, force: {ego_speed: 22, detect_time: 8}}
+    roles:
+      - {role: surrounding_vehicle, type: vehicle, count: "round(n_vehicle)", spawn: {x: 30 + i * 18, y: 3.5 - (i - 2 * round(i / 2)) * 7, yaw: 0.0}, behavior_type: lane_follow, parameters: {target_speed: ego_speed * (0.9 - i * 0.1)}, required: true, min_count: 1}
+    events:
+      - {type: manual_takeover, condition_type: simulation_time, condition: 驾驶员失能被检测到, parameters: {value: detect_time, rule: ">"}, action_type: degrade_control, action_parameters: {sensor: driver_monitor, fault: incapacity, fallback: minimal_risk_manoeuvre}}
+      - {type: emergency_brake, condition_type: simulation_time, condition: 执行最小风险停车, parameters: {value: detect_time + 2, rule: ">"}, action_type: emergency_stop, action_parameters: {deceleration: 2.0, min_safe_distance: 5.0}}
+
+  minimal_risk_manoeuvre:
+    objective: 验证无法继续自动驾驶时降级控制与最小风险停车（MRM）的完整执行
+    oracle_ref: oracle.safety.no_collision/v1
+    required_events: true
+    params:
+      ego_speed: {mean: 14, std: 4, low: 6, high: 24, risk: 1, unit: m/s}
+      trigger_time: {mean: 5, std: 2, low: 2, high: 12, risk: -1, unit: s}
+      decel: {mean: 2.0, std: 0.8, low: 1.0, high: 4.0, risk: 0, unit: m/s^2}
+      gap: {mean: 30, std: 10, low: 15, high: 55, risk: -1, unit: m}
+    roles: []
+    events:
+      - {type: emergency_brake, condition_type: simulation_time, condition: 系统请求降级并启动最小风险策略, parameters: {value: trigger_time, rule: ">"}, action_type: degrade_control, action_parameters: {sensor: ads, fault: capability_insufficient, fallback: minimal_risk_manoeuvre}}
+      - {type: emergency_brake, condition_type: simulation_time, condition: 降级后执行最小风险停车, parameters: {value: trigger_time + 2, rule: ">"}, action_type: emergency_stop, action_parameters: {deceleration: decel, min_safe_distance: 5.0}}
+    variants:
+      - {key: lane_keep_mrm, label: 本车道内减速停车, sub: LKM, force: {decel: 1.5}}
+      - {key: shoulder_pull_over, label: 靠边应急车道停车, sub: SPO, force: {decel: 2.5}}
+      - {key: rapid_mrm, label: 紧急最小风险停车, sub: RMR, force: {decel: 4.0, trigger_time: 3}}
+    constraints:
+      - {left: gap, op: ">=", right: ego_speed * 0.6 + 3, message: 初始纵向距离不足简化制动距离}

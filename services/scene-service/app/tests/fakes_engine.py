@@ -342,6 +342,9 @@ class InMemorySuiteRepository:
     async def get(self, suite_id: UUID) -> ScenarioSuite | None:
         return self.suites.get(suite_id)
 
+    async def get_by_name(self, name: str) -> ScenarioSuite | None:
+        return next((row for row in self.suites.values() if row.name == name), None)
+
     async def list_page(self, *, page: int, page_size: int) -> tuple[list[ScenarioSuite], int]:
         rows = sorted(self.suites.values(), key=lambda row: row.create_time, reverse=True)
         start = (page - 1) * page_size

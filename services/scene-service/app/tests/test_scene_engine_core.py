@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+from hunter_common.scene_taxonomy import get_scene_taxonomy
 
 from app.config import settings
 from app.scene_engine.catalog import CATALOG, CATALOG_BY_ID, CATALOG_VERSION
@@ -114,9 +115,16 @@ def test_catalog_version_matches_settings() -> None:
     assert CATALOG_VERSION == settings.scene_catalog_version
 
 
-def test_catalog_has_17_scenarios_and_unique_ids() -> None:
-    assert len(CATALOG) == 17
-    assert len(CATALOG_BY_ID) == 17
+def test_catalog_covers_all_composable_scene_types() -> None:
+    """目录应覆盖受控字典内全部可合成类型（46 类），且 logical_id 唯一。"""
+    composable = {
+        scene_type
+        for scene_type, spec in get_scene_taxonomy().scene_types.items()
+        if spec.category in {"basic", "interactive", "environment", "corner_case"}
+    }
+    assert len(CATALOG) == 46
+    assert len(CATALOG_BY_ID) == 46
+    assert {ir.scene_type for ir in CATALOG} == composable
 
 
 @pytest.mark.parametrize("ir", CATALOG, ids=lambda ir: ir.logical_id)

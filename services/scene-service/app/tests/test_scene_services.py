@@ -172,6 +172,20 @@ def test_render_export_document_batch_container() -> None:
     assert text.count("</OpenSCENARIO>") == 2
 
 
+def test_render_export_document_openscenario_maps_events() -> None:
+    """OSC 导出：事件映射为标准 Trigger/Action，参与者附控制器，天气入 Environment。"""
+    service = _scene_service()
+    scene = service.to_schema(make_scene_model(scene_type="occluded_pedestrian"))
+    text = render_export_document([scene], SceneExportFormat.OPENSCENARIO_1_2).decode("utf-8")
+    assert "<StartTrigger>" in text
+    assert "RelativeDistanceCondition" in text or "TimeToCollisionCondition" in text
+    assert "hunter-occluded_dash-controller" in text
+    assert "<Environment name=\"hunter-weather\">" in text
+    assert "SimulationTimeCondition value=" in text
+    # 自由参数仍以注释保留，便于现场追溯
+    assert "x-hunter-action" in text and "x-hunter-trigger" in text
+
+
 def test_export_file_name_follows_contract_naming() -> None:
     """文件名遵循契约命名 scene-{scene_id}-{version}.{ext}。"""
     service = _scene_service()

@@ -8340,6 +8340,120 @@ V1.24.8~V1.24.11 在平台侧建立了整套「地图可用出生点」能力（
 - **两个既有 L5 缺陷未修**（scene-service 25 端点不在契约；ota-service `/readyz` 多报 minio），需单开条目。
 - **`docs/` 不入库与「四件套同步」惯例相冲**（延续 V1.24.11 §10）：仍未解决。
 
+## V1.26.0（场景库语义化重建与 CARLA 执行对齐）
+
+Date：2026-11-09
+变更类型：功能新增 / 数据重建（场景内容事实来源由「每类手写」改为「语义契约驱动」）
+
+### 1. 现场（三条用户反馈）
+
+1. 仿真端执行平台下发场景时**看不到交通参与者**（鬼探头主车前无行人横穿），现场日志 `actors=1/1`、下发成功；
+2. 平台批量创建的场景**内容雷同**，无法区分测试目的与效果（大量类型退化成「1 辆前车 + 直行」）；
+3. 要求参考 CARLA 仿真测试技术**改进场景库、场景生成器、用例与测试集**。
+
+### 2. 根因
+
+- **内容缺失而非别名键**：旧生成器/模板按类型手写片段，`occluded_pedestrian` 等多类场景只落了自车 + 前车，平台也没有任何闸门能发现「类型要求行人/遮挡物但一个都没有」⇒ 下发成功但仿真端只能看到 1 辆车。
+- **无单一事实来源**：生成器、模板、场景引擎目录、用例派生各自维护类型清单，新增类型只补一处即出现「目录有、模板没有、用例没有」的半成品内容。
+- **无执行可判性**：`behavior_type`/`condition_type`/`action_type` 只存字符串，没有到 CARLA ScenarioRunner/OpenSCENARIO 的显式映射，未支持组合会被静默当成直行。
+
+### 3. 变更内容
+
+- **契约**：`contracts/scene-taxonomy.yaml`（`version` 1.0 → **1.1**，纯新增不改旧值）新增 `scene_semantics`（46 类可合成类型：objective / oracle_ref / params / variants / roles / events / weather / duration / ego_steer / constraints），`custom` 与 `real_vehicle_replay` 无语义契约。
+- **共享层**（`hunter_common/scene_taxonomy.py`）：解析并强校验语义（角色类型/行为、事件条件/动作、参数白名单、可行性约束、表达式引用），**递规不降级**（YAML 出错即启动失败）。
+- **语义层**（新增 `scene_engine/semantics.py`）：`build_semantic_config`（表达式驱动实例化）、`check_scene_semantics`（G9：role_missing / role_underflow / role_type_mismatch / role_behavior_mismatch / events_missing）、`audit_roles`/`group_actors`（actor_id 前缀回溯 + 唯一 (类型,行为) 兜底）、`semantic_fingerprint`（角色×行为×事件×天气档位）、`list_semantics`（只读摘要）。
+- **入库/下发双侧闸门**：`SceneService._validate_config`（create/update/publish → 2001，`details.missing_roles`）与 `SceneSimulationService._require_semantics`（下发前复检 → 2001，日志 `scene_semantics_blocked_dispatch`）与 G9 同源。
+- **目录**（新增 `catalog_semantics.py` + `catalog.py`）：场景引擎目录由 17 类扩到 46 类语义合成（含判据/角色维度覆盖统计）。
+- **生成器/模板**：`scripts/batch_add_scenes.py` 与 `templates.py` 改为语义驱动（参数采样 + variants + 指纹去重 + 必需角色自检），不再按类型手写片段。
+- **执行映射**（新增 `carla_execution.py`）：41 项 `behavior_type`、27 项 `action_type`、16 项 `condition_type` 到 CARLA/OpenSCENARIO 的显式映射 + `check_executable`（未支持组合显式列出，禁止静默直行）；`esmini.py::build_xosc` 输出真实 Controller/SpeedAction/EnvironmentAction/StartTrigger。
+- **用例派生**：`/testcases/derive`、`/suites/derive` 按语义 objective/判据/角色生成内容（`case_key` 幂等、zone 过滤、锁定测试集跳过）。
+- **只读端点**：`GET /api/v1/scene/semantics`（`listSceneSemantics`，端点 24 → 25）+ 5 个 Schema，前端「语义自检（G9）」卡片与「添加参与者按角色补齐」复用同源数据。
+- **自检脚本**：新增 `scripts/verify_scene_semantics.py`（平台 API 或 `--from-file` dry-run 产物两种数据源；输出「必需角色 / 实际角色 / 缺失 / 多余 / 违例」表，有缺失退出码 1）。
+- **文档**（本地 `docs/`，不入库）：新增 `docs/CARLA场景执行映射.md`；`carla-integration.md` §5.4.1、`HunterSim接入清单.md` §6.1 补语义闸门与 `scene_config` 契约说明。
+
+### 4. 兼容性
+
+- **下发载荷结构不变**：语义信息只影响内容生成与校验，`actors`/`events` 字段与别名键一律不改（仿真端仍按 `actor_id` 回溯角色）。
+- ⚠ **旧场景会被拦**：`create/update/publish/run` 现在会对 46 类强制必需角色；存量数据按第 6 节**清空重建**规避，`scene_type=custom` 不受约束。
+- 新增端点属纯只读附加能力，未同步 `x-hunter-endpoints` 的旧客户端不受影响。
+
+### 5. 验证（本地门禁实跑）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 语义单元测试 | `pytest services/scene-service/app/tests/test_scene_semantics.py` | **15 passed**（缺角色/类型/行为/实例不足/事件缺失/回溯兜底/指纹区分/入库 2001/下发拦截） |
+| 契约字典测试 | `pytest common/python/tests/test_scene_taxonomy_semantics.py` | **7 passed**（46 类齐全、角色/事件受控值、参数与约束自洽、变体 ≥ 2） |
+| scene-service 全量 | `pytest services/scene-service/app/tests` | **511 passed** |
+| 聚合单元门禁 | `python scripts/run_unit_tests.py` | **1832 passed / 1 failed / 1 skipped**；唯一失败为 `common/python` 的 `test_ddl_column_parity_with_orm`（`scene_svc.sim_node_registry` 未登记，**V1.24.1 既有缺口**，见 §9） |
+| L5 测试层 | `python scripts/verify_test_layer.py` | 标记一致性 / 阈值登记 / 报告模板 / 用例号 全 OK |
+| 生成器离线自证 | `batch_add_scenes.py --dry-run --seed 20261109` | **2490 条**，Schema 校验 2490/2490，每类指纹 ≥ 5、必需角色覆盖 100%、违例 0 |
+| 语义自检脚本 | `verify_scene_semantics.py --from-file <dry-run 产物>` | 46/46 类型必需角色全覆盖，**EXIT=0**；篡改场景（删行人）复跑得 `role_missing`、EXIT=1 |
+| ruff | `ruff check services/scene-service/app` / `common/python` / `flink-jobs` | 前两者通过（`common/python` 仅余 5 个既有 UP046/UP047，位于 `repository.py`/`responses.py`，非本轮引入） |
+| 前端类型 | `npm run type-check` | 通过 |
+
+> 同轮修正 `flink-jobs/tests/test_consumer_group_contract.py`：`x-hunter-kafka.consumes` 的**正则订阅**条目（`carla.*.sensor_data`）用 `topic_pattern` 表达，原断言硬取 `entry["topic"]` 导致 `KeyError`（既有红灯）。改为按 `topic_pattern or topic` 比对并校验 `subscribe_mode` 一致。
+
+### 6. 实机执行（存量数据重建，需运行中的 DB + scene-service）
+
+```bash
+# ① 先让本轮镜像上线（语义契约/执行映射随镜像内置；不重建则 /semantics 仍 404、生成器仍按旧片段出场景）
+cd /opt/HunterCore && git pull
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env build scene-service web-portal
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env up -d --force-recreate scene-service web-portal
+
+# ② 清空前先看清单：统计将被物理删除的条数与样例（期望 = 旧库全部场景数）
+sudo bash scripts/clear-scenes.sh --dry-run
+
+# ③ 物理清空 scene_svc.scenes 并释放 scene_name 唯一约束（published 无法走软删除 API，故直连 DB）
+sudo bash scripts/clear-scenes.sh --yes
+
+# ④ 离线自证：Schema 全过、语义违例 0、每类指纹 ≥ 2、必需角色覆盖 100%（不提交 API）
+python3 scripts/batch_add_scenes.py --dry-run --seed 20261109 --output scripts/output/rebuild-dryrun.json
+
+# ⑤ 正式入库（direct 直连 scene-service；--publish 创建即发布；固定 seed 保证可复现）
+python3 scripts/batch_add_scenes.py --mode direct --base-url http://localhost:8081 --user-id <admin_uuid> --roles admin --publish --seed 20261109
+
+# ⑥ 同步 46 类逻辑目录，再逐类创建生成任务（每类 count 条，Z1–Z4 配额由 profile 决定）
+H=(-H "X-User-Id: <admin_uuid>" -H "X-Roles: admin")
+curl -sS -X POST http://localhost:8081/api/v1/scene/logical/sync "${H[@]}"
+for lid in $(curl -sS "http://localhost:8081/api/v1/scene/logical?include_catalog=true&limit=200" "${H[@]}" \
+  | python3 -c 'import json,sys; print(" ".join(i["logical_id"] for i in json.load(sys.stdin)["data"]["items"]))'); do
+  curl -sS -X POST http://localhost:8081/api/v1/scene/generate "${H[@]}" -H 'Content-Type: application/json' \
+    -d "{\"logical_id\":\"$lid\",\"count\":20,\"strategy\":\"distribution\",\"profile\":\"regression\",\"seed\":20261109}"
+done
+
+# ⑦ 用例/测试集派生（scene_types 省略 = 目录内全部可合成类型；case_key 幂等，可反复跑）
+curl -sS -X POST http://localhost:8081/api/v1/scene/testcases/derive "${H[@]}" -H 'Content-Type: application/json' -d '{}'
+curl -sS -X POST http://localhost:8081/api/v1/scene/suites/derive "${H[@]}" -H 'Content-Type: application/json' -d '{"include_concrete":true}'
+
+# ⑧ 重建后自证（期望 EXIT=0、46/46 类型必需角色全覆盖；有缺失即退出码 1 并逐类列出缺口角色）
+python3 scripts/verify_scene_semantics.py --base-url http://localhost:8081 --mode direct --user-id <admin_uuid> --roles admin --json-out scripts/output/verify-semantics.json
+
+# ⑨ 现场闭环：取鬼探头（LS-INT-003）具体场景下发，核对 actors=N/N 且行人横穿可见
+curl -sS -G http://localhost:8081/api/v1/scene --data-urlencode "keyword=鬼探头" --data "page_size=5" "${H[@]}"
+curl -sS -X POST http://localhost:8081/api/v1/scene/<scene_id>/run "${H[@]}"
+```
+
+> ⚠ ②③ 会**物理删除**全部场景且不可回滚：执行前先确认备份（`scripts/backup.sh`）与 `scene_name` 唯一约束释放目标无误；⑤ 的 `--seed 20261109` 决定内容，换种子即换一整批内容，不要与其它批次混用同一随机种子做对比。
+
+### 7. 风险
+
+- **一次性内容变化**：重建后场景 ID/名称全部变化，引用旧 `scene_id` 的外部记录（用例、测试集、报告）会失效，需重新派生。
+- **强校验会拒绝旧内容**：任何绕过本平台直接写库的旧场景，下发时会被 2001 拦住（这正是 `actors=1/1` 的防线）。
+- **覆盖占比变化**：目录扩到 46 类后 `coverage_gaps` 口径随之变化，覆盖面板数值不可与 V1.25.0 横向比较。
+
+### 8. 回滚
+
+- `git revert` 本轮提交可恢复旧生成器/模板；**但已重建的数据不会自动回滚**，需按旧版本重新生成。
+
+### 9. 待办
+
+- **实机重建与下发核对未在本机执行**（本机无 PostgreSQL / 无运行中的 scene-service），第 6 节需在部署机执行；
+- `scene_svc.sim_node_registry` 仍未登记进 `common/python` 的 DDL/ORM 契约清单（延续 V1.24.1 缺口，需 Alembic/er.md/orm-mapping.md 一并决策）；
+- `common/python` 余 5 条 UP046/UP047（`repository.py`/`responses.py`）待统一升级泛型写法；
+- `docs/` 仍为忽略项：本轮三份文档改动不会随 `git pull` 到达部署机，需单独分发。
+
+
 
 
 

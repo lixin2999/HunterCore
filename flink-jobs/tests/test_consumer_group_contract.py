@@ -107,7 +107,12 @@ def test_openapi_consumes_agree_with_group_entries(
     """openapi ``x-hunter-kafka.consumes`` 的组/topic/jobs 必须与 consumer-groups.yaml 逐条一致。"""
     for entry in contract["x-hunter-kafka"]["consumes"]:
         group = groups[entry["group_id"]]
-        assert entry["topic"] in group["subscribes"], (entry["group_id"], entry["topic"])
+        # 动态 Topic（如 carla.*.sensor_data）用正则订阅，openapi 侧以 topic_pattern 表达；
+        # 两者必须是同一个字面量，避免“契约写 topic、组写 pattern”的静默错配。
+        pattern = entry.get("topic_pattern") or entry["topic"]
+        assert pattern in group["subscribes"], (entry["group_id"], pattern)
+        if "subscribe_mode" in entry:
+            assert entry["subscribe_mode"] == group.get("subscribe_mode"), entry["group_id"]
         if "jobs" in entry and group.get("jobs") is not None:
             assert entry["jobs"] == group["jobs"], entry["group_id"]
 

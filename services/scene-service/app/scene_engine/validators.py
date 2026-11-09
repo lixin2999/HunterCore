@@ -1,7 +1,8 @@
 """八道校验门（G1-G8）与双轴分级（稀有度 × 临界度）。
 
 G1 语法/结构 · G2 参数 · G3 地图 · G4 阿克曼运动学 · G5 干跑 · G6 可避免性 ·
-G7 真实性 · G8 去重（批级，由生成器在入批前执行并回填结果）。
+G7 真实性 · G8 去重（批级，由生成器在入批前执行并回填结果）·
+G9 语义完整性（必需参与者角色/行为/事件是否具备，见 ``scene_engine.semantics``）。
 
 分级口径（§2.3 / §2.8.1）：
 - 临界度 ``CI = a_req / a_max``，``a_req = v² / (2·(d - d_m))``；
@@ -25,6 +26,7 @@ from pydantic import ValidationError
 from app.models.scene_engine import Avoidability, CriticalityLevel, RarityZone, RiskLevel
 from app.scene_engine.esmini import EsminiRunner
 from app.scene_engine.ir import SceneIR, is_finite_number
+from app.scene_engine.semantics import check_scene_semantics, semantics_for
 from app.scene_engine.stats import chi2_sf, mahalanobis_d2, rarity_zone
 from app.scene_engine.vehicle_params import VehicleParams, get_vehicle_params
 from app.schemas.scene import SceneConfig, ensure_scene_type
@@ -64,7 +66,7 @@ class GateResult:
 
 @dataclass(slots=True)
 class ValidationReport:
-    """G1-G7 的汇总（G8 由生成器追加）。"""
+    """G1-G7 + G9 的汇总（G8 由生成器追加）。"""
 
     gates: list[GateResult] = field(default_factory=list)
 
@@ -273,7 +275,7 @@ def run_gates(
     bounds: tuple[float, float, float, float] | None = None,
     esmini: EsminiRunner | None = None,
 ) -> ValidationReport:
-    """执行 G1-G7（G8 由生成器在批级追加；物理能力取 vehicle_params）。"""
+    """执行 G1-G7 + G9（G8 由生成器在批级追加；物理能力取 vehicle_params）。"""
     resolved_vehicle = vehicle or get_vehicle_params()
     report = ValidationReport()
 
@@ -384,6 +386,20 @@ def run_gates(
             realism_problem = f"参与者 {actor.get('actor_id')} 减速度 {deceleration} 超限"
             break
     report.add("G7", realism_problem is None, realism_problem or "参数真实性检查通过")
+
+    # G9 语义完整性：按 scene_semantics 复核必需角色/行为/事件，杜绝"下发成功但只有 1 个
+    # 参与者"（无合成语义的类型如 custom/实车回放标记 skipped，不参与判定）
+    if semantics_for(ir.scene_type) is None:
+        report.add("G9", True, f"场景类型 {ir.scene_type} 未声明语义契约，跳过", skipped=True)
+    else:
+        semantics_problems = check_scene_semantics(ir.scene_type, config, values=values)
+        report.add(
+            "G9",
+            not semantics_problems,
+            "语义完整：必需角色/行为/事件齐备"
+            if not semantics_problems
+            else "；".join(problem.message for problem in semantics_problems[:5]),
+        )
 
     return report
 

@@ -572,6 +572,15 @@ class SuiteRepository:
                 )
             ).scalars().first()
 
+    async def get_by_name(self, name: str) -> ScenarioSuite | None:
+        """按名称取测试集（名称唯一；自动派生据此幂等复用）。"""
+        async with self._db.session() as session:
+            return (
+                await session.execute(
+                    select(ScenarioSuite).where(ScenarioSuite.name == name)
+                )
+            ).scalars().first()
+
     async def list_page(self, *, page: int, page_size: int) -> tuple[list[ScenarioSuite], int]:
         stmt = (
             select(ScenarioSuite)

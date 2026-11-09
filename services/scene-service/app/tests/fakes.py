@@ -25,6 +25,12 @@ from hunter_common.exceptions import (
 from app.core.client_ip import build_base_url
 from app.repositories.carla import SimInstance, SimInstanceSnapshot
 from app.repositories.sim_nodes import NodeEndpoint
+from app.scene_engine.semantics import (
+    build_actors,
+    build_events,
+    build_weather,
+    semantics_for,
+)
 
 #: 默认创建者（与契约 creator 的 uuid 语义一致）
 DEFAULT_CREATOR = UUID("11111111-1111-4111-8111-111111111111")
@@ -38,26 +44,35 @@ _DEFAULT_WEATHER: dict[str, float] = {
     "sun_azimuth": 0.0,
     "sun_altitude": 45.0,
 }
+#: 契约地图段（非原点坐标，便于识别「是否误删了原点」）
+_DEFAULT_MAP: dict[str, Any] = {
+    "map_id": "Town01",
+    "map_type": "carla_town",
+    "spawn_point": {"x": 120.5, "y": 310.25, "z": 0.0, "yaw": 0.0},
+}
+#: 契约成功判据
+_DEFAULT_CRITERIA: dict[str, Any] = {
+    "max_speed_deviation": 0.5,
+    "no_collision": True,
+    "min_safe_distance": 3.0,
+}
 
 
-def config_payload(**overrides: Any) -> dict[str, Any]:
-    """构造 4.2.2 结构 config（可直接作为创建/更新请求的 config）。"""
+def config_payload(scene_type: str = "straight_cruise", **overrides: Any) -> dict[str, Any]:
+    """构造 4.2.2 结构 config（可直接作为创建/更新请求的 config）。
+
+    参与者/事件/天气取自 ``scene_semantics`` 语义契约（与批量生成器/模板同源）：G9 闸门会
+    拒绝「无参与者/无事件」的降级内容，测试数据必须与真实下发内容一致；未声明语义的类型
+    （``custom``）或未受控类型回落 ``straight_cruise`` 语义，以便由 Schema 层报错。
+    """
+    semantics = semantics_for(scene_type) or semantics_for("straight_cruise")
     payload: dict[str, Any] = {
-        "map": {
-            "map_id": "Town01",
-            "map_type": "carla_town",
-            # 非原点坐标（有效值由仿真端校验/替换，V1.25.0）：用 0 会让“是否误删了原点”难以从断言里看出
-            "spawn_point": {"x": 120.5, "y": 310.25, "z": 0.0, "yaw": 0.0},
-        },
+        "map": dict(_DEFAULT_MAP),
         "ego_vehicle": {"model": "HUNTER_SE", "initial_speed": 1.5, "initial_steer": 0.0},
-        "weather": dict(_DEFAULT_WEATHER),
-        "actors": [],
-        "events": [],
-        "success_criteria": {
-            "max_speed_deviation": 0.5,
-            "no_collision": True,
-            "min_safe_distance": 3.0,
-        },
+        "weather": build_weather(semantics) if semantics is not None else dict(_DEFAULT_WEATHER),
+        "actors": build_actors(semantics) if semantics is not None else [],
+        "events": build_events(semantics) if semantics is not None else [],
+        "success_criteria": dict(_DEFAULT_CRITERIA),
         "duration": 30.0,
     }
     payload.update(overrides)
@@ -65,13 +80,14 @@ def config_payload(**overrides: Any) -> dict[str, Any]:
 
 
 def create_payload(scene_name: str = "直线巡航场景", **overrides: Any) -> dict[str, Any]:
-    """构造 POST /api/v1/scene 请求体。"""
+    """构造 POST /api/v1/scene 请求体（config 默认随 scene_type 的语义契约生成）。"""
+    scene_type = str(overrides.get("scene_type") or "straight_cruise")
     payload: dict[str, Any] = {
         "scene_name": scene_name,
-        "scene_type": "straight_cruise",
+        "scene_type": scene_type,
         "description": "单元测试场景",
         "tags": ["test", "basic"],
-        "config": config_payload(),
+        "config": config_payload(scene_type),
     }
     payload.update(overrides)
     return payload
@@ -95,7 +111,7 @@ def make_scene_model(
         scene_name=scene_name,
         scene_type=scene_type,
         description="单元测试场景",
-        config_json=config if config is not None else config_payload(),
+        config_json=config if config is not None else config_payload(scene_type),
         version=version,
         creator=creator,
         create_time=now,
