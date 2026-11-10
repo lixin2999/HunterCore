@@ -8407,34 +8407,52 @@ sudo bash scripts/clear-scenes.sh --dry-run
 # ③ 物理清空 scene_svc.scenes 并释放 scene_name 唯一约束（published 无法走软删除 API，故直连 DB）
 sudo bash scripts/clear-scenes.sh --yes
 
-# ④ 离线自证：Schema 全过、语义违例 0、每类指纹 ≥ 2、必需角色覆盖 100%（不提交 API）
-python3 scripts/batch_add_scenes.py --dry-run --seed 20261109 --output scripts/output/rebuild-dryrun.json
+# ④⑤⑧ 的 python3 脚本依赖 pydantic/hunter_common/app：宿主机裸跑必 ModuleNotFoundError，
+# 一律在 scene-service 镜像内执行（镜像自带依赖与字典；仓库 rw 挂到 /repo，产物落回宿主机）。
+# --user 0:0：镜像默认非 root(10001)，而 /repo/.env 在宿主机是 0600 root，settings 读它必 PermissionError；
+#   dry-run 不连 DB，环境变量仍由 compose 注入（优先级高于 .env）
+C=(docker compose -f infra/deploy/docker-compose.yml --project-directory .)
+PY=("${C[@]}" run --rm --no-deps --user 0:0 -v "$PWD:/repo" -w /repo --entrypoint python3 scene-service)
 
-# ⑤ 正式入库（direct 直连 scene-service；--publish 创建即发布；固定 seed 保证可复现）
-python3 scripts/batch_add_scenes.py --mode direct --base-url http://localhost:8081 --user-id <admin_uuid> --roles admin --publish --seed 20261109
+# ④ 离线自证：Schema 全过、语义违例 0、每类指纹 ≥ 2、必需角色覆盖 100%（不提交 API）
+"${PY[@]}" scripts/batch_add_scenes.py --dry-run --seed 20261109 --output scripts/output/rebuild-dryrun.json
+
+# ⑤ 正式入库（容器内用服务名；GATEWAY_HMAC_SECRET 由 compose 环境自动注入用于验签；--publish 创建即发布）
+"${PY[@]}" scripts/batch_add_scenes.py --mode direct --base-url http://scene-service:8081 \
+  --user-id <admin_uuid> --roles admin --publish --seed 20261109
+#    备选（走网关 JWT，免直连验签）：--mode gateway --base-url http://api-gateway:8080 \
+#      --username admin --password '<pwd>'   ⚠ 网关单会话：跑批期间勿用同账号登 Web
+#<admin_uuid> 可以用这条命令获取：docker exec hunter-postgres psql -U hunter -d hunter_core -tAc "select user_id from user_svc.users where username='admin';"
 
 # ⑥ 同步 46 类逻辑目录，再逐类创建生成任务（每类 count 条，Z1–Z4 配额由 profile 决定）
-H=(-H "X-User-Id: <admin_uuid>" -H "X-Roles: admin")
-curl -sS -X POST http://localhost:8081/api/v1/scene/logical/sync "${H[@]}"
-for lid in $(curl -sS "http://localhost:8081/api/v1/scene/logical?include_catalog=true&limit=200" "${H[@]}" \
+#    生产配了 GATEWAY_HMAC_SECRET 时，宿主机直连 8081 带 X-User-Id/X-Roles 会 401；改走网关 JWT
+#    （网关按前缀 /api/v1/scene 透传，engine 端点同样适用；JWT 有效期 30min）
+TOKEN=$(curl -sS -X POST http://localhost:8080/api/v1/user/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<pwd>"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])')
+H=(-H "Authorization: Bearer $TOKEN")
+curl -sS -X POST http://localhost:8080/api/v1/scene/logical/sync "${H[@]}"
+for lid in $(curl -sS "http://localhost:8080/api/v1/scene/logical?include_catalog=true&limit=200" "${H[@]}" \
   | python3 -c 'import json,sys; print(" ".join(i["logical_id"] for i in json.load(sys.stdin)["data"]["items"]))'); do
-  curl -sS -X POST http://localhost:8081/api/v1/scene/generate "${H[@]}" -H 'Content-Type: application/json' \
+  curl -sS -X POST http://localhost:8080/api/v1/scene/generate "${H[@]}" -H 'Content-Type: application/json' \
     -d "{\"logical_id\":\"$lid\",\"count\":20,\"strategy\":\"distribution\",\"profile\":\"regression\",\"seed\":20261109}"
 done
 
 # ⑦ 用例/测试集派生（scene_types 省略 = 目录内全部可合成类型；case_key 幂等，可反复跑）
-curl -sS -X POST http://localhost:8081/api/v1/scene/testcases/derive "${H[@]}" -H 'Content-Type: application/json' -d '{}'
-curl -sS -X POST http://localhost:8081/api/v1/scene/suites/derive "${H[@]}" -H 'Content-Type: application/json' -d '{"include_concrete":true}'
+curl -sS -X POST http://localhost:8080/api/v1/scene/testcases/derive "${H[@]}" -H 'Content-Type: application/json' -d '{}'
+curl -sS -X POST http://localhost:8080/api/v1/scene/suites/derive "${H[@]}" -H 'Content-Type: application/json' -d '{"include_concrete":true}'
 
 # ⑧ 重建后自证（期望 EXIT=0、46/46 类型必需角色全覆盖；有缺失即退出码 1 并逐类列出缺口角色）
-python3 scripts/verify_scene_semantics.py --base-url http://localhost:8081 --mode direct --user-id <admin_uuid> --roles admin --json-out scripts/output/verify-semantics.json
+"${PY[@]}" scripts/verify_scene_semantics.py --mode direct --base-url http://scene-service:8081 \
+  --user-id <admin_uuid> --roles admin --json-out scripts/output/verify-semantics.json
 
 # ⑨ 现场闭环：取鬼探头（LS-INT-003）具体场景下发，核对 actors=N/N 且行人横穿可见
-curl -sS -G http://localhost:8081/api/v1/scene --data-urlencode "keyword=鬼探头" --data "page_size=5" "${H[@]}"
-curl -sS -X POST http://localhost:8081/api/v1/scene/<scene_id>/run "${H[@]}"
+curl -sS -G http://localhost:8080/api/v1/scene --data-urlencode "keyword=鬼探头" --data "page_size=5" "${H[@]}"
+curl -sS -X POST http://localhost:8080/api/v1/scene/<scene_id>/run "${H[@]}"
 ```
 
 > ⚠ ②③ 会**物理删除**全部场景且不可回滚：执行前先确认备份（`scripts/backup.sh`）与 `scene_name` 唯一约束释放目标无误；⑤ 的 `--seed 20261109` 决定内容，换种子即换一整批内容，不要与其它批次混用同一随机种子做对比。
+> ⚠ ④⑤⑧ **不要在宿主机裸跑** `python3 scripts/*.py`（宿主机无 pydantic/hunter_common ⇒ `ModuleNotFoundError`），统一用上面的 `"${PY[@]}"`；⑥⑦⑨ 的网关 JWT 有效期 30min 且**单会话**（登录会顶掉同账号 Web 会话），跑批期间不要用同账号登录前端。
+> ⚠ **执行 ⑦⑧ 前先重建镜像**：V1.26.0 镜像上 `GET /api/v1/scene/concrete` 与 `POST /api/v1/scene/suites/derive` 会整体 5000（`defer` 多参数缺陷），修复与重跑步骤见 **V1.26.1**。
 
 ### 7. 风险
 
@@ -8452,6 +8470,144 @@ curl -sS -X POST http://localhost:8081/api/v1/scene/<scene_id>/run "${H[@]}"
 - `scene_svc.sim_node_registry` 仍未登记进 `common/python` 的 DDL/ORM 契约清单（延续 V1.24.1 缺口，需 Alembic/er.md/orm-mapping.md 一并决策）；
 - `common/python` 余 5 条 UP046/UP047（`repository.py`/`responses.py`）待统一升级泛型写法；
 - `docs/` 仍为忽略项：本轮三份文档改动不会随 `git pull` 到达部署机，需单独分发。
+
+## V1.26.1（缺陷修复：`defer` 多参数被当成关系路径链 —— `/concrete` 与 `/suites/derive` 整体 5000）
+
+Date：2026-11-10
+变更类型：缺陷修复（scene-service 只读查询的语句构造）+ 新增免数据库回归钉桩；**必须重建 `scene-service` 镜像**才生效（服务代码在镜像内）
+
+### 1. 现场
+
+按 V1.26.0 第 6 节在部署机执行，④–⑦ 全部通过、唯 ⑧ 整体失败：
+
+```text
+# ④ dry-run（容器内）
+[validate] 通过 2490/2490 条（Schema=True）
+[dry-run] 已写出 2490 条场景 → scripts/output/rebuild-dryrun.json
+
+# ⑤ 入库（mode=direct，--publish）
+=== 提交结果 ===
+新建: 2490  幂等跳过(已存在): 0  发布: 0（幂等已发布: 2490）  失败: 0
+
+# ⑥ 逻辑目录同步：{"version":"1.1.0","synced":46, ...}
+# ⑦ 用例派生：{"created":184,...}；生成任务：46 个均 202 + status=pending（响应后后台执行）
+
+# ⑧ 测试集派生
+curl -sS -X POST .../api/v1/scene/suites/derive -d '{"include_concrete":true}'
+{"code":5000,"message":"服务器内部错误", ...}
+
+# ⑧ 语义自检
+[error] 具体场景读取失败: GET /api/v1/scene/concrete 失败: HTTP 500
+```
+
+数据面同一时间已核对为全绿，故与数据/表结构无关：
+
+| 判据 | 读数 |
+|---|---|
+| `\d scene_engine.concrete_scenarios` | 21 列与 `07_scene_engine.sql` 完全一致（含 `vil_safe`/`allowed_modes`/`scene_config`），索引、CHECK、`update_time` 触发器齐全 |
+| `select count(*) from scene_engine.concrete_scenarios` | **920**（46 类 × 20 条） |
+| `generation_tasks` 分组 | **succeeded 46**（无 failed） |
+| `verify_scene_semantics.py --from-file` | **46/46 类型必需角色全覆盖，语义违例 0，EXIT=0** |
+| `curl /api/v1/scene/concrete?page=1&page_size=2` | 仍 **HTTP 500 + code=5000**（与页大小、数据量无关） |
+
+### 2. 根因
+
+traceback 原文（`docker logs hunter-scene`）：
+
+```text
+File "/app/app/repositories/engine.py", line 238, in list_page
+    .options(defer(*[getattr(ConcreteScenario, name) for name in CONCRETE_DEFERRED]))
+File ".../sqlalchemy/orm/strategy_options.py", line 579, in defaultload
+    return self._set_relationship_strategy(attr, None)
+...
+sqlalchemy.exc.ArgumentError: Mapped attribute 'ConcreteScenario.param_values'
+does not refer to a mapped entity
+```
+
+机制：**`defer(a, b, c)` 的多参数是「关系路径链」而不是并列字段**（`*addl_attrs`，SQLAlchemy 已弃用）。第 2 个起的属性被当作第一个字段的子路径，走 `defaultload` → 关系分支 → 抛错。只有 `param_values` 真正被 defer，其余四个必炸，因此：
+
+- `GET /api/v1/scene/concrete`（`list_page`）与 `GET/POST /api/v1/scene/suites/derive`（`_derived_suite_items` 复用 `list_page`）**必然同时 500**，与空表/满表无关；
+- `GET /api/v1/scene/concrete/{id}` 走 `get()`（不 defer）→ 不受影响；
+- 打 `defer(*...)` 的还有 `list_all()`（覆盖分析路径），同样不可用。
+
+本地（SQLAlchemy 2.0.53，不连库，语句构造即触发）三写法对照：
+
+| 写法 | 结果 |
+|---|---|
+| `options(defer(*5 个 Mapped 属性))` | ❌ `ArgumentError: Mapped attribute ... does not refer to a mapped entity`（线上原状） |
+| `options(defer(*5 个字符串))` | ❌ `Strings are not accepted for attribute names in loader options` |
+| `options(*[defer(attr) for attr in ...])` | ✅ 只排除 5 个大字段（SELECT 列 22→18） |
+
+### 3. 修复内容
+
+1. **`repositories/engine.py` 新增 `concrete_defer_options()`**：逐字段生成 defer 选项，文档串固化「多参数 = 关系路径链」这一坑。
+2. **`list_page()` 与 `list_all()` 改用 `.options(*concrete_defer_options())`**，SQL 列集合与原来意图一致（只省 5 个大字段），不改变过滤/排序/分页语义。
+3. **新增钉桩 `test_concrete_defer_options_build_compilable_statement`**：不连库，仅 `select(...).options(...).compile()` 即断言「能构造」且「5 个大字段确实不在 SELECT 列中」。原有用例只断言模型属性存在，漏掉了整条读路径 500。
+4. **文档**：本条为 `release.md` 唯一记录（`docs/` 为忽略项，见 §8）。
+
+### 4. 兼容性
+
+- 端点路径、请求参数、响应结构、错误码**全部不变**；修复后 `GET /concrete` 正常返回 920 条摘要。
+- 列表/统计/对账路径仍**不返回** `param_values`/`param_vec`/`validity`/`generator`/`scene_config`——需要这些字段的调用方必须走 `GET /concrete/{id}`（V1.26.0 既有约定，本次未变）。
+- 无 DDL / Kafka / OpenAPI / 契约 / ConfigMap 变更；无需重建数据库、无需重跑 ④⑤⑥⑦ 的数据作业。
+- ⚠ **必须重建 `scene-service` 镜像**：缺陷在镜像内的 `/app/app/repositories/engine.py`，只 `git pull` 不 build 的话 ⑦⑧ 依旧 500。
+
+### 5. 验证（本地门禁实跑）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 缺陷复现（改前） | 临时脚本对 `defer(*[5 属性])` 构造语句 | 与线上一致抛 `ArgumentError`；脚本已删除，不入仓 |
+| 新钉桩 | `pytest services/scene-service/app/tests/test_scene_engine_hardening.py -k "concrete_defer or deferred"` | **2 passed** |
+| scene-service 全量 | `pytest services/scene-service` | **512 passed**（V1.26.0 为 511，新增 1 例） |
+| ruff | `ruff check app/repositories/engine.py app/tests/test_scene_engine_hardening.py` | All checks passed |
+| 语句形态 | 编译产物列数 | 18 列，5 个延迟字段全部不在 SELECT 中 |
+
+### 6. 实机执行
+
+```bash
+cd /opt/HunterCore
+
+# ① 必须先重建镜像（缺陷在镜像内），再重建容器
+git pull
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env build scene-service
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env up -d --force-recreate scene-service
+
+# ② 自证读路径恢复：期望 "total":920，而不是 code=5000
+TOKEN=$(curl -sS -X POST http://localhost:8080/api/v1/user/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<pwd>"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])')
+H=(-H "Authorization: Bearer $TOKEN")
+curl -sS "http://localhost:8080/api/v1/scene/concrete?page=1&page_size=2" "${H[@]}"
+
+# ③ 重跑 ⑦ 的测试集派生（用例已派生 184 条，不必重跑 testcases/derive）
+curl -sS -X POST http://localhost:8080/api/v1/scene/suites/derive "${H[@]}" -H 'Content-Type: application/json' -d '{"include_concrete":true}'
+#    期望：created/updated 合计 46，每类型 item_count = 4 用例 + ≤12 条具体场景
+
+# ④ 重跑 ⑧ 语义自检
+C=(docker compose -f infra/deploy/docker-compose.yml --project-directory .)
+PY=("${C[@]}" run --rm --no-deps --user 0:0 -v "$PWD:/repo" -w /repo --entrypoint python3 scene-service)
+"${PY[@]}" scripts/verify_scene_semantics.py --mode direct --base-url http://scene-service:8081 \
+  --user-id <admin_uuid> --roles admin --json-out scripts/output/verify-semantics.json
+echo "EXIT=$?"
+```
+
+> ⚠ ⑥⑦ 已产出的 2490 场景 / 46 逻辑场景 / 920 具体场景 / 184 用例**不需要重建**，本条目只修复读取路径；不要为此重跑 ②③（清库不可回滚）。
+
+### 7. 风险
+
+- 若部署机只 `git pull` 不 `build scene-service`，⑦⑧ 仍会 500，且现象与修复前完全一致（易误判为「没修好」）。
+- `concrete_defer_options()` 仍是「延迟加载」策略：任何新加进 `CONCRETE_DEFERRED` 的字段，若被列表响应使用，会退化为按行惰性查询（N+1）。
+- 钉桩只覆盖语句可构造与列集合，不覆盖真实数据库往返；若日后 ORM 列改名，`test_concrete_deferred_columns_are_real_columns` 与本节用例会同时报警。
+
+### 8. 回滚
+
+- `git revert` 本条提交即回到 `defer(*[...])` 写法 ⇒ `/concrete`、`/suites/derive` 立即恢复 500。**不要在生产回滚**，除非同时接受场景库「不可浏览具体场景」的降级。
+- 回滚不涉及数据：920 条具体场景与 184 条用例不受影响。
+
+### 9. 待办
+
+- **实机读数待回填**（§6 ②③④）：`total=920`、`suites/derive` 的 created/updated、verify 的 `46/46 [ok]` 与 `EXIT=0`。
+- **V1.26.0 §6 的 ⑨ 现场闭环仍未做**：取鬼探头 `LS-INT-003` 具体场景下发，核对 `actors=N/N` 与行人横穿可见——这才是最初「仿真端看不到交通参与者」的最终验收。
+- 全仓 `defer(` 已 grep 复核：除本节修好的两处外无其它多参数用法；后续新增 `.options(load_only(...))`/`joinedload(...)` 时同样遵循「一字段一 option」。
 
 
 

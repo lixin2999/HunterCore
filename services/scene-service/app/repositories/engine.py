@@ -53,6 +53,18 @@ CONCRETE_DEFERRED: tuple[str, ...] = (
 )
 
 
+def concrete_defer_options() -> tuple[Any, ...]:
+    """具体场景延迟加载选项：每个字段一个 ``defer``。
+
+    ⚠ ``defer(a, b, c)`` 的多参数形式是「关系路径链」（``*addl_attrs``，SQLAlchemy 已弃用），
+    会把后续字段当成第一个字段的子路径，构造语句时即抛
+    ``ArgumentError: Mapped attribute ... does not refer to a mapped entity``（V1.26.0 现场
+    ``GET /api/v1/scene/concrete`` / ``/suites/derive`` 500 的根因）。
+    正确写法是 ``.options(*[defer(attr) for attr in ...])`` 并列展开。
+    """
+    return tuple(defer(getattr(ConcreteScenario, name)) for name in CONCRETE_DEFERRED)
+
+
 class LogicalScenarioRepository:
     """逻辑场景（IR 目录）读写。"""
 
@@ -235,7 +247,7 @@ class ConcreteScenarioRepository:
             conditions.append(ConcreteScenario.status == status)
         stmt = (
             select(ConcreteScenario)
-            .options(defer(*[getattr(ConcreteScenario, name) for name in CONCRETE_DEFERRED]))
+            .options(*concrete_defer_options())
             .where(*conditions)
             .order_by(ConcreteScenario.create_time.desc())
             .offset((page - 1) * page_size)
@@ -256,7 +268,7 @@ class ConcreteScenarioRepository:
         """全量读取（覆盖分析用；上限保护，不加载 JSONB/向量大列）。"""
         stmt = (
             select(ConcreteScenario)
-            .options(defer(*[getattr(ConcreteScenario, name) for name in CONCRETE_DEFERRED]))
+            .options(*concrete_defer_options())
             .order_by(ConcreteScenario.create_time.desc())
             .limit(max(1, min(limit, 10000)))
         )

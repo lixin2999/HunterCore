@@ -19,6 +19,8 @@ from uuid import UUID, uuid4
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
@@ -28,7 +30,11 @@ from app.models.scene_engine import (
     LogicalScenarioStatus,
     SuiteStatus,
 )
-from app.repositories.engine import CONCRETE_DEFERRED, _is_unique_violation
+from app.repositories.engine import (
+    CONCRETE_DEFERRED,
+    _is_unique_violation,
+    concrete_defer_options,
+)
 from app.scene_engine.carla_execution import check_executable
 from app.scene_engine.catalog import CATALOG_BY_ID, CATALOG_VERSION
 from app.scene_engine.compiler import default_values
@@ -768,6 +774,20 @@ def test_concrete_deferred_columns_are_real_columns() -> None:
     for name in CONCRETE_DEFERRED:
         assert getattr(ConcreteScenario, name) is not None
     assert {"param_values", "scene_config"} <= set(CONCRETE_DEFERRED)
+
+
+def test_concrete_defer_options_build_compilable_statement() -> None:
+    """列表/统计查询必须能构造，且真的排除大字段。
+
+    ``defer(a, b, c)`` 的多参数形式被当成关系路径链，会在构造语句时抛
+    ``ArgumentError``（V1.26.0 现场 /concrete、/suites/derive 500 的根因），
+    此用例在无数据库的语句构造阶段就护住。
+    """
+    stmt = select(ConcreteScenario).options(*concrete_defer_options())
+    sql = str(stmt.compile(dialect=postgresql.dialect()))
+    assert "concrete_scenarios.scenario_id" in sql
+    for name in CONCRETE_DEFERRED:
+        assert f"concrete_scenarios.{name}" not in sql
 
 
 # =====================================================================
