@@ -8735,6 +8735,9 @@ V1.26.1 现场闭环（2026-11-10）后，仿真端（HunterSim）用 `SCN-2054-
    发（动物/锥桶等 `type=other` 按步行动作执行属正常）；新增动物降级显式警告——`_ANIMAL_KINDS`
    （animal/dog/cat/deer/cattle/livestock，与仿真端 `scene_mapper._ANIMAL_KINDS` 同口径）命中即警告
    「CARLA 0.9.16 无动物资产，仿真端将降级为行人执行（animal_asset_missing）」。
+   注意暴露面：`check_executable` 在**具体场景渲染路径**（`POST /concrete/{id}/render` 的
+   `execution.warnings`）执行，不在 `run_scene` 下发链路；下发运行的降级留痕以仿真节点侧
+   `animal_asset_missing`（映射告警 → `run.log`/`mapping.json` 产物）与进度 `actors_count` 为准（§6 ⑤）。
 6. **公开单实例装配** `semantics.py::actor_entry_for(role, index, variables)`：下发期补齐复用生成期
    同一装配口径，避免两处事实源漂移。
 7. **项⑤**：不改 HunterSim（本仓哲学：平台侧交付文档与登记）——登记为仿真端待办（§9），
@@ -8783,22 +8786,44 @@ curl -sS -G "http://localhost:8080/api/v1/scene" "${H[@]}" \
   --data "scene_type=animal_crossing" --data "status=published" --data "tags=sub:herd" --data "page_size=1"
 # 期望：total=15（存量批次 herd 子场景），记下任一条 scene_id（联调用的即 SCN-2054-AC-HRD）
 
-# ③ 重下发（需 Carla 管理 API 在线）
+# ③ 重下发（需 Carla 管理 API 在线）——用 ② 查到的 scene_id（herd 子场景）
 curl -sS -X POST "http://localhost:8080/api/v1/scene/<scene_id>/run" "${H[@]}"
-# 期望：code=0；仿真端映射日志 Scene participants mapped: count=3（此前 count=1）
-#       3 头 speed_ms=2.0（crossing_speed 已回填，无 unresolved_param）
-#       animal_asset_missing×3（预期资产降级，与平台侧警告同口径）
+# 期望：code=0（sim_instance_id 记为 $SIM_ID）
+# ⚠ 注意下发 herd（sub:herd）才有实例补齐；下到 dog/deer 子场景（sub:dog_dash/sub:deer_cross）
+#   只会有参数回填（value:5.0 / 18.x），actor_repairs 为空是正确行为
 
-# ④ 平台侧留痕（修复逐条可见，不静默）
+# ④ 平台侧修复留痕（hunter-scene 日志，逐条可见不静默）
 docker logs hunter-scene 2>&1 | grep -A2 scene_dispatch_legacy_repaired
-# 期望：param_repairs=[{where:"actors[animal-1].parameters.crossing_speed", raw:"animal_speed",
+# 期望（herd）：param_repairs=[{where:"actors[animal-1].parameters.crossing_speed", raw:"animal_speed",
 #        value:2.0, approximate:false}] + actor_repairs=[{role:"animal",
 #        actor_ids:["animal-2","animal-3"], before:1, after:3, anchored_to:"animal-1"}]
+#        （dog_dash 对照组：仅 param_repairs value:5.0，actor_repairs=[]）
 
-# ⑤ 预检读数（可选项 ① 的平台侧留痕）
-docker logs hunter-scene 2>&1 | grep -E "animal_asset_missing|参与者 .* 为动物"
-# 期望：预检报告含「参与者 animal-1 为动物（kind=cattle）：…降级为行人执行」；
-#       不再出现「参与者 animal-1 为车辆但行为 'sudden_cross' 按行人执行」（旧误报）
+# ⑤ 映射与降级读数（勘误 2026-11-11：check_executable 只在「具体场景渲染」路径执行、
+#    不在 run_scene 下发链路；首版把本条写成 grep hunter-scene 日志，实机不成立，特此更正）
+#  ⑤a 平台侧可见的映射信号（进度 API；actors_count = 仿真端映射参与者数 + 1 自车）：
+SIM_ID=<③返回的sim_instance_id>
+curl -sS "http://localhost:8080/api/v1/scene/simulations/$SIM_ID" "${H[@]}" | python3 -m json.tool | grep -E 'actors_count|status'
+# 期望：herd actors_count=4（3 动物 + 自车；修复前 herd 为 2）；dog_dash 对照组为 2
+#  ⑤b animal_asset_missing 的产生端在仿真节点（sim-node-01），不在 hunter-scene：
+#     终态后 GET /api/v1/scene/simulations/$SIM_ID/result → artifacts 的 run.log / mapping.json
+#     （MinIO 预签名 URL）：actors_mapped=3、mapping_warning animal_asset_missing ×3；
+#     或直接看仿真节点 stdout 日志：Scene participants mapped: count=3（无 unresolved_param）
+#  ⑤c 项① 平台侧预检留痕（具体场景渲染路径，920 条里 animal_crossing 占 20 条）：
+LID=$(curl -sS "http://localhost:8080/api/v1/scene/logical?limit=200" "${H[@]}" \
+  | python3 -c 'import json,sys
+items=json.load(sys.stdin)["data"]["items"]
+print(next(i["logical_id"] for i in items if i.get("scene_type")=="animal_crossing"))')
+CID=$(curl -sS "http://localhost:8080/api/v1/scene/concrete?logical_id=$LID&page_size=1" "${H[@]}" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["items"][0]["scenario_id"])')
+curl -sS -X POST "http://localhost:8080/api/v1/scene/concrete/$CID/render" "${H[@]}" \
+  | python3 -c 'import json,sys
+data=json.load(sys.stdin)["data"]
+print("passed:", data.get("passed"))
+for w in (data.get("execution") or {}).get("warnings", []): print("warn:", w)'
+# 期望：warn 含「参与者 animal-N 为动物（kind=…）：…降级为行人执行（animal_asset_missing）」；
+#       无「参与者 animal-N 为车辆但行为 'sudden_cross' 按行人执行」（旧误报）
+
 ```
 
 ### 7. 风险
