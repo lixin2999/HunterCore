@@ -8826,7 +8826,7 @@ for w in (data.get("execution") or {}).get("warnings", []): print("warn:", w)'
 
 ```
 
-**实机回报（2026-11-11，部署机 `/opt/HunterCore`；②④⑤c 已验，⑤a/⑤b 待补）**：
+**实机回报（2026-11-11，部署机 `/opt/HunterCore`；②④⑤a⑤b⑤c 全部闭环）**：
 
 ```text
 # ① build + up：20 步中 3 步重建（RUN pip install 71.8s）；hunter-scene 启动；contracts v1.2 只读挂载生效
@@ -8841,8 +8841,21 @@ for w in (data.get("execution") or {}).get("warnings", []): print("warn:", w)'
 # ⑤c 项① 平台侧预检（concrete render）—— 实机闭环：
 #    passed=True；warn=「参与者 animal-1 为动物（kind=dog）：CARLA 0.9.16 无动物资产，
 #    仿真端将降级为行人执行（animal_asset_missing）」；旧误报「为车辆但行为按行人执行」未出现
-# ⑤a/⑤b 待补：进度 actors_count（期望 4=3 动物+自车）、结果产物 run.log（期望 actors_mapped=3、
-#    mapping_warning animal_asset_missing ×3、无 unresolved_param）——命令见 §6 ⑤a/⑤b
+# ⑤a 进度与终态（herd 重发实例 inst-1ccfe5f0ed0d4c699ef2c0bc1bf5121a / sim-20261111074102-c61bde4d）：
+#    连续 19 次轮询 actors_count=4（progress 1.02% → 77.56%，10s 间隔）；终态
+#    status=succeeded、actors_count=4、success=True（对照 dog_dash=2：1 行人 + 自车）
+# ⑤b 产物读数（仿真机本地 data/adapter/artifacts/sim-20261111075352-b77127f7/
+#    a54ac840-1217-4ef9-9107-9cf09e9493a3/run.log；同场景 herd 重发实例 inst-6775f3ac82b541e98ab56c0a5c46ee7c）：
+#    status=succeeded / actors_declared=3 / actors_mapped=3 / actors_by_type={'walker': 3}
+#    events_total=1 / events_runtime=1 / events_disabled=0
+#    mapping_warnings={'ego_blueprint_normalized': 1, 'animal_asset_missing': 3}
+#    mapping_warning animal_asset_missing object_kind=cattle ×3；无 unresolved_param
+#    注：产物仅落仿真机本地（节点未配 HUNTER_CORE_JWT_TOKEN，ArtifactManager 直传按
+#    best-effort 跳过），平台 result 的预签名 URL 指向未上传的 object_key → NoSuchKey；
+#    属 HunterSim 侧接入配置缺失，不影响平台侧判据（run.log 由本地文件取证）
+# 附：轮询第 20 次曾出现 data:null（scene-service 无对应请求日志、节点心跳连续），随后
+#    同一实例查询恢复为 succeeded —— 属网关/鉴权层瞬时失败，实例未丢失（06:26 实例
+#    inst-0a30b6d4… 同样跑完并留下 run.log）
 ```
 
 ### 7. 风险
@@ -8868,9 +8881,13 @@ for w in (data.get("execution") or {}).get("warnings", []): print("warn:", w)'
 - **项⑤（HunterSim 待办，建议 V3.7.2）**：`participant_states` 写行补 `source_behavior_type`，
   面板行为标签回显（登记详情：`docs/HunterSim场景语义对齐方案.md` §12.2）。
 - **仿真端可后续消费** `action_semantics` 标记（区分期望/指令；当前行为不变）。
-- **实机读数**：②④⑤c **已回填**（2026-11-11，见 §6「实机回报」——herd 补齐 1→3 + `crossing_speed:2.0`、
-  dog_dash 对照组 5.0、concrete 渲染动物降级警告在且无误报）；**⑤a/⑤b 待补**（进度 `actors_count=4`、
-  `run.log` 的 `actors_mapped=3`/`animal_asset_missing`×3——命令见 §6 ⑤a/⑤b）。
+- **实机读数**：②④⑤a⑤b⑤c **全部已回填**（2026-11-11，见 §6「实机回报」——herd 补齐 1→3 +
+  `crossing_speed:2.0`、dog_dash 对照组 5.0、concrete 渲染动物降级警告在且无误报、进度与终态
+  `actors_count=4`/`succeeded`、`run.log` 的 `actors_mapped=3`/`animal_asset_missing`×3/无
+  `unresolved_param`）。
+- **仿真节点产物直传未生效（HunterSim 侧接入配置）**：节点未配 `HUNTER_CORE_JWT_TOKEN`，
+  `ArtifactManager` 按 best-effort 只保留本地产物 ⇒ 平台 result 的预签名下载地址 `NoSuchKey`。
+  补 `HUNTER_CORE_GATEWAY_URL` + `HUNTER_CORE_JWT_TOKEN` 后重跑即可直接下载（不影响本版本判据）。
 
 
 
