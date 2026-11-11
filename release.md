@@ -8826,6 +8826,25 @@ for w in (data.get("execution") or {}).get("warnings", []): print("warn:", w)'
 
 ```
 
+**实机回报（2026-11-11，部署机 `/opt/HunterCore`；②④⑤c 已验，⑤a/⑤b 待补）**：
+
+```text
+# ① build + up：20 步中 3 步重建（RUN pip install 71.8s）；hunter-scene 启动；contracts v1.2 只读挂载生效
+# ② 存量 herd 清点：GET /scene?scene_type=animal_crossing&status=published&tags=sub:herd → total=15
+# ③ 重下发 herd（a54ac840-1217-4ef9-9107-9cf09e9493a3）→ code=0，inst-0a30b6d4b59e4b588758711378c69d11
+# ④ 平台修复留痕（trace 14911bea）—— 项②+④ 实机闭环：
+#    actor_repairs=[{'role':'animal','actor_ids':['animal-2','animal-3'],'before':1,'after':3,'anchored_to':'animal-1'}]
+#    param_repairs=[{'where':'actors[animal-1].parameters.crossing_speed','name':'crossing_speed',
+#                    'raw':'animal_speed','value':2.0,'approximate':False}]
+#    对照组 dog_dash（002e8a81，3 次重发 trace 47dfd123/33448da7/79cfdee7）：value:5.0、actor_repairs=[]
+#    （dog/deer 子场景 1 头，无补齐需求；回填为变体 force 精确值，approximate=False）
+# ⑤c 项① 平台侧预检（concrete render）—— 实机闭环：
+#    passed=True；warn=「参与者 animal-1 为动物（kind=dog）：CARLA 0.9.16 无动物资产，
+#    仿真端将降级为行人执行（animal_asset_missing）」；旧误报「为车辆但行为按行人执行」未出现
+# ⑤a/⑤b 待补：进度 actors_count（期望 4=3 动物+自车）、结果产物 run.log（期望 actors_mapped=3、
+#    mapping_warning animal_asset_missing ×3、无 unresolved_param）——命令见 §6 ⑤a/⑤b
+```
+
 ### 7. 风险
 
 - 下发期修复是 **best-effort**：生成期未存储采样向量，重建口径是「均值 ∪ 变体 force」——
@@ -8849,7 +8868,9 @@ for w in (data.get("execution") or {}).get("warnings", []): print("warn:", w)'
 - **项⑤（HunterSim 待办，建议 V3.7.2）**：`participant_states` 写行补 `source_behavior_type`，
   面板行为标签回显（登记详情：`docs/HunterSim场景语义对齐方案.md` §12.2）。
 - **仿真端可后续消费** `action_semantics` 标记（区分期望/指令；当前行为不变）。
-- **实机读数待回填**（§6 ②③④⑤ 的期望值）。
+- **实机读数**：②④⑤c **已回填**（2026-11-11，见 §6「实机回报」——herd 补齐 1→3 + `crossing_speed:2.0`、
+  dog_dash 对照组 5.0、concrete 渲染动物降级警告在且无误报）；**⑤a/⑤b 待补**（进度 `actors_count=4`、
+  `run.log` 的 `actors_mapped=3`/`animal_asset_missing`×3——命令见 §6 ⑤a/⑤b）。
 
 
 
