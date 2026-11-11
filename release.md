@@ -8443,12 +8443,67 @@ curl -sS -X POST http://localhost:8080/api/v1/scene/suites/derive "${H[@]}" -H '
 
 # ⑧ 重建后自证（期望 EXIT=0、46/46 类型必需角色全覆盖；有缺失即退出码 1 并逐类列出缺口角色）
 "${PY[@]}" scripts/verify_scene_semantics.py --mode direct --base-url http://scene-service:8081 \
-  --user-id <admin_uuid> --roles admin --json-out scripts/output/verify-semantics.json
+  --user-id cd34f8d8-c434-4dba-9450-1934cbc09b13 --roles admin --json-out scripts/output/verify-semantics.json
 
-# ⑨ 现场闭环：取鬼探头（LS-INT-003）具体场景下发，核对 actors=N/N 且行人横穿可见
-curl -sS -G http://localhost:8080/api/v1/scene --data-urlencode "keyword=鬼探头" --data "page_size=5" "${H[@]}"
-curl -sS -X POST http://localhost:8080/api/v1/scene/<scene_id>/run "${H[@]}"
+# ⑨ 现场闭环：鬼探头 = LS-INT-003 / scene_type=occluded_pedestrian（最初 actors=1/1 的验收点）
+#  ⑨-1 只读核对：平台发出的 config 里到底有几个参与者、分别什么角色/行为/生成点
+curl -sS -G http://localhost:8080/api/v1/scene "${H[@]}" \
+  --data "scene_type=occluded_pedestrian" --data "status=published" --data "page_size=3" \
+  | python3 -c '
+import json,sys
+d=json.load(sys.stdin)["data"]
+print("published total =", d["total"])
+for s in d["items"]:
+    cfg=s["config"]; actors=cfg["actors"]
+    print("---", s["scene_id"], s["scene_name"])
+    print("    actors:", len(actors), "(+1 ego =", len(actors)+1, ")")
+    for a in actors:
+        b=a["behavior"]; sp=a["spawn_point"]
+        print("     ", a["actor_id"], a["type"], b["behavior_type"],
+              "x=%s y=%s" % (sp.get("x"), sp.get("y")))
+    print("    events:", [e["type"] for e in cfg["events"]])
+'
+#  期望：published total 为几十条量级（occluded_pedestrian 实测 45）；每场景 actors >= 2，
+#        且必需角色 dart_out_pedestrian（行人）与 occluder（遮挡物）必在；
+#        second_pedestrian 取决于 night_rain 采样值（NRN 变体下为 1）；事件应含 pedestrian_crossing + collision。
+#        若 actors 为空或只有 1 个，说明 ⑤ 入库内容有问题（不应发生）
+
+#  ⑨-2 真下发（需 CARLA 管理 API 在线；mode=sil 可不带请求体）
+SCENE_ID=$(curl -sS -G http://localhost:8080/api/v1/scene "${H[@]}" \
+  --data "scene_type=occluded_pedestrian" --data "status=published" --data "page_size=1" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["items"][0]["scene_id"])')
+RESP=$(curl -sS -X POST "http://localhost:8080/api/v1/scene/$SCENE_ID/run" "${H[@]}" \
+  -H 'Content-Type: application/json' -d '{"mode":"sil"}')
+echo "$RESP"
+SIM_ID=$(echo "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["sim_instance_id"])')
+
+#  ⑨-3 进度/结果（仿真端本步应回显 actors=N/N 且行人横穿可见）
+curl -sS "http://localhost:8080/api/v1/scene/simulations/$SIM_ID" "${H[@]}"
 ```
+
+> ⑨ 全绿判据：⑨-1 每个场景 `actors >= 2` 且必含 `dart_out_pedestrian` 与 `occluder`（角色由 `actor_id` 前缀回溯），事件含 `pedestrian_crossing`（急刹）与 `collision`；⑨-2 `HTTP=200` 且回 `sim_instance_id`（若 `2001` 说明语义闸门拦住缺角色场景，需回查 ⑤ 入库内容）；⑨-3 仿真端消费者日志 `actors=N/N` 中 N 与 ⑨-1 的参与者数一致，即最初「看不到交通参与者」闭环。
+
+**⑨ 实机读数（2026-11-10，部署机闭环通过）**：
+
+```text
+# ⑨-1 GET /api/v1/scene?scene_type=occluded_pedestrian&status=published&page_size=3
+published total = 45
+--- 602b46a3-3b1b-49f4-8c50-6607e5dd152c SCN-0900-OP-NRN-L4-NRN-3a2e-dart_out_pe
+    actors: 3 (+1 ego = 4)
+      dart_out_pedestrian-1 pedestrian occluded_dash x=12.0 y=-5.0
+      occluder-1          other      static        x=10.0 y=-3.2
+      second_pedestrian-1 pedestrian sudden_cross  x=18.0 y=-5.5
+    events: ['pedestrian_crossing', 'collision']
+#   另两条同类型场景 occluder x 分别 10.0 / 5.76（随 occluder_gap 采样变化，非雷同）
+
+# ⑨-2 POST /api/v1/scene/602b46a3-.../run → code=0 / HTTP 200
+sim_instance_id=inst-feab43f164a746248a4cb59cfcfe581d sim_id=sim-20261110021520-42afe94b status=pending
+
+# ⑨-3 GET /api/v1/scene/simulations/inst-feab43f164a746248a4cb59cfcfe581d
+"status":"pending","carla_status":"PENDING","progress_percent":0.0,"total_time_s":30.0,"actors_count":4
+```
+
+关键判据 **`actors_count: 4`**（3 名参与者 + 自车）：同一条下发链路在 V1.26.0 重建后给出的参与者数是 4，而问题 1 的现场是 `actors=1/1`——平台侧因果链已闭环（内容缺失 → 语义重建 → 下发含行人/遮挡物/第二行人 + 两个触发事件）。仿真端画面确认仍属 HunterSim 职责，需其按 `docs/HunterSim场景语义对齐方案.md` 回验，本仓库不代写。
 
 > ⚠ ②③ 会**物理删除**全部场景且不可回滚：执行前先确认备份（`scripts/backup.sh`）与 `scene_name` 唯一约束释放目标无误；⑤ 的 `--seed 20261109` 决定内容，换种子即换一整批内容，不要与其它批次混用同一随机种子做对比。
 > ⚠ ④⑤⑧ **不要在宿主机裸跑** `python3 scripts/*.py`（宿主机无 pydantic/hunter_common ⇒ `ModuleNotFoundError`），统一用上面的 `"${PY[@]}"`；⑥⑦⑨ 的网关 JWT 有效期 30min 且**单会话**（登录会顶掉同账号 Web 会话），跑批期间不要用同账号登录前端。
@@ -8466,7 +8521,7 @@ curl -sS -X POST http://localhost:8080/api/v1/scene/<scene_id>/run "${H[@]}"
 
 ### 9. 待办
 
-- **实机重建与下发核对未在本机执行**（本机无 PostgreSQL / 无运行中的 scene-service），第 6 节需在部署机执行；
+- ~~实机重建与下发核对未在本机执行~~：**已在部署机完成**（2026-11-10）——④ dry-run 2490/2490、⑤ 入库 2490 幂等、⑥ synced 46、⑦ 184 用例 + 920 具体场景、⑧ suites/derive created 46（修 V1.26.1 后）、⑨ 下发 `actors_count=4`，逐项读数见 §6；
 - `scene_svc.sim_node_registry` 仍未登记进 `common/python` 的 DDL/ORM 契约清单（延续 V1.24.1 缺口，需 Alembic/er.md/orm-mapping.md 一并决策）；
 - `common/python` 余 5 条 UP046/UP047（`repository.py`/`responses.py`）待统一升级泛型写法；
 - `docs/` 仍为忽略项：本轮三份文档改动不会随 `git pull` 到达部署机，需单独分发。
@@ -8572,23 +8627,38 @@ git pull
 docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env build scene-service
 docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env up -d --force-recreate scene-service
 
-# ② 自证读路径恢复：期望 "total":920，而不是 code=5000
+# ② 自证读路径恢复：期望 HTTP=200 且 "total":920，而不是 code=5000
 TOKEN=$(curl -sS -X POST http://localhost:8080/api/v1/user/login -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"<pwd>"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])')
+  -d '{"username":"admin","password":"<pwd>"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])'); echo "token_len=${#TOKEN}"
 H=(-H "Authorization: Bearer $TOKEN")
-curl -sS "http://localhost:8080/api/v1/scene/concrete?page=1&page_size=2" "${H[@]}"
+curl -sS -w '\nHTTP=%{http_code}\n' "http://localhost:8080/api/v1/scene/concrete?page=1&page_size=2" "${H[@]}"
 
 # ③ 重跑 ⑦ 的测试集派生（用例已派生 184 条，不必重跑 testcases/derive）
-curl -sS -X POST http://localhost:8080/api/v1/scene/suites/derive "${H[@]}" -H 'Content-Type: application/json' -d '{"include_concrete":true}'
-#    期望：created/updated 合计 46，每类型 item_count = 4 用例 + ≤12 条具体场景
+curl -sS -w '\nHTTP=%{http_code}\n' -X POST http://localhost:8080/api/v1/scene/suites/derive "${H[@]}" \
+  -H 'Content-Type: application/json' -d '{"include_concrete":true}'
+#    期望：created 46 / updated 0，每类型 item_count = 11
+#    （4 条派生用例 TC-<逻辑ID>-Z1..Z4 + 7 条具体场景：默认 profile=regression 的配额是
+#      Z1 14 / Z2 5 / Z3 1 / Z4 0，而每分区最多 DERIVED_CONCRETE_PER_ZONE=3 条
+#      ⇒ Z1 取 3、Z2 取 3、Z3 取 1、Z4 取 0 = 7）
 
-# ④ 重跑 ⑧ 语义自检
+# ④ 重跑 ⑧ 语义自检（--user-id 用实名 UUID：写成 <admin_uuid> 会被 shell 当成输入重定向）
 C=(docker compose -f infra/deploy/docker-compose.yml --project-directory .)
 PY=("${C[@]}" run --rm --no-deps --user 0:0 -v "$PWD:/repo" -w /repo --entrypoint python3 scene-service)
 "${PY[@]}" scripts/verify_scene_semantics.py --mode direct --base-url http://scene-service:8081 \
-  --user-id <admin_uuid> --roles admin --json-out scripts/output/verify-semantics.json
+  --user-id cd34f8d8-c434-4dba-9450-1934cbc09b13 --roles admin --json-out scripts/output/verify-semantics.json
 echo "EXIT=$?"
 ```
+
+**实机回报（2026-11-10，部署机 `/opt/HunterCore` 全绿）**：
+
+```text
+# ① git pull → 06fb0c0..198c2eb；grep -c concrete_defer_options = 3；build 20 步中 5 步重建（含 RUN pip install 76.7s）
+# ② HTTP=200，"total":920，page_size=2 正常返回两条 Z1 摘要（此前必 5000）
+# ③ HTTP=200，{"created":46,"updated":0,"skipped":0}，46 个套件 item_count 全部 = 11
+# ④ [ok] 46 个场景类型的必需角色全部覆盖（契约 1.1.0）；EXIT=0
+```
+
+> ④ 的逐类读数（抽样 3/类、缺失/多余/违例全 0）与 V1.26.0 → `scripts/output/verify-semantics.json` 一致；`--from-file` 离线自检与在线 direct 自检结论完全相同，说明 V1.26.0 的 2490/46/920/184 数据面无需重建，缺陷纯在读路径。
 
 > ⚠ ⑥⑦ 已产出的 2490 场景 / 46 逻辑场景 / 920 具体场景 / 184 用例**不需要重建**，本条目只修复读取路径；不要为此重跑 ②③（清库不可回滚）。
 
@@ -8605,9 +8675,157 @@ echo "EXIT=$?"
 
 ### 9. 待办
 
-- **实机读数待回填**（§6 ②③④）：`total=920`、`suites/derive` 的 created/updated、verify 的 `46/46 [ok]` 与 `EXIT=0`。
-- **V1.26.0 §6 的 ⑨ 现场闭环仍未做**：取鬼探头 `LS-INT-003` 具体场景下发，核对 `actors=N/N` 与行人横穿可见——这才是最初「仿真端看不到交通参与者」的最终验收。
+- ~~实机读数待回填（§6 ②③④）~~：**已回填**（2026-11-10）——`total=920` / `created=46` / `46/46 [ok]` / `EXIT=0`，见 §6「实机回报」。
+- ~~V1.26.0 §6 的 ⑨ 现场闭环~~：**已完成**（2026-11-10）——⑨-1 `occluded_pedestrian` published 45 条、每条 3 名参与者（行人/遮挡物/第二行人）+ `pedestrian_crossing`/`collision`；⑨-2 `POST /run` `code=0`；⑨-3 进度回 `actors_count: 4`（3 参与者 + 自车），与最初 `actors=1/1` 形成正反对比。读数原文见 V1.26.0 §6「⑨ 实机读数」。
 - 全仓 `defer(` 已 grep 复核：除本节修好的两处外无其它多参数用法；后续新增 `.options(load_only(...))`/`joinedload(...)` 时同样遵循「一字段一 option」。
+
+---
+
+## V1.27.0（仿真端联调遗留项闭环：动物场景下发的平台侧配合 —— 契约 v1.2 群畜多头 / 裸参数名解析与存量回填 / 事件动作语义声明 / 动物降级留痕）
+
+Date：2026-11-11
+变更类型：缺陷修复（场景下发链路）+ 契约增量（`scene-taxonomy.yaml` v1.1→v1.2）+ 下发语义声明；**必须重建 `scene-service` 镜像**才生效（服务代码在镜像内；`contracts/` 为只读挂载，`git pull` 后随容器重建生效）
+
+### 1. 现场
+
+V1.26.1 现场闭环（2026-11-10）后，仿真端（HunterSim）用 `SCN-2054-AC-HRD`（`animal_crossing` 群畜）
+继续联调，回报 **5 个「需平台侧配合」问题**：
+
+```text
+① dog 资产缺失降级：只有仿真端打 animal_asset_missing，平台侧无留痕；
+   且平台预检把 animal-1 误报成「参与者为车辆但行为按行人执行」
+② crossing_speed 下发为变量名字符串 "animal_speed" → 仿真端 unresolved_param 回落默认速度
+③ ev-1:brake 事件动作不驱动自车行为（仿真端不知道这是期望还是指令）
+④ 群畜（herd）子场景 3 头只映射出 1 个 actor
+⑤ 面板行为标签未回显 sudden_cross
+```
+
+### 2. 根因（逐项实锤）
+
+| # | 根因 |
+|---|---|
+| ① | `carla_execution.check_executable` 的 WalkAction 告警对**任意 type** 发（动物是 `type=other`，不是车辆）；动物资产降级（CARLA 0.9.16 无动物 mesh）未在平台侧显式声明 |
+| ② | `semantics.resolve_value` 只把「含运算符 / 可转 float」的字符串当表达式，**裸参数名**（`crossing_speed: animal_speed`）原样落库并下发；存量库（seed 20261109，2490 条）已按缺陷形态落库 |
+| ③ | 契约从未声明事件动作语义：`events[].action`（如 `ev-1` 的 `brake`）是**评估基线**而非指令——若仿真端替自车执行期望动作，评估会自我实现（oracle 恒真）；但没有声明，仿真端只能按版本猜 |
+| ④ | 契约 `animal_crossing.animal.count:"1"` 是**常量**，「群畜穿行（herd）」变体被压成 1 头；且 spawn 表达式无 `i` 维度，没有多实例铺开机制 |
+| ⑤ | **仿真端问题**：`participant_states` 上报只写 1 行且未携带 `source_behavior_type`；映射层 `TrafficParticipantConfig.source_behavior_type` 已保留 `sudden_cross`，平台下发侧无字段缺失 |
+
+### 3. 修复内容（①②③④ 闭环，⑤ 登记）
+
+1. **契约 v1.2（项④）** `contracts/scene-taxonomy.yaml`：`animal_crossing` 新增参数 `n_animals`
+   （mean 1.2 / low 1 / high 4）；`count:"1"` → `count:"round(n_animals)"`；spawn 按 `i` 铺开
+   （`x: animal_x + i*1.2, y: -4.5 - i*0.9`）；三变体 force `n_animals`（dog_dash/deer_cross=1、
+   herd=3）。新批次生成 herd 即 3 头。
+2. **生成期解析（项②根因）** `semantics.py::resolve_value`：`if text in variables` 先于表达式
+   判定——裸参数名解析为该参数数值，字面量（`longitudinal`/`left`）不受影响（方案文档改动 A）。
+3. **下发期存量修复（项②存量 + 项④存量）** 新模块 `app/scene_engine/dispatch_repair.py`：
+   `repair_dispatch_config(config, scene_type, tags)` 在 `run_scene` 的 `_dispatch_payload` 之后执行——
+   - **参数回填**：`actors/events` 里值仍是参数名的字符串，按「语义均值 ∪ 变体 force」重建参数向量
+     回填；force 值 `approximate=False`（精确），均值兜底 `approximate=True`（近似，留痕可辨）；
+   - **实例补齐**：三重闸门（count 表达式引用参数被变体 force ∧ 期望数>存量数 ∧ 期望数>均值口径数）
+     才补——仅追加绝不删减，防误改「采样值恰好少」的合法单实例场景；出生点锚定存量首实例的
+     采样位姿、按表达式相对间距铺开，不整体重算存量位姿；
+   - 逐条返回 `ParamRepair`/`ActorRepair` 记录，调用方写 `scene_dispatch_legacy_repaired` 结构化日志；
+     **只改下发副本，不回写库**（测试钉死 stored config 不变）；`custom` 类型/无 `sub:` 标签的
+     场景不修（交仿真端 `unresolved_param` 留痕，两端口径一致）。
+4. **动作语义声明（项③）** `simulation.py`：下发载荷新增 `action_semantics:"expectation_only"`
+   （`ACTION_SEMANTICS_EXPECTATION`）——事件动作是评估基线而非指令，自车处置由被测系统产生；
+   仿真端按标记区分「期望/指令」，不再按版本猜。方案文档 §7 F 的落地。
+5. **预检修正（项①）** `carla_execution.py::check_executable`：WalkAction 告警只对 `type=vehicle`
+   发（动物/锥桶等 `type=other` 按步行动作执行属正常）；新增动物降级显式警告——`_ANIMAL_KINDS`
+   （animal/dog/cat/deer/cattle/livestock，与仿真端 `scene_mapper._ANIMAL_KINDS` 同口径）命中即警告
+   「CARLA 0.9.16 无动物资产，仿真端将降级为行人执行（animal_asset_missing）」。
+6. **公开单实例装配** `semantics.py::actor_entry_for(role, index, variables)`：下发期补齐复用生成期
+   同一装配口径，避免两处事实源漂移。
+7. **项⑤**：不改 HunterSim（本仓哲学：平台侧交付文档与登记）——登记为仿真端待办（§9），
+   建议在 `participant_states` 写行时补 `source_behavior_type` 字段。
+
+### 4. 兼容性
+
+- **契约 v1.1→v1.2 为增量**（新参数 + count 表达式化），`hunter_common` 加载器向后兼容；旧消费者
+  忽略未知参数即可。`version` 字段 1.1→1.2（读侧只做记录比对，无分支逻辑）。
+- **存量库 2490 条不需要重建**：herd 缺实例、参数字符串在下发期修复；`param_overrides` 先于修复
+  合并，运行期覆盖不受影响。新批次生成期即正确，不经过下发期修复。
+- **下发载荷**新增 `action_semantics` 键（与 V1.25.0 的 `spawn_semantics` 同模式，声明性标记）；
+  API 路由、请求/响应 Schema、错误码**全部不变**。
+- 无 DDL / Kafka / OpenAPI 变更；下发期修复不回写库，随时可用镜像回滚收回行为。
+- ⚠ **必须重建 `scene-service` 镜像**（Python 修复在镜像内）；`contracts/` 为只读挂载，
+  `git pull` 后 `up -d --force-recreate` 即带上 v1.2 契约。
+
+### 5. 验证（本地门禁实跑）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| scene-service 全量 | `pytest services/scene-service` | **527 passed**（V1.26.1 为 512；新增 15 例：`test_dispatch_repair.py` 11 + `check_executable` 4） |
+| 存量修复钉桩 | `pytest services/scene-service/app/tests/test_dispatch_repair.py` | 11 passed（生成期/修复单元/下发链路三层：stored config 不变、三重闸门、无标签均值兜底） |
+| 预检钉桩 | `pytest ... -k "check_executable"`（hardening 内新增 4） | 动物降级警告 ✓ / 车辆误报消除 ✓ / 车辆仍告警 ✓ / prop 不误报 ✓ |
+| 新批次生成 | `batch_add_scenes.py --dry-run --only-type animal_crossing --seed 20261111` | 45 条：dog 15×1、deer 15×1、herd 15×3；`crossing_speed` **全数值化**（0 字符串） |
+| 语义自检 | `verify_scene_semantics.py --from-file` | animal×3 变体覆盖、违例 0、EXIT=0 |
+| 端到端（离线，两仓 venv 隔离） | 平台构造「存量形态 herd 载荷（crossing_speed="animal_speed"、1 头）」→ 下发期修复落盘 JSON → HunterSim `map_scene_config` | `Scene participants mapped: count=3`；3 头 `walker`+`speed_ms=2.0`+`source_behavior_type=sudden_cross`；无 `unresolved_param`；`animal_asset_missing`×3（预期降级）；spawn 铺开 (31.70,-4.50)/(32.90,-5.40)/(34.10,-6.30) |
+| ruff | `ruff check`（涉改文件） | All checks passed |
+| common/python | `pytest common/python` | 345 passed（1 失败 `test_ddl_column_parity_with_orm` 为干净 main 同样失败的存量问题，非本轮引入） |
+
+### 6. 实机执行（部署机，重下发 herd 验收）
+
+```bash
+cd /opt/HunterCore
+
+# ① 重建镜像（Python 修复在镜像内）+ 容器（contracts 只读挂载随 git pull 生效）
+git pull
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env build scene-service
+docker compose -f infra/deploy/docker-compose.yml --project-directory . --env-file .env up -d --force-recreate scene-service
+
+# ② 找一条存量 herd 场景（tags 里的 sub:herd 是下发期修复的变体标记）
+TOKEN=$(curl -sS -X POST http://localhost:8080/api/v1/user/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<pwd>"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["access_token"])')
+H=(-H "Authorization: Bearer $TOKEN")
+curl -sS -G "http://localhost:8080/api/v1/scene" "${H[@]}" \
+  --data "scene_type=animal_crossing" --data "status=published" --data "tags=sub:herd" --data "page_size=1"
+# 期望：total=15（存量批次 herd 子场景），记下任一条 scene_id（联调用的即 SCN-2054-AC-HRD）
+
+# ③ 重下发（需 Carla 管理 API 在线）
+curl -sS -X POST "http://localhost:8080/api/v1/scene/<scene_id>/run" "${H[@]}"
+# 期望：code=0；仿真端映射日志 Scene participants mapped: count=3（此前 count=1）
+#       3 头 speed_ms=2.0（crossing_speed 已回填，无 unresolved_param）
+#       animal_asset_missing×3（预期资产降级，与平台侧警告同口径）
+
+# ④ 平台侧留痕（修复逐条可见，不静默）
+docker logs hunter-scene 2>&1 | grep -A2 scene_dispatch_legacy_repaired
+# 期望：param_repairs=[{where:"actors[animal-1].parameters.crossing_speed", raw:"animal_speed",
+#        value:2.0, approximate:false}] + actor_repairs=[{role:"animal",
+#        actor_ids:["animal-2","animal-3"], before:1, after:3, anchored_to:"animal-1"}]
+
+# ⑤ 预检读数（可选项 ① 的平台侧留痕）
+docker logs hunter-scene 2>&1 | grep -E "animal_asset_missing|参与者 .* 为动物"
+# 期望：预检报告含「参与者 animal-1 为动物（kind=cattle）：…降级为行人执行」；
+#       不再出现「参与者 animal-1 为车辆但行为 'sudden_cross' 按行人执行」（旧误报）
+```
+
+### 7. 风险
+
+- 下发期修复是 **best-effort**：生成期未存储采样向量，重建口径是「均值 ∪ 变体 force」——
+  无 `sub:` 标签的场景回填均值（`approximate=True`），可能与原采样有偏差（已逐条留痕可审计）。
+- 实例补齐**仅追加绝不删减**；三重闸门防误改合法采样场景，但也意味着「count 表达式未被 force」
+  的多实例场景不会被补（当前契约下仅 herd 命中，符合预期）。
+- `action_semantics` 为声明性标记：仿真端当前未读取（行为不变：本就不执行事件动作），
+  待 HunterSim 后续消费（§9）。
+- 存量 herd 的补齐位姿以「存量首实例为锚 + 契约相对间距」推算，与生成期重新采样的位姿不同
+  （刻意如此：不重算存量位姿）；对评估无影响（速度/行为均按契约值）。
+
+### 8. 回滚
+
+- `git revert` 本条提交即回到 v1.1 契约与无修复路径 ⇒ 存量 herd 下发回到 1 头、`crossing_speed`
+  回到变量名字符串。**不要在生产回滚**，除非接受联调遗留项重新出现。
+- 回滚不涉及数据：修复只作用于下发副本，2490 条存量场景 / 920 具体场景 / 184 用例不受影响。
+- 新批次（≥本版本生成）即使回滚平台，其库内形态已是多头 + 数值化（生成期产物，不依赖下发期修复）。
+
+### 9. 待办
+
+- **项⑤（HunterSim 待办，建议 V3.7.2）**：`participant_states` 写行补 `source_behavior_type`，
+  面板行为标签回显（登记详情：`docs/HunterSim场景语义对齐方案.md` §12.2）。
+- **仿真端可后续消费** `action_semantics` 标记（区分期望/指令；当前行为不变）。
+- **实机读数待回填**（§6 ②③④⑤ 的期望值）。
+
 
 
 

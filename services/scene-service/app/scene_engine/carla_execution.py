@@ -155,6 +155,22 @@ _RULE_MAP: Final[dict[str, str]] = {
 #: 事件里可省略的「起始速度」参数名（按优先级）
 _SPEED_KEYS: Final[tuple[str, ...]] = ("target_speed", "speed", "value", "crossing_speed")
 
+#: 动物类 kind 取值：与仿真端 ``scene_mapper._ANIMAL_KINDS``（animal/dog/cat/deer）对齐，
+#: 并补上本仓 taxonomy 实际使用的 cattle / livestock（``animal_crossing.animal_kind`` 的
+#: select 取值）。``parameters.animal_kind`` 非空即视为动物（仿真端口径一致）。
+_ANIMAL_KINDS: Final[frozenset[str]] = frozenset(
+    {"animal", "dog", "cat", "deer", "cattle", "livestock"}
+)
+
+
+def _animal_kind(parameters: Mapping[str, Any]) -> str | None:
+    """参与者的动物 kind（非动物返回 None；口径与仿真端 animal_asset_missing 判定一致）。"""
+    animal_kind = str(parameters.get("animal_kind") or "").strip().lower()
+    if animal_kind:
+        return animal_kind
+    object_kind = str(parameters.get("object_kind") or "").strip().lower()
+    return object_kind if object_kind in _ANIMAL_KINDS else None
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionReport:
@@ -209,12 +225,24 @@ def check_executable(config: Mapping[str, Any]) -> ExecutionReport:
         if mapping is None:
             unsupported.append(f"参与者 {actor_id} 的行为 {behavior_type!r} 未定义执行映射")
             continue
-        is_pedestrian = "pedestrian" in str(actor.get("type") or "").lower()
-        if mapping.osc_action == "WalkAction" and not is_pedestrian:
+        actor_type = str(actor.get("type") or "").strip().lower()
+        # V1.27.0：WalkAction 告警只对「车辆」发——type=other（动物/锥桶/碎片等）按行人/
+        # 步行动作执行属正常（动物穿行 sudden_cross、碎皮遗洒等），旧口径把 animal-1
+        # 误报成「参与者为车辆但行为按行人执行」。
+        if mapping.osc_action == "WalkAction" and actor_type == "vehicle":
             warnings.append(f"参与者 {actor_id} 为车辆但行为 {behavior_type!r} 按行人执行")
         if mapping.osc_action == "FollowTrajectoryAction":
             unsupported.append(
                 f"参与者 {actor_id} 的行为 {behavior_type!r} 需要显式轨迹，当前配置未提供"
+            )
+        # V1.27.0：动物类参与者显式报告资产降级（与仿真端 animal_asset_missing 同口径）——
+        # CARLA 0.9.16 无动物资产，仿真端会降级为行人执行；平台侧同步留痕，避免「下发成功
+        # 但画面是行人」被当成静默降级。
+        kind = _animal_kind(behavior.get("parameters") or {})
+        if kind is not None and actor_type == "other":
+            warnings.append(
+                f"参与者 {actor_id} 为动物（kind={kind}）：CARLA 0.9.16 无动物资产，"
+                f"仿真端将降级为行人执行（animal_asset_missing）"
             )
 
     for index, event in enumerate(events):

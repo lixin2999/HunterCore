@@ -37,6 +37,7 @@ from app.repositories.simulations import (
     VilSessionStore,
     carla_topic_names,
 )
+from app.scene_engine.dispatch_repair import repair_dispatch_config
 from app.scene_engine.semantics import check_scene_semantics
 from app.scene_engine.vehicle_geometry import (
     SENSOR_MOUNT_REFERENCE_KEY,
@@ -75,6 +76,12 @@ _MAX_FINALIZED_INSTANCES = 4096
 #: 原样下发（``(0,0,0)`` 是目录模板的占位值），``actors[].spawn_point`` 仍是**相对自车出生点
 #: 的偏移**；把占位原点换成有效车道坐标、并据此叠加参与者偏移，均是仿真端（HunterSim）的职责。
 SPAWN_SEMANTICS_RELATIVE = "relative_to_ego"
+
+#: 下发载荷的事件动作语义声明（V1.27.0，方案文档 §7 F）：``events[].action`` 是**评估基线**
+#: （期望留档），不是可执行指令——自车的处置（如 ev-1 的 brake）由被测系统/驾驶策略产生，
+#: 平台不注入、仿真端不执行；若仿真端替自车执行期望动作，评估会自我实现（oracle 恒真）。
+#: 仿真端应依据本标记区分「期望」与「指令」，不再按版本猜行为。
+ACTION_SEMANTICS_EXPECTATION = "expectation_only"
 
 
 def _forbidden_match(forbidden: frozenset[str], path: str) -> bool:
@@ -188,7 +195,7 @@ class SceneSimulationService:
 
     @staticmethod
     def _dispatch_payload(config: dict[str, Any]) -> dict[str, Any]:
-        """构造下发载荷：场景存量值原样下发 + 出生点语义标记（V1.25.0）。
+        """构造下发载荷：场景存量值原样下发 + 语义标记（出生点 V1.25.0 / 动作 V1.27.0）。
 
         历史上（V1.24.8）这里做过两件事：把参与者偏移折算成绝对坐标、以及把落在原点的
         自车出生点拦下返 2001。两者都已推翻：平台无从得知目标地图的有效车道坐标（需实机
@@ -196,8 +203,16 @@ class SceneSimulationService:
         因此现在只打上 ``spawn_semantics=relative_to_ego`` 标记，把「选有效出生坐标 +
         按该基准叠加参与者偏移」明确交给仿真端（实现方案见
         ``docs/HunterSim传感器挂载换算方案.md`` 第二部分）。
+
+        V1.27.0 起另打 ``action_semantics=expectation_only``：事件动作是评估基线而非指令
+        （见 :data:`ACTION_SEMANTICS_EXPECTATION`）。存量场景的裸参数名回填与实例补齐由
+        :func:`app.scene_engine.dispatch_repair.repair_dispatch_config` 在本方法之后执行。
         """
-        return {**config, "spawn_semantics": SPAWN_SEMANTICS_RELATIVE}
+        return {
+            **config,
+            "spawn_semantics": SPAWN_SEMANTICS_RELATIVE,
+            "action_semantics": ACTION_SEMANTICS_EXPECTATION,
+        }
 
     @staticmethod
     def _require_semantics(scene_type: str, payload: dict[str, Any]) -> None:
@@ -254,6 +269,18 @@ class SceneSimulationService:
         )
         # 下发载荷：V1.25.0 起不再做相对→绝对折算、不再拦原点（见 _dispatch_payload）
         dispatch_config = self._dispatch_payload(merged.model_dump(mode="json"))
+        # 存量场景下发期修复（V1.27.0）：裸参数名回填（crossing_speed=animal_speed 这类
+        # 生成期缺陷落库值）+ 变体提升的角色实例补齐（herd 群畜 1→N）。逐条留痕，
+        # 不静默改写；新场景在生成期即正确，这里通常为空操作。
+        repair = repair_dispatch_config(dispatch_config, str(model.scene_type), model.tags or [])
+        if not repair.empty:
+            logger.warning(
+                "scene_dispatch_legacy_repaired",
+                scene_id=str(scene_id),
+                scene_type=str(model.scene_type),
+                param_repairs=[item.to_dict() for item in repair.param_repairs],
+                actor_repairs=[item.to_dict() for item in repair.actor_repairs],
+            )
         self._attach_sensor_mount_reference(dispatch_config)
         # 下发前语义复检：缺必需参与者角色直接 2001（否则仿真端只能看到 1 辆车却“下发成功”）
         self._require_semantics(str(model.scene_type), dispatch_config)

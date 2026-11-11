@@ -19,7 +19,7 @@
 # 加载：hunter_common.scene_taxonomy（定位顺序：SCENE_TAXONOMY_FILE → 向上查找
 #   contracts/scene-taxonomy.yaml；容器内由 ./contracts 只读挂载或镜像内置提供）。
 # =====================================================================
-version: "1.1"
+version: "1.2"
 source: "场景生成器与场景管理详细设计文档 §4.2.1 分类体系 + GB/T 47025—2026 覆盖面"
 status: confirmed_extensible
 note: "本文件为可扩展受控字典；categories[].types 的并集等于 scene_types 全集"
@@ -1106,12 +1106,13 @@ scene_semantics:
       animal_x: {mean: 24, std: 8, low: 10, high: 45, risk: -1, unit: m}
       animal_speed: {mean: 3.5, std: 1.5, low: 1.0, high: 7.0, risk: 1, unit: m/s}
       animal_kind: {mean: 0, std: 1, low: 0, high: 2, discrete: true}
+      n_animals: {mean: 1.2, std: 0.8, low: 1, high: 4, risk: 1, discrete: true}
     variants:
-      - {key: dog_dash, label: 狗突然窜出, sub: DOG, force: {animal_kind: 0, animal_speed: 5.0}}
-      - {key: deer_cross, label: 大型动物横穿, sub: DER, force: {animal_kind: 1, animal_x: 18}}
-      - {key: herd, label: 群畜穿行, sub: HRD, force: {animal_kind: 2, animal_speed: 2.0}}
+      - {key: dog_dash, label: 狗突然窜出, sub: DOG, force: {animal_kind: 0, animal_speed: 5.0, n_animals: 1}}
+      - {key: deer_cross, label: 大型动物横穿, sub: DER, force: {animal_kind: 1, animal_x: 18, n_animals: 1}}
+      - {key: herd, label: 群畜穿行, sub: HRD, force: {animal_kind: 2, animal_speed: 2.0, n_animals: 3}}
     roles:
-      - {role: animal, type: other, count: "1", spawn: {x: animal_x, y: -4.5, yaw: 1.5708}, behavior_type: sudden_cross, parameters: {animal_kind: {select: [dog, deer, cattle], index: animal_kind}, crossing_speed: animal_speed}, required: true, min_count: 1}
+      - {role: animal, type: other, count: "round(n_animals)", spawn: {x: animal_x + i * 1.2, y: -4.5 - i * 0.9, yaw: 1.5708}, behavior_type: sudden_cross, parameters: {animal_kind: {select: [dog, deer, cattle], index: animal_kind}, crossing_speed: animal_speed}, required: true, min_count: 1}
     events:
       - {type: pedestrian_crossing, condition_type: relative_distance, condition: 动物进入车道且距自车低于阈值, parameters: {value: animal_x - 6, rule: "<", relative_distance_type: longitudinal}, action_type: brake, action_parameters: {deceleration: 4.5}}
     constraints:

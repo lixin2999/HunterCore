@@ -141,7 +141,12 @@ def resolve_parameters(
 
 
 def resolve_value(value: Any, variables: Mapping[str, float], *, where: str = "") -> Any:
-    """解析角色/事件参数值：``{select/index}`` → 受控取值，表达式 → 数值，其余保持字面量。"""
+    """解析角色/事件参数值：``{select/index}`` → 受控取值，表达式 → 数值，其余保持字面量。
+
+    V1.27.0 起支持**裸参数名**：值恰为语义参数名（如 ``crossing_speed: animal_speed``）
+    时解析为该参数数值。此前这类值以字符串原样落库/下发，仿真端只能 ``unresolved_param``
+    回落默认速度（方案文档 ``docs/HunterSim场景语义对齐方案.md`` 改动 A）。
+    """
     if isinstance(value, bool):
         return 1.0 if value else 0.0
     if isinstance(value, (int, float)):
@@ -160,6 +165,8 @@ def resolve_value(value: Any, variables: Mapping[str, float], *, where: str = ""
     text = str(value).strip()
     if _is_expression(text):
         return round(evaluate(text, variables, where=where), 3)
+    if text in variables:
+        return round(float(variables[text]), 3)
     return text
 
 
@@ -250,6 +257,18 @@ def _actor_entry(
             ),
         },
     }
+
+
+def actor_entry_for(
+    role: RoleSemantics, index: int, variables: Mapping[str, float]
+) -> dict[str, Any]:
+    """按语义契约装配第 ``index`` 个（0 基）参与者条目。
+
+    公开单实例装配入口（V1.27.0）：下发期存量修复（:mod:`app.scene_engine.dispatch_repair`）
+    需要在不整体重算存量位姿的前提下补齐角色实例，复用生成期的同一装配口径，
+    避免两处事实源漂移。
+    """
+    return _actor_entry(role, index, variables)
 
 
 def build_events(

@@ -370,6 +370,56 @@ def test_check_executable_flags_unsupported_combinations() -> None:
     assert check_executable(VALID_BASE_CONFIG).unsupported == ()
 
 
+def _animal_actor(actor_type: str, kind: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "actor_id": "animal-1",
+        "type": actor_type,
+        "spawn_point": {"x": 24.0, "y": -4.5, "z": 0.0, "yaw": 1.5708},
+        "behavior": {
+            "behavior_type": "sudden_cross",
+            "parameters": {"crossing_speed": 5.0, **kind},
+        },
+    }
+
+
+def test_check_executable_reports_animal_degradation_without_false_vehicle_warning() -> None:
+    """动物参与者（type=other + sudden_cross）：不再误报「车辆按行人执行」，改为显式报告资产降级。"""
+    config = json.loads(json.dumps(VALID_BASE_CONFIG))
+    config["actors"] = [_animal_actor("other", {"animal_kind": "dog"})]
+    report = check_executable(config)
+    assert report.unsupported == ()
+    warnings = "\n".join(report.warnings)
+    assert "为车辆但行为" not in warnings, "type=other 不是车辆，WalkAction 属正常（动物/遗洒物）"
+    assert "animal_asset_missing" in warnings
+    assert "无动物资产" in warnings
+    assert "kind=dog" in warnings
+
+
+def test_check_executable_object_kind_animal_also_reported() -> None:
+    """object_kind 命中动物取值（如 deer）同样报告降级——与仿真端口径一致。"""
+    config = json.loads(json.dumps(VALID_BASE_CONFIG))
+    config["actors"] = [_animal_actor("other", {"object_kind": "deer"})]
+    warnings = "\n".join(check_executable(config).warnings)
+    assert "animal_asset_missing" in warnings
+
+
+def test_check_executable_still_warns_vehicle_with_walk_action() -> None:
+    """车辆执行步行类行为仍是真告警（误配类型），保留原有判定。"""
+    config = json.loads(json.dumps(VALID_BASE_CONFIG))
+    config["actors"] = [_animal_actor("vehicle", {"animal_kind": "dog"})]
+    warnings = "\n".join(check_executable(config).warnings)
+    assert "为车辆但行为 'sudden_cross' 按行人执行" in warnings
+    assert "animal_asset_missing" not in warnings, "type=vehicle 不走动物降级分支"
+
+
+def test_check_executable_prop_kind_not_reported_as_animal() -> None:
+    """普通遗洒物（object_kind=tyre）不触发动物降级报告。"""
+    config = json.loads(json.dumps(VALID_BASE_CONFIG))
+    config["actors"] = [_animal_actor("other", {"object_kind": "tyre"})]
+    warnings = "\n".join(check_executable(config).warnings)
+    assert "animal_asset_missing" not in warnings
+
+
 # =====================================================================
 # 三、G3 围栏 / G7 真实性口径（P1）
 # =====================================================================
