@@ -8878,16 +8878,108 @@ for w in (data.get("execution") or {}).get("warnings", []): print("warn:", w)'
 
 ### 9. 待办
 
-- **项⑤（HunterSim 待办，建议 V3.7.2）**：`participant_states` 写行补 `source_behavior_type`，
-  面板行为标签回显（登记详情：`docs/HunterSim场景语义对齐方案.md` §12.2）。
-- **仿真端可后续消费** `action_semantics` 标记（区分期望/指令；当前行为不变）。
-- **实机读数**：②④⑤a⑤b⑤c **全部已回填**（2026-11-11，见 §6「实机回报」——herd 补齐 1→3 +
+> HunterSim 侧待办共 **3 项**：1 项代码改动（建议 V3.7.2）+ 1 项防御性消费 + 1 项接入配置；
+> 平台侧均**无需代码变更**（待办 3 仅需管理员配合签发服务令牌）。平台侧实机读数已全部回填，无待办。
+
+- **待办 1｜项⑤：`participant_states` 补 `source_behavior_type` + 面板行为标签回显（建议 V3.7.2）**
+  - 现象：面板行为标签未回显 `sudden_cross`。
+  - 根因（仿真端）：`participant_states` 上报只写 1 行且未携带 `source_behavior_type`；映射层
+    `TrafficParticipantConfig.source_behavior_type` 已保留 `sudden_cross`（§5 离线端到端已证），
+    只差上报/展示链路补一字段。
+  - 改动明细：写 `participant_states` 的行补 `source_behavior_type`（或报告字段），面板从该字段
+    回显「行为标签」；**平台下发侧无配合项**。
+  - 验收判据：重下发 `SCN-2054-AC-HRD`（herd），面板行为标签回显 `sudden_cross`
+    （dog_dash 对照组同理）。
+  - 登记详情：`docs/HunterSim场景语义对齐方案.md` §12.2。
+- **待办 2｜消费 `action_semantics` 标记（防御性消费，无强制期限）**
+  - 背景：本版本下发载荷根节点新增 `action_semantics:"expectation_only"`
+    （`ACTION_SEMANTICS_EXPECTATION`）——`events[].action`（如 `ev-1` 的 `brake`）是**评估基线
+    （期望动作）**而非指令：自车处置必须由被测系统产生，仿真端若替自车执行期望动作，评估会
+    自我实现（oracle 恒真）。
+  - 改动明细：仿真端读取下发载荷时按该标记分支——`expectation_only` ⇒ 只用于评估对照、
+    不替自车执行；后续若引入「指令」语义，按标记区分，不再按版本猜。
+  - 当前行为不变：仿真端本就不执行事件动作，消费前后行为一致。
+  - 验收判据：重下发任一场景后，仿真端留痕已读取该标记（日志或映射产物），`ev-1:brake`
+    仍不驱动自车。
+- **待办 3｜仿真节点产物直传生效（HunterSim 侧接入配置，非代码缺陷）**
+  - 现象：节点未配 `HUNTER_CORE_JWT_TOKEN` ⇒ `ArtifactManager` 按 best-effort 跳过直传，
+    产物只落本地 `data/adapter/artifacts/<sim_id>/<scene_id>/` ⇒ 平台 result 的预签名下载地址
+    指向未上传的 `object_key` → `NoSuchKey`（§6 ⑤b 因此只能从本地 run.log 取证）。
+  - 改动明细：
+    1. 管理员为节点签发**服务令牌**（`typ=service`；不要用 admin 登录 Token——V1.23.6 约定，
+       用户单会话会互踢）：`POST /api/v1/user/service-token`，体 `{"client_id":"sim-node-01"}`
+       （**与 node_id 同值**，与首次注册的 owner 绑定一致，否则注册/心跳报 1002）；节点若已持有
+       注册/心跳用的服务令牌可直接复用。命令细节见 `docs/HunterSim接入清单.md` §2。
+    2. 仿真节点配置两个环境变量并重启节点进程：
+       `HUNTER_CORE_GATEWAY_URL=http://<SERVER_IP>:8080`、`HUNTER_CORE_JWT_TOKEN=<上一步服务令牌>`。
+    3. 重下发任一 published 场景（可复用 herd）。
+  - 验收判据：终态后 `GET /api/v1/scene/simulations/<id>/result` → `artifacts[].download_url`
+    直接 200 下载（`run.log`/`mapping.json`），不再 `NoSuchKey`；result 回报的 `object_key`
+    在 MinIO `hunter-scene-assets` 真实存在（平台换发 900s 预签名；对象键规范见
+    `docs/carla-integration.md` §5.7）。
+  - 注意：服务令牌 TTL 默认 7 天，过期 401+1001 ⇒ 同 `client_id` 重签（即轮换）；预签名 URL
+    的 host 由平台 `MINIO_PUBLIC_ENDPOINT` 决定，须为仿真机可达地址（运维操作手册 §7.5.1）。
+    **不影响本版本判据**（run.log 本地文件可取证）。
+- **实机读数（平台侧，无待办）**：②④⑤a⑤b⑤c **全部已回填**（2026-11-11，见 §6「实机回报」——herd 补齐 1→3 +
   `crossing_speed:2.0`、dog_dash 对照组 5.0、concrete 渲染动物降级警告在且无误报、进度与终态
   `actors_count=4`/`succeeded`、`run.log` 的 `actors_mapped=3`/`animal_asset_missing`×3/无
   `unresolved_param`）。
-- **仿真节点产物直传未生效（HunterSim 侧接入配置）**：节点未配 `HUNTER_CORE_JWT_TOKEN`，
-  `ArtifactManager` 按 best-effort 只保留本地产物 ⇒ 平台 result 的预签名下载地址 `NoSuchKey`。
-  补 `HUNTER_CORE_GATEWAY_URL` + `HUNTER_CORE_JWT_TOKEN` 后重跑即可直接下载（不影响本版本判据）。
+
+## V1.27.1（调整：登录 Access Token 有效期 30min → 60min —— 配置默认值 / Redis 会话 TTL / OpenAPI 契约 / 部署编排 / 断言同步）
+
+Date：2026-11-12
+变更类型：配置值与契约值调整（`jwt_access_token_expire_minutes` 30 → 60；`session:{user_id}` TTL 1800 → 3600）；**无表结构 / API 结构变化**；改默认值需重建 `api-gateway` 镜像，仅改部署 `.env` 则无需重建
+
+### 1. 现场
+
+登录平台后 Access Token **30 分钟**即过期（G-04 决策① 的收紧值），连续操作/联调时频繁收到 1003 并反复重登，影响使用体验。
+
+### 2. 变更内容
+
+| 层 | 文件 | 变更 |
+|---|---|---|
+| 代码默认值 | `common/python/hunter_common/config.py` | `jwt_access_token_expire_minutes: 30 → 60` |
+| Redis 契约 | `contracts/database/redis-keys.yaml` | `session:{user_id}` `ttl_seconds: 1800 → 3600`，`ttl_source` 改为 V1.27.1 决策，`ops` 示例 `EX 3600` |
+| OpenAPI 契约 | `contracts/openapi/api-gateway.yaml` | Access Token 文案 30min → 60min；`TokenPair.expires_in.example: 1800 → 3600` |
+| OpenAPI 契约（引用方） | `data-analytics.yaml` / `data-collector.yaml` / `ota-service.yaml` / `remote-control.yaml` / `scene-service.yaml` | Bearer Token 说明 30min → 60min（仅文案） |
+| 部署编排 | `.env.example`、`infra/deploy/.env.example`、`infra/deploy/docker-compose.yml`、`infra/k8s/base/01-configmap-common.yaml` | 默认值/示例值 30 → 60（compose 回退值 `:-60`） |
+| 测试断言 | `common/python/tests/test_config.py`、`test_storage_contracts.py`、`tests/support/thresholds.py`、`tests/support/flow.py`、`scripts/verify_data_layer.py`、`services/api-gateway/app/tests/{conftest,test_auth,test_openapi_contract}.py` | 30/1800 → 60/3600 |
+| 注释/文档 | `services/api-gateway/{README.md,app/core/{auth,security}.py,app/schemas/auth.py,app/services/auth_service.py}`、`frontend/src/utils/storage.ts`、`docs/api-gateway.md`、`docs/运维操作手册.md`、`docs/故障排查指南.md` | TTL 口径同步为 60min |
+
+实现本身无需改动：`core/security.py` 的 `exp` 与 `auth_service` 的会话 TTL / `expires_in` 均由
+`jwt_access_token_expire_minutes * 60` 派生。
+
+### 3. 安全口径（留痕）
+
+G-04 决策① 原意是「前端 Token 存 localStorage ⇒ 服务端收紧 Access TTL」：由系统约束第 8 条原值
+**2h** 收紧到 **30min**。本次按使用方要求调整为 **60min**，**仍短于原设计 2h**；Refresh Token 7d、
+单会话互踢、CSP、localStorage 硬 TTL 等其余措施不变。契约 `ttl_source` 已显式记录本次决策，
+不做静默改写。
+
+### 4. 部署与生效
+
+1. **仅调整有效期（推荐，无需重建）**：在部署机 `infra/deploy/.env` 设
+   `JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60`，`docker compose up -d api-gateway` 重建容器（环境变量注入即生效）。
+   ⚠ 若部署机 `.env` 仍显式写着 `30`，会覆盖 compose 的 `:-60` 回退值，必须同步修改。
+2. **采用新默认值**：`git pull` 后重建 `api-gateway` 镜像（`common/python` 打在镜像内）。
+3. 已签发的旧 Token 不受影响（`exp` 在签发时固定）；**重新登录后**新 Token 有效期为 3600s，
+   Redis `session:{user_id}` TTL 同步为 3600s。
+
+### 5. 验证
+
+- 离线：`pytest common/python/tests/test_config.py common/python/tests/test_storage_contracts.py`（29 passed）、
+  `pytest services/api-gateway/app/tests`（97 passed）。
+- 实机（可选）：重新登录后解 JWT 得 `exp - iat = 3600`；`POST /api/v1/user/login` 响应
+  `data.expires_in = 3600`；`redis-cli TTL session:{user_id}` ≈ 3600。
+
+### 6. 回滚
+
+将 `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` 改回 `30` 并重建 `api-gateway` 容器即可（纯配置，无数据迁移；
+存量 Token 自然过期）。
+
+### 7. 待办
+
+- 无。HunterSim 侧无配合项（服务令牌 TTL 仍为 7d，与本项无关）。
 
 
 
