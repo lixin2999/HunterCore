@@ -1,9 +1,9 @@
 /**
  * 本地会话持久化（纯函数模块，不依赖 Pinia/axios，避免循环依赖）
  *
- * 说明：服务端会话态为 Redis `session:{user_id}`（30 分钟，G-04 决策①收紧），前端本地仅保存 Token 副本。
+ * 说明：服务端会话态为 Redis `session:{user_id}`（60 分钟，V1.27.1；G-04 决策① 原 30 分钟），前端本地仅保存 Token 副本。
  * 安全（G-04①：localStorage + 短 TTL + 严格 CSP）：
- * - Access Token 短 TTL（30min）由服务端签发控制，到期经请求层 401 静默刷新；
+ * - Access Token 短 TTL（60min，V1.27.1；G-04① 原 30min）由服务端签发控制，到期经请求层 401 静默刷新；
  * - 本地副本硬 TTL：Refresh Token 已过期时读取即清理（不留不可用的 Token 残影）；
  * - CSP 由 Nginx 响应头（infra/deploy/config/nginx.conf）+ index.html meta 双层施加；
  * - 禁止在日志中输出 Token。

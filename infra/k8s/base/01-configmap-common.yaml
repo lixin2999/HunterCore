@@ -60,5 +60,5 @@ data:
 
   # ---------- 认证与安全（JWT 密钥本体在 Secret） ----------
   JWT_ALGORITHM: "HS256"
-  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: "30"         # Access Token 30min（G-04① 收紧，原 2h）
+  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: "60"         # Access Token 60min（V1.27.1 调整；G-04① 原 30min，仍短于原 2h）
   JWT_REFRESH_TOKEN_EXPIRE_DAYS: "7"            # Refresh Token 7d

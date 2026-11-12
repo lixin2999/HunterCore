@@ -135,9 +135,9 @@ class UserProfile(BaseModel):
 
 
 class TokenPair(BaseModel):
-    """Token 对（契约 TokenPair；Access 30min + Refresh 7d 单次轮换）。"""
+    """Token 对（契约 TokenPair；Access 60min + Refresh 7d 单次轮换）。"""
 
-    access_token: str = Field(description="JWT Access Token（30 分钟，G-04①）")
+    access_token: str = Field(description="JWT Access Token（60 分钟，V1.27.1；G-04① 原 30 分钟）")
     refresh_token: str = Field(description="Refresh Token（7 天，单次使用轮换）")
     token_type: Literal["Bearer"] = "Bearer"
     expires_in: int = Field(description="Access Token 有效期（秒）")

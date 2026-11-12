@@ -220,5 +220,5 @@ class HunterBaseConfig(BaseSettings):
             )
         return self
     jwt_algorithm: str = "HS256"
-    jwt_access_token_expire_minutes: int = 30    # Access Token 30min（G-04 决策①收紧，原设计文档 2h）
+    jwt_access_token_expire_minutes: int = 60    # Access Token 60min（V1.27.1：G-04① 30min → 60min，仍短于原设计文档 2h）
     jwt_refresh_token_expire_days: int = 7       # Refresh Token 7d

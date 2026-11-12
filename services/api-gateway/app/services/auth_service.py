@@ -5,7 +5,7 @@
 - IP 锁定（14.5 节）：失败计数键 ``rate_limit:{ip}:login-fail``（复用契约键模式
   ``rate_limit:{ip}:{api}``，{api} 槽位=login-fail）；锁定期间返回 429 + Retry-After
 - 会话（redis-keys.yaml 第 1 条）：``session:{user_id}`` = Access Token 原样存储，
-  TTL 1800s（G-04① 收紧）；登录写入 / 刷新覆盖 / 登出 DEL（撤销语义见 core/auth.py 模块注释）
+  TTL 3600s（V1.27.1；G-04① 原 1800s）；登录写入 / 刷新覆盖 / 登出 DEL（撤销语义见 core/auth.py 模块注释）
 - MFA(TOTP)：G-23 已在数据库契约增 `users.mfa_enabled` / `users.totp_secret` 字段，
   但 TOTP 签发/校验流程（含密钥加密存储）尚未实现，当前仍按契约
   「账号未启用 MFA 时忽略」处理；启用前需同步实现校验逻辑与前端绑定流程
@@ -109,7 +109,7 @@ class AuthService:
         permissions = await self._users.get_permission_codes(user.user_id)
         # 6) 更新 last_login_time（契约 login description 明确要求）
         await self._users.touch_last_login(user.user_id)
-        # 7) 签发 Token 对 + 写会话（redis-keys 第 1 条：SET session:{user_id} EX 1800，G-04①）
+        # 7) 签发 Token 对 + 写会话（redis-keys 第 1 条：SET session:{user_id} EX 3600，V1.27.1）
         pair = await self._issue_pair(
             user_id=str(user.user_id),
             username=user.username,
@@ -332,7 +332,7 @@ class AuthService:
             await self._redis.set(
                 session_key(user_id),
                 access_token,
-                expire_seconds=cfg.jwt_access_token_expire_minutes * 60,  # 30min（redis-keys 第 1 条，G-04①）
+                expire_seconds=cfg.jwt_access_token_expire_minutes * 60,  # 60min（redis-keys 第 1 条，V1.27.1）
             )
         except Exception as exc:
             logger.error("session_write_failed", user_id=user_id)
@@ -340,7 +340,7 @@ class AuthService:
         return TokenPair(
             access_token=access_token,
             refresh_token=refresh_token,
-            expires_in=cfg.jwt_access_token_expire_minutes * 60,          # 1800（G-04①）
+            expires_in=cfg.jwt_access_token_expire_minutes * 60,          # 3600（V1.27.1）
             refresh_expires_in=cfg.jwt_refresh_token_expire_days * 86400,  # 604800
             user=UserProfile(
                 user_id=UUID(user_id),

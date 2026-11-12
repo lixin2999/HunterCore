@@ -33,8 +33,8 @@ API 网关：统一接入、JWT 认证鉴权、五级限流熔断、路由转发
 
 - **口令**：bcrypt 哈希（`user_svc.users.password_hash`；轮次 `PASSWORD_BCRYPT_ROUNDS=12`）
 - **JWT**（设计文档 3.2.2 节）：载荷 `sub/username/roles/permissions/iat/exp/iss/jti`；
-  Access 30min（G-04 决策①收紧，原 2h）+ Refresh 7d；算法白名单（`HS256`），`iss=hunter-platform`
-- **会话**：Redis `session:{user_id}` = Access Token 原样存储，TTL 1800s
+  Access 60min（V1.27.1：G-04 决策① 原 30min，仍短于原 2h）+ Refresh 7d；算法白名单（`HS256`），`iss=hunter-platform`
+- **会话**：Redis `session:{user_id}` = Access Token 原样存储，TTL 3600s
   （redis-keys.yaml 第 1 条，owner=api-gateway）；**强依赖** —— Redis 不可用统一 503 + code=5001，禁止降级
 - **撤销语义**（redis-keys.yaml pending #6 选项②）：不引入黑名单键 —— 登录写入 / 刷新覆盖 /
   登出 DEL 会话；`get_current_user` 校验「会话存在且与当前 Token 全等」，旧 Token 即刻失效
@@ -55,7 +55,7 @@ API 网关：统一接入、JWT 认证鉴权、五级限流熔断、路由转发
 |------|------------------|----------|
 | `typ` | `access` | `service` |
 | `sub` | `user_id` | `service:{client_id}` |
-| 会话键 | `session:{user_id}`（1800s） | `session:service:{client_id}`（默认 604800s） |
+| 会话键 | `session:{user_id}`（3600s） | `session:service:{client_id}`（默认 604800s） |
 | 生效范围 | 全部控制台端点 + 转发 | 仅 `data-collector` 上传端点（presign/complete） |
 | 失效路径 | 重新登录 / 刷新 / 登出 | 重新签发（轮换）/ DELETE 撤销 / 到期 |
 

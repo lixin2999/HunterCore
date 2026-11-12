@@ -438,7 +438,7 @@ def ota_progress_key(task_id: str) -> str:
 
 
 def session_key(user_id: str) -> str:
-    """用户会话 Redis 键（``session:{user_id}``，TTL 30 分钟，G-04① 收紧）。"""
+    """用户会话 Redis 键（``session:{user_id}``，TTL 60 分钟，V1.27.1；G-04① 原 30 分钟）。"""
     pattern = contracts.redis_key("session:{user_id}")["pattern"]
     return pattern.replace("{user_id}", user_id)
 

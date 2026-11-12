@@ -35,7 +35,7 @@ async def test_login_success_returns_token_pair(
     assert body["code"] == 0
     data = body["data"]
     assert data["token_type"] == "Bearer"
-    assert data["expires_in"] == 1800           # Access 30min（契约 example 1800，G-04①）
+    assert data["expires_in"] == 3600           # Access 60min（契约 example 3600，V1.27.1）
     assert data["refresh_expires_in"] == 604800  # Refresh 7d（契约 example 604800）
     user = data["user"]
     assert user["username"] == "admin"

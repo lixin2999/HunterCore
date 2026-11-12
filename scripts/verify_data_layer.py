@@ -202,7 +202,7 @@ EXPECTED_VEHICLE_TOPICS: dict[str, tuple[int, str, str]] = {
 #: Redis 受控键契约（键模式 → (类型, TTL 秒)；None = 不过期）——来源：系统关键约束第 8 条
 #: 改动需同步 contracts/database/redis-keys.yaml 与各服务 x-hunter-service.redis_keys 声明
 EXPECTED_REDIS_KEYS: dict[str, tuple[str, int | None]] = {
-    "session:{user_id}": ("String", 1800),  # G-04① 收紧（原系统关键约束第 8 条 7200）
+    "session:{user_id}": ("String", 3600),  # V1.27.1：G-04① 30min → 60min（原系统关键约束第 8 条 7200）
     "vehicle:status:{vehicle_id}": ("Hash", None),
     "vehicle:online:set": ("Set", None),
     "rate_limit:{ip}:{api}": ("String", 1),  # V1.21.9：窗口从 60s 改为 1s（契约附录 D 单位为 QPS）

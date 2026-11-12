@@ -488,7 +488,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        网关校验的 JWT Access Token（30min，G-04① 收紧；Refresh Token 7d）。
+        网关校验的 JWT Access Token（60min，V1.27.1；G-04① 原 30min；Refresh Token 7d）。
         网关透传 `X-User-Id` / `X-Roles` / `X-Request-ID`（服务侧二次校验角色与资源域 `remote`，
         见 `x-hunter-control-safety.authorization`）；**禁止**用查询串 / 请求体传递 Token。
 

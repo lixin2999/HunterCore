@@ -863,7 +863,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        控制台用户 JWT Access Token（30 分钟，G-04① 收紧），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
+        控制台用户 JWT Access Token（60 分钟，V1.27.1；G-04① 原 30 分钟），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
         载荷结构（3.2.2 节）：`sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` /
         `iss="hunter-platform"` / `jti`。服务侧按 RBAC 资源域 `ota` 复核：
         `read`（版本/任务/记录查询）、`create`（创建版本与任务）、`execute`（启动/暂停/恢复/终止/回滚/退役）。
@@ -2364,7 +2364,7 @@ x-hunter-ota-security:
     - "version_code 单调递增（平台发布门禁 + 车端校验双保险）"
     - "A/B 分区：刷写非活动分区，TEST 自检失败回退原分区（车端自动）；平台人工回滚仅对 SUCCESS 记录下发 ota_rollback 指令"
   authorization:
-    authn: "JWT Access Token（30min，G-04①）+ Refresh Token（7d），网关校验后注入 X-User-Id / X-Roles / X-Trace-Id"
+    authn: "JWT Access Token（60min，V1.27.1；G-04① 原 30min）+ Refresh Token（7d），网关校验后注入 X-User-Id / X-Roles / X-Trace-Id"
     rbac_resource: "ota"
     actions: ["read（查询版本/任务/记录）", "create（创建版本/任务）", "execute（提测/提审/驳回/发布/退役/启动/暂停/恢复/终止/回滚）"]
     error_mapping: "Token 缺失/无效 → 1001；Token 过期 → 1003；权限不足 → 1002"

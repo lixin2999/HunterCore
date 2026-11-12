@@ -20,7 +20,7 @@ from __future__ import annotations
 # 键模式常量（值 = redis-keys.yaml keys[].pattern 逐字镜像；禁止改写大小写/分隔符）
 # =====================================================================
 
-#: 会话 JWT（api-gateway 写读；TTL 1800s，G-04① 收紧）
+#: 会话 JWT（api-gateway 写读；TTL 3600s，V1.27.1；G-04① 原 1800s）
 SESSION = "session:{user_id}"
 #: 车辆最新状态读模型 Hash（data-collector 写，多服务只读；不过期）
 VEHICLE_STATUS = "vehicle:status:{vehicle_id}"

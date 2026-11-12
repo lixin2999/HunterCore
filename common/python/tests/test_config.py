@@ -92,9 +92,9 @@ def test_minio_public_endpoint_used_for_presign_url() -> None:
 
 
 def test_jwt_token_ttl_matches_spec() -> None:
-    """Access Token 30min（G-04 决策①收紧，原设计文档 2h）/ Refresh Token 7d。"""
+    """Access Token 60min（V1.27.1 调整；G-04 决策① 原 30min，仍短于原设计文档 2h）/ Refresh Token 7d。"""
     settings = DemoSettings()
-    assert settings.jwt_access_token_expire_minutes == 30
+    assert settings.jwt_access_token_expire_minutes == 60
     assert settings.jwt_refresh_token_expire_days == 7
 
 

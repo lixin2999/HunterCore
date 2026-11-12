@@ -501,7 +501,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        控制台用户 JWT Access Token（30 分钟，G-04① 收紧），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
+        控制台用户 JWT Access Token（60 分钟，V1.27.1；G-04① 原 30 分钟），由网关校验后转发（注入 `X-User-Id` / `X-Roles` / `X-Trace-Id`）。
         载荷结构（3.2.2 节）：`sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` /
         `iss="hunter-platform"` / `jti`。服务侧按 RBAC 资源域 `analytics`（action ∈ read/execute）复核：
         查询类端点需 `analytics:read`，报告生成需 `analytics:execute`。

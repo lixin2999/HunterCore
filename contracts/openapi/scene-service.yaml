@@ -1055,7 +1055,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT Access Token（30 分钟，网关签发，G-04① 收紧）。载荷：`sub`(user_id) / `username` / `roles` / `permissions` /
+        JWT Access Token（60 分钟，网关签发，V1.27.1；G-04① 原 30 分钟）。载荷：`sub`(user_id) / `username` / `roles` / `permissions` /
         `iat` / `exp` / `iss` / `jti`。网关校验后注入 `X-User-Id`、`X-Roles`、`X-Trace-Id`，
         服务侧据此执行 RBAC（`permissions.resource=scene`，action ∈ create/read/update/delete/execute）
         与数据权限（按 creator/项目隔离）。

@@ -242,9 +242,9 @@ def test_login_public_but_session_endpoints_require_bearer(
 
 
 def test_token_ttl_matches_security_contract(contract: dict[str, Any]) -> None:
-    """Access Token 30min（G-04① 收紧）/ Refresh Token 7d（设计文档 14.1 节）。"""
+    """Access Token 60min（V1.27.1；G-04① 原 30min）/ Refresh Token 7d（设计文档 14.1 节）。"""
     props = contract["components"]["schemas"]["TokenPair"]["properties"]
-    assert props["expires_in"]["example"] == 1800
+    assert props["expires_in"]["example"] == 3600
     assert props["refresh_expires_in"]["example"] == 604800
     assert props["token_type"]["enum"] == ["Bearer"]
 

@@ -78,8 +78,8 @@ OTA_STATE_MACHINE: tuple[str, ...] = (
 OTA_ROLLBACK_PATH: tuple[str, ...] = ("TEST", "ROLLBACK", "ROLLED_BACK")
 
 # ---------------------------------------------------------------- Redis TTL（第 8 条）
-#: 用户会话 TTL（秒，30 分钟；G-04① 收紧，原第 8 条 7200）
-SESSION_TTL_SECONDS: int = 1800
+#: 用户会话 TTL（秒，60 分钟；V1.27.1：G-04① 30min → 60min，原第 8 条 7200）
+SESSION_TTL_SECONDS: int = 3600
 #: 场景配置缓存 TTL（秒，1 小时）
 SCENE_CACHE_TTL_SECONDS: int = 3600
 #: OTA 进度 Hash TTL（秒，任务结束后 1 天）

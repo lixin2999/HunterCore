@@ -30,7 +30,7 @@ info:
 
     **统一响应**：`{code, message, data, request_id, timestamp}`；`code=0` 成功，非 0 为预定义错误码（附录 A）。
 
-    **认证**：`Authorization: Bearer <JWT>`；Access Token 30min（G-04 决策①收紧，原设计文档 2h）、Refresh Token 7d，支持 MFA(TOTP)。
+    **认证**：`Authorization: Bearer <JWT>`；Access Token 60min（V1.27.1 调整，G-04 决策① 原 30min，仍短于原设计文档 2h）、Refresh Token 7d，支持 MFA(TOTP)。
     车辆设备采用 X.509 双向 TLS（CommonName = vehicle_id）+ Kafka SASL_SSL，不通过 REST 认证。
 
     **链路追踪**：入口优先透传 `X-Request-ID`，未提供则生成 UUID；转发后端时附加
@@ -65,11 +65,11 @@ paths:
       tags: [auth]
       summary: 用户登录（用户名密码 + 可选 MFA(TOTP)）
       description: |
-        设计文档 3.2.1 节登录流程：验证用户名密码 → 生成 JWT Access Token(30min，G-04①) + Refresh Token(7d)。
+        设计文档 3.2.1 节登录流程：验证用户名密码 → 生成 JWT Access Token(60min，V1.27.1；G-04① 原 30min) + Refresh Token(7d)。
 
         - MFA(TOTP)：请求携带 `totp_code`；缺失或校验失败返回 1001（附录 A 无 MFA 专用错误码，禁止新增）
         - 暴力破解防护（14.5 节）：登录失败次数限制 + IP 锁定；失败/成功均审计留痕（禁止记录密码）
-        - 成功后更新 `user_svc.users.last_login_time`，并写 Redis `session:{user_id}`（30 分钟，G-04①）
+        - 成功后更新 `user_svc.users.last_login_time`，并写 Redis `session:{user_id}`（60 分钟，V1.27.1；G-04① 原 30 分钟）
       security: []
       parameters:
         - $ref: '#/components/parameters/TraceRequestId'
@@ -146,7 +146,7 @@ paths:
       description: |
         设计文档 14.1 节：支持主动注销。
 
-        - 清除 Redis `session:{user_id}`；Access Token 加入黑名单直至其自然过期（≥ 30min 保留窗口，G-04① 收紧后窗口同步缩短）
+        - 清除 Redis `session:{user_id}`；Access Token 加入黑名单直至其自然过期（≥ 60min 保留窗口，V1.27.1 调整后窗口同步延长）
         - 幂等：Token 已失效仍返回 code=0（不泄露 Token 状态）
       security:
         - bearerAuth: []
@@ -414,7 +414,7 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        JWT Access Token（30 分钟；G-04 决策①：前端 Token 存 localStorage，服务端同步收紧 TTL，原设计文档 2h）。载荷结构（设计文档 3.2.2 节）：
+        JWT Access Token（60 分钟；V1.27.1 调整：G-04 决策① 原 30 分钟，仍短于原设计文档 2h）。载荷结构（设计文档 3.2.2 节）：
         `sub`(user_id) / `username` / `roles` / `permissions` / `iat` / `exp` / `iss="hunter-platform"` / `jti`。
 
         校验失败映射：Token 缺失或无效 → 1001；Token 过期 → 1003（客户端调用 /api/v1/user/refresh）；
@@ -775,7 +775,7 @@ components:
       properties:
         access_token:
           type: string
-          description: JWT Access Token（30 分钟，G-04①）
+          description: JWT Access Token（60 分钟，V1.27.1；G-04① 原 30 分钟）
         refresh_token:
           type: string
           writeOnly: true
@@ -786,7 +786,7 @@ components:
           default: Bearer
         expires_in:
           type: integer
-          example: 1800
+          example: 3600
           description: Access Token 有效期（秒）
         refresh_expires_in:
           type: integer

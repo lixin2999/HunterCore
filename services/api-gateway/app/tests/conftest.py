@@ -171,7 +171,7 @@ def make_access_token(
 
 async def seed_session(fake_redis: FakeRedis, token: str, user_id: str) -> None:
     """写入会话（登录等价物），供 get_current_user 严格校验使用。"""
-    await fake_redis.set(session_key(user_id), token, expire_seconds=1800)  # G-04①（30min）
+    await fake_redis.set(session_key(user_id), token, expire_seconds=3600)  # V1.27.1（60min）
 
 
 @pytest.fixture()

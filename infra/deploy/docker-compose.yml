@@ -72,7 +72,7 @@ x-business-env: &business-env
   # G-02：网关→后端身份头 HMAC 签名密钥（网关与 5 个后端服务共用；≥ 32 字节随机串）
   GATEWAY_HMAC_SECRET: ${GATEWAY_HMAC_SECRET}
   JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
-  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-30}  # G-04① 收紧（原设计文档 120 = 2h）
+  JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-60}  # V1.27.1：G-04① 30min → 60min（原设计文档 120 = 2h）
   JWT_REFRESH_TOKEN_EXPIRE_DAYS: ${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-7}
 
 # 业务服务通用挂载：Kafka 契约目录只读（标量锚点，供各服务 volumes 列表项引用）
