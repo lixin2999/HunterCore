@@ -8977,6 +8977,21 @@ G-04 决策① 原意是「前端 Token 存 localStorage ⇒ 服务端收紧 Acc
 - 实机（可选）：重新登录后解 JWT 得 `exp - iat = 3600`；`POST /api/v1/user/login` 响应
   `data.expires_in = 3600`；`redis-cli TTL session:{user_id}` ≈ 3600。
 
+**实机回报（2026-11-12，部署机 `/opt/HunterCore`）**：
+
+```text
+# ① 重建镜像：hunter/api-gateway:0.1.0（104s；pip install 89s）
+# ② 首次 up -d 后容器 env 仍为 30 —— 根因：/opt/HunterCore/.env 第 68 行显式 30，
+#    覆盖 compose 的 :-60 回退值（环境变量优先于代码默认值）
+# ③ 改 .env → `compose config` 解析值 "60" → up -d api-gateway 重建容器
+# ④ docker inspect：JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60
+# ⑤ POST /api/v1/user/login → code=0、expires_in=3600（改前 1800）
+# ⑥ GET /healthz → 200（/health 为 404：网关健康路径是 /healthz）
+```
+
+> 现场教训：部署包 `.env` 由旧模板生成时会**显式带着 30**，只重建镜像不改 `.env` 不会生效。
+> 升级到 V1.27.1 时务必先 `grep '^JWT_ACCESS_TOKEN_EXPIRE_MINUTES=' .env` 核对并改为 60。
+
 ### 6. 回滚
 
 将 `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` 改回 `30` 并重建 `api-gateway` 容器即可（纯配置，无数据迁移；
