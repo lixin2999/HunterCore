@@ -8958,12 +8958,17 @@ G-04 决策① 原意是「前端 Token 存 localStorage ⇒ 服务端收紧 Acc
 
 ### 4. 部署与生效
 
-1. **仅调整有效期（推荐，无需重建）**：在部署机 `infra/deploy/.env` 设
-   `JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60`，`docker compose up -d api-gateway` 重建容器（环境变量注入即生效）。
-   ⚠ 若部署机 `.env` 仍显式写着 `30`，会覆盖 compose 的 `:-60` 回退值，必须同步修改。
+> 单机 Compose 部署的规范调用（与 `scripts/common.sh` 的 `HC_COMPOSE_ARGS` 一致，在 `/opt/HunterCore` 下执行）：
+> `docker compose -f infra/deploy/docker-compose.yml --project-directory . <cmd>`
+> 运行期配置唯一入口是 **`/opt/HunterCore/.env`**（`--project-directory .` 决定；不是 `infra/deploy/.env`）。
+
+1. **仅调整有效期（推荐，无需重建）**：在部署机 `/opt/HunterCore/.env` 设
+   `JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60`，再 `up -d api-gateway` 重建容器（环境变量注入即生效）。
+   ⚠ 若 `.env` 仍显式写着 `30`，会覆盖 compose 的 `:-60` 回退值，必须同步修改。
+   ⚠ `docker compose restart` **不会**重读环境变量，必须用 `up -d`（触发 recreate）。
 2. **采用新默认值**：`git pull` 后重建 `api-gateway` 镜像（`common/python` 打在镜像内）。
 3. 已签发的旧 Token 不受影响（`exp` 在签发时固定）；**重新登录后**新 Token 有效期为 3600s，
-   Redis `session:{user_id}` TTL 同步为 3600s。
+   Redis `session:{user_id}` TTL 同步为 3600s。存量会话键仍按旧 TTL 到期，刷新/重登后变为 3600s。
 
 ### 5. 验证
 
