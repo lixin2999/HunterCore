@@ -78,6 +78,9 @@ class Vehicle(Base):
     #        "steps": {"db|scram|topics|cert": {"state":..., "ts":..., "error":...}}}
     # 写入方：仅 vehicle-service；历史内置台账可为 NULL
     provision_status: Mapped[dict | None] = mapped_column(JSONB)
+    # V1.28.0 车端当前网络地址（IPv4/IPv6）：data-collector health 心跳回写（权威）+
+    # vehicle-service 建账/台账人工录入；未上报且未录入时为 NULL
+    ip_address: Mapped[str | None] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
 
     # 无 relationship：events / vehicle_telemetry / algorithm_metrics / ota_records 的 vehicle_id

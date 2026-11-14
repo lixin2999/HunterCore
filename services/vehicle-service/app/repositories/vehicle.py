@@ -133,6 +133,7 @@ class VehicleStore:
         fence_json: dict[str, Any] | None,
         description: str | None,
         provision_status: dict[str, Any],
+        ip_address: str | None = None,
     ) -> Vehicle:
         """provisioning 第 1 步：在同一事务内 INSERT 台账；unique 冲突由调用方通过
         IntegrityError 捕获映射 3002。本方法只 flush（不 commit），事务边界由调用方控制。
@@ -147,6 +148,7 @@ class VehicleStore:
             device_cert_sn=None,
             fence_json=fence_json,
             description=description,
+            ip_address=ip_address,
             provision_status=provision_status,
         )
         session.add(row)
@@ -202,6 +204,7 @@ class VehicleStore:
         software_version: str | None = None,
         fence_json: dict[str, Any] | None = None,
         description: str | None = None,
+        ip_address: str | None = None,
     ) -> Vehicle | None:
         """PATCH：仅更新提供的字段（None = 未提供，不写入）。"""
         values: dict[str, Any] = {}
@@ -217,6 +220,8 @@ class VehicleStore:
             values["fence_json"] = fence_json
         if description is not None:
             values["description"] = description
+        if ip_address is not None:
+            values["ip_address"] = ip_address
         async with self._db.session() as session:
             row = (
                 await session.execute(

@@ -20,6 +20,20 @@ VehicleStatusLiteral = Literal[
     "emergency",
 ]
 
+#: 车端网络地址宽松校验（V1.28.0；IPv4 或标准压缩/简写 IPv6，与 health.schema.json ``ip`` 同型；
+#: 严格判定由心跳回写链路 ipaddress 模块负责）
+IP_ADDRESS_PATTERN = (
+    r"^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
+    r"|^(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:"
+    r"|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}"
+    r"|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}"
+    r"|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}"
+    r"|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}"
+    r"|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}"
+    r"|[0-9A-Fa-f]{1,4}:(:[0-9A-Fa-f]{1,4}){1,6}"
+    r"|:(:[0-9A-Fa-f]{1,4}){1,7}|::)$"
+)
+
 
 class ProvisionStep(BaseModel):
     """provisioning 4 步的单步状态（写入 vehicle_svc.vehicles.provision_status.steps）。"""
@@ -47,6 +61,12 @@ class VehicleCreateRequest(BaseModel):
     software_version: str | None = Field(default=None, max_length=32)
     fence_json: dict[str, Any] | None = None
     description: str | None = Field(default=None, max_length=500)
+    ip_address: str | None = Field(
+        default=None,
+        max_length=45,
+        pattern=IP_ADDRESS_PATTERN,
+        description="车端当前网络地址（可选人工录入；health 心跳上报后以车端值为权威）",
+    )
     takeover_existing: bool = Field(
         default=False,
         description="若 SCRAM/Topic/证书已存在（历史遗留），是否接管复用（跳过创建）",
@@ -64,6 +84,12 @@ class VehicleUpdateRequest(BaseModel):
     software_version: str | None = Field(default=None, max_length=32)
     fence_json: dict[str, Any] | None = None
     description: str | None = Field(default=None, max_length=500)
+    ip_address: str | None = Field(
+        default=None,
+        max_length=45,
+        pattern=IP_ADDRESS_PATTERN,
+        description="车端网络地址（置 null 不清除：心跳回写为权威，人工录入仅作初值）",
+    )
 
 
 # ---------- 响应 ----------
@@ -79,6 +105,7 @@ class VehicleRow(BaseModel):
     register_time: datetime
     last_online_time: datetime | None = None
     device_cert_sn: str | None = None
+    ip_address: str | None = None
     provision_state: ProvisionState
     provision_steps: list[ProvisionStep] = Field(default_factory=list)
 

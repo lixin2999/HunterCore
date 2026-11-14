@@ -69,6 +69,10 @@ class VehicleLedgerRepository(Protocol):
         """按主键读取台账名称；车辆不存在返回 ``None``（禁止伪造默认值）。"""
         ...  # pragma: no cover - 协议声明
 
+    async def update_ip_address(self, vehicle_id: str, ip_address: str) -> bool:
+        """回写车端网络地址（V1.28.0）；车辆不存在返回 ``False``。"""
+        ...  # pragma: no cover - 协议声明
+
 
 class VehicleLedgerWriter:
     """台账回写器（health / telemetry / Sweeper 三条路径共用，内部节流）。"""
@@ -90,6 +94,9 @@ class VehicleLedgerWriter:
         self._seen_writes: dict[str, float] = {}
         #: vehicle_id → (台账名称, 最近一次查询尝试时刻)
         self._name_cache: dict[str, tuple[str | None, float]] = {}
+        #: vehicle_id → 最近一次尝试写入的 ip_address（V1.28.0；IP 低频变更，
+        #: 去重不靠时间窗口——与最近写入值一致即跳过，变化时立即落库）
+        self._ip_writes: dict[str, str] = {}
 
     @property
     def enabled(self) -> bool:
@@ -160,6 +167,31 @@ class VehicleLedgerWriter:
             vehicle_id=vehicle_id,
         )
 
+    async def record_ip(self, vehicle_id: str, ip: str, *, now: float | None = None) -> bool:
+        """按 health 心跳回写 ``ip_address``（V1.28.0）；返回是否实际写库。
+
+        车端上报值为权威（覆盖人工录入）；与按车缓存的最近写入值一致时跳过——
+        IP 变化频率远低于心跳周期，去重不依赖节流窗口，也**不占用**状态回写的
+        节流时间戳（两种写入互不影响）。异常隔离与“失败也计入去重”沿用
+        :meth:`record_status` 约束 2：DB 持续故障时不会退化为每秒一次 UPDATE；
+        瞬时故障后若 IP 值不变则不重试，直到下次变化自动校正（可接受：页面
+        数字旧一点不得放大成数据管道中断）。
+
+        ``now`` 仅为与其它 record_* 保持调用形态一致（去重按值不按时钟）。
+        """
+        if not self._enabled or not vehicle_id or not ip:
+            return False
+        if self._ip_writes.get(vehicle_id) == ip:
+            return False
+        self._ip_writes[vehicle_id] = ip
+        self._prune()
+        return await self._run(
+            "vehicle_ledger_ip_write_failed",
+            lambda: self._repo.update_ip_address(vehicle_id, ip),
+            vehicle_id=vehicle_id,
+            ip=ip,
+        )
+
     async def vehicle_name(self, vehicle_id: str, *, now: float | None = None) -> str | None:
         """查询台账名称（供读模型补写 ``vehicle_name`` 字段）；带 TTL 缓存与异常隔离。
 
@@ -221,6 +253,7 @@ class VehicleLedgerWriter:
             self._status_writes,
             self._seen_writes,
             self._name_cache,
+            self._ip_writes,
         ):
             while len(store) > MAX_TRACKED_VEHICLES:
                 store.pop(next(iter(store)))

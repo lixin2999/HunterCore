@@ -139,13 +139,20 @@ async def list_logical_scenarios(
     category: Annotated[str | None, Query(max_length=32, description="分类过滤")] = None,
     keyword: Annotated[str | None, Query(min_length=1, max_length=64, description="ID/名称模糊")] = None,
     include_catalog: Annotated[bool, Query(description="是否包含未同步的内置目录项")] = True,
-    limit: Annotated[int, Query(ge=1, le=500, description="返回上限")] = 200,
+    limit: Annotated[int, Query(ge=1, le=500, description="扫描上限（分页前）")] = 200,
+    page: Annotated[int, Query(ge=1, description="页码（从 1 起）")] = 1,
+    page_size: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE, description="每页条数")] = DEFAULT_PAGE_SIZE,
 ) -> LogicalScenarioListResponse:
-    """逻辑场景列表（DB 快照优先，目录补齐；按 logical_id 去重）。"""
-    items = await service.list_logical(
-        category=category, keyword=keyword, include_catalog=include_catalog, limit=limit
+    """逻辑场景列表（DB 快照优先，目录补齐；按 logical_id 去重；过滤后分页）。"""
+    items, total = await service.list_logical(
+        category=category,
+        keyword=keyword,
+        include_catalog=include_catalog,
+        limit=limit,
+        page=page,
+        page_size=page_size,
     )
-    data = LogicalScenarioListData(items=items, total=len(items))
+    data = LogicalScenarioListData(items=items, total=total, page=page, page_size=page_size)
     return LogicalScenarioListResponse(data=data, request_id=trace_request_id())
 
 

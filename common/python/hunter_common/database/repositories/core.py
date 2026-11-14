@@ -88,6 +88,20 @@ class VehicleRepository(BaseRepository[Vehicle]):
         result = await self.session.execute(stmt)
         return bool(getattr(result, "rowcount", 0))
 
+    async def update_ip_address(self, vehicle_id: str, ip_address: str) -> bool:
+        """回写车端网络地址（V1.28.0 单条 UPDATE）；返回是否命中行。
+
+        写入方：data-collector health 心跳回写（权威值）与 vehicle-service 台账录入；
+        车辆不存在返回 ``False``（不新建行）。
+        """
+        stmt = (
+            update(Vehicle)
+            .where(Vehicle.vehicle_id == vehicle_id)
+            .values(ip_address=ip_address)
+        )
+        result = await self.session.execute(stmt)
+        return bool(getattr(result, "rowcount", 0))
+
 
 class UserRepository(BaseRepository[User]):
     """用户读写（user_svc.users）+ RBAC 展开查询。"""

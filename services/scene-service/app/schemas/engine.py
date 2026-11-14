@@ -66,6 +66,8 @@ class LogicalScenarioDetail(LogicalScenarioSummary):
 class LogicalScenarioListData(BaseModel):
     items: list[LogicalScenarioSummary]
     total: int
+    page: int = 1
+    page_size: int = 20
 
 
 class LogicalScenarioListResponse(ApiResponse[LogicalScenarioListData]):

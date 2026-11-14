@@ -429,6 +429,12 @@ components:
         register_time: { type: string, format: date-time }
         last_online_time: { type: string, format: date-time, nullable: true }
         device_cert_sn: { type: string, nullable: true }
+        ip_address:
+          type: string
+          nullable: true
+          maxLength: 45
+          pattern: '^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|^(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(:[0-9A-Fa-f]{1,4}){1,6}|:(:[0-9A-Fa-f]{1,4}){1,7}|::)$'
+          description: 车端当前网络地址（V1.28.0；IPv4/简写 IPv6 宽松校验；data-collector health 心跳回写为权威 + 建账/台账人工录入；未上报且未录入为 null，前端显示 "-"）
         provision_state:
           type: string
           enum: [pending, in_progress, ready, failed]
@@ -466,6 +472,12 @@ components:
         software_version: { type: string, nullable: true, maxLength: 32 }
         fence_json: { type: object, nullable: true }
         description: { type: string, nullable: true, maxLength: 500 }
+        ip_address:
+          type: string
+          nullable: true
+          maxLength: 45
+          pattern: '^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|^(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(:[0-9A-Fa-f]{1,4}){1,6}|:(:[0-9A-Fa-f]{1,4}){1,7}|::)$'
+          description: 车端网络地址（可选人工录入初值；health 心跳上报后以车端值为权威）
         takeover_existing:
           type: boolean
           default: false
@@ -480,6 +492,12 @@ components:
         software_version: { type: string, nullable: true, maxLength: 32 }
         fence_json: { type: object, nullable: true }
         description: { type: string, nullable: true, maxLength: 500 }
+        ip_address:
+          type: string
+          nullable: true
+          maxLength: 45
+          pattern: '^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|^(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(:[0-9A-Fa-f]{1,4}){1,6}|:(:[0-9A-Fa-f]{1,4}){1,7}|::)$'
+          description: 车端网络地址（省略/null = 不更新：心跳回写为权威，人工录入仅作初值）
 
     ProvisionResult:
       type: object

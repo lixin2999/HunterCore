@@ -85,7 +85,7 @@ DDL 定义表结构，本文件定义「ORM 如何映射这些结构」「每个
 <!-- repository-table:start -->
 | Repository | 模型 | 模块 | 专属方法（映射的契约索引） |
 |------------|------|------|---------------------------|
-| `VehicleRepository` | `Vehicle` | `repositories/core.py` | `get_by_device_cert_sn`（`uq_vehicles_device_cert_sn`）、`list_by_status`（`idx_vehicles_status_last_online`）、`update_status`（单条 `UPDATE ... RETURNING`，1 次往返）、`touch_last_online_time`（单条 UPDATE + rowcount 判定；WHERE 附加时间比较 → 时间单调不回退，不改写 status 列） |
+| `VehicleRepository` | `Vehicle` | `repositories/core.py` | `get_by_device_cert_sn`（`uq_vehicles_device_cert_sn`）、`list_by_status`（`idx_vehicles_status_last_online`）、`update_status`（单条 `UPDATE ... RETURNING`，1 次往返）、`touch_last_online_time`（单条 UPDATE + rowcount 判定；WHERE 附加时间比较 → 时间单调不回退，不改写 status 列）、`update_ip_address`（单条 UPDATE + rowcount 判定；V1.28.0 心跳回写 ip_address 列，实现模式与 touch_last_online_time 一致） |
 | `UserRepository` | `User` | `repositories/core.py` | `get_by_username`（`uq_users_username`）、`get_by_email`（`uq_users_email`，小写比较）、`list_role_codes` / `list_permission_codes`（RBAC 展开）、`touch_last_login`（单条 UPDATE + rowcount 判定） |
 | `RoleRepository` | `Role` | `repositories/core.py` | `get_by_role_code`（`uq_roles_role_code`）、`list_enabled`（`roles.status`） |
 | `PermissionRepository` | `Permission` | `repositories/core.py` | `get_by_permission_code`（`uq_permissions_permission_code`）、`list_by_resource`（`idx_permissions_resource_action`） |
@@ -176,7 +176,7 @@ tasks = await OtaTaskRepository(session).find_all(
 | 服务 | 允许使用的共享 Repository | 说明 |
 |------|--------------------------|------|
 | `scene-service` | `SceneRepository` | `scene_svc.scenes`（软删除） |
-| `data-collector` | `EventRepository`、`VehicleTelemetryRepository`、`VehicleRepository` | `data_collector.events` / `vehicle_telemetry`（写路径幂等）；`VehicleRepository` **仅限**回写 `vehicle_svc.vehicles.status` / `last_online_time` 两列（V1.18.11：Redis 读模型 → 台账，「车辆管理」页的唯一数据源；经 `app/repositories/vehicle_ledger.py` 适配层，节流 + 异常隔离）——其余列（含主数据与 `provision_status`）仍归 vehicle-service，禁止扩展 |
+| `data-collector` | `EventRepository`、`VehicleTelemetryRepository`、`VehicleRepository` | `data_collector.events` / `vehicle_telemetry`（写路径幂等）；`VehicleRepository` **仅限**回写 `vehicle_svc.vehicles.status` / `last_online_time` / `ip_address` 三列（V1.18.11：Redis 读模型 → 台账，「车辆管理」页的唯一数据源；V1.28.0 增 `ip_address`：health 心跳上报经 `VehicleLedgerWriter.record_ip` 回写，上报值为权威；经 `app/repositories/vehicle_ledger.py` 适配层，节流 + 异常隔离）——其余列（含主数据与 `provision_status`）仍归 vehicle-service，禁止扩展 |
 | `data-analytics` | `AlgorithmMetricRepository`、`EventRepository`、`VehicleTelemetryRepository` | 分析读取（时序 + 事件，只读） |
 | `vil-forwarder` | 无（只读 Redis `vil:session:*` / `vil:active`，不访问数据库） | VIL 数据面 `telemetry_clean → carla.{sim_id}.vil_state`；登记本行仅为消除「未登记白名单」，**不得**新增共享 Repository 引用 |
 | `ota-service` | `OtaVersionRepository`、`OtaTaskRepository`、`OtaRecordRepository` | `ota_svc` 三表（灰度成功率统计等） |

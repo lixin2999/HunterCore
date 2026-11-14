@@ -138,17 +138,37 @@ function errorMessage(error: unknown, fallback: string): string {
  * ===================================================================== */
 const logicalLoading = ref(false)
 const logicalRows = ref<LogicalScenarioSummary[]>([])
-const logicalQuery = reactive({ category: '', keyword: '' })
+const logicalTotal = ref(0)
+const logicalQuery = reactive({ category: '', keyword: '', page: 1, page_size: DEFAULT_PAGE_SIZE })
 
 async function loadLogical(): Promise<void> {
   logicalLoading.value = true
   try {
     const data = await listLogicalScenarios(compactParams(logicalQuery))
     logicalRows.value = data.items
+    logicalTotal.value = data.total
   } catch (error) {
     ElMessage.error(errorMessage(error, '逻辑场景加载失败'))
   } finally {
     logicalLoading.value = false
+  }
+}
+
+/** 过滤条件变化/点查询：回到第 1 页 */
+function handleLogicalSearch(): void {
+  logicalQuery.page = 1
+  void loadLogical()
+}
+
+/** 提交生成任务下拉选项（与表格分页解耦，一次性全量加载） */
+const logicalOptions = ref<LogicalScenarioSummary[]>([])
+
+async function loadLogicalOptions(): Promise<void> {
+  try {
+    const data = await listLogicalScenarios({ page: 1, page_size: 200 })
+    logicalOptions.value = data.items
+  } catch (error) {
+    ElMessage.error(errorMessage(error, '逻辑场景选项加载失败'))
   }
 }
 
@@ -157,7 +177,7 @@ async function handleSyncCatalog(): Promise<void> {
   try {
     const data = await syncLogicalCatalog()
     ElMessage.success(`目录已同步（版本 ${data.version}，${data.synced} 个逻辑场景）`)
-    await loadLogical()
+    await Promise.all([loadLogical(), loadLogicalOptions()])
   } catch (error) {
     ElMessage.error(errorMessage(error, '目录同步失败'))
   }
@@ -285,6 +305,13 @@ const taskLoading = ref(false)
 const tasks = ref<GenerationTask[]>([])
 const taskTotal = ref(0)
 const taskStatusFilter = ref<GenerationTaskStatus | undefined>(undefined)
+const taskQuery = reactive({ page: 1, page_size: DEFAULT_PAGE_SIZE })
+
+/** 状态过滤变化：回到第 1 页再刷新 */
+function handleTaskFilterChange(): void {
+  taskQuery.page = 1
+  void refreshTasks()
+}
 
 let taskTimer: ReturnType<typeof setInterval> | null = null
 
@@ -310,8 +337,8 @@ async function refreshTasks(silent = false): Promise<void> {
   }
   try {
     const data = await listGenerationTasks({
-      page: 1,
-      page_size: 20,
+      page: taskQuery.page,
+      page_size: taskQuery.page_size,
       status: taskStatusFilter.value,
     })
     tasks.value = data.items
@@ -508,6 +535,12 @@ const coverageLoading = ref(false)
 const coverageProfile = ref<GenerationProfile>('exploration')
 const coverage = ref<CoverageOverview | null>(null)
 const coverageGaps = ref<CoverageGap[]>([])
+/** 盲区表客户端分页（gaps 一次性返回全量，行数有界） */
+const gapQuery = reactive({ page: 1, page_size: DEFAULT_PAGE_SIZE })
+const coverageGapRows = computed(() => {
+  const start = (gapQuery.page - 1) * gapQuery.page_size
+  return coverageGaps.value.slice(start, start + gapQuery.page_size)
+})
 
 async function loadCoverage(): Promise<void> {
   coverageLoading.value = true
@@ -518,6 +551,7 @@ async function loadCoverage(): Promise<void> {
     ])
     coverage.value = overview
     coverageGaps.value = gaps.items
+    gapQuery.page = 1
   } catch (error) {
     ElMessage.error(errorMessage(error, '覆盖分析加载失败'))
   } finally {
@@ -534,7 +568,8 @@ function handleFillGap(gap: CoverageGap): void {
   // 零场景缺口先补基线样本（不限定稀有分区），分区缺口才带 target_zone
   overridesText.value =
     gap.kind === 'zero_scenes' ? '{}' : JSON.stringify({ target_zone: gap.zone }, null, 2)
-  activeTab.value = 'generate'
+  // 生成表单在「生成任务」Tab 内（Tab 名为 tasks，历史误写 generate 导致跳转失效）
+  activeTab.value = 'tasks'
 }
 
 /** 类型 × 分区矩阵行（按具体场景数降序，未产出的类型排在后） */
@@ -577,6 +612,7 @@ function handleTabChange(name: string | number): void {
 
 onMounted(() => {
   void loadLogical()
+  void loadLogicalOptions()
   void refreshTasks()
 })
 
@@ -606,11 +642,11 @@ onBeforeUnmount(stopPolling)
                 clearable
                 placeholder="逻辑场景 ID / 名称"
                 style="width: 200px"
-                @keyup.enter="loadLogical"
+                @keyup.enter="handleLogicalSearch"
               />
             </el-form-item>
             <el-form-item>
-              <el-button type="primary" :loading="logicalLoading" @click="loadLogical">查询</el-button>
+              <el-button type="primary" :loading="logicalLoading" @click="handleLogicalSearch">查询</el-button>
             </el-form-item>
           </el-form>
 
@@ -678,6 +714,17 @@ onBeforeUnmount(stopPolling)
               </template>
             </el-table-column>
           </el-table>
+
+          <el-pagination
+            class="pager"
+            layout="total, sizes, prev, pager, next"
+            :total="logicalTotal"
+            :current-page="logicalQuery.page"
+            :page-size="logicalQuery.page_size"
+            :page-sizes="[DEFAULT_PAGE_SIZE, 50, 100]"
+            @current-change="(page: number) => { logicalQuery.page = page; loadLogical() }"
+            @size-change="(size: number) => { logicalQuery.page_size = size; logicalQuery.page = 1; loadLogical() }"
+          />
         </el-card>
       </el-tab-pane>
 
@@ -693,7 +740,7 @@ onBeforeUnmount(stopPolling)
                 <el-form-item label="逻辑场景" required>
                   <el-select v-model="generateForm.logical_id" filterable placeholder="选择逻辑场景" style="width: 100%">
                     <el-option
-                      v-for="row in logicalRows"
+                      v-for="row in logicalOptions"
                       :key="row.logical_id"
                       :label="`${row.logical_id} · ${row.name}`"
                       :value="row.logical_id"
@@ -767,7 +814,7 @@ onBeforeUnmount(stopPolling)
               clearable
               placeholder="全部状态"
               style="width: 150px"
-              @change="() => refreshTasks()"
+              @change="handleTaskFilterChange"
             >
               <el-option
                 v-for="option in taskStatusOptions"
@@ -845,7 +892,17 @@ onBeforeUnmount(stopPolling)
               </template>
             </el-table-column>
           </el-table>
-          <div class="hint total">共 {{ taskTotal }} 个任务</div>
+
+          <el-pagination
+            class="pager"
+            layout="total, sizes, prev, pager, next"
+            :total="taskTotal"
+            :current-page="taskQuery.page"
+            :page-size="taskQuery.page_size"
+            :page-sizes="[DEFAULT_PAGE_SIZE, 50, 100]"
+            @current-change="(page: number) => { taskQuery.page = page; refreshTasks() }"
+            @size-change="(size: number) => { taskQuery.page_size = size; taskQuery.page = 1; refreshTasks() }"
+          />
         </el-card>
       </el-tab-pane>
 
@@ -1006,7 +1063,7 @@ onBeforeUnmount(stopPolling)
           <el-col :span="15">
             <el-card v-loading="coverageLoading" shadow="never" class="block">
               <template #header><span>场景类型 × 稀有分区矩阵</span></template>
-              <el-table :data="coverageTypeRows" size="small" empty-text="暂无具体场景">
+              <el-table :data="coverageTypeRows" size="small" max-height="360" empty-text="暂无具体场景">
                 <el-table-column prop="label" label="场景类型" min-width="160" show-overflow-tooltip />
                 <el-table-column prop="total" label="合计" width="80" fixed="left" />
                 <el-table-column v-for="zone in ['Z1', 'Z2', 'Z3', 'Z4']" :key="zone" :label="zone" width="80">
@@ -1018,7 +1075,7 @@ onBeforeUnmount(stopPolling)
           <el-col :span="9">
             <el-card v-loading="coverageLoading" shadow="never" class="block">
               <template #header><span>角色维度覆盖（语义必需参与者）</span></template>
-              <el-table :data="coverageRoleRows" size="small" empty-text="暂无角色覆盖">
+              <el-table :data="coverageRoleRows" size="small" max-height="360" empty-text="暂无角色覆盖">
                 <el-table-column prop="role" label="角色" min-width="140" show-overflow-tooltip />
                 <el-table-column prop="count" label="覆盖场景数" width="110" />
               </el-table>
@@ -1030,7 +1087,7 @@ onBeforeUnmount(stopPolling)
           <template #header>
             <span>覆盖盲区（零场景基线 + 按 {{ GENERATION_PROFILE_LABELS[coverageProfile] }} 配额计算的 Z3/Z4 缺口）</span>
           </template>
-          <el-table :data="coverageGaps" size="small" empty-text="当前剖面下无缺口">
+          <el-table :data="coverageGapRows" size="small" empty-text="当前剖面下无缺口">
             <el-table-column prop="logical_id" label="逻辑场景" width="140" />
             <el-table-column prop="name" label="名称" min-width="180" show-overflow-tooltip />
             <el-table-column label="缺口类型" width="120">
@@ -1059,6 +1116,17 @@ onBeforeUnmount(stopPolling)
               </template>
             </el-table-column>
           </el-table>
+
+          <el-pagination
+            class="pager"
+            layout="total, sizes, prev, pager, next"
+            :total="coverageGaps.length"
+            :current-page="gapQuery.page"
+            :page-size="gapQuery.page_size"
+            :page-sizes="[DEFAULT_PAGE_SIZE, 50, 100]"
+            @current-change="(page: number) => { gapQuery.page = page }"
+            @size-change="(size: number) => { gapQuery.page_size = size; gapQuery.page = 1 }"
+          />
         </el-card>
       </el-tab-pane>
     </el-tabs>

@@ -150,6 +150,7 @@ class Provisioner:
                     software_version=req.software_version,
                     fence_json=req.fence_json,
                     description=req.description,
+                    ip_address=req.ip_address,
                     provision_status=status,
                 )
             steps["db"] = _new_step("db", "ok")

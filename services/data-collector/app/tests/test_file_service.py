@@ -529,6 +529,47 @@ async def test_list_files_filters_by_date_and_data_type_prefix_segments() -> Non
     assert storage.list_calls[-1]["prefix"] == "2026-09-19/"
 
 
+async def test_list_files_video_bucket_prefix_maps_remote_control_layout() -> None:
+    """hunter-video 前缀映射（V1.28.0 修复：旧实现按 {vid}/{date} 拼接→视频桶过滤全失效）。
+
+    键布局 remote-control/{vid}/{yyyy}/{mm}/{dd}/{session}.mp4（无 data_type 段）。
+    """
+    service, storage, _ = make_service()
+    key = f"remote-control/{VEHICLE_ID}/2026/09/18/session-01.mp4"
+    storage.put(VIDEO_BUCKET, key, CONTENT)
+
+    # 车辆 + 日期：日期拆为 {yyyy}/{mm}/{dd} 段，能够命中对象
+    data = await service.list_files(
+        vehicle_id=VEHICLE_ID, bucket=VIDEO_BUCKET, date=DATE, data_type=None, marker=None, limit=100
+    )
+    assert storage.list_calls[-1]["prefix"] == f"remote-control/{VEHICLE_ID}/2026/09/18/"
+    assert [item.object_key for item in data.items] == [key]
+
+    # 仅车辆：列举该车辆全部日期
+    await service.list_files(
+        vehicle_id=VEHICLE_ID, bucket=VIDEO_BUCKET, date=None, data_type=None, marker=None, limit=100
+    )
+    assert storage.list_calls[-1]["prefix"] == f"remote-control/{VEHICLE_ID}/"
+
+    # data_type 在视频桶被忽略（键内无该段，前端同步禁用筛选）
+    await service.list_files(
+        vehicle_id=VEHICLE_ID, bucket=VIDEO_BUCKET, date=None, data_type="video", marker=None, limit=100
+    )
+    assert storage.list_calls[-1]["prefix"] == f"remote-control/{VEHICLE_ID}/"
+
+    # 未给车辆：日期无法锚定（vid 段在前）→ 列举 remote-control/ 整段
+    await service.list_files(
+        vehicle_id=None, bucket=VIDEO_BUCKET, date=DATE, data_type=None, marker=None, limit=100
+    )
+    assert storage.list_calls[-1]["prefix"] == "remote-control/"
+
+    # 日期非 YYYY-MM-DD 格式：按原样段拼接（尽力而为，不报错）
+    await service.list_files(
+        vehicle_id=VEHICLE_ID, bucket=VIDEO_BUCKET, date="20260918", data_type=None, marker=None, limit=100
+    )
+    assert storage.list_calls[-1]["prefix"] == f"remote-control/{VEHICLE_ID}/20260918/"
+
+
 # ---------------------------------------------------------------------------
 # delete_files（V1.21.20：批量删除 / 清理无效记录）
 # ---------------------------------------------------------------------------

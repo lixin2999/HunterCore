@@ -304,8 +304,14 @@ paths:
       tags: [files]
       summary: 查询已上传文件清单（MinIO 对象列举 + 下载预签名）
       description: |
-        按 `bucket` + `vehicle_id` + `date` 前缀列举 MinIO 对象（5.5 节命名规范：
-        `{bucket}/{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}`），
+        按 `bucket` + `vehicle_id` + `date` 前缀列举 MinIO 对象，前缀构造按桶对象键布局感知（V1.28.0）：
+        - 常规桶（hunter-rosbag / hunter-raw-data 等，5.5 节命名规范
+          `{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}`）：非空段依次拼接；
+        - hunter-video（遥控会话录像，键结构
+          `remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/{session}.{mp4,json}`，见
+          contracts/database/object-storage.yaml）：日期拆为 `{yyyy}/{mm}/{dd}` 段；
+          键内无 `data_type` 段，该桶忽略 `data_type` 过滤（前端同步禁用该筛选项）；
+          未给 `vehicle_id` 时日期无法锚定前缀，列举 `remote-control/` 整段。
         每个对象返回 15 分钟预签名下载地址（支持 Range 分片下载）。
 
         分页采用游标语义（`marker` → `next_marker`）：MinIO 列举接口不提供对象总数，
@@ -322,11 +328,15 @@ paths:
         - name: date
           in: query
           required: false
-          description: 上传日期（`YYYY-MM-DD`，UTC；不传则列举该车辆全部日期）
+          description: |
+            上传日期（`YYYY-MM-DD`，UTC；不传则列举该车辆全部日期）。
+            hunter-video 桶下拆为 `{yyyy}/{mm}/{dd}` 段参与前缀匹配（需同时传 `vehicle_id` 才能锚定）。
           schema: { type: string, format: date }
         - name: data_type
           in: query
           required: false
+          description: |
+            数据类型段过滤（仅对常规桶有效；hunter-video 对象键无 data_type 段，该桶忽略此参数）。
           schema: { $ref: "#/components/schemas/FileDataType" }
         - name: marker
           in: query

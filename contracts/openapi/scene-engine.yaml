@@ -123,8 +123,10 @@ paths:
         - name: limit
           in: query
           required: false
-          description: 返回上限（与分页解耦，列表为目录型数据）
+          description: 扫描上限（分页前；列表为目录型数据，DB 快照 + 内置目录合并后先截断再分页）
           schema: { type: integer, minimum: 1, maximum: 500, default: 200 }
+        - $ref: "#/components/parameters/PageQuery"
+        - $ref: "#/components/parameters/PageSizeQuery"
       responses:
         "200":
           description: 逻辑场景列表
@@ -1224,7 +1226,9 @@ components:
                 items:
                   type: array
                   items: { $ref: "#/components/schemas/LogicalScenarioSummary" }
-                total: { type: integer }
+                total: { type: integer, description: 过滤后全量条数（分页前） }
+                page: { type: integer }
+                page_size: { type: integer }
     LogicalScenarioResponse:
       allOf:
         - $ref: "#/components/schemas/ApiResponse"

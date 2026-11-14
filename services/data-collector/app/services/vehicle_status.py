@@ -31,6 +31,7 @@ last_online_time``（“车辆管理”页的唯一数据源，Redis 读模型�
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 from typing import Any, Protocol
 
@@ -128,6 +129,20 @@ class VehicleStatusWriter:
             mapping["lat"] = str(lat)
             mapping["lng"] = str(lng)
             mapping["lat_lng_at"] = f"{current:.3f}"
+        # V1.28.0：health 顶层可选 ip（车端排期上报，同 G-08 模式）→ 回写台账 ip_address。
+        # 上报值为权威（覆盖人工录入）；非法值仅记 WARN 不回写（禁止脏数据进台账）；
+        # 未上报时不做任何写入（台账保留现有人工录入值）。
+        ip_value = payload.get("ip")
+        if ip_value is not None and self._ledger is not None:
+            ip_text = str(ip_value)
+            try:
+                ipaddress.ip_address(ip_text)
+            except ValueError:
+                logger.warning(
+                    "health_ip_invalid_ignored", vehicle_id=vehicle_id, ip=ip_text
+                )
+            else:
+                await self._ledger.record_ip(vehicle_id, ip_text, now=current)
         if timestamp > 0:
             mapping["vehicle_ts"] = f"{timestamp:.3f}"
         name = await self._lookup_name(vehicle_id, current)

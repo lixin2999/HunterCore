@@ -50,6 +50,8 @@ export interface VehicleRow {
   last_online_time?: string | null
   /** 客户端证书序列号（大写十六进制；未开通或证书缺失为空） */
   device_cert_sn?: string | null
+  /** 车端当前网络地址（V1.28.0；health 心跳回写为权威 + 人工录入；未上报且未录入为空，列表显示 "-"） */
+  ip_address?: string | null
   provision_state: ProvisionAggregateState
   provision_steps: ProvisionStep[]
 }
@@ -93,6 +95,8 @@ export interface VehicleCreateRequest {
   software_version?: string | null
   fence_json?: Record<string, unknown> | null
   description?: string | null
+  /** 车端网络地址（可选人工录入初值；心跳上报后以车端值为权威） */
+  ip_address?: string | null
   /** 若 SCRAM/Topic/证书已存在（历史遗留），是否接管复用（不重复创建） */
   takeover_existing?: boolean
 }
@@ -105,6 +109,8 @@ export interface VehicleUpdateRequest {
   software_version?: string | null
   fence_json?: Record<string, unknown> | null
   description?: string | null
+  /** 车端网络地址（省略/null = 不更新；心跳回写为权威） */
+  ip_address?: string | null
 }
 
 /** 一键开通响应（ProvisionResult；scram_password 一次性，服务端不落 DB/日志） */

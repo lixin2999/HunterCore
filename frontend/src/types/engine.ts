@@ -101,6 +101,8 @@ export interface LogicalScenarioDetail extends LogicalScenarioSummary {
 export interface LogicalScenarioListData {
   items: LogicalScenarioSummary[]
   total: number
+  page?: number
+  page_size?: number
 }
 
 export interface LogicalVersionSummary {

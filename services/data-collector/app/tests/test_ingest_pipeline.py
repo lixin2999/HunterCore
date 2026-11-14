@@ -380,6 +380,23 @@ async def test_status_writer_hooks_ledger_writeback() -> None:
     assert repo.status_calls[-1][1].value == OFFLINE_STATUS
 
 
+async def test_status_writer_records_ip_from_health() -> None:
+    """health 顶层可选 ip → 台账回写（V1.28.0）；非法值/未上报不回写。"""
+    redis = FakeRedisHash()
+    repo = FakeVehicleLedgerRepository()
+    writer = VehicleStatusWriter(redis, make_ledger_writer(repo))
+    base = {"vehicle_id": "HUNTER-001", "status": "online_idle", "system": {}, "timestamp": NOW}
+
+    await writer.update_from_health(base | {"ip": "192.168.10.21"}, now=NOW)
+    assert repo.ip_calls == [("HUNTER-001", "192.168.10.21")]
+
+    await writer.update_from_health(base, now=NOW + 1)   # 未上报 → 不回写（保留现有值）
+    assert repo.ip_calls == [("HUNTER-001", "192.168.10.21")]
+
+    await writer.update_from_health(base | {"ip": "not-an-ip"}, now=NOW + 2)  # 非法 → 仅 WARN
+    assert repo.ip_calls == [("HUNTER-001", "192.168.10.21")]
+
+
 async def test_status_writer_writes_vehicle_name_from_ledger() -> None:
     """读模型补写 vehicle_name（V1.19.20：此前无任何写方，看板/remote-control 名称恒空）。"""
     redis = FakeRedisHash()

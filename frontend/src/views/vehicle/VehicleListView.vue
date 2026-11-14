@@ -278,6 +278,9 @@ onMounted(load)
       <el-table-column prop="vehicle_id" label="车辆 ID" width="130" />
       <el-table-column prop="vehicle_name" label="名称" min-width="120" show-overflow-tooltip />
       <el-table-column prop="model" label="型号" width="100" />
+      <el-table-column label="IP 地址" width="140" show-overflow-tooltip>
+        <template #default="{ row }">{{ row.ip_address || '-' }}</template>
+      </el-table-column>
       <el-table-column label="状态" width="100">
         <template #default="{ row }">
           <StatusTag kind="vehicle" :value="row.status" />

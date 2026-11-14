@@ -224,8 +224,10 @@ class SceneEngineService:
         keyword: str | None = None,
         include_catalog: bool = True,
         limit: int = 200,
-    ) -> list[LogicalScenarioSummary]:
-        """逻辑场景列表：DB 快照优先，目录补齐未同步项。"""
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[LogicalScenarioSummary], int]:
+        """逻辑场景列表：DB 快照优先，目录补齐未同步项；返回 (当页切片, 过滤后总数)。"""
         items: list[LogicalScenarioSummary] = []
         seen: set[str] = set()
         try:
@@ -241,7 +243,11 @@ class SceneEngineService:
                 if summary.logical_id not in seen:
                     items.append(summary)
         items.sort(key=lambda item: (item.logical_id, item.version))
-        return items[:limit]
+        scanned = items[:limit]
+        page = max(1, int(page))
+        page_size = max(1, int(page_size))
+        offset = (page - 1) * page_size
+        return scanned[offset : offset + page_size], len(scanned)
 
     async def get_logical(self, logical_id: str, version: str | None = None) -> LogicalScenarioDetail:
         """逻辑场景详情（含 IR 与参数/绑定/约束声明）。"""

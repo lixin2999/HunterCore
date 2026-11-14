@@ -124,6 +124,7 @@ def _to_row(v: Vehicle) -> VehicleRow:
         register_time=v.register_time,
         last_online_time=v.last_online_time,
         device_cert_sn=v.device_cert_sn,
+        ip_address=v.ip_address,
         provision_state=aggregate_from_row(v.provision_status),  # type: ignore[arg-type]
         provision_steps=steps_to_list(v.provision_status),
     )

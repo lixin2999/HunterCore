@@ -70,22 +70,49 @@ async def _generate(client: AsyncClient, *, count: int = 6, seed: int = 20261023
 # =====================================================================
 async def test_list_logical_returns_catalog(client: AsyncClient, scene_env: object) -> None:
     """未同步 DB 时目录兜底：46 个内置逻辑场景（17 手写 + 29 语义合成）全部可见。"""
-    resp = await client.get(f"{SCENE_BASE}/logical", headers=ADMIN_HEADERS)
+    resp = await client.get(
+        f"{SCENE_BASE}/logical", headers=ADMIN_HEADERS, params={"page_size": 100}
+    )
     assert resp.status_code == 200
     data = _data(resp)
     assert data["total"] == len(CATALOG) == 46
+    assert data["page"] == 1 and data["page_size"] == 100
     assert {item["logical_id"] for item in data["items"]} == {ir.logical_id for ir in CATALOG}
     assert all(item["origin"] == "catalog" for item in data["items"])
     assert all(item["version"] == CATALOG_VERSION for item in data["items"])
 
 
-async def test_list_logical_filters_category_and_keyword(client: AsyncClient) -> None:
-    """分类与关键字过滤（关键字命中 ID 或名称）。"""
-    by_category = await client.get(
-        f"{SCENE_BASE}/logical", headers=ADMIN_HEADERS, params={"category": "interactive"}
+async def test_list_logical_pagination(client: AsyncClient) -> None:
+    """分页：默认第 1 页 20 条；page=2 与 page=1 不重叠；全量拼接覆盖目录。"""
+    first = _data(
+        await client.get(f"{SCENE_BASE}/logical", headers=ADMIN_HEADERS, params={"page": 1})
     )
-    items = _data(by_category)["items"]
+    assert len(first["items"]) == first["page_size"] == 20
+    assert first["total"] == 46
+
+    second = _data(
+        await client.get(f"{SCENE_BASE}/logical", headers=ADMIN_HEADERS, params={"page": 2})
+    )
+    ids_p1 = [item["logical_id"] for item in first["items"]]
+    ids_p2 = [item["logical_id"] for item in second["items"]]
+    assert set(ids_p1).isdisjoint(ids_p2)
+    assert second["total"] == 46 and len(second["items"]) == 20
+
+    # 排序稳定（logical_id, version）：两页拼接 = 全量前 40 条
+    assert ids_p1 + ids_p2 == sorted(set(ids_p1 + ids_p2))
+
+
+async def test_list_logical_filters_category_and_keyword(client: AsyncClient) -> None:
+    """分类与关键字过滤（关键字命中 ID 或名称；过滤后 total 为全量数）。"""
+    by_category = await client.get(
+        f"{SCENE_BASE}/logical",
+        headers=ADMIN_HEADERS,
+        params={"category": "interactive", "page_size": 100},
+    )
+    data = _data(by_category)
+    items = data["items"]
     assert items and all(item["category"] == "interactive" for item in items)
+    assert data["total"] == len(items)
 
     by_keyword = await client.get(
         f"{SCENE_BASE}/logical", headers=ADMIN_HEADERS, params={"keyword": "INT-001"}

@@ -26,6 +26,7 @@ import {
   PROVISION_STEP_ORDER,
   PROVISION_STEP_STATE_LABELS,
   PROVISION_STEP_STATE_TAG_TYPES,
+  VEHICLE_IP_PATTERN,
 } from '@/constants/vehicle'
 import { PERMISSIONS } from '@/constants/permissions'
 import type { ProvisionStep, VehicleDetail, VehicleUpdateRequest } from '@/types/vehicle'
@@ -190,11 +191,23 @@ const editForm = reactive<VehicleUpdateRequest>({
   firmware_version: '',
   software_version: '',
   description: '',
+  ip_address: '',
 })
 
 const editRules: FormRules<VehicleUpdateRequest> = {
   vehicle_name: [{ max: 64, message: '名称长度 ≤ 64', trigger: 'blur' }],
   description: [{ max: 500, message: '描述长度 ≤ 500', trigger: 'blur' }],
+  ip_address: [
+    {
+      // 留空 = 不更新（后端 exclude_unset；心跳上报值为权威，人工录入仅作初值）
+      validator: (_rule, value: unknown, callback: (error?: Error) => void) => {
+        const text = String(value ?? '').trim()
+        if (!text || VEHICLE_IP_PATTERN.test(text)) callback()
+        else callback(new Error('请输入合法的 IPv4 / IPv6 地址'))
+      },
+      trigger: 'blur',
+    },
+  ],
 }
 
 function openEdit(): void {
@@ -206,6 +219,7 @@ function openEdit(): void {
     firmware_version: v.firmware_version ?? '',
     software_version: v.software_version ?? '',
     description: v.description ?? '',
+    ip_address: v.ip_address ?? '',
   })
   editVisible.value = true
 }
@@ -220,7 +234,12 @@ async function submitEdit(): Promise<void> {
   }
   editSubmitting.value = true
   try {
-    await patchVehicle(vehicleId.value, { ...editForm })
+    // 空 IP 不提交（后端把 ip_address: "" 当非法格式；省略 = 保持原值）
+    const { ip_address, ...rest } = editForm
+    const payload: VehicleUpdateRequest = ip_address?.trim()
+      ? { ...rest, ip_address: ip_address.trim() }
+      : { ...rest }
+    await patchVehicle(vehicleId.value, payload)
     ElMessage.success('台账信息已更新')
     editVisible.value = false
     await load()
@@ -325,6 +344,10 @@ watch(
           <el-descriptions-item label="证书序列号">
             <code>{{ detail.device_cert_sn || '-' }}</code>
           </el-descriptions-item>
+          <el-descriptions-item label="车端 IP">
+            {{ detail.ip_address || '-' }}
+            <span class="hint">（health 心跳自动回写，人工录入仅作初值）</span>
+          </el-descriptions-item>
           <el-descriptions-item label="备注" :span="3">{{ detail.description || '-' }}</el-descriptions-item>
           <el-descriptions-item label="地理围栏" :span="3">
             <pre class="fence">{{ fenceText }}</pre>
@@ -408,6 +431,9 @@ watch(
         </el-form-item>
         <el-form-item label="软件版本">
           <el-input v-model="editForm.software_version" maxlength="32" />
+        </el-form-item>
+        <el-form-item label="IP 地址" prop="ip_address">
+          <el-input v-model="editForm.ip_address" maxlength="45" placeholder="可选；车端心跳上报后以车端值为准" />
         </el-form-item>
         <el-form-item label="备注" prop="description">
           <el-input v-model="editForm.description" type="textarea" :rows="3" maxlength="500" show-word-limit />

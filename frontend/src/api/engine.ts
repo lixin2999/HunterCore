@@ -46,12 +46,14 @@ import type {
 
 /* ------------------------------ 逻辑场景 ------------------------------ */
 
-/** 逻辑场景列表（GET /api/v1/scene/logical；DB 快照 + 内置目录） */
+/** 逻辑场景列表（GET /api/v1/scene/logical；DB 快照 + 内置目录；page/page_size 分页，limit 为扫描上限） */
 export function listLogicalScenarios(params: {
   category?: string
   keyword?: string
   include_catalog?: boolean
   limit?: number
+  page?: number
+  page_size?: number
 } = {}): Promise<LogicalScenarioListData> {
   return request<LogicalScenarioListData>({ url: '/scene/logical', method: 'get', params })
 }

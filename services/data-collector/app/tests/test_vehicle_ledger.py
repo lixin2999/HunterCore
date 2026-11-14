@@ -217,6 +217,62 @@ async def test_empty_vehicle_id_is_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
+# IP 回写（V1.28.0：health 心跳上报 ip → 台账 ip_address）
+# ---------------------------------------------------------------------------
+async def test_record_ip_writes_only_on_change() -> None:
+    """按值去重：同值重复上报只写一次；值变化立即落库（不受节流窗口限制）。"""
+    repo = FakeVehicleLedgerRepository()
+    clock = FakeClock()
+    writer = make_writer(repo, clock)
+
+    assert await writer.record_ip(VEHICLE, "192.168.10.21") is True
+    for _ in range(3):
+        clock.advance(1)
+        assert await writer.record_ip(VEHICLE, "192.168.10.21") is False
+    clock.advance(60)
+    assert await writer.record_ip(VEHICLE, "10.20.30.40") is True
+
+    assert repo.ip_calls == [
+        (VEHICLE, "192.168.10.21"),
+        (VEHICLE, "10.20.30.40"),
+    ]
+
+
+async def test_record_ip_failure_is_swallowed_and_deduped() -> None:
+    """DB 故障：只告警不上抛；失败尝试同样计入去重（同值重复上报不逐条打库）。"""
+    repo = FakeVehicleLedgerRepository(fail_with=RuntimeError("database unavailable"))
+    writer = make_writer(repo, FakeClock())
+
+    assert await writer.record_ip(VEHICLE, "192.168.10.21") is False
+    assert await writer.record_ip(VEHICLE, "192.168.10.21") is False
+    assert repo.ip_calls == []
+
+
+async def test_record_ip_respects_disabled_switch() -> None:
+    """开关关闭/空入参：不触碰 DB（与其余 record_* 同一短路语义）。"""
+    repo = FakeVehicleLedgerRepository()
+    writer = make_writer(repo, FakeClock(), vehicle_ledger_write_enabled=False)
+
+    assert await writer.record_ip(VEHICLE, "192.168.10.21") is False
+    assert await writer.record_ip("", "192.168.10.21") is False
+    assert await writer.record_ip(VEHICLE, "") is False
+    assert repo.ip_calls == []
+
+
+async def test_record_ip_does_not_touch_status_throttle_window() -> None:
+    """IP 写入不占用状态节流时间戳：两种回写互不影响。"""
+    repo = FakeVehicleLedgerRepository()
+    clock = FakeClock()
+    writer = make_writer(repo, clock)
+
+    assert await writer.record_status(VEHICLE, "auto_driving") is True
+    clock.advance(1)
+    assert await writer.record_ip(VEHICLE, "192.168.10.21") is True
+    # 状态窗口仍锚在首次写入：1s 后的同状态上报仍被节流
+    assert await writer.record_status(VEHICLE, "auto_driving") is False
+
+
+# ---------------------------------------------------------------------------
 # 台账名称查询（V1.19.20：读模型 vehicle_name 字段的取数来源）
 # ---------------------------------------------------------------------------
 async def test_vehicle_name_cached_within_ttl_and_refreshed_after_expiry() -> None:

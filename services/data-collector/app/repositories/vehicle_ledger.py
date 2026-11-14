@@ -51,5 +51,10 @@ class VehicleLedgerRepositoryAdapter:
             vehicle = await VehicleRepository(session).get(vehicle_id)
             return vehicle.vehicle_name if vehicle is not None else None
 
+    async def update_ip_address(self, vehicle_id: str, ip_address: str) -> bool:
+        """回写台账 ``ip_address``（V1.28.0 health 心跳上报）；返回是否命中行。"""
+        async with self._db.session() as session:
+            return await VehicleRepository(session).update_ip_address(vehicle_id, ip_address)
+
 
 __all__ = ["VehicleLedgerRepositoryAdapter"]

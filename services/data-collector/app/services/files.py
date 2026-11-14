@@ -74,6 +74,9 @@ MIME_BY_EXTENSION: dict[str, str] = {
 #: 分片 complete 请求参数缺失的校验（multipart 必须回带 upload_id + parts）
 _DATE_LINE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+#: hunter-video 桶对象键根前缀（遥控会话录像：remote-control/{vid}/{yyyy}/{mm}/{dd}/…）
+VIDEO_KEY_ROOT = "remote-control"
+
 
 class FileService:
     """文件上传业务逻辑（MinIO 仓储 + sensor_file 生产者）。"""
@@ -402,15 +405,16 @@ class FileService:
     ) -> FileListData:
         """文件清单（契约 GET /files：对象键前缀列举 + marker 游标分页）。
 
-        - 前缀 = 非空段 ``{vehicle_id}/{date}/{data_type}`` 依次拼接（对象键规范
+        - 前缀按桶对象键布局感知构造（:meth:`_build_list_prefix`，V1.28.0）：
+          常规桶 = 非空段 ``{vehicle_id}/{date}/{data_type}`` 依次拼接（对象键规范
           ``{vehicle_id}/{date}/{data_type}/{timestamp}_{seq}.{ext}``，契约 x-hunter-file-upload-flow）；
+          hunter-video = ``remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/``（遥控会话录像，
+          键内无 data_type 段，见 contracts/database/object-storage.yaml）；
           三段全缺省则列举整桶（运维/管理端跨车辆检索）；
         - max_keys = limit + 1 判断截断（契约 limit ≤ 200）；
         - 每项即时签发 15 分钟预签名下载 URL（900s，支持 Range）。
         """
-        full_prefix = "".join(
-            f"{segment}/" for segment in (vehicle_id, date, data_type) if segment
-        )
+        full_prefix = self._build_list_prefix(bucket, vehicle_id, date, data_type)
         items, truncated, next_marker = await asyncio.to_thread(
             self._storage.list_objects,
             bucket,
@@ -447,6 +451,32 @@ class FileService:
             items=file_items,
             next_marker=next_marker if has_more else None,
             truncated=has_more,
+        )
+
+    @staticmethod
+    def _build_list_prefix(
+        bucket: str, vehicle_id: str | None, date: str | None, data_type: str | None
+    ) -> str:
+        """按桶布局感知的前缀构造（V1.28.0 修复：视频桶过滤失效/数据不全）。
+
+        - **hunter-video**（远程会话录像，键含 ``remote-control/`` 前缀与拆分的日期段）：
+          车辆 → ``remote-control/{vid}/``；另加日期 ``YYYY-MM-DD`` → 拆为
+          ``{yyyy}/{mm}/{dd}`` 段；日期非该格式时按原样段拼接（尽力而为）；
+          未给车辆时日期无法锚定到前缀（键结构 vid 在前），列举 ``remote-control/`` 整段；
+          键内无 data_type 段，视频桶忽略 data_type（前端同步禁用该筛选）；
+        - 其余桶（hunter-rosbag / hunter-raw-data 等）：维持非空段
+          ``{vehicle_id}/{date}/{data_type}`` 依次拼接（与 presign 命名一致）。
+        """
+        if bucket == settings.minio_bucket_video:
+            if not vehicle_id:
+                return f"{VIDEO_KEY_ROOT}/" if date else ""
+            segments = [vehicle_id]
+            if date:
+                parts = date.split("-")
+                segments.extend(parts if len(parts) == 3 and all(parts) else [date])
+            return f"{VIDEO_KEY_ROOT}/{'/'.join(segments)}/"
+        return "".join(
+            f"{segment}/" for segment in (vehicle_id, date, data_type) if segment
         )
 
     # ---------- delete（数据清理，V1.21.20；V1.21.22 配对 + 有效录像护栏） ----------

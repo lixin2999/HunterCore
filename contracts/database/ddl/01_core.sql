@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS vehicle_svc.vehicles (
     -- 历史车辆（部署内置台账）可为 NULL，前端按 pending 展示；
     -- 写入方：仅 vehicle-service（其它服务只读，跨 schema 禁直查）
     provision_status JSONB,
+    ip_address       TEXT,                                      -- 车端当前网络地址（IPv4/IPv6）；health 心跳自动回写 + 建账/台账人工录入，心跳上报值为权威
     description      TEXT
 );
 COMMENT ON TABLE vehicle_svc.vehicles IS

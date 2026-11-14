@@ -9001,6 +9001,130 @@ G-04 决策① 原意是「前端 Token 存 localStorage ⇒ 服务端收紧 Acc
 
 - 无。HunterSim 侧无配合项（服务令牌 TTL 仍为 7d，与本项无关）。
 
+## V1.28.0（前端列表分页与覆盖分析改版 + 车辆 IP 台账字段 + 文件浏览视频桶前缀修复）
+
+Date：2026-11-13
+变更类型：新增功能（分页 / 车辆 IP）+ 缺陷修复（覆盖分析「去生成」跳转 / 视频桶文件过滤）；含表结构增列（Alembic `0005` 必跑）与 OpenAPI/Kafka 契约增量（全部向后兼容）；**需重建 `scene-service`、`vehicle-service`、`data-collector`、`hunter-web` 四个镜像**
+
+### 1. 现场
+
+使用方回报 5 个问题（均附页面截图）：
+
+```text
+① 场景生成器·逻辑场景列表无分页（全量平铺）；
+② 生成任务列表无分页且数据不全（46 个任务只显示 20 条，无任何翻页入口）；
+③ 覆盖分析页布局不合理（类型×分区矩阵/角色表整页纵向拉长）、盲区列表（100+ 行）无分页；
+   另实测发现「去生成」按钮跳转失效；
+④ 车辆管理列表无 IP 字段（表/ORM/契约/前端全链路缺失）；经确认采用「车端心跳自动上报」
+   方案：health 上报值为权威 + 建账/台账可人工录入；
+⑤ 事件与文件·文件浏览分页有问题、数据不全（按车辆/日期过滤后空结果）。
+```
+
+### 2. 根因
+
+| # | 根因 |
+|---|---|
+| ① | `GET /scene/logical` 仅有 `limit`（上限 500，无 page/total）；前端 `logicalQuery` 也只有 category/keyword |
+| ② | 后端已支持 page/page_size，但前端 `refreshTasks` 硬编码 `page:1, page_size:20`，表格下方只有「共 N 个任务」文案、无分页条 |
+| ③ | 矩阵/角色两卡片无内部滚动、盲区表一次渲染全部行；**bug**：`handleFillGap` 把 `activeTab` 置为 `'generate'`，而 Tab 名是 `'tasks'`，跳转静默失败 |
+| ④ | `vehicle_svc.vehicles` 表、ORM、Schema、Kafka health 契约、前端均无 IP 字段 |
+| ⑤ | hunter-video 对象键为 `remote-control/{vid}/{yyyy}/{mm}/{dd}/…`，但 `list_files` 前缀按常规桶 `{vid}/{date}/{data_type}` 拼接 → 车辆/日期过滤在视频桶全部失效 |
+
+### 3. 变更内容
+
+**① 逻辑场景分页（scene-service + 前端）**
+
+- `routers/engine.py`：`GET /logical` 新增 `page`（≥1）/`page_size`（1..200）查询参数；`limit` 保留为扫描上限（默认 500 不变）；
+- `services/engine.py` `list_logical`：合并 DB+目录、过滤排序后切片，返回 `(items, total)`；
+- `schemas/engine.py` / `contracts/openapi/scene-engine.yaml`：`LogicalScenarioListData` 增 `page/page_size`（参数 $ref 公共 `PageQuery/PageSizeQuery`）；
+- 前端：逻辑场景表格下加 `el-pagination`；提交生成任务的下拉数据源与表格解耦（`logicalOptions` 一次性 `page_size=200` 加载，避免分页后只剩当前页）。
+
+**② 生成任务分页（纯前端）**
+
+- `taskQuery = reactive({ page: 1, page_size: 20 })`；「共 N 个任务」文案替换为 `el-pagination`（total, sizes, prev, pager, next）；状态过滤变更重置 `page=1`；轮询刷新保持当前页。
+
+**③ 覆盖分析改版（纯前端 + bug 修复）**
+
+- `handleFillGap` 的 `activeTab` 改回 `'tasks'`（「去生成」跳转恢复）；
+- 盲区列表客户端切片分页（`gapQuery` + `coverageGapRows` computed，切换剖面/刷新重置 page=1）；
+- 矩阵/角色两卡片保持并排，两个 `el-table` 加 `max-height="360"` 内部滚动，不再撑长页面。
+
+**④ 车辆 IP 字段（数据层 + 三条链路）**
+
+| 层 | 文件 | 变更 |
+|---|---|---|
+| DDL | `contracts/database/ddl/01_core.sql`、`infra/deploy/sql/schema.sql` | `vehicle_svc.vehicles` 增列 `ip_address TEXT`（可空）；schema.sql 另追加幂等 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`（沿用 provision_status 先例） |
+| 迁移 | `hunter_common/database/migrations/versions/0005_vehicle_ip_address.py` | 新增（`op.add_column`，参照 0002 体例） |
+| ORM/共享层 | `models/core.py`、`repositories/core.py` | `Vehicle.ip_address`；`VehicleRepository.update_ip_address`（单条 UPDATE + rowcount，与 touch_last_online_time 同模式；已在 `orm-mapping.md` 登记，data-collector 写列白名单同步扩为三列） |
+| Kafka 契约 | `contracts/kafka/schemas/health.schema.json` | 顶层新增**可选**字段 `ip`（IPv4/IPv6 pattern；沿用 G-08/G-11「车端排期上报，未上报不回写」模式） |
+| 心跳回写 | data-collector `vehicle_status.py`/`vehicle_ledger.py`/`vehicle_ledger.py(repositories)` | `update_from_health` 读 `ip` → `ipaddress` 严格校验（非法仅 WARN 忽略）→ `record_ip` 按值去重落库（异常隔离、不占状态节流窗口）；上报值覆盖人工录入值（车端为权威） |
+| REST | vehicle-service `schemas/vehicle.py`（`IP_ADDRESS_PATTERN`）、`routers`/`repositories`/`provisioner`、`contracts/openapi/vehicle-service.yaml` | Row/Detail/Create/Update 全链路增可选 `ip_address`（max_length 45）；patch 经 `exclude_unset` 透传 |
+| 前端 | `types/vehicle.ts`、`constants/vehicle.ts`、`VehicleListView`/`VehicleDetailView`/`VehicleCreateDialog` | 列表增「IP 地址」列（空显示 `-`）；详情展示 IP + 修改台账对话框增 IP 输入；创建 Step1 增可选 IP；空 IP 提交前剔除（避免 `""` 触发 pattern 422） |
+
+**⑤ 文件浏览视频桶前缀修复（data-collector + 前端）**
+
+- `services/files.py`：新增 `_build_list_prefix` 按桶布局感知——hunter-video 用 `remote-control/{vid}/{yyyy}/{mm}/{dd}/`（日期 `YYYY-MM-DD` 拆段；未给车辆时退化为列举 `remote-control/` 整段；键内无 data_type 段，该桶忽略 data_type）；其余桶维持 `{vid}/{date}/{data_type}` 拼接；
+- `contracts/openapi/data-collector.yaml`：`GET /files` description 与 date/data_type 参数同步按桶过滤语义；
+- 前端 `EventListView.vue`：Bucket 为 hunter-video 时禁用「数据类型」选择器并清空已选值。
+
+### 4. 兼容性
+
+- **全部契约变更为增量**：`/logical` 新参有默认值（旧调用方不受影响）；health `ip`、vehicle `ip_address` 均可选（旧车端不报、旧前端不传均正常）；未升级的车端/调用方无需任何配合改动。
+- `ip_address` 为可空列，存量行为 NULL（页面显示 `-`）；新库经 schema.sql 直接带列。
+- ⚠ 本次修复了 data-collector 对 `vehicles` 表的写列白名单（orm-mapping.md：status/last_online_time 两列 → +ip_address 三列），其余列仍禁写。
+- **必须重建镜像**：`scene-service`、`vehicle-service`、`data-collector`、`hunter-web`（服务/前端代码在镜像内）；`contracts/` 为只读挂载，`git pull` 后随容器重建生效。
+
+### 5. 验证（本门禁实跑，Python 3.12 `.venv`）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| scene-service 单测（含分页断言 + 引擎契约测试） | `pytest services/scene-service/app/tests -q` | **528 passed** |
+| data-collector 单测（含 record_ip 4 例、health IP 透传、视频桶前缀映射、契约测试） | `pytest services/data-collector/app/tests -q` | **203 passed** |
+| vehicle-service 单测（含 IP 字段校验 + 契约测试） | `pytest services/vehicle-service/app/tests -q` | **46 passed** |
+| 全量单测 | `python scripts/run_unit_tests.py` | 除 `common/python` 外全部目标通过；`common/python` 345 passed / 1 failed（**存量**，见 §9 待办 2，与本变更无关） |
+| 数据层契约校验 | `python scripts/verify_data_layer.py` | 31 项通过 / 1 项失败（同上存量；Repository 专属方法/ORM↔DDL 对账均过） |
+| 前端（vue-tsc 类型检查 + 构建） | `cd frontend && npm run build` | ✓ built in 37.27s，类型检查 0 错误 |
+
+### 6. 部署与生效（实机步骤）
+
+> 在部署机 `/opt/HunterCore` 执行；compose 别名与运维手册一致：`C=(docker compose -f infra/deploy/docker-compose.yml --project-directory .)`。
+
+1. `git pull`。
+2. **执行 Alembic 迁移**（存量库必做；宿主机无依赖，在带依赖的容器内跑，`--user 0:0` 约定同 V1.26.0 §实机）：
+   ```bash
+   C=(docker compose -f infra/deploy/docker-compose.yml --project-directory .)
+   "${C[@]}" run --rm --no-deps --user 0:0 -v "$PWD:/repo" -w /repo \
+     --entrypoint python3 scene-service -m alembic -c common/python/alembic.ini upgrade head
+   ```
+   幂等自检：`docker exec hunter-postgres psql -U hunter -d hunter_core -c "\\d vehicle_svc.vehicles"` 应见 `ip_address | text`。
+3. 重建四个镜像并滚动：`"${C[@]}" up -d --build scene-service vehicle-service data-collector web`。
+4. 页面验收：场景生成器三个 Tab 分页条、覆盖分析「去生成」跳转任务 Tab、车辆列表 IP 列、文件浏览选 hunter-video 桶后数据类型置灰且按车辆/日期过滤命中。
+
+**实机回报（待回填）**：
+
+```text
+（待部署机实机执行后回填：迁移读数 / 四镜像重建耗时 / 页面验收截图结论 / 心跳 ip 回写实测）
+```
+
+### 7. 回滚
+
+- 服务/前端：`git revert` 本条提交后重建四个镜像即可；`/logical` 新参、可选 IP 字段均为增量，旧前端对新后端/新前端对旧后端均可运行（多余 query 参被忽略）。
+- 数据库：`ip_address` 为可空列，**建议保留不回滚**（无害）；确需回滚 `alembic downgrade -1`。
+- ⚠ 回滚 health.schema.json 后，若车端已升级到上报 `ip` 的版本，`additionalProperties:false` 会拒绝新字段 ⇒ health 消息进死信；回滚平台前先确认车端未上报 `ip`。
+
+### 8. 实机验证要点（部署后逐项确认）
+
+- 生成任务 Tab 显示全部任务（页数 = ⌈N/20⌉）；逻辑场景切页后表格变、提交下拉仍全量；
+- 覆盖分析「去生成」落到任务 Tab；盲区表 20 行/页；
+- 车辆创建录入 IP → 列表/详情回显；台账修改 IP 生效；
+- 文件浏览 hunter-video：指定车辆+日期后仅命中当日会话；hunter-raw-data 行为与修前一致（回归）。
+
+### 9. 待办
+
+- **待办 1｜车端 agent 排期**：health 消息增报 `ip` 字段（本版本平台侧已就绪：未上报前 IP 依赖建账/台账人工录入，页面显示 `-`）。
+- **待办 2｜存量、与本变更无关**：`verify_data_layer.py` / `common/python/tests::test_ddl_column_parity_with_orm` 在 HEAD 即因 `scene_svc.sim_node_registry`（V1.24.x 引入的 `08_sim_nodes.sql`）未登记进契约表清单 `EXPECTED_TABLES` 而失败，需单独走「更新契约并评审」；本版本未碰该表，门禁结果已按此口径解读。
+- **待办 3｜§6 实机回报回填**：部署机升级完成后回填迁移读数与页面验收结果。
+
 
 
 

@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS vehicle_svc.vehicles (
     -- 结构：{"state":"pending|in_progress|ready|failed", "steps":{"db|scram|topics|cert":{state,ts,error}}}
     -- 写入方：仅 vehicle-service；历史内置台账可为 NULL
     provision_status JSONB,
+    ip_address       TEXT,                                      -- 车端当前网络地址（IPv4/IPv6）；health 心跳自动回写 + 建账/台账人工录入，心跳上报值为权威
     description      TEXT
 );
 COMMENT ON TABLE vehicle_svc.vehicles IS
@@ -102,6 +103,8 @@ CREATE INDEX IF NOT EXISTS idx_vehicles_status_last_online
 --   需显式补齐后续版本引入的列，否则 vehicle-service provisioning 写入报 UndefinedColumnError。
 --   V1.18.0：provision_status（vehicle-service 一键开通状态，结构见契约 x-hunter-provisioning）
 ALTER TABLE vehicle_svc.vehicles ADD COLUMN IF NOT EXISTS provision_status JSONB;
+--   V1.28.0：ip_address（车端网络地址；data-collector health 心跳回写 + vehicle-service 台账录入）
+ALTER TABLE vehicle_svc.vehicles ADD COLUMN IF NOT EXISTS ip_address TEXT;
 
 -- ---------- user_svc.users：用户 ----------
 CREATE TABLE IF NOT EXISTS user_svc.users (

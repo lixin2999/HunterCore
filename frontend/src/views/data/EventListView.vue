@@ -184,6 +184,12 @@ function handleFileSearch(): void {
   void loadFilePage(0)
 }
 
+/** Bucket 切换：hunter-video 键内无 data_type 段，切到视频桶时清空该筛选（V1.28.0） */
+function handleBucketChange(): void {
+  if (isVideoBucket.value) fileQuery.data_type = undefined
+  handleFileSearch()
+}
+
 function goFilePrev(): void {
   if (filePageIndex.value > 0) void loadFilePage(filePageIndex.value - 1)
 }
@@ -362,7 +368,7 @@ onMounted(async () => {
       <el-tab-pane label="文件浏览（MinIO）" name="files">
         <el-form :inline="true" class="filter">
           <el-form-item label="Bucket">
-            <el-select v-model="fileQuery.bucket" placeholder="选择 Bucket" style="width: 220px" @change="handleFileSearch">
+            <el-select v-model="fileQuery.bucket" placeholder="选择 Bucket" style="width: 220px" @change="handleBucketChange">
               <el-option
                 v-for="option in bucketOptions"
                 :key="option.value"
@@ -382,7 +388,14 @@ onMounted(async () => {
             </el-select>
           </el-form-item>
           <el-form-item label="数据类型">
-            <el-select v-model="fileQuery.data_type" clearable placeholder="全部" style="width: 140px">
+            <!-- hunter-video 对象键无 data_type 段，后端忽略该过滤，前端同步禁用（V1.28.0） -->
+            <el-select
+              v-model="fileQuery.data_type"
+              clearable
+              :disabled="isVideoBucket"
+              :placeholder="isVideoBucket ? '视频桶不支持' : '全部'"
+              style="width: 140px"
+            >
               <el-option v-for="(label, value) in FILE_DATA_TYPE_LABELS" :key="value" :label="label" :value="value" />
             </el-select>
           </el-form-item>
