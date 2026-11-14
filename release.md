@@ -9146,10 +9146,14 @@ Date：2026-11-13
 
 - **待办 1｜车端 agent 排期**：health 消息增报 `ip` 字段（本版本平台侧已就绪：未上报前 IP 依赖建账/台账人工录入，页面显示 `-`）。
 - **待办 2｜存量、与本变更无关**：`verify_data_layer.py` / `common/python/tests::test_ddl_column_parity_with_orm` 在 HEAD 即因 `scene_svc.sim_node_registry`（V1.24.x 引入的 `08_sim_nodes.sql`）未登记进契约表清单 `EXPECTED_TABLES` 而失败，需单独走「更新契约并评审」；本版本未碰该表，门禁结果已按此口径解读。
+  **【已关闭（2026-11-14，V1.28.1 ④）】**两个门禁均转绿：按「共享 schema 内的服务私有表」口径登记豁免（表级 `SERVICE_OWNED_TABLES`）并由服务侧新增逐列对账测试；未改 DDL/ORM、未新增 Alembic 迁移。详见 V1.28.1 §3 ④ / §5 / §9 待办 4。
 - **待办 3｜§6 实机回报回填**：部署机升级完成后回填迁移读数与页面验收结果。
 
 
 ## V1.28.1（车辆 IP 只走心跳回写 + 用例与测试集分页布局 + 文件浏览时间倒序页码分页）
+
+> 追加一项（同日）：**数据层门禁存量失败转绿**（`common/python` `test_ddl_column_parity_with_orm`，
+> 对象 `scene_svc.sim_node_registry`），见 §3 ④、§5、§9 待办 4。
 
 Date：2026-11-14
 变更类型：缺陷修复 + 交互调整（含 data-collector `GET /files` 契约增量 `order`/`page` 与响应字段，向后兼容；**无表结构变更，不需 Alembic**）；需重建 `data-collector`、`web-portal` 两个镜像（`tools/vehicle-simulator` 为宿主机工具，随仓库更新）
@@ -9165,6 +9169,13 @@ Date：2026-11-14
 ③ 文件浏览页面分页有问题、数据显示不全；要求把查询出来的数据按时间倒序排列。
 ```
 
+验收后追加一项门禁治理（§5 曾以「存量失败」读数放行）：
+
+```text
+④ 修复 scripts/run_unit_tests.py 中 common/python 的存量失败 test_ddl_column_parity_with_orm
+   （报错对象 scene_svc.sim_node_registry），使门禁恢复全绿。
+```
+
 ### 2. 根因
 
 | # | 根因 |
@@ -9172,6 +9183,7 @@ Date：2026-11-14
 | ① | V1.28.0 给 `ip_address` 开了**两条写路径**（人工录入 + 心跳回写），但真实车端 agent 尚未排期上报 `health.ip`（V1.28.0 §9 待办 1），页面又没人工填 ⇒ 列恒为空；工具侧 `vehicle-simulator` 也不发 `ip`，联调链路同样拿不到值 |
 | ② | 右侧「测试集与基线」卡片只有 `共 N 个测试集` 文案，**从未接分页组件**（后端 `list_suites` 早已支持 `page/page_size`，前端 `suitePage` 固定第 1 页）；两卡片 14/10 分栏下左表列宽合计 ≈1000px、右表 ≈550px 均超出可用宽度 ⇒ 横向滚动 + `fixed` 列遮挡；筛选条件变更未重置 `page`，停在深页号时看起来就是「没数据」 |
 | ③ | 契约 `GET /files` 只有 `marker` 游标 + `truncated`，**无 `total`、无排序能力** ⇒ 前端只能「上一页/下一页」逐游标前进、跳不了页也看不到总量；MinIO 列举按对象键字典序返回（`{vid}/{date}/{data_type}/{timestamp}_{seq}`），最新文件反而排在最后；且首次切到该 Tab 不自动列举，必须手点「查询」 |
+| ④ | 豁免机制只按 **schema 前缀**识别服务私有表（`ingest_platform.` / `scene_engine.`）。`scene_svc.sim_node_registry`（V1.24.1 `08_sim_nodes.sql`）位于**共享 schema** `scene_svc` 但 ORM 模型故意不入共享包（`app/models/sim_node_registry.py` 文档已写明），于是两个数据层门禁都把它当成「契约外新增表」报错：`common/python` `test_ddl_column_parity_with_orm`（`set(parsed) == EXPECTED_TABLES`）与 `scripts/verify_data_layer.py`（31 项通过 / 1 项失败）。真实缺口是**表未登记契约 + 豁免后无人对账**（ORM 列本身与 DDL 完全一致，逐列比对已验证），非缺列 |
 
 ### 3. 变更内容
 
@@ -9202,6 +9214,32 @@ Date：2026-11-14
 - `contracts/openapi/data-collector.yaml`：参数与响应字段同步；`x-hunter-pending-confirmation` #2 口径更新（无 DB 元信息表时以扫描式提供 `total`，窗口超限显式回报）；
 - 前端 `EventListView.vue`：默认 `order=time_desc`；底部「第 N 页 / 上一页 / 下一页」换成 `el-pagination`（total, sizes, prev, pager, next, jumper），筛选区「每页」下拉并入分页条；`scan_truncated` 时显示告警条；首次切到文件 Tab 自动列举。
 
+**④ 数据层门禁存量项转绿（共享契约登记 + 服务侧对账，不改 DDL / 不改 ORM）**
+
+先逐列比对确认真实缺口：`08_sim_nodes.sql` 的 18 列与 `SimNodeRegistry`（含 `CreateTimeMixin` /
+`UpdateTimeMixin` 两列）列名、类型、可空性、主键**完全一致** ⇒ 不存在缺列/缺映射，缺的是
+「契约登记 + 对账归属」。按仓库已有的服务私有表惯例（与 06/07 同策略：不入共享 `ALL_MODELS`、
+不入 Alembic，由 `scripts/init-db.sh` 3d 步应用 DDL）做表级豁免：
+
+| 文件 | 变更 |
+|---|---|
+| `common/python/tests/test_database_models.py` | 把内联的 `startswith(("ingest_platform.", "scene_engine."))` 提升为可声明常量 `SERVICE_PRIVATE_SCHEMA_PREFIXES`；新增**表级**豁免清单 `SERVICE_OWNED_TABLES`（表名 → 服务侧对账测试文件）并登记 `scene_svc.sim_node_registry`；`test_contract_files_exist` 补 `08_sim_nodes.sql`（旧清单只到 07，新 DDL 从未被契约文件校验覆盖）；新增 2 个护栏用例：`_are_covered_service_side`（对账文件必须存在且提及表名，防「豁免 = 无人校验」假绿）、`_are_not_in_shared_metadata`（豁免表不得同时出现在共享元数据） |
+| `services/scene-service/app/tests/test_sim_node_registry_ddl.py`（新） | 本表的 DDL ↔ ORM 对账归属方：6 例逐例覆盖列名集合、逐列类型与可空性（`TIMESTAMPTZ` ↔ `DateTime(timezone=True)`）、主键、V1.24.2 四列在 CREATE TABLE 与幂等 ALTER **两路径均存在**、JSONB 两列 NOT NULL + `server_default` |
+| `scripts/verify_data_layer.py` | 新增 `SERVICE_OWNED_TABLES: {表名: (DDL 文件, 对账测试)}`；校验 1 检查两者存在（否则失败）；校验 2 的豁免由「按 schema」改为 `_is_shared()` 同时排除两类服务私有表 |
+| `contracts/database/er.md` | §1 表清单补登记 `scene_svc.sim_node_registry`（node_id / scene-service / 服务私有表）；新增「共享 schema 内的服务私有表」声明块，写明豁免与覆盖必须成对、新增此类表的三步登记流程 |
+
+⚠ 口径区分：本次只修「登记与对账归属」，**不改 DDL、不改 ORM、不新增 Alembic 迁移**（与 06/07 一致：
+`migrations/env.py` 只导入 `hunter_common.database.models`，该表自然不进入 `create_all` 与离线 SQL 校验范围）。
+
+**⑤ 顺带发现并修复：契约 ConfigMap 漏同步 V1.28.0 的 `health.ip`（非本次需求，跑 lint 阶段时暴露）**
+
+`python scripts/generate_contracts_configmap.py --check` 在 HEAD 即失败：V1.28.0 给
+`contracts/kafka/schemas/health.schema.json` 增 `ip` 字段时未重生 K8s 嵌入副本，
+`infra/k8s/base/03-configmap-contracts.yaml` 内的 health schema 仍无 `ip`（`additionalProperties:false`）——
+**K8s 形态下消费侧运行时校验会拒收带 `ip` 的心跳**，即 V1.28.1 车辆 IP 回写在 K8s 上会静默失效。
+已执行生成器重生清单（仅 `health` 段 +9/-1：description、`ip` 属性、example 各一处），
+`--check` 转 PASS；compose 部署路径不读本文件，影响面仅 K8s。
+
 ### 4. 兼容性
 
 - `GET /files` 契约变更为**增量**：`order` 缺省 `key_asc`、`page` 缺省 1，旧调用方（含车端 presign/complete 链路）不受影响；`FileListData` 新字段旧前端忽略即可。
@@ -9210,6 +9248,10 @@ Date：2026-11-14
 - 移除页面 IP 录入不影响 REST 字段：仍可用 API 写入，但该值会被下一次心跳覆盖（车端上报值为权威）。
 - **无表结构、无 Alembic 迁移**；`contracts/` 为只读挂载，`git pull` 后随容器重建生效。
 - 必须重建镜像：`data-collector`、`web-portal`（compose 服务名，前端服务名不是 `web`）。
+- ④ 属**测试/契约文档层变更**：不改运行时行为、不改表结构、不改镜像内容（`contracts/` 为只读挂载）；
+  豁免仅影响共享侧对账范围，覆盖率反而提高（此前该表无任何 DDL↔ORM 对账，仅行为用例）。
+- ⑤ 只改生成产物 `infra/k8s/base/03-configmap-contracts.yaml`（由 `contracts/kafka` 可重现生成，无手写内容）；
+  对旧消息零影响（仅放宽为承认已存在的 `ip` 字段），K8s 侧需 `kubectl apply` 该 ConfigMap 并滚动消费方才生效。
 
 ### 5. 验证（本门禁实跑，Python 3.12 `.venv`）
 
@@ -9217,7 +9259,12 @@ Date：2026-11-14
 |---|---|---|
 | data-collector 单测（含 4 个新 `time_desc` 用例：倒序、页码切片、窗口截断、`key_asc` 向后兼容） | `pytest services/data-collector -q` | **207 passed**（V1.28.0 为 203） |
 | vehicle-simulator 单测（含 health `ip` 上报 3 例：缺省不携带 / IPv4 / IPv6 过 schema pattern） | `pytest tools/vehicle-simulator/tests -q` | **20 passed** |
-| 全量单测 | `python scripts/run_unit_tests.py` | 除 `common/python` 外全部目标通过；`common/python` 345 passed / 1 failed（**存量** `sim_node_registry` 未登记契约，见 V1.28.0 §9 待办 2，与本变更无关） |
+| 全量单测 | `python scripts/run_unit_tests.py` | **全部通过（11 个目标）**——本仓库该门禁首次全绿（此前 `common/python` 长期 1 failed）；`common/python` **348 passed**（原 345 passed / 1 failed：原失败用例转绿 + 新增 2 个豁免护栏用例，并给已有文件清单用例补 `08_sim_nodes.sql`） |
+| scene-service 单测（含新增 `test_sim_node_registry_ddl.py` 6 例对账） | `pytest services/scene-service -q` | **534 passed**（逐列比对确认 DDL ↔ ORM 已一致，无需改表） |
+| 数据层契约校验 | `python scripts/verify_data_layer.py` | **通过 36 项 / 失败 0 项**（V1.24.1 起长期「31 通过 / 1 失败」，本次转绿；新增两项 PASS：服务私有表 DDL 契约存在 + 对账测试就位） |
+| Lint | `ruff check common/python services scripts/verify_data_layer.py` | All checks passed（mypy 按 CI 口径不覆盖 `scripts/verify_data_layer.py`，其存量类型问题属单独治理项，本次未新增） |
+| CI lint 阶段全部命令 | `verify_test_layer.py` / `generate_contracts_configmap.py --check` / `render_k8s.py --check` / `verify_infra.py` | 均通过；其中 ConfigMap 一致性为本次修复的 ⑤（HEAD 即 FAIL，重生后 PASS） |
+| ❗ 存量 lint 债（本次未引入、未处理） | `ruff check tests common/python services flink-jobs`（CI lint 阶段第 6 条） | 本地 ruff 0.16.7 报 **123 errors**，全部集中在 `services/ingest-platform/**` 与 `services/vehicle-service/**`（本次未改动这两个服务，已单独核对改动文件 ruff 全绿）；需确认 CI 端 ruff 版本后单独治理 |
 | 前端（vue-tsc 类型检查 + 构建） | `cd frontend && npm run build` | ✓ built in 28.65s（构建耗时有波动，仅留末次实测读数），类型检查 0 错误 |
 
 ### 6. 部署与生效（实机步骤）
@@ -9241,6 +9288,8 @@ Date：2026-11-14
 - 服务/前端：`git revert` 本条提交后重建 `data-collector`、`web-portal`；`GET /files` 的 `order`/`page` 为增量参数，FastAPI 会忽略多余 query 参，单向回滚不报错（但注意 §4 前后端同批回滚的建议）。
 - 车辆 IP：回滚前端即恢复人工录入入口，后端与契约无需改动（字段一直是可选）。
 - 无数据库回滚项。
+- ④ 回滚：`git revert` 对应改动即恢复旧门禁行为（`common/python` 重回 1 failed / `verify_data_layer.py` 重回 1 项失败）；新增的服务侧对账测试可独立保留（不依赖豁免机制），**无需**数据库与镜像回滚。
+- ⑤ 回滚：`git checkout HEAD -- infra/k8s/base/03-configmap-contracts.yaml` 即回到旧嵌入副本（同时 `--check` 重回 FAIL）；不单独回滚也不影响 compose 环境。
 
 ### 8. 实机验证要点（部署后逐项确认）
 
@@ -9254,6 +9303,17 @@ Date：2026-11-14
 - **待办 1｜车端 agent 排期**（沿用 V1.28.0 待办 1，口径收紧）：本版本移除人工录入后，`health.ip` 未上报前车辆 IP 列**恒为 `-`**（模拟器已可上报，可先用于联调与验收）。
 - **待办 2｜扫描窗口经验值**：`LIST_SCAN_MAX_OBJECTS=20000` 按「单车单日原始数据」量级估算；若实机常态超限（频繁 `scan_truncated`），应改走 `x-hunter-pending-confirmation` #2 的「DB 元信息表」方案以获得精确总数与低成本分页。
 - **待办 3｜§6 实机回报回填**：部署机升级完成后回填镜像滚动读数与 §8 验收结果。
+- **待办 4｜存量门禁失败（V1.28.0 §9 待办 2）——已完成（2026-11-14）**：`common/python`
+  `test_ddl_column_parity_with_orm` 与 `scripts/verify_data_layer.py` 均已转绿（读数见 §5），
+  V1.28.0 §9 待办 2 同步标注关闭。旧待办假设「需同步 Alembic 离线 SQL」，经核 **不需**：
+  Alembic `env.py` 只导入 `hunter_common.database.models`，该表自然不进入 `create_all` 与离线 SQL 校验，
+  与 06/07 同策略由 `scripts/init-db.sh` 3d 步幂等应用 DDL（已在 V1.24.2 落地）。
+  ⚠ 本项只修「契约登记 + 对账归属」，未改 DDL/ORM；若后续把该表提升为共享表（入 `ALL_MODELS` +
+  Alembic 迁移），需删除两处 `SERVICE_OWNED_TABLES` 登记并改走迁移评审。
+- **待办 5｜契约 ConfigMap 漏同步——已修复（2026-11-14），待确认是否越界**：见 §3 ⑤。
+  属于 V1.28.0 遗漏的产物重生（非本次三项需求），本次顺手重生后 `--check` 转绿；
+  若认为应归入单独提交，`git checkout HEAD -- infra/k8s/base/03-configmap-contracts.yaml` 即剥出。
+  **后续约定**：改 `contracts/kafka/**` 必须同批跑 `python scripts/generate_contracts_configmap.py`（否则仅 K8s 形态受影响，本地易漏）。
 
 
 

@@ -14,6 +14,7 @@
 | `user_svc` | user_roles | (user_id, role_id) | user-service | 否 |
 | `user_svc` | role_permissions | (role_id, permission_id) | user-service | 否 |
 | `scene_svc` | scenes | scene_id (UUID) | scene-service | 是（deleted_at） |
+| `scene_svc` | sim_node_registry | node_id (TEXT) | scene-service（服务私有表，V1.24.1） | 否 |
 | `ota_svc` | ota_versions | version_id (UUID) | ota-service | 否 |
 | `ota_svc` | ota_tasks | task_id (UUID) | ota-service | 否 |
 | `ota_svc` | ota_records | record_id (BIGSERIAL) | ota-service | 否 |
@@ -36,6 +37,14 @@
 > `hunter_common.database.models.ALL_MODELS` 与 `REPOSITORY_BY_MODEL`
 > （`verify_data_layer.py` 的 `SERVICE_PRIVATE_SCHEMAS` 豁免）；DDL ↔ ORM 一致性由服务侧测试钉住
 > （`app/tests/test_scene_engine_ddl.py`）。仅本服务可读写，禁止跨服务直查。
+
+> **共享 schema 内的服务私有表**：`scene_svc.sim_node_registry`（`08_sim_nodes.sql`，V1.24.1）与
+> `scenes` 同库同 schema，但 ORM 模型也归属服务内（`services/scene-service/app/models/sim_node_registry.py`），
+> 同样**不入**共享 `ALL_MODELS`。因豁免机制原本只按 schema 前缀识别，该表一度未登记而使两个
+> 数据层门禁误报「契约外新增表」；现按表级登记豁免：`verify_data_layer.py` 与服务侧均有一份
+> `SERVICE_OWNED_TABLES`（表名 → 服务侧对账测试文件），**豁免必须与覆盖成对出现**，
+> 逐列/类型/可空性/主键对账由 `app/tests/test_sim_node_registry_ddl.py` 钉住。
+> 新增此类表时：建 DDL 文件 + 服务内模型 + 服务侧对账测试，并在两处 `SERVICE_OWNED_TABLES` 同步登记。
 
 ## 2. 关系（物理外键 = FK，逻辑外键 = LOGICAL）
 

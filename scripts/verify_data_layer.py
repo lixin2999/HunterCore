@@ -3,7 +3,9 @@
 
 校验项：
   1. 契约文件齐备（contracts/database/ddl/*.sql + enums.md + er.md；contracts/kafka 清单与 Schema）
-  2. DDL ↔ ORM 逐表逐列一致（列名、规范化类型、可空性、主键）
+  2. DDL ↔ ORM 逐表逐列一致（列名、规范化类型、可空性、主键；
+     服务私有表与共享 schema 内的服务私有表豁免，由 SERVICE_PRIVATE_SCHEMAS /
+     SERVICE_OWNED_TABLES 登记并由服务侧对账测试钉住）
   3. DDL CHECK 枚举 ↔ hunter_common.database.enums 受控词表一致
   4. TimescaleDB hypertable 契约（1 day 分块 / 90 天保留）在 DDL、迁移、代码常量三处一致
   5. Alembic 离线 SQL 可生成（无需数据库），包含全部 13 张表与 hypertable/保留策略语句
@@ -119,6 +121,18 @@ EXPECTED_TABLES: dict[str, str] = {
 #:   不进入共享 hunter_common 元数据）——其表由服务自身契约管理，豁免于共享 13 表 L2 契约的
 #:   DDL↔ORM 逐列对账。新增服务私有 schema 必须在此登记并在 orm-mapping.md §3.5 声明边界。
 SERVICE_PRIVATE_SCHEMAS: frozenset[str] = frozenset({"ingest_platform", "scene_engine"})
+
+#: 服务私有表（DDL 在共享 schema 内、ORM 模型在服务内，不入共享 ALL_MODELS）
+#:   → (定义文件, 服务侧 DDL↔ORM 对账测试)。与 SERVICE_PRIVATE_SCHEMAS 同构地豁免于共享
+#:   13 表逐列对账，代价是共享侧不再覆盖该表，因此**必须同时声明对账测试文件**，
+#:   由校验 1 强制（文件缺失或未提及表名即失败），避免退化为「共享侧不算、服务侧无人管」的假绿。
+#:   边界声明：contracts/database/er.md §1；新增此类表需同步两处登记（本字典 + er.md）。
+SERVICE_OWNED_TABLES: dict[str, tuple[str, str]] = {
+    "scene_svc.sim_node_registry": (
+        "08_sim_nodes.sql",
+        "services/scene-service/app/tests/test_sim_node_registry_ddl.py",
+    ),
+}
 
 #: 契约 schema（ddl/00_schemas.sql 中必须全部创建）
 EXPECTED_SCHEMAS = (
@@ -428,6 +442,17 @@ def check_contract_files() -> None:
             ok(f"DDL 契约存在: contracts/database/ddl/{name}")
         else:
             fail(f"缺失 DDL 契约: contracts/database/ddl/{name}")
+    for fq_name, (ddl_file, parity_test) in sorted(SERVICE_OWNED_TABLES.items()):
+        if (DDL_DIR / ddl_file).is_file():
+            ok(f"服务私有表 DDL 契约存在: contracts/database/ddl/{ddl_file}（{fq_name}）")
+        else:
+            fail(f"缺失服务私有表 DDL: contracts/database/ddl/{ddl_file}（{fq_name}）")
+        test_path = ROOT / parity_test
+        covered = test_path.is_file() and fq_name in test_path.read_text(encoding="utf-8")
+        if covered:
+            ok(f"服务私有表对账测试就位: {parity_test}")
+        else:
+            fail(f"服务私有表 {fq_name} 豁免共享对账但无服务侧对账测试: {parity_test}")
     for name in ("README.md", "er.md", "enums.md", "orm-mapping.md"):
         path = DB_CONTRACT_DIR / name
         if path.is_file():
@@ -465,9 +490,16 @@ def check_ddl_orm_parity() -> tuple[dict[str, Any], dict[str, Any]]:
     orm = orm_tables()
     before = len(failures)
 
-    # 服务私有 schema 的表豁免共享 13 表对账（由服务自身契约管理，不入共享 ORM 元数据）
-    shared_ddl = {t for t in ddl if t.split(".", 1)[0] not in SERVICE_PRIVATE_SCHEMAS}
-    shared_orm = {t for t in orm if t.split(".", 1)[0] not in SERVICE_PRIVATE_SCHEMAS}
+    # 服务私有表豁免共享 13 表对账：整 schema 私有（SERVICE_PRIVATE_SCHEMAS）
+    # 与共享 schema 内的服务私有表（SERVICE_OWNED_TABLES，ORM 在服务内）两类，均由服务侧测试钉住
+    def _is_shared(fq_name: str) -> bool:
+        return (
+            fq_name.split(".", 1)[0] not in SERVICE_PRIVATE_SCHEMAS
+            and fq_name not in SERVICE_OWNED_TABLES
+        )
+
+    shared_ddl = {t for t in ddl if _is_shared(t)}
+    shared_orm = {t for t in orm if _is_shared(t)}
 
     missing_tables = sorted(set(EXPECTED_TABLES) - set(shared_ddl))
     extra_tables = sorted(set(shared_ddl) - set(EXPECTED_TABLES))

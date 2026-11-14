@@ -57,19 +57,35 @@ EXPECTED_TABLES: set[str] = {
     "data_analytics.algorithm_metrics",
 }
 
+#: 服务私有 schema（整 schema 归属单一服务）的表前缀：本共享库测试不导入服务包，
+#: 其表级契约校验见服务侧 test_ddl_contract.py / test_scene_engine_ddl.py
+SERVICE_PRIVATE_SCHEMA_PREFIXES: tuple[str, ...] = ("ingest_platform.", "scene_engine.")
+
+#: ORM 模型归属服务侧、但位于**共享 schema** 的 DDL 表（fq 名称 → 服务侧对账测试文件）。
+#: 豁免理由与整 schema 私有表相同（共享包不能反向依赖服务包），代价是共享侧不再对账，
+#: 因此必须同时声明对账文件——由 test_service_owned_ddl_tables_are_covered_service_side 强制，
+#: 避免退化为「共享侧不算、服务侧无人管」的假绿。边界声明见 contracts/database/er.md §1。
+SERVICE_OWNED_TABLES: dict[str, str] = {
+    "scene_svc.sim_node_registry": (
+        "services/scene-service/app/tests/test_sim_node_registry_ddl.py"
+    ),
+}
+
 
 def ddl_tables() -> dict[str, set[str]]:
     """提取 DDL 中每张表的列名（列定义固定 4 空格缩进，续行缩进更深）。
 
-    注：ingest_platform 表的 ORM 模型归属服务侧（services/ingest-platform/app/models），
-    scene_engine 同理（services/scene-service/app/models/scene_engine.py），本共享库测试不导入服务包，
-    其表级契约校验见服务侧 test_ddl_contract.py / test_scene_engine_ddl.py。
+    注：ORM 模型归属服务侧的表（整 schema 私有或共享 schema 内的服务私有表）不在
+    本共享库对账范围内，豁免声明见 SERVICE_PRIVATE_SCHEMA_PREFIXES / SERVICE_OWNED_TABLES。
     """
     tables: dict[str, set[str]] = {}
     for path in sorted(DDL_DIR.glob("*.sql")):
         text = path.read_text(encoding="utf-8")
         for match in CREATE_TABLE_RE.finditer(text):
-            if match.group(1).startswith(("ingest_platform.", "scene_engine.")):
+            fq_name = match.group(1)
+            if fq_name.startswith(SERVICE_PRIVATE_SCHEMA_PREFIXES) or (
+                fq_name in SERVICE_OWNED_TABLES
+            ):
                 continue
             columns: set[str] = set()
             for line in match.group(2).splitlines():
@@ -108,6 +124,7 @@ def test_contract_files_exist() -> None:
         "05_timeseries.sql",
         "06_ingest_platform.sql",
         "07_scene_engine.sql",
+        "08_sim_nodes.sql",
     ):
         assert (DDL_DIR / name).is_file(), f"缺失 DDL 契约文件: {name}"
     for name in ("er.md", "enums.md", "README.md"):
@@ -130,6 +147,24 @@ def test_ddl_column_parity_with_orm() -> None:
     assert set(parsed) == EXPECTED_TABLES, "DDL 表清单与契约不一致"
     for fq_name, table in Base.metadata.tables.items():
         assert parsed[fq_name] == {column.name for column in table.columns}, f"{fq_name} 列不一致"
+
+
+def test_service_owned_ddl_tables_are_covered_service_side() -> None:
+    """豁免表必须在服务侧有真实的 DDL↔ORM 对账测试（防止豁免 = 无人校验）。
+
+    判据：声明的对账文件存在，且文件内确实出现了该表名（按表名驱动对账，而非只测 schema）。
+    """
+    for fq_name, test_file in SERVICE_OWNED_TABLES.items():
+        path = ROOT / test_file
+        assert path.is_file(), f"{fq_name} 声明的服务侧对账测试不存在: {test_file}"
+        text = path.read_text(encoding="utf-8")
+        assert fq_name in text, f"{test_file} 未提及 {fq_name}，不能确认已逐列对账"
+
+
+def test_service_owned_ddl_tables_are_not_in_shared_metadata() -> None:
+    """豁免表不得同时出现在共享 ORM 元数据里（否则两侧对账口径冲突）。"""
+    leaked = set(SERVICE_OWNED_TABLES) & set(Base.metadata.tables)
+    assert not leaked, f"服务私有表不应注册进 hunter_common 共享元数据: {sorted(leaked)}"
 
 
 def test_primary_keys_match_orm() -> None:
