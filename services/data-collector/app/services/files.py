@@ -7,7 +7,9 @@
   任一不符 → 6001 / HTTP 422，审查 R2 修复）→ multipart 先合并分片再校验 →
   hunter-rosbag 对象打生命周期归类 Tag（G-12，hunter-retention=regular|event，
   打标失败 → 5001 不通知下游）→ 发布 sensor_file（key=vehicle_id，载荷契约固定）；
-- list：对象键前缀列举（vehicle_id/date/data_type 段）+ marker 游标分页，即时签发 15 分钟下载 URL。
+- list：对象键前缀列举（vehicle_id/date/data_type 段）；order=key_asc 为 marker 游标分页（旧行为），
+  order=time_desc 为「按修改时间倒序 + 页码分页」（V1.28.1，需扫描前缀，回报 total/scan_truncated）；
+  即时签发 15 分钟下载 URL。
 """
 from __future__ import annotations
 
@@ -41,6 +43,7 @@ from app.schemas.files import (
     FileDeleteData,
     FileDeleteFailure,
     FileListData,
+    FileListOrder,
     FileObjectItem,
     FilePresignData,
     FilePresignPart,
@@ -76,6 +79,14 @@ _DATE_LINE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 #: hunter-video 桶对象键根前缀（遥控会话录像：remote-control/{vid}/{yyyy}/{mm}/{dd}/…）
 VIDEO_KEY_ROOT = "remote-control"
+
+#: order=time_desc 时的前缀扫描窗口上限（对象数，V1.28.1）：MinIO 无服务端时间排序能力，
+#: 「最近文件在最前」必须先取回内存再排序；超限即停止扫描并回报 scan_truncated，
+#: 由前端提示缩小筛选范围（避免整桶列举失控）。
+LIST_SCAN_MAX_OBJECTS = 20000
+
+#: 扫描时单次 list_objects 的 MaxKeys（MinIO 服务端硬上限 1000）
+LIST_SCAN_BATCH = 1000
 
 
 class FileService:
@@ -402,8 +413,10 @@ class FileService:
         data_type: str | None,
         marker: str | None,
         limit: int,
+        order: FileListOrder = "key_asc",
+        page: int = 1,
     ) -> FileListData:
-        """文件清单（契约 GET /files：对象键前缀列举 + marker 游标分页）。
+        """文件清单（契约 GET /files：对象键前缀列举 + 两种分页/排序模式）。
 
         - 前缀按桶对象键布局感知构造（:meth:`_build_list_prefix`，V1.28.0）：
           常规桶 = 非空段 ``{vehicle_id}/{date}/{data_type}`` 依次拼接（对象键规范
@@ -411,22 +424,36 @@ class FileService:
           hunter-video = ``remote-control/{vehicle_id}/{yyyy}/{mm}/{dd}/``（遥控会话录像，
           键内无 data_type 段，见 contracts/database/object-storage.yaml）；
           三段全缺省则列举整桶（运维/管理端跨车辆检索）；
-        - max_keys = limit + 1 判断截断（契约 limit ≤ 200）；
+        - **order=key_asc**（旧行为，保留）：对象键字典序 + marker 游标分页，max_keys=limit+1 判截断；
+        - **order=time_desc**（V1.28.1）：扫描前缀内对象（上限 LIST_SCAN_MAX_OBJECTS）后按
+          ``last_modified`` 倒序（同值以对象键倒序保证稳定），再以 page/limit 切片并回报
+          ``total``；预签名仅对当页条目签发（不在扫描阶段批量签名）；
         - 每项即时签发 15 分钟预签名下载 URL（900s，支持 Range）。
         """
         full_prefix = self._build_list_prefix(bucket, vehicle_id, date, data_type)
-        items, truncated, next_marker = await asyncio.to_thread(
-            self._storage.list_objects,
-            bucket,
-            full_prefix,
-            limit + 1,
-            marker,
-        )
-        has_more = truncated or len(items) > limit
-        if len(items) > limit:
-            items = items[:limit]
-        if has_more and not next_marker and items:
-            next_marker = items[-1]["object_key"]
+        scan_truncated = False
+        total: int | None = None
+        if order == "time_desc":
+            scanned, scan_truncated = await self._scan_prefix(bucket, full_prefix)
+            scanned.sort(key=lambda item: (-item["last_modified"], item["object_key"]))
+            total = len(scanned)
+            start = max(page - 1, 0) * limit
+            items = scanned[start : start + limit]
+            has_more = start + limit < total
+            next_marker = None
+        else:
+            items, truncated, next_marker = await asyncio.to_thread(
+                self._storage.list_objects,
+                bucket,
+                full_prefix,
+                limit + 1,
+                marker,
+            )
+            has_more = truncated or len(items) > limit
+            if len(items) > limit:
+                items = items[:limit]
+            if has_more and not next_marker and items:
+                next_marker = items[-1]["object_key"]
         file_items: list[FileObjectItem] = []
         for item in items:
             video_size, is_orphan = await self._annotate_video(
@@ -451,7 +478,35 @@ class FileService:
             items=file_items,
             next_marker=next_marker if has_more else None,
             truncated=has_more,
+            order=order,
+            total=total,
+            page=page if order == "time_desc" else None,
+            scan_truncated=scan_truncated,
         )
+
+    async def _scan_prefix(self, bucket: str, prefix: str) -> tuple[list[dict[str, Any]], bool]:
+        """前缀全量列举（order=time_desc 专用，V1.28.1）；返回 ``(items, scan_truncated)``。
+
+        以 ``list_objects`` 的 marker（= 上一页末项对象键，与 MinIO ``StartAfter`` 对齐）
+        逐批拉取，直到列举自然结束或达窗口上限 LIST_SCAN_MAX_OBJECTS。
+        单次失败直接上抛（由路由层统一转 5001），不做静默降级。
+        """
+        collected: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            batch, _, next_cursor = await asyncio.to_thread(
+                self._storage.list_objects,
+                bucket,
+                prefix,
+                min(LIST_SCAN_BATCH, LIST_SCAN_MAX_OBJECTS - len(collected)),
+                cursor,
+            )
+            collected.extend(batch)
+            if not batch or not next_cursor:
+                return collected, False
+            if len(collected) >= LIST_SCAN_MAX_OBJECTS:
+                return collected, True
+            cursor = next_cursor
 
     @staticmethod
     def _build_list_prefix(

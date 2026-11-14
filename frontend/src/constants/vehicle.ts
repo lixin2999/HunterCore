@@ -62,15 +62,9 @@ export const VEHICLE_MODEL_OPTIONS: ReadonlyArray<{ value: string; label: string
 /** vehicle_id 校验（契约 VehicleIdPath.pattern：^[A-Za-z0-9_-]{1,32}$） */
 export const VEHICLE_ID_STRICT_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 
-/**
- * 车端网络地址校验（V1.28.0；IPv4 或标准压缩/简写 IPv6）
- *
- * 与契约同源：contracts/openapi/vehicle-service.yaml ``ip_address.pattern`` /
- * contracts/kafka/schemas/health.schema.json ``ip.pattern``；严格判定由后端
- * ipaddress 模块负责，本表仅表单拦截明显错输入。
- */
-export const VEHICLE_IP_PATTERN =
-  /^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|^(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(:[0-9A-Fa-f]{1,4}){1,6}|:(:[0-9A-Fa-f]{1,4}){1,7}|::)$/
+/* V1.28.1：原 VEHICLE_IP_PATTERN（台账人工录入表单校验）已删除——
+ * 页面不再录入 IP，ip_address 唯一写路径为 data-collector 心跳回写（严格判定在后端
+ * ipaddress 模块，契约：contracts/kafka/schemas/health.schema.json ip.pattern）。 */
 
 /** 每车 Topic 数量（契约 x-hunter-kafka.per_vehicle_topics；用于文案提示，不参与业务判定） */
 export const PER_VEHICLE_TOPIC_COUNT = 8

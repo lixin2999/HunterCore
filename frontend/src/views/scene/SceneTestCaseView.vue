@@ -138,6 +138,12 @@ async function loadTestCases(): Promise<void> {
   }
 }
 
+/** V1.28.1：筛选条件变化后回到第一页，否则会停在旧页号上误以为"数据不全" */
+function searchTestCases(): void {
+  testCaseQuery.page = 1
+  void loadTestCases()
+}
+
 const caseVisible = ref(false)
 const caseSubmitting = ref(false)
 const caseForm = reactive({
@@ -205,6 +211,7 @@ async function submitCase(): Promise<void> {
     await createTestCase(payload)
     ElMessage.success('测试用例已创建')
     caseVisible.value = false
+    testCaseQuery.page = 1
     await loadTestCases()
   } catch (error) {
     ElMessage.error(errorMessage(error, '测试用例创建失败'))
@@ -283,6 +290,7 @@ async function runDerive(mode: 'cases' | 'suites', dryRun = false): Promise<void
           : `派生用例：新增 ${data.created} 条，跳过 ${data.skipped} 条`,
       )
       if (!dryRun) {
+        testCaseQuery.page = 1
         await loadTestCases()
       }
     } else {
@@ -293,6 +301,7 @@ async function runDerive(mode: 'cases' | 'suites', dryRun = false): Promise<void
         `派生测试集：新建 ${data.created} 个，更新 ${data.updated} 个，跳过 ${data.skipped} 个`,
       )
       if (!dryRun) {
+        suitePage.page = 1
         await loadSuites()
       }
     }
@@ -338,6 +347,7 @@ async function submitSuiteCreate(): Promise<void> {
     suiteCreateVisible.value = false
     suiteCreateForm.name = ''
     suiteCreateForm.description = ''
+    suitePage.page = 1
     await loadSuites()
   } catch (error) {
     ElMessage.error(errorMessage(error, '测试集创建失败'))
@@ -523,9 +533,10 @@ onMounted(() => {
 
 <template>
   <div class="scene-testcase">
+    <!-- V1.28.1：14/10 分栏下左右两张表最小列宽之和均大于可用宽度，出现横向滚动与列被裁切，改为 15/9 并压缩列宽；窄屏整行堆叠 -->
     <el-row :gutter="12">
       <!-- ========================= 测试用例 ========================= -->
-      <el-col :span="14">
+      <el-col :span="15" :xs="24" :sm="24" :md="15">
         <el-card shadow="never">
           <template #header>
             <div class="card-header">
@@ -541,10 +552,23 @@ onMounted(() => {
 
           <el-form :inline="true" class="filter">
             <el-form-item label="逻辑场景">
-              <el-input v-model="testCaseQuery.logical_id" clearable placeholder="LS-…" style="width: 140px" />
+              <el-input
+                v-model="testCaseQuery.logical_id"
+                clearable
+                placeholder="LS-…"
+                style="width: 140px"
+                @keyup.enter="searchTestCases"
+                @clear="searchTestCases"
+              />
             </el-form-item>
             <el-form-item label="状态">
-              <el-select v-model="testCaseQuery.status" clearable placeholder="全部" style="width: 120px">
+              <el-select
+                v-model="testCaseQuery.status"
+                clearable
+                placeholder="全部"
+                style="width: 120px"
+                @change="searchTestCases"
+              >
                 <el-option
                   v-for="option in testCaseStatusOptions"
                   :key="option.value"
@@ -554,31 +578,38 @@ onMounted(() => {
               </el-select>
             </el-form-item>
             <el-form-item>
-              <el-button type="primary" :loading="testCaseLoading" @click="loadTestCases">查询</el-button>
+              <el-button type="primary" :loading="testCaseLoading" @click="searchTestCases">查询</el-button>
             </el-form-item>
           </el-form>
 
-          <el-table v-loading="testCaseLoading" :data="testCases" size="small" row-key="test_case_id" empty-text="暂无用例">
-            <el-table-column prop="case_key" label="编号" width="140" />
-            <el-table-column prop="name" label="名称" min-width="170" show-overflow-tooltip />
-            <el-table-column prop="logical_id" label="逻辑场景" width="130" />
-            <el-table-column label="判据" min-width="190" show-overflow-tooltip>
+          <el-table
+            v-loading="testCaseLoading"
+            :data="testCases"
+            size="small"
+            row-key="test_case_id"
+            empty-text="暂无用例"
+            max-height="560"
+          >
+            <el-table-column prop="case_key" label="编号" width="124" />
+            <el-table-column prop="name" label="名称" min-width="150" show-overflow-tooltip />
+            <el-table-column prop="logical_id" label="逻辑场景" width="102" />
+            <el-table-column label="判据" min-width="170" show-overflow-tooltip>
               <template #default="{ row }">{{ row.oracle_ref }}</template>
             </el-table-column>
-            <el-table-column label="平台" width="120" show-overflow-tooltip>
+            <el-table-column label="平台" width="96" show-overflow-tooltip>
               <template #default="{ row }">{{ row.platforms.join(' / ') }}</template>
             </el-table-column>
-            <el-table-column label="状态" width="90">
+            <el-table-column label="状态" width="80">
               <template #default="{ row }">
                 <el-tag :type="TEST_CASE_STATUS_TAG_TYPES[row.status] ?? 'info'" size="small">
                   {{ TEST_CASE_STATUS_LABELS[row.status] ?? row.status }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="超时" width="80">
+            <el-table-column label="超时" width="64">
               <template #default="{ row }">{{ row.timeout_seconds }}s</template>
             </el-table-column>
-            <el-table-column label="操作" width="80" fixed="right">
+            <el-table-column label="操作" width="70" fixed="right">
               <template #default="{ row }">
                 <el-button link type="primary" @click="openCaseDetail(row)">详情</el-button>
               </template>
@@ -587,16 +618,19 @@ onMounted(() => {
 
           <el-pagination
             class="pager"
-            layout="total, prev, pager, next"
+            layout="total, sizes, prev, pager, next"
             :total="testCaseTotal"
             :page-size="testCaseQuery.page_size"
+            :current-page="testCaseQuery.page"
+            :page-sizes="[20, 50, 100]"
             @current-change="(page: number) => { testCaseQuery.page = page; loadTestCases() }"
+            @size-change="(size: number) => { testCaseQuery.page_size = size; testCaseQuery.page = 1; loadTestCases() }"
           />
         </el-card>
       </el-col>
 
       <!-- ========================= 测试集 ========================= -->
-      <el-col :span="10">
+      <el-col :span="9" :xs="24" :sm="24" :md="9">
         <el-card shadow="never">
           <template #header>
             <div class="card-header">
@@ -610,26 +644,43 @@ onMounted(() => {
             </div>
           </template>
 
-          <el-table v-loading="suiteLoading" :data="suites" size="small" row-key="suite_id" empty-text="暂无测试集">
-            <el-table-column prop="name" label="名称" min-width="140" show-overflow-tooltip />
-            <el-table-column label="状态" width="90">
+          <el-table
+            v-loading="suiteLoading"
+            :data="suites"
+            size="small"
+            row-key="suite_id"
+            empty-text="暂无测试集"
+            max-height="560"
+          >
+            <el-table-column prop="name" label="名称" min-width="130" show-overflow-tooltip />
+            <el-table-column label="状态" width="78">
               <template #default="{ row }">
                 <el-tag :type="SUITE_STATUS_TAG_TYPES[row.status] ?? 'info'" size="small">
                   {{ SUITE_STATUS_LABELS[row.status] ?? row.status }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column prop="item_count" label="条目" width="70" />
-            <el-table-column label="更新时间" width="160">
+            <el-table-column prop="item_count" label="条目" width="60" />
+            <el-table-column label="更新时间" width="156">
               <template #default="{ row }">{{ formatDateTimeString(row.update_time) }}</template>
             </el-table-column>
-            <el-table-column label="操作" width="90" fixed="right">
+            <el-table-column label="操作" width="68" fixed="right">
               <template #default="{ row }">
                 <el-button link type="primary" @click="openSuiteDetail(row)">详情</el-button>
               </template>
             </el-table-column>
           </el-table>
-          <div class="hint total">共 {{ suiteTotal }} 个测试集</div>
+          <!-- V1.28.1：旧版只有总数文案、无翻页入口，46 个测试集只能看到第一页 20 个 -->
+          <el-pagination
+            class="pager"
+            layout="total, sizes, prev, pager, next"
+            :total="suiteTotal"
+            :page-size="suitePage.page_size"
+            :current-page="suitePage.page"
+            :page-sizes="[10, 20, 50, 100]"
+            @current-change="(page: number) => { suitePage.page = page; loadSuites() }"
+            @size-change="(size: number) => { suitePage.page_size = size; suitePage.page = 1; loadSuites() }"
+          />
         </el-card>
       </el-col>
     </el-row>

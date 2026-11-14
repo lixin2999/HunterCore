@@ -19,6 +19,7 @@ from app.schemas.files import (
     FileCompleteResponse,
     FileDeleteRequest,
     FileDeleteResponse,
+    FileListOrder,
     FileListResponse,
     FilePresignRequest,
     FilePresignResponse,
@@ -49,13 +50,30 @@ async def list_files(
         Query(pattern=r"^\d{4}-\d{2}-\d{2}$", description="上传日期（YYYY-MM-DD，UTC；可选过滤）"),
     ] = None,
     data_type: Annotated[FileDataType | None, Query(description="数据类型（可选过滤）")] = None,
-    marker: Annotated[str | None, Query(max_length=1024, description="分页游标（上一页 next_marker）")] = None,
+    marker: Annotated[
+        str | None,
+        Query(max_length=1024, description="分页游标（仅 order=key_asc，上一页 next_marker）"),
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=200, description="单页上限（≤200，默认 50）")] = 50,
+    order: Annotated[
+        FileListOrder,
+        Query(
+            description=(
+                "排序与分页方式：key_asc=对象键字典序 + 游标分页（默认，兼容旧调用方）；"
+                "time_desc=修改时间倒序 + 页码分页（V1.28.1）"
+            )
+        ),
+    ] = "key_asc",
+    page: Annotated[int, Query(ge=1, description="页码（1 起，仅 order=time_desc 生效）")] = 1,
 ) -> FileListResponse:
-    """文件清单（对象键前缀列举 + marker 游标；每项即时签发 15 分钟下载 URL）。
+    """文件清单（对象键前缀列举；每项即时签发 15 分钟下载 URL）。
 
     R1（V1.21.16）：此前实现私增 ``prefix`` 且漏了契约要求的 ``date``/``data_type``，
     前端按契约发 date/data_type 被 FastAPI 静默忽略 ⇒ 筛查形同虚设；本版与契约对齐。
+
+    V1.28.1：新增 ``order``/``page``——旧游标模式按对象键序返回且无 ``total``，前端只能
+    「上一页/下一页」逐游标前进，既跳不了页也看不到总量（表现为「分页有问题、数据不全」）；
+    ``order=time_desc`` 扫描前缀后按修改时间倒序并以 ``page`` 切片，回报 ``total`` 供页码分页。
     """
     data = await service.list_files(
         vehicle_id=vehicle_id,
@@ -64,6 +82,8 @@ async def list_files(
         data_type=data_type.value if data_type else None,
         marker=marker,
         limit=limit,
+        order=order,
+        page=page,
     )
     return FileListResponse(code=0, message="success", data=data, request_id=trace_request_id())
 

@@ -11,6 +11,10 @@ from app.schemas.common import FileDataType, UploadBucket, UploadMethod
 #: 生命周期归类（G-12，契约 FilePresignRequest/FileCompleteRequest.retention）
 FileRetention = Literal["regular", "event"]
 
+#: 清单排序方式（V1.28.1）：key_asc=对象键字典序 + marker 游标分页（旧行为）；
+#: time_desc=按 last_modified 倒序 + 页码分页（需先扫描前缀，返回 total）
+FileListOrder = Literal["key_asc", "time_desc"]
+
 #: 打标义务说明（与 contracts/database/object-storage.yaml lifecycle.tagging 同源）
 _RETENTION_DESC = (
     "生命周期归类（G-12，仅 hunter-rosbag 消费）：事件包必须显式 event（永久），"
@@ -170,13 +174,25 @@ class FileObjectItem(BaseModel):
 
 
 class FileListData(BaseModel):
-    """文件清单数据体（prefix 列举 + marker 游标分页）。"""
+    """文件清单数据体（prefix 列举；order 决定游标分页或页码分页）。"""
 
     model_config = ConfigDict(extra="forbid")
 
     items: list[FileObjectItem] = Field(default_factory=list, description="对象清单")
-    next_marker: str | None = Field(default=None, description="下一页游标（无更多数据时为 null）")
+    next_marker: str | None = Field(
+        default=None, description="下一页游标（仅 order=key_asc；无更多数据或页码模式为 null）"
+    )
     truncated: bool = Field(description="是否被截断（存在更多对象）")
+    # ↓ 排序/分页元信息（V1.28.1；order=key_asc 时 total/page 为 null，保持旧调用方兼容）
+    order: FileListOrder = Field(default="key_asc", description="排序方式（缺省对象键字典序）")
+    total: int | None = Field(
+        default=None, description="命中对象总数（仅 order=time_desc 页码模式；游标模式为 null）"
+    )
+    page: int | None = Field(default=None, description="当前页码（1 起，仅页码模式）")
+    scan_truncated: bool = Field(
+        default=False,
+        description="时间倒序扫描窗口达上限被截断（排序与 total 仅基于窗口内对象，需缩小前缀范围）",
+    )
 
 
 class FileListResponse(BaseModel):

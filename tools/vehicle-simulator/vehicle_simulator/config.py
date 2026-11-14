@@ -34,6 +34,8 @@ class SimConfig:
     health_hz: float = 1.0
     duration_s: float = 0.0                    # 0 = 一直运行（Ctrl-C 退出）
     start_soc: int = 80
+    # ---------- health 上报 IP（V1.28.1，平台台账回写数据源） ----------
+    ip: str = "auto"                           # auto=探测本机出口 IP；none/off=不上报；其他=显式 IP
     # ---------- 视频 ----------
     # ⚠ 基址里的 host:port 必须指向与浏览器拉流**同一个** SRS 实例（否则推流落在 A、拉流取自 B，
     #   浏览器永远 502 而车端看着“推流正常”）；HTTP-API 端口本项目统一 9090（不是 SRS 默认的 1985），
@@ -127,6 +129,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--health-hz", type=float, default=float(_env("SIM_HEALTH_HZ", "1")))
     p.add_argument("--duration", type=float, default=float(_env("SIM_DURATION", "0")), help="运行秒数（0=一直运行）")
     p.add_argument("--start-soc", type=int, default=int(_env("SIM_START_SOC", "80")))
+    p.add_argument(
+        "--ip",
+        default=_env("SIM_VEHICLE_IP", "auto"),
+        help="health 上报的车端 IP：auto=探测本机出口 IP（默认）；none=不上报；或显式 IP（如 192.168.10.21）",
+    )
     p.add_argument("--srs-rtmp", default=_env("SIM_SRS_RTMP"), help="SRS RTMP 基址，如 rtmp://IP:1935/remote_control")
     p.add_argument("--srs-whip", default=_env("SIM_SRS_WHIP"), help="SRS WHIP 基址（无 ffmpeg 回退），如 http://IP/rtc/v1/whip/（同源反代）或 http://IP:9090/rtc/v1/whip/")
     p.add_argument("--stream-prefix", default=_env("RC_SRS_STREAM_PREFIX", "hunter"))
@@ -154,6 +161,7 @@ def from_args(argv: list[str] | None = None) -> SimConfig:
         health_hz=ns.health_hz,
         duration_s=ns.duration,
         start_soc=ns.start_soc,
+        ip=ns.ip,
         srs_rtmp=ns.srs_rtmp,
         srs_whip=ns.srs_whip,
         stream_prefix=ns.stream_prefix,

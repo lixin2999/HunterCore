@@ -23,6 +23,9 @@ from uuid import UUID
 from hunter_common.database.enums import EventLevel, EventType
 from hunter_common.database.models import Event
 
+#: 未显式指定 mtime 时的默认 last_modified（旧行为：所有对象同一时刻）
+DEFAULT_LAST_MODIFIED = 1724035200.0
+
 __all__ = [
     "FakeEventRepository",
     "FakeMinioStorage",
@@ -45,6 +48,8 @@ class FakeMinioStorage:
 
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], bytes] = {}
+        #: 对象键 → 伪造 last_modified（V1.28.1：时间倒序排序用例需差异化 mtime）
+        self.mtimes: dict[tuple[str, str], float] = {}
         #: 对象键 → 伪造 ETag（不设置时按 md5 生成）
         self.etag_overrides: dict[tuple[str, str], str] = {}
         self.multipart_sessions: dict[str, list[dict[str, Any]]] = {}
@@ -63,9 +68,11 @@ class FakeMinioStorage:
         self._upload_seq = 0
 
     # ---------- 测试辅助 ----------
-    def put(self, bucket: str, key: str, data: bytes) -> None:
-        """写入对象内容（模拟车端直传完成）。"""
+    def put(self, bucket: str, key: str, data: bytes, last_modified: float | None = None) -> None:
+        """写入对象内容（模拟车端直传完成；可附带伪造 mtime 供时间倒序用例）。"""
         self.objects[(bucket, key)] = data
+        if last_modified is not None:
+            self.mtimes[(bucket, key)] = last_modified
 
     def hashes_of(self, bucket: str, key: str) -> tuple[int, str, str]:
         """返回对象真实 (size, md5, sha256)，供用例构造正确声明值。"""
@@ -102,7 +109,7 @@ class FakeMinioStorage:
         return {
             "size_bytes": len(data),
             "etag": etag,
-            "last_modified": 1724035200.0,
+            "last_modified": self.mtimes.get((bucket, key), DEFAULT_LAST_MODIFIED),
             "content_type": "application/octet-stream",
         }
 
@@ -128,7 +135,7 @@ class FakeMinioStorage:
                 "object_key": key,
                 "size_bytes": len(self.objects[(bucket, key)]),
                 "etag": hashlib.md5(self.objects[(bucket, key)]).hexdigest(),
-                "last_modified": 1724035200.0,
+                "last_modified": self.mtimes.get((bucket, key), DEFAULT_LAST_MODIFIED),
             }
             for key in page
         ]

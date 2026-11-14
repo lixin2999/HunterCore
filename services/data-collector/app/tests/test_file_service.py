@@ -6,7 +6,8 @@
   multipart 合并与合并失败回滚（2001）、sensor_file 投递载荷、Kafka 故障（5001）；
 - 生命周期归类打标（G-12）：hunter-rosbag 按 retention 打 Tag、非 rosbag 不打标、
   打标失败 5001 且不发布 sensor_file；
-- 清单：车辆/日期/数据类型前缀段隔离、limit+1 截断与 next_marker 游标、预签名下载地址。
+- 清单：车辆/日期/数据类型前缀段隔离、limit+1 截断与 next_marker 游标、预签名下载地址；
+  order=time_desc（V1.28.1）按 last_modified 倒序 + 页码切片并回报 total/scan_truncated。
 
 **关键回归（审查 R2）**：完整性校验必须基于「对象真实内容摘要」——
 sha256 必须参与判定，且不得以 ETag 代替内容校验（multipart 对象 ETag 带 ``-N`` 后缀）。
@@ -568,6 +569,145 @@ async def test_list_files_video_bucket_prefix_maps_remote_control_layout() -> No
         vehicle_id=VEHICLE_ID, bucket=VIDEO_BUCKET, date="20260918", data_type=None, marker=None, limit=100
     )
     assert storage.list_calls[-1]["prefix"] == f"remote-control/{VEHICLE_ID}/20260918/"
+
+
+# ---------------------------------------------------------------------------
+# list_files（order=time_desc：修改时间倒序 + 页码分页，V1.28.1）
+# ---------------------------------------------------------------------------
+async def test_list_files_time_desc_sorts_by_last_modified_desc() -> None:
+    """时间倒序：最新对象在最前（旧游标模式只能按对象键字典序，不反映上传时间）。"""
+    service, storage, _ = make_service()
+    oldest = f"{VEHICLE_ID}/2026-09-18/point_cloud/1724035200_1.pcd"
+    newest = f"{VEHICLE_ID}/2026-09-18/point_cloud/1724035200_2.pcd"
+    middle = f"{VEHICLE_ID}/2026-09-18/point_cloud/1724035200_3.pcd"
+    storage.put(RAW_BUCKET, oldest, CONTENT, last_modified=1_000.0)
+    storage.put(RAW_BUCKET, newest, CONTENT, last_modified=3_000.0)
+    storage.put(RAW_BUCKET, middle, CONTENT, last_modified=2_000.0)
+
+    data = await service.list_files(
+        vehicle_id=VEHICLE_ID,
+        bucket=RAW_BUCKET,
+        date=None,
+        data_type=None,
+        marker=None,
+        limit=10,
+        order="time_desc",
+    )
+
+    assert [item.object_key for item in data.items] == [newest, middle, oldest]
+    assert [item.last_modified for item in data.items] == [3_000.0, 2_000.0, 1_000.0]
+    assert data.order == "time_desc"
+    assert data.total == 3 and data.page == 1
+    assert data.truncated is False and data.next_marker is None
+    assert data.scan_truncated is False
+
+
+async def test_list_files_time_desc_pages_by_page_number() -> None:
+    """页码分页：page 逐页切片，末页不再截断（修复旧版「只能逐游标前进、无法跳页」）。"""
+    service, storage, _ = make_service()
+    for seq in range(1, 6):
+        storage.put(
+            RAW_BUCKET,
+            f"{VEHICLE_ID}/2026-09-18/point_cloud/1724035200_{seq}.pcd",
+            CONTENT,
+            last_modified=float(seq),
+        )
+
+    page1 = await service.list_files(
+        vehicle_id=VEHICLE_ID,
+        bucket=RAW_BUCKET,
+        date=None,
+        data_type=None,
+        marker=None,
+        limit=2,
+        order="time_desc",
+        page=1,
+    )
+    page2 = await service.list_files(
+        vehicle_id=VEHICLE_ID,
+        bucket=RAW_BUCKET,
+        date=None,
+        data_type=None,
+        marker=None,
+        limit=2,
+        order="time_desc",
+        page=2,
+    )
+    page3 = await service.list_files(
+        vehicle_id=VEHICLE_ID,
+        bucket=RAW_BUCKET,
+        date=None,
+        data_type=None,
+        marker=None,
+        limit=2,
+        order="time_desc",
+        page=3,
+    )
+
+    # mtime 倒序 = seq 5 → 1；每页 2 条
+    assert [item.size_bytes for item in page1.items] == [len(CONTENT)] * 2
+    assert [item.last_modified for item in page1.items] == [5.0, 4.0]
+    assert [item.last_modified for item in page2.items] == [3.0, 2.0]
+    assert [item.last_modified for item in page3.items] == [1.0]
+    assert (page1.total, page2.total, page3.total) == (5, 5, 5)
+    assert page1.truncated is True and page3.truncated is False
+    assert page3.page == 3
+
+
+async def test_list_files_time_desc_reports_scan_truncated_beyond_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """扫描窗口达上限：停止扫描并回报 scan_truncated（total 仅为窗口内数量，不谎报全量）。"""
+    monkeypatch.setattr("app.services.files.LIST_SCAN_MAX_OBJECTS", 3)
+    service, storage, _ = make_service()
+    for seq in range(1, 6):
+        storage.put(
+            RAW_BUCKET,
+            f"{VEHICLE_ID}/2026-09-18/point_cloud/1724035200_{seq}.pcd",
+            CONTENT,
+            last_modified=float(seq),
+        )
+
+    data = await service.list_files(
+        vehicle_id=VEHICLE_ID,
+        bucket=RAW_BUCKET,
+        date=None,
+        data_type=None,
+        marker=None,
+        limit=10,
+        order="time_desc",
+    )
+
+    assert data.scan_truncated is True
+    assert data.total == 3 and len(data.items) == 3
+
+
+async def test_list_files_key_asc_keeps_cursor_semantics_and_null_total() -> None:
+    """向后兼容：缺省 order=key_asc 仍是游标分页，total/page 为 null（旧调用方不受影响）。"""
+    service, storage, _ = make_service()
+    for seq in range(1, 4):
+        storage.put(
+            RAW_BUCKET,
+            f"{VEHICLE_ID}/2026-09-18/point_cloud/1724035200_{seq}.pcd",
+            CONTENT,
+            last_modified=float(seq),
+        )
+
+    data = await service.list_files(
+        vehicle_id=VEHICLE_ID,
+        bucket=RAW_BUCKET,
+        date=None,
+        data_type=None,
+        marker=None,
+        limit=2,
+    )
+
+    assert data.order == "key_asc"
+    assert data.total is None and data.page is None
+    assert data.scan_truncated is False
+    assert data.truncated is True and data.next_marker is not None
+    # 游标模式只调一次列举（未进入扫描循环）
+    assert len(storage.list_calls) == 1
 
 
 # ---------------------------------------------------------------------------

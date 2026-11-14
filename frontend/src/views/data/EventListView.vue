@@ -5,7 +5,8 @@
  * 契约：
  * - GET  /api/v1/data/events（分页、类型/等级/确认状态/时间范围过滤）
  * - POST /api/v1/data/events/{event_id}/acknowledge（事件确认，审计留痕）
- * - GET  /api/v1/data/files（游标分页；download_url 预签名 15 分钟，支持 Range）
+ * - GET  /api/v1/data/files（V1.28.1 默认 order=time_desc：修改时间倒序 + 页码分页；
+ *   download_url 预签名 15 分钟，支持 Range）
  * 说明：事件类型与等级为受控词表（系统约束第 13 条），等级不可由前端放宽。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -112,21 +113,19 @@ const fileQuery = reactive<FileListQuery>({
   vehicle_id: undefined,
   data_type: undefined,
   date: undefined,
+  // V1.28.1：默认按修改时间倒序（旧版按对象键字典序，最新文件排在最后且无法跳页）
+  order: 'time_desc',
 })
 const files = ref<FileObjectItem[]>([])
 const fileLoading = ref(false)
 const fileLimit = ref(50)
+const filePage = ref(1)
+const fileTotal = ref(0)
+/** 后端扫描窗口（20000 对象）达上限：排序与总数仅基于窗口内对象，需提示缩小范围 */
+const fileScanTruncated = ref(false)
+const fileInitialized = ref(false)
 const selectedKeys = ref<string[]>([])
 const deleting = ref(false)
-
-/**
- * 游标 marker 栈分页（契约 GET /files 仅返回 next_marker，无 total）：
- * `markers[i]` = 请求第 i+1 页所用的 marker（首页为 undefined）；
- * 加载后据 truncated/next_marker 写回 `markers[i+1]`，实现上一页 / 下一页双向导航。
- */
-const markers = ref<(string | undefined)[]>([undefined])
-const filePageIndex = ref(0)
-const hasNext = ref(false)
 
 const canDelete = computed(() => userStore.hasPermission(PERMISSIONS.dataExecute))
 
@@ -143,34 +142,24 @@ const bucketOptions = computed(() =>
   Object.entries(UPLOAD_BUCKET_LABELS).map(([value, label]) => ({ value, label })),
 )
 
-function resetFilePagination(): void {
-  markers.value = [undefined]
-  filePageIndex.value = 0
-  hasNext.value = false
-  files.value = []
-  selectedKeys.value = []
-}
-
-/** 加载指定页（index 对应 markers[index]；过滤条件变更时从第 0 页重来） */
-async function loadFilePage(index: number): Promise<void> {
+/**
+ * 加载当前页（V1.28.1 页码分页）：契约 order=time_desc 下服务端扫描前缀、按修改时间
+ * 倒序并回报 total，因此可直接跳页与显示总量；旧游标模式（只能逐页前进、无总数）已下线。
+ */
+async function loadFiles(): Promise<void> {
   fileLoading.value = true
+  fileInitialized.value = true
   try {
     const data = await listFiles({
       ...fileQuery,
       limit: fileLimit.value,
-      marker: markers.value[index],
+      page: filePage.value,
     })
     files.value = data.items
-    filePageIndex.value = index
+    // 兼容旧响应（order=key_asc 无 total）：降级为当页条数，不谎报总量
+    fileTotal.value = data.total ?? data.items.length
+    fileScanTruncated.value = data.scan_truncated === true
     selectedKeys.value = []
-    // 丢弃比当前页更深的已知游标，再登记下一页游标
-    markers.value = markers.value.slice(0, index + 1)
-    if (data.truncated && data.next_marker) {
-      markers.value[index + 1] = data.next_marker
-      hasNext.value = true
-    } else {
-      hasNext.value = false
-    }
   } catch (error) {
     ElMessage.error(error instanceof HunterApiError ? error.message : '文件列表加载失败')
   } finally {
@@ -178,24 +167,31 @@ async function loadFilePage(index: number): Promise<void> {
   }
 }
 
-/** 条件/每页条数变更：回到首页重新列举 */
+/** 条件/每页条数变更：回到第一页重新列举（旧版停在深页号会看起来「没数据」） */
 function handleFileSearch(): void {
-  resetFilePagination()
-  void loadFilePage(0)
+  filePage.value = 1
+  void loadFiles()
+}
+
+function handleFilePageChange(page: number): void {
+  filePage.value = page
+  void loadFiles()
+}
+
+function handleFileLimitChange(size: number): void {
+  fileLimit.value = size
+  handleFileSearch()
+}
+
+/** 首次切到「文件浏览」页自动列举（V1.28.1：旧版必须手点「查询」，看起来根本没有数据） */
+function handleTabChange(name: string | number): void {
+  if (name === 'files' && !fileInitialized.value) void loadFiles()
 }
 
 /** Bucket 切换：hunter-video 键内无 data_type 段，切到视频桶时清空该筛选（V1.28.0） */
 function handleBucketChange(): void {
   if (isVideoBucket.value) fileQuery.data_type = undefined
   handleFileSearch()
-}
-
-function goFilePrev(): void {
-  if (filePageIndex.value > 0) void loadFilePage(filePageIndex.value - 1)
-}
-
-function goFileNext(): void {
-  if (hasNext.value) void loadFilePage(filePageIndex.value + 1)
 }
 
 function handleSelectionChange(rows: FileObjectItem[]): void {
@@ -231,7 +227,7 @@ async function handleDelete(): Promise<void> {
     } else {
       ElMessage.success(text)
     }
-    await loadFilePage(filePageIndex.value)
+    await loadFiles()
   } catch (error) {
     ElMessage.error(error instanceof HunterApiError ? error.message : '删除失败')
   } finally {
@@ -252,7 +248,7 @@ onMounted(async () => {
 
 <template>
   <div class="data-view">
-    <el-tabs v-model="activeTab" type="border-card">
+    <el-tabs v-model="activeTab" type="border-card" @tab-change="handleTabChange">
       <el-tab-pane label="事件列表" name="events">
         <el-form :inline="true" class="filter">
           <el-form-item label="车辆">
@@ -402,11 +398,6 @@ onMounted(async () => {
           <el-form-item label="日期">
             <el-date-picker v-model="fileQuery.date" type="date" value-format="YYYY-MM-DD" placeholder="全部日期" />
           </el-form-item>
-          <el-form-item label="每页">
-            <el-select v-model="fileLimit" style="width: 110px" @change="handleFileSearch">
-              <el-option v-for="size in [20, 50, 100, MAX_PAGE_SIZE]" :key="size" :label="`${size} 条`" :value="size" />
-            </el-select>
-          </el-form-item>
           <el-form-item>
             <el-button type="primary" :loading="fileLoading" @click="handleFileSearch">查询</el-button>
             <el-button
@@ -452,11 +443,26 @@ onMounted(async () => {
           </el-table-column>
         </el-table>
 
-        <div class="pager">
-          <span class="pager-info">第 {{ filePageIndex + 1 }} 页</span>
-          <el-button :disabled="filePageIndex === 0 || fileLoading" @click="goFilePrev">上一页</el-button>
-          <el-button :disabled="!hasNext || fileLoading" @click="goFileNext">下一页</el-button>
-        </div>
+        <!-- 扫描窗口截断提示（V1.28.1）：total 与倒序仅基于窗口内对象，不谎报全量 -->
+        <el-alert
+          v-if="fileScanTruncated"
+          class="scan-warning"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="筛选范围内对象数超过扫描窗口（20000 个），排序与总数仅覆盖窗口内对象，请缩小车辆/日期/类型范围"
+        />
+
+        <el-pagination
+          class="pager"
+          layout="total, sizes, prev, pager, next, jumper"
+          :total="fileTotal"
+          :current-page="filePage"
+          :page-size="fileLimit"
+          :page-sizes="[20, 50, 100, MAX_PAGE_SIZE]"
+          @current-change="handleFilePageChange"
+          @size-change="handleFileLimitChange"
+        />
       </el-tab-pane>
     </el-tabs>
   </div>
@@ -472,9 +478,7 @@ onMounted(async () => {
   text-align: right;
 }
 
-.pager-info {
-  margin-right: 12px;
-  color: var(--el-text-color-secondary);
-  font-size: 13px;
+.scan-warning {
+  margin-top: 12px;
 }
 </style>

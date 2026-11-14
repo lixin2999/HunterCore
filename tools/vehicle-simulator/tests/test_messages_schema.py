@@ -43,6 +43,21 @@ def test_health_matches_schema(schema_loader, model):
         "offline", "online_idle", "auto_driving", "remote_controlled",
         "upgrading", "charging", "fault", "emergency",
     }
+    # 未配置 ip 时不携带该键（契约可选字段；平台侧不回写）
+    assert "ip" not in msg
+
+
+def test_health_carries_optional_ip(schema_loader, model):
+    """V1.28.1：health 上报 ip（平台台账回写唯一数据源），需通过 schema pattern 校验。"""
+    msg = build_health(VID, model.state, now=1_700_000_000.5, ip="192.168.10.21")
+    _validate(schema_loader, "health", msg)
+    assert msg["ip"] == "192.168.10.21"
+
+
+def test_health_ip_v6_accepted(schema_loader, model):
+    msg = build_health(VID, model.state, now=1_700_000_000.5, ip="fe80:1881:0:3001::5")
+    _validate(schema_loader, "health", msg)
+    assert msg["ip"] == "fe80:1881:0:3001::5"
 
 
 def test_command_result_matches_schema(schema_loader):

@@ -19,6 +19,7 @@ from vehicle_simulator.messages import (
     build_command_result,
     build_health,
     build_telemetry,
+    detect_local_ip,
     new_command_id,
 )
 
@@ -45,6 +46,17 @@ class VehicleSimulator:
         self._frames_seen = 0
         self._session_id: str | None = None
         self._stop = threading.Event()
+        # health 上报 IP（V1.28.1）：auto 启动时探测一次；none/off 不报；其他按配置值
+        self._health_ip = self._resolve_health_ip(cfg)
+
+    @staticmethod
+    def _resolve_health_ip(cfg: SimConfig) -> str | None:
+        raw = (cfg.ip or "").strip()
+        if raw.lower() in ("", "none", "off"):
+            return None
+        if raw.lower() == "auto":
+            return detect_local_ip()
+        return raw
 
     # ---------- 状态快照（供视频线程读取） ----------
     def state_snapshot(self):
@@ -112,7 +124,7 @@ class VehicleSimulator:
         self._safe_produce(self.cfg.telemetry_topic(), self.cfg.vehicle_id, msg)
 
     def _emit_health(self) -> None:
-        msg = build_health(self.cfg.vehicle_id, self.model.state)
+        msg = build_health(self.cfg.vehicle_id, self.model.state, ip=self._health_ip)
         self._safe_produce(self.cfg.health_topic(), self.cfg.vehicle_id, msg)
 
     def _safe_produce(self, topic: str, key: str, value: dict[str, Any]) -> None:

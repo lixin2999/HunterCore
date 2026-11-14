@@ -18,7 +18,6 @@ import BundleDownloadNotice from './BundleDownloadNotice.vue'
 import {
   PER_VEHICLE_TOPIC_COUNT,
   VEHICLE_ID_STRICT_PATTERN,
-  VEHICLE_IP_PATTERN,
   VEHICLE_MODEL_OPTIONS,
 } from '@/constants/vehicle'
 import type { ProvisionResult, VehicleCreateRequest } from '@/types/vehicle'
@@ -44,7 +43,6 @@ const form = reactive<VehicleCreateRequest>({
   software_version: '',
   description: '',
   fence_json: null,
-  ip_address: '',
   takeover_existing: false,
 })
 
@@ -62,17 +60,6 @@ const rules: FormRules<VehicleCreateRequest> = {
     { max: 64, message: '名称长度 ≤ 64', trigger: 'blur' },
   ],
   description: [{ max: 500, message: '描述长度 ≤ 500', trigger: 'blur' }],
-  ip_address: [
-    {
-      // 留空 = 不录入（health 心跳上报后以车端值为权威）
-      validator: (_rule, value: unknown, callback: (error?: Error) => void) => {
-        const text = String(value ?? '').trim()
-        if (!text || VEHICLE_IP_PATTERN.test(text)) callback()
-        else callback(new Error('请输入合法的 IPv4 / IPv6 地址'))
-      },
-      trigger: 'blur',
-    },
-  ],
 }
 
 /** 一次性口令结果（Step 2 展示；关闭对话框后清空） */
@@ -119,12 +106,8 @@ async function handleSubmit(): Promise<void> {
   }
   submitting.value = true
   try {
-    // 空 IP 不提交（后端把 ip_address: "" 当非法格式；省略 = 未录入，等心跳回写）
-    const { ip_address, ...rest } = form
-    const payload: VehicleCreateRequest = ip_address?.trim()
-      ? { ...rest, ip_address: ip_address.trim() }
-      : { ...rest }
-    const result = await createVehicle(payload)
+    // IP 不在建账录入范围（V1.28.1：唯一写路径为 data-collector 心跳回写）
+    const result = await createVehicle({ ...form })
     provisionResult.value = result
     kafkaPropertiesPreview.value = buildKafkaPropertiesPreview(result)
     currentStep.value = 2
@@ -223,9 +206,6 @@ function handleCancel(): void {
         </el-form-item>
         <el-form-item label="软件版本">
           <el-input v-model="form.software_version" placeholder="可留空" maxlength="32" />
-        </el-form-item>
-        <el-form-item label="IP 地址" prop="ip_address">
-          <el-input v-model="form.ip_address" placeholder="可留空；车端心跳上报后自动回写（上报值为权威）" maxlength="45" />
         </el-form-item>
         <el-form-item label="备注">
           <el-input v-model="form.description" type="textarea" :rows="2" maxlength="500" show-word-limit />

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import random
+import socket
 import time
 import uuid
 from typing import Any
@@ -120,10 +121,39 @@ def build_telemetry(
     }
 
 
-def build_health(vehicle_id: str, state: VehicleState, *, now: float | None = None, free_storage_mb: int = 8192) -> dict[str, Any]:
-    """health.schema.json（status + system 必需；gear/free_storage_mb 可选顶层）。"""
+def detect_local_ip() -> str | None:
+    """探测本机出口 IP（UDP connect 技巧：不实际发包，只选默认路由的源地址）。
+
+    失败回退 hostname 解析；仍失败返回 None（health 不上报 ip，平台不回写）。
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("10.255.255.255", 1))
+        return str(sock.getsockname()[0])
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return None
+    finally:
+        sock.close()
+
+
+def build_health(
+    vehicle_id: str,
+    state: VehicleState,
+    *,
+    now: float | None = None,
+    free_storage_mb: int = 8192,
+    ip: str | None = None,
+) -> dict[str, Any]:
+    """health.schema.json（status + system 必需；gear/free_storage_mb/ip 可选顶层）。
+
+    ip（V1.28.1）：车端网络地址，平台 data-collector 消费后回写台账 vehicles.ip_address
+    （上报值为权威）；未配置/探测失败则不携带该键（契约可选字段，不回写）。
+    """
     ts = time.time() if now is None else now
-    return {
+    payload: dict[str, Any] = {
         "vehicle_id": vehicle_id,
         "timestamp": round(ts, 3),
         "status": resolve_status(state, online=True),
@@ -131,6 +161,9 @@ def build_health(vehicle_id: str, state: VehicleState, *, now: float | None = No
         "free_storage_mb": free_storage_mb,
         "system": _system_section(ts),
     }
+    if ip:
+        payload["ip"] = ip
+    return payload
 
 
 def build_command_result(

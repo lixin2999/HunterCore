@@ -262,11 +262,22 @@ export interface FileObjectItem {
   is_orphan?: boolean
 }
 
-/** 文件列表响应数据（游标分页） */
+/** 清单排序与分页方式（V1.28.1）：key_asc=对象键序 + 游标分页；time_desc=修改时间倒序 + 页码分页 */
+export type FileListOrder = 'key_asc' | 'time_desc'
+
+/** 文件列表响应数据（order 决定游标模式还是页码模式） */
 export interface FileListData {
   items: FileObjectItem[]
+  /** 下一页游标（仅 order=key_asc；页码模式为 null） */
   next_marker: string | null
   truncated: boolean
+  order?: FileListOrder
+  /** 命中对象总数（仅 order=time_desc；游标模式为 null） */
+  total?: number | null
+  /** 当前页码（1 起，仅 order=time_desc） */
+  page?: number | null
+  /** 扫描窗口达上限被截断（排序与 total 仅基于窗口内对象，需缩小筛选范围） */
+  scan_truncated?: boolean
 }
 
 /** 文件列表查询参数（GET /api/v1/data/files） */
@@ -278,6 +289,10 @@ export interface FileListQuery {
   data_type?: FileDataType
   marker?: string
   limit?: number
+  /** 排序与分页方式（缺省 key_asc；控制台默认 time_desc） */
+  order?: FileListOrder
+  /** 页码（1 起，仅 order=time_desc 生效） */
+  page?: number
 }
 
 /** 批量删除请求（POST /api/v1/data/files/delete；object_keys 相对 bucket，≤200/次） */

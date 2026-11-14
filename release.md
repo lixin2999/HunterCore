@@ -9004,7 +9004,7 @@ G-04 决策① 原意是「前端 Token 存 localStorage ⇒ 服务端收紧 Acc
 ## V1.28.0（前端列表分页与覆盖分析改版 + 车辆 IP 台账字段 + 文件浏览视频桶前缀修复）
 
 Date：2026-11-13
-变更类型：新增功能（分页 / 车辆 IP）+ 缺陷修复（覆盖分析「去生成」跳转 / 视频桶文件过滤）；含表结构增列（Alembic `0005` 必跑）与 OpenAPI/Kafka 契约增量（全部向后兼容）；**需重建 `scene-service`、`vehicle-service`、`data-collector`、`hunter-web` 四个镜像**
+变更类型：新增功能（分页 / 车辆 IP）+ 缺陷修复（覆盖分析「去生成」跳转 / 视频桶文件过滤）；含表结构增列（Alembic `0005` 必跑）与 OpenAPI/Kafka 契约增量（全部向后兼容）；**需重建 `scene-service`、`vehicle-service`、`data-collector`、`web-portal` 四个镜像**
 
 ### 1. 现场
 
@@ -9072,7 +9072,7 @@ Date：2026-11-13
 - **全部契约变更为增量**：`/logical` 新参有默认值（旧调用方不受影响）；health `ip`、vehicle `ip_address` 均可选（旧车端不报、旧前端不传均正常）；未升级的车端/调用方无需任何配合改动。
 - `ip_address` 为可空列，存量行为 NULL（页面显示 `-`）；新库经 schema.sql 直接带列。
 - ⚠ 本次修复了 data-collector 对 `vehicles` 表的写列白名单（orm-mapping.md：status/last_online_time 两列 → +ip_address 三列），其余列仍禁写。
-- **必须重建镜像**：`scene-service`、`vehicle-service`、`data-collector`、`hunter-web`（服务/前端代码在镜像内）；`contracts/` 为只读挂载，`git pull` 后随容器重建生效。
+- **必须重建镜像**：`scene-service`、`vehicle-service`、`data-collector`、`web-portal`（compose 服务名，镜像 `hunter/web-portal`；服务/前端代码在镜像内）；`contracts/` 为只读挂载，`git pull` 后随容器重建生效。
 
 ### 5. 验证（本门禁实跑，Python 3.12 `.venv`）
 
@@ -9090,20 +9090,43 @@ Date：2026-11-13
 > 在部署机 `/opt/HunterCore` 执行；compose 别名与运维手册一致：`C=(docker compose -f infra/deploy/docker-compose.yml --project-directory .)`。
 
 1. `git pull`。
-2. **执行 Alembic 迁移**（存量库必做；宿主机无依赖，在带依赖的容器内跑，`--user 0:0` 约定同 V1.26.0 §实机）：
+2. **执行 Alembic 迁移**（存量库必做；宿主机无依赖，在带依赖的容器内跑，`--user 0:0` 约定同 V1.26.0 §实机）。
+   ⚠ **部署库由 `schema.sql` 初始化，本就没有 Alembic 历史（`alembic_version` 为空）**——裸跑 `upgrade head` 会从 0001 起重放全部历史：0001 全幂等（create_all checkfirst / IF NOT EXISTS / `if_not_exists`）会“成功”并写入版本号，0002 的非幂等 `add_column` 则必然报 `DuplicateColumnError`（事务回滚，**存量数据无损**）。首次升级必须**先 stamp 到已落库的修订点再 upgrade**：
    ```bash
    C=(docker compose -f infra/deploy/docker-compose.yml --project-directory .)
-   "${C[@]}" run --rm --no-deps --user 0:0 -v "$PWD:/repo" -w /repo \
-     --entrypoint python3 scene-service -m alembic -c common/python/alembic.ini upgrade head
+   PY=("${C[@]}" run --rm --no-deps --user 0:0 -v "$PWD:/repo" -w /repo --entrypoint python3 scene-service)
+   # ① 若已被裸 upgrade 中断过，current 应显示 0001_initial_schema（预期内，无需清理）
+   "${PY[@]}" -m alembic -c common/python/alembic.ini current
+   # ② 抽验 0002–0004 已全部落库（schema.sql 是唯一建库入口，正常均在；不符则 stamp 到实际落库点）
+   docker exec hunter-postgres psql -U hunter -d hunter_core -c \
+     "select count(*) from information_schema.columns where table_schema='user_svc' and table_name='users' and column_name in ('must_change_password','mfa_enabled','totp_secret')"   # 期望 3
+   docker exec hunter-postgres psql -U hunter -d hunter_core -c \
+     "select conname, pg_get_constraintdef(oid) from pg_constraint where conname in ('ota_versions_status_check','events_event_type_check')"  # 期望含 testing/reviewing 与 collision_pre_warning
+   # ③ stamp 只写版本号不执行 DDL；随后 upgrade head 仅执行本版本的 0005
+   "${PY[@]}" -m alembic -c common/python/alembic.ini stamp 0004_event_pre_warning
+   "${PY[@]}" -m alembic -c common/python/alembic.ini upgrade head
    ```
-   幂等自检：`docker exec hunter-postgres psql -U hunter -d hunter_core -c "\\d vehicle_svc.vehicles"` 应见 `ip_address | text`。
-3. 重建四个镜像并滚动：`"${C[@]}" up -d --build scene-service vehicle-service data-collector web`。
+   幂等自检：`docker exec hunter-postgres psql -U hunter -d hunter_core -c "\\d vehicle_svc.vehicles"` 应见 `ip_address | text`；`"${PY[@]}" -m alembic -c common/python/alembic.ini current` 应见 `0005_vehicle_ip_address`。
+   **后续新版本**（`alembic_version` 已由本节走到 0005）直接裸跑 `upgrade head` 即可，无需再 stamp。
+3. 重建四个镜像并滚动（⚠ 前端服务名是 `web-portal`，不是 `web`）：`"${C[@]}" up -d --build scene-service vehicle-service data-collector web-portal`。
 4. 页面验收：场景生成器三个 Tab 分页条、覆盖分析「去生成」跳转任务 Tab、车辆列表 IP 列、文件浏览选 hunter-video 桶后数据类型置灰且按车辆/日期过滤命中。
 
-**实机回报（待回填）**：
+**实机回报（2026-11-14，部署机 `/opt/HunterCore`）**：
 
 ```text
-（待部署机实机执行后回填：迁移读数 / 四镜像重建耗时 / 页面验收截图结论 / 心跳 ip 回写实测）
+① 裸 upgrade head 在 0002 报 DuplicateColumnError（alembic_version 为空 → 从 0001 重放；
+   0001 幂等但整事务回滚未落账，重跑时 current 无输出），存量数据无损
+② 抽验：users 三列 count=3；ota_versions_status_check 含 testing/reviewing；
+   events_event_type_check 含 collision_pre_warning → 0002–0004 均已由 schema.sql 落库
+③ stamp 0004_event_pre_warning ✓ → upgrade head 仅执行 0005_vehicle_ip_address ✓
+④ Step3 踩第二坑：`up -d --build ... web` 报 no such service——服务名是 `web-portal`
+   （容器名倒是 hunter-web），已修正本节
+⑤ `up -d --build scene-service vehicle-service data-collector web-portal`：233s 构建 5 镜像
+   （顺带重建 api-gateway 属预期：共享库 common/python 变更，所有基于它的镜像 hash 均变）；
+   18/18 up：api-gateway Healthy，vehicle/scene/collector/web 容器 Started
+⑥ \d vehicle_svc.vehicles → `ip_address | text` ✓；alembic current →
+   `0005_vehicle_ip_address (head)` ✓
+⑦ 待回报：§8 四项页面验收 + 心跳 ip 回写实测（需车端上报或台账人工录入后验证）
 ```
 
 ### 7. 回滚
@@ -9124,6 +9147,113 @@ Date：2026-11-13
 - **待办 1｜车端 agent 排期**：health 消息增报 `ip` 字段（本版本平台侧已就绪：未上报前 IP 依赖建账/台账人工录入，页面显示 `-`）。
 - **待办 2｜存量、与本变更无关**：`verify_data_layer.py` / `common/python/tests::test_ddl_column_parity_with_orm` 在 HEAD 即因 `scene_svc.sim_node_registry`（V1.24.x 引入的 `08_sim_nodes.sql`）未登记进契约表清单 `EXPECTED_TABLES` 而失败，需单独走「更新契约并评审」；本版本未碰该表，门禁结果已按此口径解读。
 - **待办 3｜§6 实机回报回填**：部署机升级完成后回填迁移读数与页面验收结果。
+
+
+## V1.28.1（车辆 IP 只走心跳回写 + 用例与测试集分页布局 + 文件浏览时间倒序页码分页）
+
+Date：2026-11-14
+变更类型：缺陷修复 + 交互调整（含 data-collector `GET /files` 契约增量 `order`/`page` 与响应字段，向后兼容；**无表结构变更，不需 Alembic**）；需重建 `data-collector`、`web-portal` 两个镜像（`tools/vehicle-simulator` 为宿主机工具，随仓库更新）
+
+### 1. 现场
+
+使用方接续 V1.28.0 验收，回报 3 个问题（均附页面截图）：
+
+```text
+① 车辆管理列表「IP 地址」一直是 `-`；要求去掉手动修改保存，只由心跳自动回写；
+② 用例与测试集页面布局不合理、列表数据显示不全（右侧 46 个测试集只能看到 20 个，
+   左表列被裁切并出现横向滚动）；
+③ 文件浏览页面分页有问题、数据显示不全；要求把查询出来的数据按时间倒序排列。
+```
+
+### 2. 根因
+
+| # | 根因 |
+|---|---|
+| ① | V1.28.0 给 `ip_address` 开了**两条写路径**（人工录入 + 心跳回写），但真实车端 agent 尚未排期上报 `health.ip`（V1.28.0 §9 待办 1），页面又没人工填 ⇒ 列恒为空；工具侧 `vehicle-simulator` 也不发 `ip`，联调链路同样拿不到值 |
+| ② | 右侧「测试集与基线」卡片只有 `共 N 个测试集` 文案，**从未接分页组件**（后端 `list_suites` 早已支持 `page/page_size`，前端 `suitePage` 固定第 1 页）；两卡片 14/10 分栏下左表列宽合计 ≈1000px、右表 ≈550px 均超出可用宽度 ⇒ 横向滚动 + `fixed` 列遮挡；筛选条件变更未重置 `page`，停在深页号时看起来就是「没数据」 |
+| ③ | 契约 `GET /files` 只有 `marker` 游标 + `truncated`，**无 `total`、无排序能力** ⇒ 前端只能「上一页/下一页」逐游标前进、跳不了页也看不到总量；MinIO 列举按对象键字典序返回（`{vid}/{date}/{data_type}/{timestamp}_{seq}`），最新文件反而排在最后；且首次切到该 Tab 不自动列举，必须手点「查询」 |
+
+### 3. 变更内容
+
+**① 车辆 IP 单一写路径 = 心跳回写**
+
+| 层 | 文件 | 变更 |
+|---|---|---|
+| 前端 | `VehicleCreateDialog.vue`、`VehicleDetailView.vue` | 移除建账/台账的「IP 地址」输入项与校验规则（含提交前空值剔除逻辑）；详情提示改为「由车端 health 心跳自动回写；车端未上报前显示 `-`」 |
+| 前端 | `constants/vehicle.ts` | 删除已无使用方的 `VEHICLE_IP_PATTERN`（留注释说明取代关系） |
+| 工具 | `tools/vehicle-simulator`（`config.py`/`messages.py`/`simulator.py`） | health 新增 `ip` 上报：`--ip` / `SIM_VEHICLE_IP`，`auto`（默认，探测本机出口 IP）/`none`（不上报）/显式 IP；`detect_local_ip()` 用 UDP connect 技巧不实际发包，失败回退 `gethostbyname`，仍失败返回 `None`（不携带该键） |
+| 平台 | 不变 | `health.ip` → `ipaddress` 严格校验 → `VehicleLedgerWriter.record_ip` 按值去重落库（V1.28.0 链路） |
+| REST | 不变 | `vehicle-service` 的 `ip_address` 字段保留（可选，供运维/脚本兜底），仅取消页面录入入口 |
+
+> 取代 V1.28.0 §8 验收项「车辆创建录入 IP → 列表/详情回显」——该项已作废。
+
+**② 用例与测试集页（纯前端 `SceneTestCaseView.vue`）**
+
+- 右表接入 `el-pagination`（total, sizes, prev, pager, next；`page-sizes=[10,20,50,100]`），`page/page_size` 走既有 `suitePage` → 后端 `list_suites`；派生/新建测试集后重置 `page=1`；
+- 分栏 `14/10` → `15/9`，窄屏（xs/sm）整行堆叠；两表加 `max-height="560"` 内部滚动；
+- 列宽压缩：左表 `140/170/130/190/120/90/80/80` → `124/150/102/170/96/80/64/70`，右表 `140/90/70/160/90` → `130/78/60/156/68`；
+- 左表补 `sizes` 与 `current-page` 绑定；筛选变更走 `searchTestCases()` 重置 `page=1`，输入框支持回车/清空即查；新建用例与派生用例后同样重置。
+
+**③ 文件浏览时间倒序 + 页码分页（data-collector + 契约 + 前端）**
+
+- `schemas/files.py`：新增 `FileListOrder = Literal["key_asc", "time_desc"]`；`FileListData` 增 `order`/`total`/`page`/`scan_truncated`；
+- `services/files.py`：`list_files` 增 `order`/`page`；新增 `_scan_prefix()` 以 `list_objects` 游标逐批（`LIST_SCAN_BATCH=1000`）扫描前缀，窗口上限 `LIST_SCAN_MAX_OBJECTS=20000`，超限停止并回报 `scan_truncated`；`time_desc` 下按 `(-last_modified, object_key)` 排序后以 `page/limit` 切片，**预签名仅对当页条目签发**（不在扫描阶段批量签名）；
+- `routers/files.py`：`GET /files` 新增 `order`（默认 `key_asc`）/`page`（默认 1）查询参，旧调用方行为逐字不变；
+- `contracts/openapi/data-collector.yaml`：参数与响应字段同步；`x-hunter-pending-confirmation` #2 口径更新（无 DB 元信息表时以扫描式提供 `total`，窗口超限显式回报）；
+- 前端 `EventListView.vue`：默认 `order=time_desc`；底部「第 N 页 / 上一页 / 下一页」换成 `el-pagination`（total, sizes, prev, pager, next, jumper），筛选区「每页」下拉并入分页条；`scan_truncated` 时显示告警条；首次切到文件 Tab 自动列举。
+
+### 4. 兼容性
+
+- `GET /files` 契约变更为**增量**：`order` 缺省 `key_asc`、`page` 缺省 1，旧调用方（含车端 presign/complete 链路）不受影响；`FileListData` 新字段旧前端忽略即可。
+- ⚠ `time_desc` 页码模式**每次翻页都会重扫前缀**（≤20000 对象、1000/次），成本随前缀内对象数线性增长；无筛选的整桶列举明显慢于旧游标模式，故 `total` 只覆盖扫描窗口并以 `scan_truncated` 显式声明，不谎报全量。
+- 前后端**建议同批升级/回滚**：后端回滚而前端未回滚时，响应无 `total` ⇒ 前端 `fileTotal` 退化为当页条数，翻页将反复得到同一页。
+- 移除页面 IP 录入不影响 REST 字段：仍可用 API 写入，但该值会被下一次心跳覆盖（车端上报值为权威）。
+- **无表结构、无 Alembic 迁移**；`contracts/` 为只读挂载，`git pull` 后随容器重建生效。
+- 必须重建镜像：`data-collector`、`web-portal`（compose 服务名，前端服务名不是 `web`）。
+
+### 5. 验证（本门禁实跑，Python 3.12 `.venv`）
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| data-collector 单测（含 4 个新 `time_desc` 用例：倒序、页码切片、窗口截断、`key_asc` 向后兼容） | `pytest services/data-collector -q` | **207 passed**（V1.28.0 为 203） |
+| vehicle-simulator 单测（含 health `ip` 上报 3 例：缺省不携带 / IPv4 / IPv6 过 schema pattern） | `pytest tools/vehicle-simulator/tests -q` | **20 passed** |
+| 全量单测 | `python scripts/run_unit_tests.py` | 除 `common/python` 外全部目标通过；`common/python` 345 passed / 1 failed（**存量** `sim_node_registry` 未登记契约，见 V1.28.0 §9 待办 2，与本变更无关） |
+| 前端（vue-tsc 类型检查 + 构建） | `cd frontend && npm run build` | ✓ built in 28.65s（构建耗时有波动，仅留末次实测读数），类型检查 0 错误 |
+
+### 6. 部署与生效（实机步骤）
+
+> 在部署机 `/opt/HunterCore` 执行；别名同 V1.28.0：`C=(docker compose -f infra/deploy/docker-compose.yml --project-directory .)`。
+
+1. `git pull`。
+2. **无需数据库迁移**（本版本未动表结构，`alembic current` 应仍为 `0005_vehicle_ip_address (head)`）。
+3. 重建两个镜像并滚动：`"${C[@]}" up -d --build data-collector web-portal`。
+4. 页面验收见 §8；模拟器联调：`python -m vehicle_simulator --vehicle-id HUNTER-001 …`（默认 `--ip auto`）。
+
+**实机回报（待回填）**：
+
+```text
+① 待回报：镜像重建与容器滚动结果
+② 待回报：§8 四项验收 + 心跳 ip 回写实测（模拟器上报后车辆列表 IP 应出现）
+```
+
+### 7. 回滚
+
+- 服务/前端：`git revert` 本条提交后重建 `data-collector`、`web-portal`；`GET /files` 的 `order`/`page` 为增量参数，FastAPI 会忽略多余 query 参，单向回滚不报错（但注意 §4 前后端同批回滚的建议）。
+- 车辆 IP：回滚前端即恢复人工录入入口，后端与契约无需改动（字段一直是可选）。
+- 无数据库回滚项。
+
+### 8. 实机验证要点（部署后逐项确认）
+
+- 车辆管理：建账对话框与台账修改对话框**不再出现 IP 输入项**；模拟器/车端上报后，列表与详情 IP 自动出现（库侧直验：`docker exec hunter-postgres psql -U hunter -d hunter_core -c "select vehicle_id, ip_address from vehicle_svc.vehicles"`；回写失败才打日志：`docker logs hunter-collector 2>&1 | grep vehicle_ledger_ip_write_failed`，成功路径无日志属预期）；
+- 用例与测试集：右侧显示「共 46 条」并可翻到第 2/3 页；左右两表无横向滚动、`操作` 列不被裁切；改筛选/派生后回到第 1 页；
+- 文件浏览：进入 Tab 自动列举；**最新对象在第一页首行**；可跳页、可切每页条数、显示总量；选整桶无筛选时若超窗口应见黄色截断提示；
+- 回归：`hunter-video` 桶的车辆/日期过滤仍命中（V1.28.0 修复未受影响），`order=key_asc` 旧游标行为保持（可用 `curl` 直接验证）。
+
+### 9. 待办
+
+- **待办 1｜车端 agent 排期**（沿用 V1.28.0 待办 1，口径收紧）：本版本移除人工录入后，`health.ip` 未上报前车辆 IP 列**恒为 `-`**（模拟器已可上报，可先用于联调与验收）。
+- **待办 2｜扫描窗口经验值**：`LIST_SCAN_MAX_OBJECTS=20000` 按「单车单日原始数据」量级估算；若实机常态超限（频繁 `scan_truncated`），应改走 `x-hunter-pending-confirmation` #2 的「DB 元信息表」方案以获得精确总数与低成本分页。
+- **待办 3｜§6 实机回报回填**：部署机升级完成后回填镜像滚动读数与 §8 验收结果。
 
 
 

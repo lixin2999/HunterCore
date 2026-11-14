@@ -314,9 +314,14 @@ paths:
           未给 `vehicle_id` 时日期无法锚定前缀，列举 `remote-control/` 整段。
         每个对象返回 15 分钟预签名下载地址（支持 Range 分片下载）。
 
-        分页采用游标语义（`marker` → `next_marker`）：MinIO 列举接口不提供对象总数，
-        故本端点不返回 `total`；⚠ 待确认改为「新增 DB 元信息表 + `total` 分页」的可能性
-        （见 `x-hunter-pending-confirmation`）。
+        排序与分页由 `order` 决定（V1.28.1）：
+        - `key_asc`（默认，兼容旧调用方）：对象键字典序 + 游标语义（`marker` → `next_marker`），
+          不返回 `total`（MinIO 列举接口不提供总数）；
+        - `time_desc`：服务端扫描前缀内对象（窗口上限 20000，超出则 `scan_truncated=true`）后按
+          `last_modified` 倒序（同值以对象键倒序保证稳定），按 `page`/`limit` 切片并返回 `total`，
+          供控制台「最近文件在最前 + 页码分页」使用；预签名仅对当页条目签发。
+        ⚠ 待确认项（`x-hunter-pending-confirmation`）：V1.28.1 已以扫描式 `time_desc` 满足页码分页与
+        总数需求；若后续需支持超大前缀的精确分页，再评估「新增 DB 元信息表」方案。
       operationId: listFiles
       parameters:
         - name: bucket
@@ -341,13 +346,28 @@ paths:
         - name: marker
           in: query
           required: false
-          description: 游标（上一页返回的 next_marker；首页不传）
+          description: 游标（仅 `order=key_asc` 生效；上一页返回的 next_marker，首页不传）
           schema: { type: string, maxLength: 1024 }
         - name: limit
           in: query
           required: false
           description: 单页对象数（上限与列表分页上限一致：200）
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: order
+          in: query
+          required: false
+          description: |
+            排序与分页方式（V1.28.1）：`key_asc`=对象键字典序 + 游标分页（默认，旧行为）；
+            `time_desc`=修改时间倒序 + 页码分页（返回 `total`，`marker` 被忽略）。
+          schema:
+            type: string
+            enum: [key_asc, time_desc]
+            default: key_asc
+        - name: page
+          in: query
+          required: false
+          description: 页码（1 起，仅 `order=time_desc` 生效）
+          schema: { type: integer, minimum: 1, default: 1 }
         - $ref: "#/components/parameters/TraceRequestId"
       responses:
         "200":
@@ -1262,7 +1282,7 @@ components:
 
     FileListData:
       type: object
-      required: [items, next_marker, truncated]
+      required: [items, next_marker, truncated, order, total, page, scan_truncated]
       properties:
         items:
           type: array
@@ -1270,8 +1290,26 @@ components:
         next_marker:
           type: string
           nullable: true
-          description: "下一页游标（无更多数据时为 null）"
+          description: "下一页游标（仅 order=key_asc；无更多数据或页码模式为 null）"
         truncated: { type: boolean, description: "是否被截断（存在更多对象）" }
+        order:
+          type: string
+          enum: [key_asc, time_desc]
+          description: "本次生效的排序与分页方式（V1.28.1，回带请求值）"
+        total:
+          type: integer
+          nullable: true
+          description: "命中对象总数（仅 order=time_desc 页码模式；游标模式为 null）"
+        page:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: "当前页码（1 起，仅 order=time_desc 返回；游标模式为 null）"
+        scan_truncated:
+          type: boolean
+          description: >-
+            时间倒序扫描窗口（20000 对象）达上限被截断：为 true 时排序与 total 仅基于窗口内对象，
+            应缩小筛选范围（车辆/日期/数据类型）。order=key_asc 恒为 false。
 
     FileListResponse:
       allOf:
@@ -1744,8 +1782,8 @@ x-hunter-pending-confirmation:
       impact: "Step 4 路由层实现范围；若 12.2 节存在差异（如文件清单端点不存在/路径不同）需回改契约与实现"
     - id: 2
       question: "5.5 节步骤 6「元信息入库」在 contracts/database 无对应表（data_collector schema 仅 events / vehicle_telemetry）"
-      contract_decision: "不擅自新增表：文件元信息以 MinIO 对象列举（GET /files）+ Kafka sensor_file 通知体现；如需 DB 表须先更新 DDL 契约"
-      impact: "文件清单分页/检索能力（无 total、无法按业务字段查询）；未来新增表需 DDL→ORM→migration 同步"
+      contract_decision: "不擅自新增表：文件元信息以 MinIO 对象列举（GET /files）+ Kafka sensor_file 通知体现；如需 DB 表须先更新 DDL 契约（V1.28.1 已以扫描式 order=time_desc 在内存侧提供倒序与 total，未新增表）"
+      impact: "文件清单分页/检索能力（无 DB 表则 total 仅能靠前缀扫描，窗口上限 20000 对象，超限回报 scan_truncated）；未来新增表需 DDL→ORM→migration 同步"
     - id: 3
       question: "Kafka sensor_file 消息字段清单（设计文档未给出，契约原为 schema: null）"
       contract_decision: "按 topics.yaml 描述（bucket/object_key/size/checksum）+ 5.5 命名规范定义 contracts/kafka/schemas/sensor_file.schema.json（draft-07，additionalProperties=false）"
